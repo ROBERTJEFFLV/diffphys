@@ -31,7 +31,7 @@ Note that the axis conventions are FLU (x = forward, y = left, z = up). Please c
 - **Linear Velocity**: Linear velocity in m/s (can be relative offset to target trajectory as well).
 - **Angular Velocity**: Angular velocity in the body frame and in rad/s.
 - **Previous Action**: The `sim.action` is just the previous action (same normalization).
-- **Action**: The action motor conventions are [front-right, back-right, back-left, front-left] and the motor commands are normalized in the range [-1, 1]. `rpm(a) = (max_rpm - min_rpm) * (a + 1)/2 + min_rpm`
+- **Action**: The action motor conventions are [front-right, back-right, back-left, front-left] and the motor commands are normalized in the range [-1, 1]. `rpm(action) = (max_rpm - min_rpm) * (action + 1)/2 + min_rpm`
 
 
 ### Usage: L2F
