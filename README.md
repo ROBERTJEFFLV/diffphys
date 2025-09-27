@@ -24,7 +24,14 @@ for simulation_step in range(1000):
     action = policy.evaluate_step(observation)[0] # the policy works on batches by default
     simulation.step(action) # simulation dt=10 ms
 ```
-Note that the axis conventions are FLU (x = forward, y = left, z = up). Please convert position, orientation, linear velocity and angular velocity into these conventions. The angular velocity is in the body frame. The action motor conventions are [front-right, back-right, back-left, front-left] and the motor commands are normalized in the range [-1, 1].  
+Note that the axis conventions are FLU (x = forward, y = left, z = up). Please convert position, orientation, linear velocity and angular velocity into these conventions. 
+
+- **Position**: Absolute position in meter. Can be relative offset to a target trajectory as well.
+- **Orientation**: Flattened (row-major) rotation matrix.
+- **Linear Velocity**: Linear velocity in m/s (can be relative offset to target trajectory as well).
+- **Angular Velocity**: Angular velocity in the body frame and in rad/s.
+- **Previous Action**: The `sim.action` is just the previous action (same normalization).
+- **Action**: The action motor conventions are [front-right, back-right, back-left, front-left] and the motor commands are normalized in the range [-1, 1].  
 
 
 ### Usage: L2F
