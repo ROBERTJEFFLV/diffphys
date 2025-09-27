@@ -33,6 +33,8 @@ Note that the axis conventions are FLU (x = forward, y = left, z = up). Please c
 - **Previous Action**: The `sim.action` is just the previous action (same normalization).
 - **Action**: The action motor conventions are [front-right, back-right, back-left, front-left] and the motor commands are normalized in the range [-1, 1]. `rpm(action) = (max_rpm - min_rpm) * (action + 1)/2 + min_rpm`
 
+Note that the poicy is trained for control at 100 Hz. While it can handle deviations from that, we expect best results around the nominal value. The control can be run at higher frequencies using the technique implemented in the L2F inference executor: `rl_tools/inference/applications/l2f/c_backend.h` by just advancing the latent state of the network every N steps as described later in this document. 
+
 
 ### Usage: L2F
 The following instructions show how to use [l2f](https://github.com/rl-tools/l2f), the simulator used for training the foundation policy:
