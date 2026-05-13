@@ -1,3 +1,9 @@
 [submodule "rl-tools"]
 	path = rl-tools
 	url = https://github.com/rl-tools/rl-tools.git
+[submodule "media"]
+	path = media
+	url = https://github.com/rl-tools/raptor-media.git
+[submodule "data"]
+	path = data
+	url = https://github.com/rl-tools/raptor-data.git
