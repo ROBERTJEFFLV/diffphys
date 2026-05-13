@@ -181,7 +181,7 @@ The foundation policy that has been exported as C++ code should be included (e.g
 ```bash
 git clone https://github.com/rl-tools/raptor.git
 cd raptor
-git submodule update --init rl-tools
+git submodule update --init rl-tools data
 cd rl-tools
 git submodule update --init --recursive -- external/highfive external/json external/tensorboard
 cd ..
