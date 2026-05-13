@@ -1,13 +1,13 @@
 <div align="center">
-<img src="./media/logo.svg"></img>
+<img src="https://github.com/rl-tools/raptor-media/blob/ef2dfc6ec650ad0226d74b9db33083cb9b39b4f7/logo.svg"></img>
 </div>
 
 <h1 align="center">A Foundation Policy for Quadrotor Control</h1>
 
 <div align="center">
-<a href="https://youtu.be/hVzdWRFTX3k" rel="Link to video"><img src="https://github.com/rl-tools/raptor/blob/master/media/thumbnail.jpg" width='450'/></a>
+<a href="https://youtu.be/hVzdWRFTX3k" rel="Link to video"><img src="https://github.com/rl-tools/raptor-media/blob/ef2dfc6ec650ad0226d74b9db33083cb9b39b4f7/thumbnail.jpg" width='450'/></a>
     </br>
-<a href="https://raptor.rl.tools" rel="Link to Project Page"><img src="https://github.com/rl-tools/raptor/blob/master/media/raptor.rl.tools.gif" width='450'/></a>
+<a href="https://raptor.rl.tools" rel="Link to Project Page"><img src="https://github.com/rl-tools/raptor-media/blob/ef2dfc6ec650ad0226d74b9db33083cb9b39b4f7/raptor.rl.tools.gif" width='450'/></a>
 </div>
 
 ## Usage
