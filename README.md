@@ -210,14 +210,16 @@ mkdir build
 MKL_ROOT=/opt/intel/oneapi/mkl/latest cmake -S /rl-tools -B /build -DCMAKE_BUILD_TYPE=Release -DRL_TOOLS_BACKEND_ENABLE_MKL=ON -DRL_TOOLS_ENABLE_TARGETS=ON -DRL_TOOLS_EXPERIMENTAL=ON -DRL_TOOLS_ENABLE_HDF5=ON -DRL_TOOLS_ENABLE_JSON=ON -DRL_TOOLS_ENABLE_TENSORBOARD=ON
 cmake --build /build --target foundation_policy_pre_training_sample_dynamics_parameters --target foundation_policy_pre_training --target foundation_policy_post_training -j$(nproc)
 cd /rl-tools
+export MKL_NUM_THREADS=1
 export RL_TOOLS_EXTRACK_EXPERIMENT=$(date '+%Y-%m-%d_%H-%M-%S')
 echo "Experiment: $RL_TOOLS_EXTRACK_EXPERIMENT"
 /build/src/foundation_policy/foundation_policy_pre_training_sample_dynamics_parameters
 seq 0 999 | xargs -I {} /build/src/foundation_policy/foundation_policy_pre_training ./src/foundation_policy/dynamics_parameters/{}.json
 /build/src/foundation_policy/foundation_policy_post_training
 ```
+Note, the pre-training of the 1000 teachers will take a long time. You can add `-P $(nproc)` to run multiple teacher training processes in parallel. By default `foundation_policy_post_training` uses the teacher checkpoints from `foundation-policy-v1-data` so you can also skip the `seq 0 999 | xarts ...` by sending SIGINT by pressing CTRL+C while it is running. 
 
-`foundation_policy_post_training` uses the teacher checkpoints from `foundation-policy-v0.1-data` by default. If you want to use the teacher checkpoints trained by `foundation_policy_pre_training`:
+If you want to use the teacher checkpoints trained by `foundation_policy_pre_training`:
 ```bash
 pip install p2s==0.1.14
 cd rl-tools/src/foundation_policy
