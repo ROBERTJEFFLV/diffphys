@@ -219,6 +219,7 @@ seq 0 999 | xargs -I {} /build/src/foundation_policy/foundation_policy_pre_train
 
 `foundation_policy_post_training` uses the teacher checkpoints from `foundation-policy-v0.1-data` by default. If you want to use the teacher checkpoints trained by `foundation_policy_pre_training`:
 ```bash
+pip install p2s==0.1.14
 cd rl-tools/src/foundation_policy
 ./extract_checkpoints.sh > checkpoints_$RL_TOOLS_EXTRACK_EXPERIMENT.txt
 ```
