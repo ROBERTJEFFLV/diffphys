@@ -1,0 +1,14 @@
+key,value
+run_name,sampled_narrow_finetune_from_fixed_8000
+train_seeds,"0 1 2 3 4"
+steps,8000
+eval_seeds,"10000 10001 10002"
+eval_models,"euler l2f"
+eval_dynamics_modes,"sampled fixed"
+eval_episodes,100
+eval_horizon,128
+sampled_dynamics_level,narrow
+init_actor_path,runs/diff_pre_training/diag_h128prio_16000_10seed/checkpoints
+zero_shot,0
+h128_prioritized_curriculum,1
+h128_schedule,balanced_16000
