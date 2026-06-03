@@ -18,7 +18,7 @@ namespace rl_tools::foundation_policy::diff_pre_training{
 
     constexpr bool DYNAMIC_ALLOCATION = true;
     constexpr bool DIFF_TRAINING_SAMPLE_DYNAMICS = true;
-    constexpr TI DIFF_TRAINING_BATCH_SIZE = 4;
+    constexpr TI DIFF_TRAINING_BATCH_SIZE = 64;
     constexpr TI DIFF_TRAINING_SEQUENCE_LENGTH = 128;
     constexpr TI DIFF_TRAINING_HORIZON = DIFF_TRAINING_SEQUENCE_LENGTH;
     constexpr TI DIFF_TRAINING_NUM_STEPS = 3;

@@ -1,0 +1,17 @@
+/tmp/raptor_diff_rdac_build/src/foundation_policy/foundation_policy_diff_pre_training \
+  --diff-model euler \
+  --steps 100000 \
+  --sample-dynamics \
+  --sampled-dynamics-level broad \
+  --balanced-dynamics-sampling \
+  --horizon 16 \
+  --batch-size 64 \
+  --actor-grad-clip 50 \
+  --action-grad-clip 100 \
+  --w-v 1.5 \
+  --w-w 1.0 \
+  --w-terminal-v 10 \
+  --w-terminal-w 6 \
+  --seed 0 \
+  --log-path rl-tools/runs/diff_pre_training/rdac_h16_broad_b64_long_20260603_173420/logs/train.csv \
+  --save-path rl-tools/runs/diff_pre_training/rdac_h16_broad_b64_long_20260603_173420/checkpoints/policy.bin

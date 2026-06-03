@@ -41,6 +41,27 @@ using DiffModel = fp::DiffModel;
 using EvalModel = fp::EvalModel;
 using RuntimeOptions = fp::RuntimeOptions;
 
+std::string sibling_output_path(const std::string& anchor_path, const std::string& filename){
+    const std::size_t separator = anchor_path.find_last_of("/\\");
+    if(separator == std::string::npos){
+        return filename;
+    }
+    return anchor_path.substr(0, separator + 1) + filename;
+}
+
+template <typename TI>
+void decode_dynamics_group_key(TI key, TI num_bins, TI& size_mass, TI& thrust_to_weight, TI& torque_to_inertia, TI& motor_delay, TI& curve_shape){
+    curve_shape = key % num_bins;
+    key /= num_bins;
+    motor_delay = key % num_bins;
+    key /= num_bins;
+    torque_to_inertia = key % num_bins;
+    key /= num_bins;
+    thrust_to_weight = key % num_bins;
+    key /= num_bins;
+    size_mass = key % num_bins;
+}
+
 template <typename T>
 T ramp_difficulty(long long step, long long stage_steps, long long stages){
     if(stage_steps <= 0 || stages <= 0){
@@ -1242,9 +1263,20 @@ int main(int argc, char** argv){
     }
 
     std::ofstream log_file;
+    std::ofstream batch_bin_counts_file;
     if(!options.log_path.empty()){
         log_file.open(options.log_path);
         fp::write_training_csv_header(log_file);
+        batch_bin_counts_file.open(sibling_output_path(options.log_path, "batch_bin_counts.csv"));
+        if(batch_bin_counts_file.is_open()){
+            batch_bin_counts_file << "step,batch_size,dynamics_num_groups,dynamics_group_count_min,dynamics_group_count_max,dynamics_batch_balanced";
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",size_mass_bin_" << bin_i;
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",thrust_to_weight_bin_" << bin_i;
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",torque_to_inertia_bin_" << bin_i;
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",motor_delay_bin_" << bin_i;
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",curve_shape_bin_" << bin_i;
+            batch_bin_counts_file << "\n";
+        }
     }
 
     std::cout << "foundation_policy_diff_pre_training\n";
@@ -1254,6 +1286,8 @@ int main(int argc, char** argv){
               << " balanced_dynamics_sampling=" << (options.balanced_dynamics_sampling ? "true" : "false")
               << " dynamics_balance_bins=" << fp::DYNAMICS_BALANCE_BINS
               << " batch_size=" << options.batch_size
+              << " effective_batch_size=" << options.batch_size
+              << " actor_output_dim=" << fp::ACTOR_OUTPUT_DIM
               << " horizon=" << options.horizon
               << " steps=" << options.num_steps
               << " horizon_curriculum=" << (options.horizon_curriculum ? "true" : "false")
@@ -1296,8 +1330,17 @@ int main(int argc, char** argv){
     T response_errors[MAX_BATCH_SIZE][MAX_HORIZON][fp::RESPONSE_ERROR_DIM];
     T sample_group_weights[MAX_BATCH_SIZE];
     TI sample_group_keys[MAX_BATCH_SIZE];
+    T sample_action_saturation_ratios[MAX_BATCH_SIZE];
+    TI sample_action_value_counts[MAX_BATCH_SIZE];
+    TI sample_action_saturation_counts[MAX_BATCH_SIZE];
     T step_costs[MAX_BATCH_SIZE][MAX_HORIZON];
     T q_returns[MAX_BATCH_SIZE][MAX_HORIZON];
+
+    constexpr TI NUM_DYNAMICS_BIN_GROUPS = fp::DYNAMICS_BALANCE_BINS * fp::DYNAMICS_BALANCE_BINS * fp::DYNAMICS_BALANCE_BINS * fp::DYNAMICS_BALANCE_BINS * fp::DYNAMICS_BALANCE_BINS;
+    T dynamics_bin_loss_sum[NUM_DYNAMICS_BIN_GROUPS] = {};
+    T dynamics_bin_success_sum[NUM_DYNAMICS_BIN_GROUPS] = {};
+    T dynamics_bin_action_saturation_sum[NUM_DYNAMICS_BIN_GROUPS] = {};
+    TI dynamics_bin_sample_count[NUM_DYNAMICS_BIN_GROUPS] = {};
 
     bool training_invalid = false;
     TI num_skipped_steps = 0;
@@ -1440,6 +1483,9 @@ int main(int argc, char** argv){
         rlt::set_all(device, q_weights, (T)0);
         rlt::set_all(device, reset, false);
         for(TI batch_i = 0; batch_i < MAX_BATCH_SIZE; batch_i++){
+            sample_action_saturation_ratios[batch_i] = (T)0;
+            sample_action_value_counts[batch_i] = 0;
+            sample_action_saturation_counts[batch_i] = 0;
             for(TI horizon_i = 0; horizon_i < MAX_HORIZON; horizon_i++){
                 for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
                     output_gradients[batch_i][horizon_i][action_i] = (T)0;
@@ -1570,6 +1616,35 @@ int main(int argc, char** argv){
             num_dynamics_groups > 0 &&
             dynamics_group_count_min == dynamics_group_count_max &&
             std::abs(dynamics_group_weight_sum_max - dynamics_group_weight_sum_min) < (T)1e-6;
+        TI batch_size_mass_bin_counts[fp::DYNAMICS_BALANCE_BINS] = {};
+        TI batch_thrust_to_weight_bin_counts[fp::DYNAMICS_BALANCE_BINS] = {};
+        TI batch_torque_to_inertia_bin_counts[fp::DYNAMICS_BALANCE_BINS] = {};
+        TI batch_motor_delay_bin_counts[fp::DYNAMICS_BALANCE_BINS] = {};
+        TI batch_curve_shape_bin_counts[fp::DYNAMICS_BALANCE_BINS] = {};
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            TI size_mass_bin;
+            TI thrust_to_weight_bin;
+            TI torque_to_inertia_bin;
+            TI motor_delay_bin;
+            TI curve_shape_bin;
+            decode_dynamics_group_key<TI>(sample_group_keys[batch_i], fp::DYNAMICS_BALANCE_BINS, size_mass_bin, thrust_to_weight_bin, torque_to_inertia_bin, motor_delay_bin, curve_shape_bin);
+            batch_size_mass_bin_counts[size_mass_bin]++;
+            batch_thrust_to_weight_bin_counts[thrust_to_weight_bin]++;
+            batch_torque_to_inertia_bin_counts[torque_to_inertia_bin]++;
+            batch_motor_delay_bin_counts[motor_delay_bin]++;
+            batch_curve_shape_bin_counts[curve_shape_bin]++;
+        }
+        if(batch_bin_counts_file.is_open()){
+            batch_bin_counts_file << training_step << "," << options.batch_size << "," << num_dynamics_groups << ","
+                                  << dynamics_group_count_min << "," << dynamics_group_count_max << ","
+                                  << (dynamics_batch_balanced ? "true" : "false");
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << "," << batch_size_mass_bin_counts[bin_i];
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << "," << batch_thrust_to_weight_bin_counts[bin_i];
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << "," << batch_torque_to_inertia_bin_counts[bin_i];
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << "," << batch_motor_delay_bin_counts[bin_i];
+            for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << "," << batch_curve_shape_bin_counts[bin_i];
+            batch_bin_counts_file << "\n";
+        }
         scale_sampled_dynamics_diagnostics<PARAMETERS, T, TI>(sampled_dynamics_stats, (T)1 / (T)options.batch_size);
         const T dynamics_rejection_rate = rejected_dynamics_count > 0
             ? (T)rejected_dynamics_count / ((T)rejected_dynamics_count + (T)options.batch_size)
@@ -1634,8 +1709,10 @@ int main(int argc, char** argv){
                         action_delta_max = std::max(action_delta_max, delta);
                         action_delta_count++;
                     }
+                    sample_action_value_counts[batch_i]++;
                     if(std::abs(action) > (T)0.98){
                         action_saturation_count++;
+                        sample_action_saturation_counts[batch_i]++;
                     }
                     clamped_this_step += clamped ? 1 : 0;
                     rlt::set(action_row, 0, action_i, action);
@@ -1711,6 +1788,11 @@ int main(int argc, char** argv){
         for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
             const T sample_weight = sample_group_weights[batch_i];
             const T diff_sample_weight = sample_weight * diff_rollout_weight;
+            T sample_weighted_loss_for_bin = (T)0;
+            bool sample_success_for_bin = false;
+            sample_action_saturation_ratios[batch_i] = sample_action_value_counts[batch_i] > 0
+                ? (T)sample_action_saturation_counts[batch_i] / (T)sample_action_value_counts[batch_i]
+                : (T)0;
             if(options.diff_model == DiffModel::EULER){
                 auto terms = l2f_diff::rollout_loss_and_gradients<PARAMETERS, T, TI, MAX_HORIZON>(
                     parameters[batch_i],
@@ -1735,11 +1817,13 @@ int main(int argc, char** argv){
                 mean_terms.terminal_velocity += diff_sample_weight * terms.terminal_velocity;
                 mean_terms.terminal_attitude += diff_sample_weight * terms.terminal_attitude;
                 mean_terms.terminal_angular_velocity += diff_sample_weight * terms.terminal_angular_velocity;
+                sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
                 mean_rollout_metrics.final_state_norm += l2f_diff::state_norm<T, TI>(euler_gradient_states[current_horizon]);
                 mean_rollout_metrics.final_position_norm += fp::norm3(euler_gradient_states[current_horizon].p);
                 mean_rollout_metrics.final_velocity_norm += fp::norm3(euler_gradient_states[current_horizon].v);
                 mean_rollout_metrics.final_angular_velocity_norm += fp::norm3(euler_gradient_states[current_horizon].omega);
-                if(compute_training_success_flag<T, TI>(euler_gradient_states[current_horizon])){
+                sample_success_for_bin = compute_training_success_flag<T, TI>(euler_gradient_states[current_horizon]);
+                if(sample_success_for_bin){
                     training_success_count++;
                 }
             }
@@ -1766,11 +1850,20 @@ int main(int argc, char** argv){
                 const T p_norm = fp::norm3(states[batch_i][current_horizon].position);
                 const T v_norm = fp::norm3(states[batch_i][current_horizon].linear_velocity);
                 const T w_norm = fp::norm3(states[batch_i][current_horizon].angular_velocity);
-                if(p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
-                   v_norm < fp::SUCCESS_VELOCITY_THRESHOLD &&
-                   w_norm < fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD){
+                sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
+                sample_success_for_bin = p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
+                    v_norm < fp::SUCCESS_VELOCITY_THRESHOLD &&
+                    w_norm < fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD;
+                if(sample_success_for_bin){
                     training_success_count++;
                 }
+            }
+            if(sample_group_keys[batch_i] >= 0 && sample_group_keys[batch_i] < NUM_DYNAMICS_BIN_GROUPS){
+                const TI group_key = sample_group_keys[batch_i];
+                dynamics_bin_loss_sum[group_key] += sample_weighted_loss_for_bin;
+                dynamics_bin_success_sum[group_key] += sample_success_for_bin ? (T)1 : (T)0;
+                dynamics_bin_action_saturation_sum[group_key] += sample_action_saturation_ratios[batch_i];
+                dynamics_bin_sample_count[group_key]++;
             }
             if(options.disable_physics_gradient){
                 for(TI horizon_i = 0; horizon_i < MAX_HORIZON; horizon_i++){
@@ -2452,6 +2545,42 @@ int main(int argc, char** argv){
                 training_invalid = true;
                 break;
             }
+        }
+    }
+
+    if(!options.log_path.empty()){
+        const std::string per_bin_path = sibling_output_path(options.log_path, "per_dynamics_bin_summary.csv");
+        std::ofstream per_bin_file(per_bin_path);
+        if(per_bin_file.is_open()){
+            per_bin_file << "group_key,size_mass_bin,thrust_to_weight_bin,torque_to_inertia_bin,motor_delay_bin,curve_shape_bin,sample_count,loss_mean,success_mean,action_saturation_mean\n";
+            TI min_bin_sample_count = dynamics_bin_sample_count[0];
+            TI max_bin_sample_count = dynamics_bin_sample_count[0];
+            for(TI group_key = 0; group_key < NUM_DYNAMICS_BIN_GROUPS; group_key++){
+                min_bin_sample_count = std::min(min_bin_sample_count, dynamics_bin_sample_count[group_key]);
+                max_bin_sample_count = std::max(max_bin_sample_count, dynamics_bin_sample_count[group_key]);
+                TI size_mass_bin;
+                TI thrust_to_weight_bin;
+                TI torque_to_inertia_bin;
+                TI motor_delay_bin;
+                TI curve_shape_bin;
+                decode_dynamics_group_key<TI>(group_key, fp::DYNAMICS_BALANCE_BINS, size_mass_bin, thrust_to_weight_bin, torque_to_inertia_bin, motor_delay_bin, curve_shape_bin);
+                const T inv_count = dynamics_bin_sample_count[group_key] > 0 ? (T)1 / (T)dynamics_bin_sample_count[group_key] : (T)0;
+                per_bin_file << group_key << ","
+                             << size_mass_bin << ","
+                             << thrust_to_weight_bin << ","
+                             << torque_to_inertia_bin << ","
+                             << motor_delay_bin << ","
+                             << curve_shape_bin << ","
+                             << dynamics_bin_sample_count[group_key] << ","
+                             << dynamics_bin_loss_sum[group_key] * inv_count << ","
+                             << dynamics_bin_success_sum[group_key] * inv_count << ","
+                             << dynamics_bin_action_saturation_sum[group_key] * inv_count << "\n";
+            }
+            std::cout << "per_dynamics_bin_summary=" << per_bin_path
+                      << " dynamics_bin_sample_count_min=" << min_bin_sample_count
+                      << " dynamics_bin_sample_count_max=" << max_bin_sample_count
+                      << " dynamics_bins_sampled_evenly=" << (min_bin_sample_count == max_bin_sample_count ? "true" : "false")
+                      << "\n";
         }
     }
 
