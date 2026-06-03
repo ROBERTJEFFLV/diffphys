@@ -1,0 +1,14 @@
+rows=200000
+final_step=199999
+final_loss=5.64185
+final_success=0
+final_action_saturation=0.148438
+final_hidden_separation=0.370343
+tail100_loss=0.6920158329999999
+tail100_success=0.3075
+tail100_action_saturation=0.09697264772
+tail100_hidden_separation=0.269822388
+tail1000_loss=0.5816957517
+tail1000_success=0.41775
+tail1000_action_saturation=0.048920410051
+tail1000_hidden_separation=0.2792191755
