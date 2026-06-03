@@ -78,16 +78,18 @@ namespace rl_tools::foundation_policy::diff_pre_training{
     bool save_actor_checkpoint(DEVICE& device, ACTOR& actor, const std::string& path){
         try{
             std::ofstream out(path);
-            out << "foundation_policy_diff_pre_training_actor_v1\n";
-            save_matrix_text(out, actor.content.weights.parameters, "input_dense_weights");
-            save_matrix_text(out, actor.content.biases.parameters, "input_dense_biases");
-            save_tensor_text(device, out, actor.next_module.content.weights_input.parameters, "gru_weights_input");
-            save_tensor_text(device, out, actor.next_module.content.biases_input.parameters, "gru_biases_input");
-            save_tensor_text(device, out, actor.next_module.content.weights_hidden.parameters, "gru_weights_hidden");
-            save_tensor_text(device, out, actor.next_module.content.biases_hidden.parameters, "gru_biases_hidden");
-            save_tensor_text(device, out, actor.next_module.content.initial_hidden_state.parameters, "gru_initial_hidden_state");
-            save_matrix_text(out, actor.next_module.next_module.content.weights.parameters, "output_dense_weights");
-            save_matrix_text(out, actor.next_module.next_module.content.biases.parameters, "output_dense_biases");
+            out << "foundation_policy_diff_pre_training_rdac_hidden_actor_v3\n";
+            save_matrix_text(out, actor.trunk.content.weights.parameters, "input_dense_weights");
+            save_matrix_text(out, actor.trunk.content.biases.parameters, "input_dense_biases");
+            save_tensor_text(device, out, actor.trunk.next_module.content.weights_input.parameters, "gru_weights_input");
+            save_tensor_text(device, out, actor.trunk.next_module.content.biases_input.parameters, "gru_biases_input");
+            save_tensor_text(device, out, actor.trunk.next_module.content.weights_hidden.parameters, "gru_weights_hidden");
+            save_tensor_text(device, out, actor.trunk.next_module.content.biases_hidden.parameters, "gru_biases_hidden");
+            save_tensor_text(device, out, actor.trunk.next_module.content.initial_hidden_state.parameters, "gru_initial_hidden_state");
+            save_matrix_text(out, actor.actor_head.weights.parameters, "actor_head_weights");
+            save_matrix_text(out, actor.actor_head.biases.parameters, "actor_head_biases");
+            save_matrix_text(out, actor.critic_head.weights.parameters, "critic_head_weights");
+            save_matrix_text(out, actor.critic_head.biases.parameters, "critic_head_biases");
             return true;
         }
         catch(const std::exception& e){
@@ -102,20 +104,22 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             std::ifstream in(path);
             std::string magic;
             in >> magic;
-            if(magic != "foundation_policy_diff_pre_training_actor_v1"){
+            if(magic != "foundation_policy_diff_pre_training_rdac_hidden_actor_v3"){
                 std::cerr << "Unsupported checkpoint type: " << magic << "\n";
                 return false;
             }
             bool ok = true;
-            ok = load_matrix_text(in, actor.content.weights.parameters, "input_dense_weights") && ok;
-            ok = load_matrix_text(in, actor.content.biases.parameters, "input_dense_biases") && ok;
-            ok = load_tensor_text(device, in, actor.next_module.content.weights_input.parameters, "gru_weights_input") && ok;
-            ok = load_tensor_text(device, in, actor.next_module.content.biases_input.parameters, "gru_biases_input") && ok;
-            ok = load_tensor_text(device, in, actor.next_module.content.weights_hidden.parameters, "gru_weights_hidden") && ok;
-            ok = load_tensor_text(device, in, actor.next_module.content.biases_hidden.parameters, "gru_biases_hidden") && ok;
-            ok = load_tensor_text(device, in, actor.next_module.content.initial_hidden_state.parameters, "gru_initial_hidden_state") && ok;
-            ok = load_matrix_text(in, actor.next_module.next_module.content.weights.parameters, "output_dense_weights") && ok;
-            ok = load_matrix_text(in, actor.next_module.next_module.content.biases.parameters, "output_dense_biases") && ok;
+            ok = load_matrix_text(in, actor.trunk.content.weights.parameters, "input_dense_weights") && ok;
+            ok = load_matrix_text(in, actor.trunk.content.biases.parameters, "input_dense_biases") && ok;
+            ok = load_tensor_text(device, in, actor.trunk.next_module.content.weights_input.parameters, "gru_weights_input") && ok;
+            ok = load_tensor_text(device, in, actor.trunk.next_module.content.biases_input.parameters, "gru_biases_input") && ok;
+            ok = load_tensor_text(device, in, actor.trunk.next_module.content.weights_hidden.parameters, "gru_weights_hidden") && ok;
+            ok = load_tensor_text(device, in, actor.trunk.next_module.content.biases_hidden.parameters, "gru_biases_hidden") && ok;
+            ok = load_tensor_text(device, in, actor.trunk.next_module.content.initial_hidden_state.parameters, "gru_initial_hidden_state") && ok;
+            ok = load_matrix_text(in, actor.actor_head.weights.parameters, "actor_head_weights") && ok;
+            ok = load_matrix_text(in, actor.actor_head.biases.parameters, "actor_head_biases") && ok;
+            ok = load_matrix_text(in, actor.critic_head.weights.parameters, "critic_head_weights") && ok;
+            ok = load_matrix_text(in, actor.critic_head.biases.parameters, "critic_head_biases") && ok;
             return ok;
         }
         catch(const std::exception& e){

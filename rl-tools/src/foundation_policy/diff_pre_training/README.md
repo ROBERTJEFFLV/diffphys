@@ -1,8 +1,55 @@
-# Differentiable Physics Pre-Training
+# Recurrent Differentiable-Physics Actor-Critic Pre-Training
 
-This module is an MVP differentiable-physics path for RAPTOR-style foundation-policy pre-training. It keeps the recurrent GRU actor and the implicit-identification observation: position, rotation matrix, linear velocity, angular velocity, and previous action/action history.
+This module is the differentiable-rollout pre-training path for **RDAC / Recurrent DiffPhys AC**: a single recurrent adaptive controller trained across many dynamics with differentiable rigid-body gradients.
 
-The actor is not given explicit physical parameters such as mass, inertia, thrust coefficients, torque constants, or motor time constants. Those parameters remain internal simulator parameters sampled by the rollout.
+The GRU hidden state is the only adaptive dynamics memory. It receives the current observation, previous motor action, and previous physical response-error features through the recurrent input stream. There is no explicit equivalent-dynamics latent policy output and no latent consistency target.
+
+Training may use sampled simulator parameters `theta_j` internally for stable differentiable rigid-body gradients through the rollout model. Equivalent-dynamics calculations may remain as sampled-dynamics diagnostics, but they are not policy outputs and are not training targets.
+
+The actor deployment input must not include raw physical parameters.
+
+The intended closed loop is:
+
+```text
+balanced dynamics sampler
+-> vectorized L2F/Euler interaction
+-> GRU-based adaptive actor
+-> differentiable rigid-body rollout
+-> actor-critic + differentiable physics joint update
+```
+
+The current executable implements the RDAC model skeleton directly: an encoder/GRU trunk, a 4D motor-command `actor_head` that consumes `[o_t, h_t]`, and a scalar `critic_head` trained from rollout returns over `[o_t, h_t]`. It does not train 1000 SAC teachers and does not meta-imitate teacher policies.
+
+## Architecture Target
+
+```text
+many dynamics sampler
+        |
+balanced vectorized L2F rollout as interaction data
+        |
+Recurrent DiffPhys Actor-Critic
+        |
+actor outputs motor commands / RPM setpoints
+        |
+differentiable rigid-body + motor model
+        |
+K-step differentiable rollout loss
+        |
+single adaptive controller
+```
+
+Critic training can be made asymmetric later by adding `theta_j` to the critic path during training only. The current critic is already separated from the deployed actor path, and it uses `[o_t, h_t]` rather than raw simulator parameters.
+
+Current RDAC head layout:
+
+```text
+encoder(o_t, a_{t-1}, e_{t-1}) -> u_t
+GRU(u_t, h_{t-1}) -> h_t
+actor_head([o_t, h_t]) -> a_t[0:4] motor commands / normalized RPM setpoints
+critic_head([o_t, h_t]) -> V_t
+```
+
+The actor output is exactly four motor actions. The recurrent hidden state carries all online adaptation information.
 
 ## Models
 
@@ -11,6 +58,8 @@ The actor is not given explicit physical parameters such as mass, inertia, thrus
 `--diff-model l2f_approx` keeps the previous approximate gradient path against the original L2F RK4 forward step. It is useful as a reference, but it is not the default training model because its rollout-level gradient is incomplete.
 
 The original L2F RK4 simulator is still kept for evaluation and later refinement. This MVP does not attempt to implement the full RK4 adjoint/Jacobian.
+
+`theta_j` sampled by the simulator is used by the differentiable model during training. It is not exposed to the actor.
 
 ## Euler Model
 
@@ -80,6 +129,31 @@ The Euler training path uses an SO(3) exponential-map rotation update. `Exp(.)` 
 
 ## Loss
 
+The RDAC objective is:
+
+```text
+L = L_AC
+  + lambda_diff * L_K_step_differentiable_rollout
+  + lambda_state * L_transition_consistency
+  + lambda_smooth * L_action_smoothness
+```
+
+`L_AC` is the normal single recurrent actor-critic signal for long-horizon return and exploration. It is not a bank of SAC teachers.
+
+`L_diff` is the K-step differentiable rollout loss. Starting from an interaction state `x_t`, the current actor produces motor commands, the differentiable rigid-body/motor model rolls forward, and position, attitude, velocity, angular-velocity, and action costs backpropagate through:
+
+```text
+action -> motor response -> thrust/torque -> attitude -> position -> cost
+```
+
+`L_transition_consistency` is the optional one-step interaction-model consistency term:
+
+```text
+diff_model(x_t, a_t, theta_j) ~= x_{t+1}^{interaction}
+```
+
+`L_action_smoothness` and other small mechanical stabilizers should stay minimal. The main policy gradient comes from the K-step differentiable physics rollout.
+
 The smooth stabilization loss is:
 
 ```text
@@ -113,6 +187,7 @@ Runtime options added for the stabilization MVP:
 - `--horizon-curriculum`: uses 16 -> 32 -> 64 -> user `--horizon`, capped by the build horizon.
 - `--state-curriculum`: starts from smaller initial position, velocity, attitude, and angular-velocity perturbations, then ramps to the normal sampler.
 - `--dynamics-curriculum`: starts sampled-dynamics training from nominal dynamics, then filters broad samples using basic mass, inertia, motor-time-constant, and thrust-to-weight checks.
+- `--balanced-dynamics-sampling` / `--disable-balanced-dynamics-sampling`: balanced sampling is enabled by default. Each batch is assigned bins over size/mass scale, thrust-to-weight, torque-to-inertia, and motor-delay root variables before final simulator parameters are generated. This is preferred over independently uniform final-parameter sampling.
 - `--actor-grad-clip VALUE` / `--disable-actor-grad-clip`: scales actor parameter gradients dL/dtheta by global norm after BPTT. This is the recommended default stabilizer.
 - `--action-grad-clip VALUE` / `--disable-action-grad-clip`: clips rollout-output/action gradients dL/du before BPTT. Optional, not the recommended default.
 - `--grad-clip VALUE` / `--disable-grad-clip`: deprecated aliases for `--action-grad-clip` / `--disable-action-grad-clip`. Prints a warning; use the explicit names instead.
@@ -592,8 +667,9 @@ The current bridge gap for a teacher-cost experiment is checkpoint format and po
 - Original L2F reward and SAC/TD3 core paths are not modified.
 - The existing SAC diff prototype remains separate.
 - Original L2F evaluation is implemented through `--eval-model l2f`.
-- Checkpoint save/load uses a small text format for the RAPTOR GRU actor weights only, not optimizer state.
+- Checkpoint save/load uses a small text format for the RDAC trunk, actor head, and critic head weights, not optimizer state.
 - Horizon/state curriculum, terminal loss, action bounding, rollout-output gradient clipping, and sampled-dynamics filtering are implemented for the Euler differentiable pre-training executable.
+- Balanced root-dynamics sampling, group-wise rollout weighting, equivalent-dynamics diagnostics, and the recurrent deterministic actor-critic update are implemented in the Euler differentiable pre-training executable. The deployed actor still receives no raw physical parameters.
 
 Allowed claim:
 
@@ -601,18 +677,21 @@ Allowed claim:
 - In the current fixed-dynamics tests, curriculum plus stronger velocity/angular-velocity weighting improves closed-loop evaluation and reaches nonzero success on both Euler and original L2F fixed-dynamics evaluation.
 - In the current medium sampled-dynamics audit, fixed-initialized sampled fine-tuning outperforms scratch on sampled Euler and original L2F evaluation with zero invalid rollouts and zero rejection.
 - In the current broad sampled-dynamics exploratory run, sampled evaluation remains nonzero but requires heavy rejection filtering and loses fixed-dynamics retention.
+- The architecture direction is now implemented as RDAC in the pre-training executable: one recurrent adaptive controller trained with differentiable rollout gradients, equivalent-dynamics adaptation targets, and a single critic head.
 
 Not allowed yet:
 
 - Teacher-cost reduction is proven.
-- The RAPTOR 1000-teacher pipeline is replaced.
+- A full SAC-style stochastic actor-critic or asymmetric critic with `theta_j` input is complete.
+- The RAPTOR 1000-teacher pipeline is fully replaced in all legacy post-training code outside this RDAC pre-training path.
 - Sim2real or cross-platform transfer is achieved.
 - The simplified Euler policy is a complete controller for original L2F.
 - The broad sampled-dynamics domain is solved without filtering.
 
 ## Next Steps
 
-1. Continue fixed v-strong actor-clip training.
-2. Bridge the diff-pretraining actor checkpoint into post-training initialization and compare diff-pretraining + few teachers against few-teacher-only baselines.
-3. Reduce broad sampled-dynamics rejection by designing a smoother dynamics curriculum.
-4. Later implement full L2F RK4 adjoint/Jacobian if needed.
+1. Add transition-consistency supervision that compares `diff_model(x_t, a_t, theta_j)` against the sampled interaction transition.
+2. Add the optional asymmetric critic input path for `theta_j` during training only.
+3. Use vectorized original L2F interaction rollouts as the primary data source for `L_AC`, `L_diff`, and `L_state`.
+4. Reduce broad sampled-dynamics rejection by improving balanced root-domain sampling and group-wise normalization.
+5. Later implement full L2F RK4 adjoint/Jacobian if needed.

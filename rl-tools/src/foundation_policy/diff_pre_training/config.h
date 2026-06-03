@@ -24,6 +24,11 @@ namespace rl_tools::foundation_policy::diff_pre_training{
     constexpr TI DIFF_TRAINING_NUM_STEPS = 3;
     constexpr T DIFF_TRAINING_LEARNING_RATE = 1e-4;
     constexpr TI HIDDEN_DIM = 16;
+    constexpr TI CRITIC_DIM = 1;
+    constexpr T LOSS_AC_ACTOR_WEIGHT = 0.05;
+    constexpr T LOSS_AC_CRITIC_WEIGHT = 0.10;
+    constexpr T LOSS_DIFF_ROLLOUT_WEIGHT = 5e-4;
+    constexpr T LOSS_TRANSITION_CONSISTENCY_WEIGHT = 0.05;
 
     constexpr T LOSS_POSITION_WEIGHT = 8.0;
     constexpr T LOSS_VELOCITY_WEIGHT = 0.8;
@@ -69,6 +74,8 @@ namespace rl_tools::foundation_policy::diff_pre_training{
 
     constexpr bool DYNAMICS_CURRICULUM_ENABLED = false;
     constexpr TI DYNAMICS_CURRICULUM_STAGE_STEPS = 500;
+    constexpr bool BALANCED_DYNAMICS_SAMPLING_ENABLED = true;
+    constexpr TI DYNAMICS_BALANCE_BINS = 4;
     constexpr T SAMPLED_DYNAMICS_MAX_MASS = 0.25;
     constexpr T SAMPLED_DYNAMICS_MIN_THRUST_TO_WEIGHT = 1.25;
 
@@ -88,13 +95,63 @@ namespace rl_tools::foundation_policy::diff_pre_training{
     using INPUT_LAYER = rlt::nn::layers::dense::BindConfiguration<INPUT_LAYER_CONFIG>;
     using GRU_CONFIG = rlt::nn::layers::gru::Configuration<T, TI, HIDDEN_DIM, rlt::nn::parameters::groups::Normal>;
     using GRU = rlt::nn::layers::gru::BindConfiguration<GRU_CONFIG>;
-    using OUTPUT_LAYER_CONFIG = rlt::nn::layers::dense::Configuration<T, TI, ENVIRONMENT::ACTION_DIM, rlt::nn::activation_functions::ActivationFunction::IDENTITY, rlt::nn::layers::dense::DefaultInitializer<T, TI>, rlt::nn::parameters::groups::Output>;
-    using OUTPUT_LAYER = rlt::nn::layers::dense::BindConfiguration<OUTPUT_LAYER_CONFIG>;
-    using MODULE_CHAIN = Module<INPUT_LAYER, Module<GRU, Module<OUTPUT_LAYER>>>;
-
+    constexpr TI ACTOR_OUTPUT_DIM = ENVIRONMENT::ACTION_DIM;
+    constexpr TI RESPONSE_ERROR_DIM = ENVIRONMENT::Observation::DIM;
+    constexpr TI POLICY_INPUT_DIM = ENVIRONMENT::Observation::DIM + ENVIRONMENT::ACTION_DIM + RESPONSE_ERROR_DIM;
     using CAPABILITY = rlt::nn::capability::Gradient<rlt::nn::parameters::Adam, DYNAMIC_ALLOCATION>;
-    using INPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM>;
-    using ACTOR = rlt::nn_models::sequential::Build<CAPABILITY, MODULE_CHAIN, INPUT_SHAPE>;
+    using INPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, POLICY_INPUT_DIM>;
+    using HIDDEN_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, HIDDEN_DIM>;
+    using ACTION_OUTPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::ACTION_DIM>;
+    using ACTOR_HEAD_INPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM + HIDDEN_DIM>;
+    using CRITIC_HEAD_INPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM + HIDDEN_DIM>;
+    using CRITIC_OUTPUT_SHAPE = rlt::tensor::Shape<TI, DIFF_TRAINING_SEQUENCE_LENGTH, DIFF_TRAINING_BATCH_SIZE, CRITIC_DIM>;
+
+    using ACTOR_HEAD_CONFIG = rlt::nn::layers::dense::Configuration<T, TI, ENVIRONMENT::ACTION_DIM, rlt::nn::activation_functions::ActivationFunction::IDENTITY, rlt::nn::layers::dense::DefaultInitializer<T, TI>, rlt::nn::parameters::groups::Output>;
+    using CRITIC_HEAD_CONFIG = rlt::nn::layers::dense::Configuration<T, TI, CRITIC_DIM, rlt::nn::activation_functions::ActivationFunction::IDENTITY, rlt::nn::layers::dense::DefaultInitializer<T, TI>, rlt::nn::parameters::groups::Output>;
+
+    using TRUNK_MODULE_CHAIN = Module<INPUT_LAYER, Module<GRU>>;
+
+    template <typename T_CAPABILITY>
+    struct RDACActor{
+        using CAPABILITY_TYPE = T_CAPABILITY;
+        using TRUNK = rlt::nn_models::sequential::Build<T_CAPABILITY, TRUNK_MODULE_CHAIN, INPUT_SHAPE>;
+        using ACTOR_HEAD = rlt::nn::layers::dense::Layer<ACTOR_HEAD_CONFIG, T_CAPABILITY, ACTOR_HEAD_INPUT_SHAPE>;
+        using CRITIC_HEAD = rlt::nn::layers::dense::Layer<CRITIC_HEAD_CONFIG, T_CAPABILITY, CRITIC_HEAD_INPUT_SHAPE>;
+        using OUTPUT_SHAPE = ACTION_OUTPUT_SHAPE;
+
+        TRUNK trunk;
+        ACTOR_HEAD actor_head;
+        CRITIC_HEAD critic_head;
+
+        template <typename T_NEW_CAPABILITY>
+        using CHANGE_CAPABILITY = RDACActor<T_NEW_CAPABILITY>;
+
+        template <bool T_DYNAMIC_ALLOCATION=true>
+        struct Buffer{
+            typename TRUNK::template Buffer<T_DYNAMIC_ALLOCATION> trunk;
+            typename ACTOR_HEAD::template Buffer<T_DYNAMIC_ALLOCATION> actor_head;
+            typename CRITIC_HEAD::template Buffer<T_DYNAMIC_ALLOCATION> critic_head;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, HIDDEN_SHAPE, T_DYNAMIC_ALLOCATION>> hidden;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, ACTION_OUTPUT_SHAPE, T_DYNAMIC_ALLOCATION>> action;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, ACTOR_HEAD_INPUT_SHAPE, T_DYNAMIC_ALLOCATION>> actor_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, CRITIC_HEAD_INPUT_SHAPE, T_DYNAMIC_ALLOCATION>> critic_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, CRITIC_OUTPUT_SHAPE, T_DYNAMIC_ALLOCATION>> q;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, HIDDEN_SHAPE, T_DYNAMIC_ALLOCATION>> d_hidden;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, ACTION_OUTPUT_SHAPE, T_DYNAMIC_ALLOCATION>> d_action_total;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, ACTOR_HEAD_INPUT_SHAPE, T_DYNAMIC_ALLOCATION>> d_actor_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, CRITIC_HEAD_INPUT_SHAPE, T_DYNAMIC_ALLOCATION>> d_critic_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, CRITIC_OUTPUT_SHAPE, T_DYNAMIC_ALLOCATION>> d_q_critic;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, DIFF_TRAINING_BATCH_SIZE, HIDDEN_DIM>, T_DYNAMIC_ALLOCATION>> step_hidden;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM + HIDDEN_DIM>, T_DYNAMIC_ALLOCATION>> step_actor_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM + HIDDEN_DIM>, T_DYNAMIC_ALLOCATION>> step_critic_input;
+            rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, DIFF_TRAINING_BATCH_SIZE, CRITIC_DIM>, T_DYNAMIC_ALLOCATION>> step_q;
+        };
+
+        template <bool T_DYNAMIC_ALLOCATION=true>
+        using State = typename TRUNK::template State<T_DYNAMIC_ALLOCATION>;
+    };
+
+    using ACTOR = RDACActor<CAPABILITY>;
     using ROLLOUT_ACTOR = ACTOR::CHANGE_CAPABILITY<rlt::nn::capability::Forward<DYNAMIC_ALLOCATION>>;
 
     struct ADAM_PARAMETERS: rlt::nn::optimizers::adam::DEFAULT_PARAMETERS_TENSORFLOW<T>{

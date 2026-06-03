@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "rdac_operations.h"
 
 #include <rl_tools/containers/matrix/matrix.h>
 #include <rl_tools/containers/tensor/tensor.h>
@@ -69,9 +70,21 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         scale_actor_gradients(device, static_cast<BASE_MODULE&>(actor), factor);
     }
 
+    template <typename DEVICE, typename CAPABILITY, typename T>
+    void scale_actor_gradients(DEVICE& device, RDACActor<CAPABILITY>& actor, T factor){
+        scale_actor_gradients(device, actor.trunk, factor);
+        scale_layer_gradients(device, actor.actor_head, factor);
+        scale_layer_gradients(device, actor.critic_head, factor);
+    }
+
     template <typename DEVICE, typename ACTOR>
     auto compute_actor_gradient_norm(DEVICE& device, ACTOR& actor){
         return rlt::gradient_norm(device, actor);
+    }
+
+    template <typename DEVICE, typename CAPABILITY>
+    auto compute_actor_gradient_norm(DEVICE& device, RDACActor<CAPABILITY>& actor){
+        return rdac_gradient_norm(device, actor);
     }
 
     template <typename DEVICE, typename ACTOR, typename T>

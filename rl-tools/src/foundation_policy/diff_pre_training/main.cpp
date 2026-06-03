@@ -29,10 +29,13 @@
 #include "logging_utils.h"
 #include "gradient_utils.h"
 #include "loop.h"
+#include "rdac_operations.h"
+#include "../equivalent_dynamics.h"
 
 namespace fp = rl_tools::foundation_policy::diff_pre_training;
 namespace rlt = rl_tools;
 namespace l2f_diff = rl_tools::rl::environments::l2f::diff;
+namespace eq_dyn = rl_tools::foundation_policy::equivalent_dynamics;
 
 using DiffModel = fp::DiffModel;
 using EvalModel = fp::EvalModel;
@@ -73,6 +76,19 @@ TI curriculum_stage_bucket(bool enabled, TI training_step, TI stage_steps, TI ma
         return max_bucket;
     }
     return std::min(max_bucket, training_step / stage_steps);
+}
+
+template <typename TI>
+eq_dyn::DynamicsBins<TI> scheduled_balanced_dynamics_bins(TI training_step, TI batch_i, TI num_bins){
+    eq_dyn::DynamicsBins<TI> bins;
+    if(num_bins <= 1){
+        return bins;
+    }
+    bins.size_mass = (batch_i + training_step) % num_bins;
+    bins.thrust_to_weight = ((TI)3 * batch_i + training_step) % num_bins;
+    bins.torque_to_inertia = (batch_i + (TI)2 * training_step) % num_bins;
+    bins.motor_delay = ((TI)3 * batch_i + (TI)2 * training_step) % num_bins;
+    return bins;
 }
 
 // Success-gated curriculum: explicit alternating stage plan.
@@ -271,14 +287,29 @@ struct SampledDynamicsDiagnostics{
     T inertia_trace = 0;
     T thrust_scale = 0;
     T torque_scale = 0;
+    T dynamics_size_mass_bin = 0;
+    T dynamics_thrust_to_weight_bin = 0;
+    T dynamics_torque_to_inertia_bin = 0;
+    T dynamics_motor_delay_bin = 0;
+    T equivalent_dynamics_diag_thrust_to_acceleration_gain = 0;
+    T equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain = 0;
+    T equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain = 0;
+    T equivalent_dynamics_diag_motor_rise_time_constant = 0;
+    T equivalent_dynamics_diag_motor_fall_time_constant = 0;
+    T equivalent_dynamics_diag_thrust_curve_shape = 0;
+    T equivalent_dynamics_diag_torque_curve_shape = 0;
+    T equivalent_dynamics_diag_residual_force_bias = 0;
+    T equivalent_dynamics_diag_residual_torque_bias = 0;
 };
 
 template <typename PARAMETERS, typename T, typename TI>
 SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_diagnostics(
     const PARAMETERS& parameters,
-    const PARAMETERS& nominal_parameters
+    const PARAMETERS& nominal_parameters,
+    const eq_dyn::DynamicsBins<TI>& bins
 ){
     SampledDynamicsDiagnostics<PARAMETERS, T, TI> stats;
+    const auto equivalent_dynamics_diag = eq_dyn::normalized_target_from_parameters<PARAMETERS>(parameters, nominal_parameters);
     stats.mass = parameters.dynamics.mass;
     stats.thrust_to_weight_ratio = estimated_thrust_to_weight<PARAMETERS, T, TI>(parameters);
     stats.torque_to_inertia_ratio = estimated_torque_to_inertia_ratio<PARAMETERS, T, TI>(parameters);
@@ -288,6 +319,19 @@ SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_diagnostics(
         / std::max((T)1e-12, estimated_max_thrust<PARAMETERS, T, TI>(nominal_parameters));
     stats.torque_scale = average_rotor_torque_constant_abs<PARAMETERS, T, TI>(parameters)
         / std::max((T)1e-12, average_rotor_torque_constant_abs<PARAMETERS, T, TI>(nominal_parameters));
+    stats.dynamics_size_mass_bin = (T)bins.size_mass;
+    stats.dynamics_thrust_to_weight_bin = (T)bins.thrust_to_weight;
+    stats.dynamics_torque_to_inertia_bin = (T)bins.torque_to_inertia;
+    stats.dynamics_motor_delay_bin = (T)bins.motor_delay;
+    stats.equivalent_dynamics_diag_thrust_to_acceleration_gain = equivalent_dynamics_diag.thrust_to_acceleration_gain;
+    stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain = equivalent_dynamics_diag.roll_pitch_torque_to_angular_acceleration_gain;
+    stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain = equivalent_dynamics_diag.yaw_torque_to_angular_acceleration_gain;
+    stats.equivalent_dynamics_diag_motor_rise_time_constant = equivalent_dynamics_diag.motor_rise_time_constant;
+    stats.equivalent_dynamics_diag_motor_fall_time_constant = equivalent_dynamics_diag.motor_fall_time_constant;
+    stats.equivalent_dynamics_diag_thrust_curve_shape = equivalent_dynamics_diag.thrust_curve_shape;
+    stats.equivalent_dynamics_diag_torque_curve_shape = equivalent_dynamics_diag.torque_curve_shape;
+    stats.equivalent_dynamics_diag_residual_force_bias = equivalent_dynamics_diag.residual_force_bias;
+    stats.equivalent_dynamics_diag_residual_torque_bias = equivalent_dynamics_diag.residual_torque_bias;
     return stats;
 }
 
@@ -305,6 +349,19 @@ void add_sampled_dynamics_diagnostics(
     accumulator.inertia_trace += value.inertia_trace;
     accumulator.thrust_scale += value.thrust_scale;
     accumulator.torque_scale += value.torque_scale;
+    accumulator.dynamics_size_mass_bin += value.dynamics_size_mass_bin;
+    accumulator.dynamics_thrust_to_weight_bin += value.dynamics_thrust_to_weight_bin;
+    accumulator.dynamics_torque_to_inertia_bin += value.dynamics_torque_to_inertia_bin;
+    accumulator.dynamics_motor_delay_bin += value.dynamics_motor_delay_bin;
+    accumulator.equivalent_dynamics_diag_thrust_to_acceleration_gain += value.equivalent_dynamics_diag_thrust_to_acceleration_gain;
+    accumulator.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain += value.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain;
+    accumulator.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain += value.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain;
+    accumulator.equivalent_dynamics_diag_motor_rise_time_constant += value.equivalent_dynamics_diag_motor_rise_time_constant;
+    accumulator.equivalent_dynamics_diag_motor_fall_time_constant += value.equivalent_dynamics_diag_motor_fall_time_constant;
+    accumulator.equivalent_dynamics_diag_thrust_curve_shape += value.equivalent_dynamics_diag_thrust_curve_shape;
+    accumulator.equivalent_dynamics_diag_torque_curve_shape += value.equivalent_dynamics_diag_torque_curve_shape;
+    accumulator.equivalent_dynamics_diag_residual_force_bias += value.equivalent_dynamics_diag_residual_force_bias;
+    accumulator.equivalent_dynamics_diag_residual_torque_bias += value.equivalent_dynamics_diag_residual_torque_bias;
 }
 
 template <typename PARAMETERS, typename T, typename TI>
@@ -318,6 +375,19 @@ void scale_sampled_dynamics_diagnostics(SampledDynamicsDiagnostics<PARAMETERS, T
     value.inertia_trace *= scale;
     value.thrust_scale *= scale;
     value.torque_scale *= scale;
+    value.dynamics_size_mass_bin *= scale;
+    value.dynamics_thrust_to_weight_bin *= scale;
+    value.dynamics_torque_to_inertia_bin *= scale;
+    value.dynamics_motor_delay_bin *= scale;
+    value.equivalent_dynamics_diag_thrust_to_acceleration_gain *= scale;
+    value.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain *= scale;
+    value.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain *= scale;
+    value.equivalent_dynamics_diag_motor_rise_time_constant *= scale;
+    value.equivalent_dynamics_diag_motor_fall_time_constant *= scale;
+    value.equivalent_dynamics_diag_thrust_curve_shape *= scale;
+    value.equivalent_dynamics_diag_torque_curve_shape *= scale;
+    value.equivalent_dynamics_diag_residual_force_bias *= scale;
+    value.equivalent_dynamics_diag_residual_torque_bias *= scale;
 }
 
 template <typename ENVIRONMENT>
@@ -412,7 +482,15 @@ bool sampled_parameters_safe(const PARAMETERS& parameters, T dynamics_difficulty
 }
 
 template <typename DEVICE, typename ENVIRONMENT, typename PARAMETERS, typename RNG, typename T, typename TI>
-TI sample_training_parameters(DEVICE& device, ENVIRONMENT& env, PARAMETERS& parameters, RNG& rng, const RuntimeOptions& options, T dynamics_difficulty){
+TI sample_training_parameters(
+    DEVICE& device,
+    ENVIRONMENT& env,
+    PARAMETERS& parameters,
+    RNG& rng,
+    const RuntimeOptions& options,
+    T dynamics_difficulty,
+    const eq_dyn::DynamicsBins<TI>* balanced_bins
+){
     const auto level = effective_sampled_dynamics_level<T>(options, dynamics_difficulty);
     if(!options.sample_dynamics || level == fp::SampledDynamicsLevel::FIXED){
         rlt::initial_parameters(device, env, parameters);
@@ -420,6 +498,13 @@ TI sample_training_parameters(DEVICE& device, ENVIRONMENT& env, PARAMETERS& para
     }
     ENVIRONMENT sampling_env = env;
     configure_sampled_dynamics_level(sampling_env, level);
+    if(options.balanced_dynamics_sampling && balanced_bins != nullptr){
+        eq_dyn::restrict_domain_to_bins<typename ENVIRONMENT::Parameters::DomainRandomization, T, TI>(
+            sampling_env.parameters.domain_randomization,
+            *balanced_bins,
+            fp::DYNAMICS_BALANCE_BINS
+        );
+    }
     const bool level_uses_filter = level == fp::SampledDynamicsLevel::NARROW || level == fp::SampledDynamicsLevel::MEDIUM;
     if(!options.dynamics_curriculum || dynamics_difficulty <= (T)0){
         if(options.dynamics_curriculum){
@@ -524,35 +609,41 @@ int main(int argc, char** argv){
     typename ROLLOUT_ACTOR::template State<fp::DYNAMIC_ALLOCATION> rollout_actor_state;
     fp::OPTIMIZER actor_optimizer;
 
-    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_SEQUENCE_LENGTH, fp::DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM>>> observations;
-    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::Observation::DIM>>> step_observations;
-    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_BATCH_SIZE, ENVIRONMENT::ACTION_DIM>>> step_actions;
+    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_SEQUENCE_LENGTH, fp::DIFF_TRAINING_BATCH_SIZE, fp::POLICY_INPUT_DIM>>> observations;
+    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_BATCH_SIZE, fp::POLICY_INPUT_DIM>>> step_observations;
+    rlt::Tensor<rlt::tensor::Specification<T, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_BATCH_SIZE, fp::ACTOR_OUTPUT_DIM>>> step_actions;
     rlt::Tensor<rlt::tensor::Specification<T, TI, ACTOR::OUTPUT_SHAPE>> d_output;
+    rlt::Tensor<rlt::tensor::Specification<T, TI, fp::CRITIC_OUTPUT_SHAPE>> q_targets;
+    rlt::Tensor<rlt::tensor::Specification<T, TI, fp::CRITIC_OUTPUT_SHAPE>> q_weights;
     rlt::Tensor<rlt::tensor::Specification<bool, TI, rlt::tensor::Shape<TI, fp::DIFF_TRAINING_SEQUENCE_LENGTH, fp::DIFF_TRAINING_BATCH_SIZE, 1>>> reset;
 
     rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ENVIRONMENT::Observation::DIM>> observation_row;
+    rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ENVIRONMENT::Observation::DIM>> predicted_observation_row;
     rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ENVIRONMENT::ACTION_DIM>> action_row;
 
     rlt::init(device);
     rlt::malloc(device, rng);
-    rlt::malloc(device, actor);
-    rlt::malloc(device, actor_buffer);
-    rlt::malloc(device, rollout_actor);
-    rlt::malloc(device, rollout_actor_buffer);
+    fp::rdac_malloc(device, actor);
+    fp::rdac_malloc_buffer<DEVICE, typename ACTOR::CAPABILITY_TYPE, fp::DYNAMIC_ALLOCATION>(device, actor_buffer);
+    fp::rdac_malloc(device, rollout_actor);
+    fp::rdac_malloc_buffer<DEVICE, typename ROLLOUT_ACTOR::CAPABILITY_TYPE, fp::DYNAMIC_ALLOCATION>(device, rollout_actor_buffer);
     rlt::malloc(device, rollout_actor_state);
     rlt::malloc(device, actor_optimizer);
     rlt::malloc(device, observations);
     rlt::malloc(device, step_observations);
     rlt::malloc(device, step_actions);
     rlt::malloc(device, d_output);
+    rlt::malloc(device, q_targets);
+    rlt::malloc(device, q_weights);
     rlt::malloc(device, reset);
     rlt::malloc(device, observation_row);
+    rlt::malloc(device, predicted_observation_row);
     rlt::malloc(device, action_row);
 
     rlt::init(device, rng, options.seed);
     rlt::init(device, env);
-    rlt::init_weights(device, actor, rng);
-    rlt::reset_optimizer_state(device, actor_optimizer, actor);
+    fp::rdac_init_weights(device, actor, rng);
+    fp::rdac_reset_optimizer_state(device, actor_optimizer, actor);
 
     bool init_actor_loaded_flag = false;
     std::string actor_checkpoint_to_load;
@@ -601,7 +692,7 @@ int main(int argc, char** argv){
     };
 
     auto run_evaluation = [&](){
-        rlt::copy(device, device, actor, rollout_actor);
+        fp::rdac_copy(device, device, actor, rollout_actor);
         rlt::Mode<rlt::mode::Evaluation<>> evaluation_mode;
         fp::EvalMetrics<T> eval_metrics;
         TI successes = 0;
@@ -619,7 +710,7 @@ int main(int argc, char** argv){
         for(TI episode_i = 0; episode_i < options.eval_episodes; episode_i++){
             PARAMETERS parameters;
             if(options.sample_dynamics){
-                sample_training_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(device, env, parameters, rng, options, (T)1);
+                sample_training_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(device, env, parameters, rng, options, (T)1, nullptr);
             }
             else{
                 rlt::initial_parameters(device, env, parameters);
@@ -628,14 +719,16 @@ int main(int argc, char** argv){
             rlt::sample_initial_state(device, env, parameters, state, rng);
             l2f_diff::EulerState<T, TI> euler_state;
             l2f_diff::from_l2f_state<STATE, T, TI>(state, euler_state);
-            rlt::reset(device, rollout_actor, rollout_actor_state, rng);
+            rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
+            T previous_action[ENVIRONMENT::ACTION_DIM] = {};
+            T previous_response_error[fp::RESPONSE_ERROR_DIM] = {};
 
             fp::ScalarTerms<T> episode_terms;
             bool invalid = false;
             T episode_action_norm = 0;
             for(TI step_i = 0; step_i < options.eval_horizon; step_i++){
                 if(options.reset_hidden_each_step){
-                    rlt::reset(device, rollout_actor, rollout_actor_state, rng);
+                    rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
                 }
                 if(options.eval_model == EvalModel::EULER){
                     l2f_diff::observe<T, TI>(euler_state, observation_row);
@@ -643,10 +736,17 @@ int main(int argc, char** argv){
                 else{
                     rlt::observe(device, env, parameters, state, typename ENVIRONMENT::Observation{}, observation_row, rng);
                 }
+                rlt::set_all(device, step_observations, (T)0);
                 for(TI observation_i = 0; observation_i < ENVIRONMENT::Observation::DIM; observation_i++){
                     rlt::set(device, step_observations, rlt::get(observation_row, 0, observation_i), 0, observation_i);
                 }
-                rlt::evaluate_step(device, rollout_actor, step_observations, rollout_actor_state, step_actions, rollout_actor_buffer, rng, evaluation_mode);
+                for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+                    rlt::set(device, step_observations, previous_action[action_i], 0, ENVIRONMENT::Observation::DIM + action_i);
+                }
+                for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                    rlt::set(device, step_observations, previous_response_error[error_i], 0, ENVIRONMENT::Observation::DIM + ENVIRONMENT::ACTION_DIM + error_i);
+                }
+                fp::rdac_evaluate_step(device, rollout_actor, step_observations, rollout_actor_state, step_actions, rollout_actor_buffer, rng, evaluation_mode);
                 T action[4];
                 T action_norm_sq = 0;
                 for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
@@ -661,6 +761,7 @@ int main(int argc, char** argv){
                     );
                     action_norm_sq += action[action_i] * action[action_i];
                     rlt::set(action_row, 0, action_i, action[action_i]);
+                    previous_action[action_i] = action[action_i];
                 }
                 episode_action_norm += std::sqrt(action_norm_sq);
                 if(options.eval_model == EvalModel::EULER){
@@ -803,6 +904,8 @@ int main(int argc, char** argv){
     std::cout << "diff_model=" << fp::diff_model_name(options.diff_model)
               << " sampled_dynamics=" << (options.sample_dynamics ? "true" : "false")
               << " sampled_dynamics_level=" << fp::sampled_dynamics_level_name(options.sample_dynamics ? options.sampled_dynamics_level : fp::SampledDynamicsLevel::FIXED)
+              << " balanced_dynamics_sampling=" << (options.balanced_dynamics_sampling ? "true" : "false")
+              << " dynamics_balance_bins=" << fp::DYNAMICS_BALANCE_BINS
               << " batch_size=" << options.batch_size
               << " horizon=" << options.horizon
               << " steps=" << options.num_steps
@@ -826,8 +929,12 @@ int main(int argc, char** argv){
               << " init_actor_path=" << (options.init_actor_path.empty() ? "none" : options.init_actor_path)
               << " init_actor_loaded=" << (init_actor_loaded_flag ? "true" : "false")
               << "\n";
-    std::cout << "actor=RAPTOR_GRU_FOUNDATION_POLICY observation_dim=" << ENVIRONMENT::Observation::DIM
+    std::cout << "actor=RDAC_GRU_ADAPTIVE_ACTOR observation_dim=" << ENVIRONMENT::Observation::DIM
+              << " policy_input_dim=" << fp::POLICY_INPUT_DIM
+              << " response_error_dim=" << fp::RESPONSE_ERROR_DIM
               << " action_dim=" << ENVIRONMENT::ACTION_DIM
+              << " actor_output_dim=" << fp::ACTOR_OUTPUT_DIM
+              << " adaptive_memory=gru_hidden_only"
               << " explicit_physical_parameters_in_observation=false\n";
 
     STATE states[MAX_BATCH_SIZE][MAX_HORIZON + 1];
@@ -839,6 +946,11 @@ int main(int argc, char** argv){
     T action_derivatives[MAX_BATCH_SIZE][MAX_HORIZON][ENVIRONMENT::ACTION_DIM];
     T output_gradients[MAX_BATCH_SIZE][MAX_HORIZON][ENVIRONMENT::ACTION_DIM];
     T action_gradients[MAX_HORIZON][ENVIRONMENT::ACTION_DIM];
+    T response_errors[MAX_BATCH_SIZE][MAX_HORIZON][fp::RESPONSE_ERROR_DIM];
+    T sample_group_weights[MAX_BATCH_SIZE];
+    TI sample_group_keys[MAX_BATCH_SIZE];
+    T step_costs[MAX_BATCH_SIZE][MAX_HORIZON];
+    T q_returns[MAX_BATCH_SIZE][MAX_HORIZON];
 
     bool training_invalid = false;
     TI num_skipped_steps = 0;
@@ -931,7 +1043,7 @@ int main(int argc, char** argv){
         }
         bool optimizer_reset_flag = false;
         if(options.reset_optimizer_on_curriculum_transition && (horizon_changed || state_curriculum_changed)){
-            rlt::reset_optimizer_state(device, actor_optimizer, actor);
+            fp::rdac_reset_optimizer_state(device, actor_optimizer, actor);
             optimizer_reset_flag = true;
         }
         const T terminal_ramp_multiplier_value = terminal_ramp_multiplier<T, TI>(options, steps_since_horizon_change);
@@ -972,10 +1084,13 @@ int main(int argc, char** argv){
         T action_gradient_norm_sq_before_clip = 0;
         T action_gradient_norm_sq_after_clip = 0;
         bool action_gradient_clipped = false;
-        rlt::copy(device, device, actor, rollout_actor);
-        rlt::reset(device, rollout_actor, rollout_actor_state, rng);
+        fp::rdac_copy(device, device, actor, rollout_actor);
+        rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
         rlt::set_all(device, observations, (T)0);
+        rlt::set_all(device, step_observations, (T)0);
         rlt::set_all(device, d_output, (T)0);
+        rlt::set_all(device, q_targets, (T)0);
+        rlt::set_all(device, q_weights, (T)0);
         rlt::set_all(device, reset, false);
         for(TI batch_i = 0; batch_i < MAX_BATCH_SIZE; batch_i++){
             for(TI horizon_i = 0; horizon_i < MAX_HORIZON; horizon_i++){
@@ -983,11 +1098,15 @@ int main(int argc, char** argv){
                     output_gradients[batch_i][horizon_i][action_i] = (T)0;
                     action_derivatives[batch_i][horizon_i][action_i] = (T)1;
                 }
+                for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                    response_errors[batch_i][horizon_i][error_i] = (T)0;
+                }
             }
         }
 
         fp::RolloutMetrics<T> mean_rollout_metrics;
         const T diagnostic_nan = std::numeric_limits<T>::quiet_NaN();
+        const T diff_rollout_weight = fp::LOSS_DIFF_ROLLOUT_WEIGHT;
         T action_value_sum = 0;
         T action_value_sq_sum = 0;
         T action_abs_sum = 0;
@@ -1005,14 +1124,33 @@ int main(int argc, char** argv){
         T thrust_norm_sum = 0;
         T torque_norm_sum = 0;
         TI force_cache_count = 0;
+        T transition_consistency_loss = 0;
+        bool single_step_state_finite = current_horizon > 0;
+        bool single_step_action_finite = current_horizon > 0;
+        bool single_step_reward_finite = current_horizon > 0;
+        bool single_step_done_finite = current_horizon > 0;
         SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_stats;
         for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            const auto dynamics_bins = scheduled_balanced_dynamics_bins<TI>(training_step, batch_i, fp::DYNAMICS_BALANCE_BINS);
+            const TI sample_key_raw = (((dynamics_bins.size_mass * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.thrust_to_weight)
+                * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.torque_to_inertia)
+                * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.motor_delay);
+            const TI sample_key = options.sample_dynamics && options.balanced_dynamics_sampling ? sample_key_raw : (TI)0;
+            sample_group_keys[batch_i] = sample_key;
+            sample_group_weights[batch_i] = (T)0;
             rejected_dynamics_count += sample_training_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(
-                device, env, parameters[batch_i], rng, options, dynamics_difficulty
+                device, env, parameters[batch_i], rng, options, dynamics_difficulty,
+                options.balanced_dynamics_sampling && options.sample_dynamics ? &dynamics_bins : nullptr
             );
             add_sampled_dynamics_diagnostics<PARAMETERS, T, TI>(
                 sampled_dynamics_stats,
-                sampled_dynamics_diagnostics<PARAMETERS, T, TI>(parameters[batch_i], env.parameters)
+                sampled_dynamics_diagnostics<PARAMETERS, T, TI>(
+                    parameters[batch_i],
+                    env.parameters,
+                    options.balanced_dynamics_sampling && options.sample_dynamics
+                        ? dynamics_bins
+                        : eq_dyn::bins_from_parameters<PARAMETERS, TI>(parameters[batch_i], fp::DYNAMICS_BALANCE_BINS)
+                )
             );
             rlt::sample_initial_state(device, env, parameters[batch_i], states[batch_i][0], rng);
             if(options.state_curriculum || options.fixed_state_difficulty >= (T)0){
@@ -1023,6 +1161,66 @@ int main(int argc, char** argv){
             mean_rollout_metrics.initial_velocity_norm += fp::norm3(states[batch_i][0].linear_velocity);
             mean_rollout_metrics.initial_angular_velocity_norm += fp::norm3(states[batch_i][0].angular_velocity);
         }
+        TI num_dynamics_groups = 0;
+        TI dynamics_group_count_min = options.batch_size > 0 ? options.batch_size : 0;
+        TI dynamics_group_count_max = 0;
+        T dynamics_group_weight_sum_min = std::numeric_limits<T>::infinity();
+        T dynamics_group_weight_sum_max = -std::numeric_limits<T>::infinity();
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            bool first_in_group = true;
+            for(TI previous_i = 0; previous_i < batch_i; previous_i++){
+                if(sample_group_keys[previous_i] == sample_group_keys[batch_i]){
+                    first_in_group = false;
+                    break;
+                }
+            }
+            if(first_in_group){
+                num_dynamics_groups++;
+            }
+        }
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            TI group_count = 0;
+            for(TI other_i = 0; other_i < options.batch_size; other_i++){
+                if(sample_group_keys[other_i] == sample_group_keys[batch_i]){
+                    group_count++;
+                }
+            }
+            sample_group_weights[batch_i] = num_dynamics_groups > 0 && group_count > 0
+                ? (T)1 / ((T)num_dynamics_groups * (T)group_count)
+                : (T)1 / (T)options.batch_size;
+        }
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            bool first_in_group = true;
+            for(TI previous_i = 0; previous_i < batch_i; previous_i++){
+                if(sample_group_keys[previous_i] == sample_group_keys[batch_i]){
+                    first_in_group = false;
+                    break;
+                }
+            }
+            if(!first_in_group){
+                continue;
+            }
+            TI group_count = 0;
+            T group_weight_sum = 0;
+            for(TI other_i = 0; other_i < options.batch_size; other_i++){
+                if(sample_group_keys[other_i] == sample_group_keys[batch_i]){
+                    group_count++;
+                    group_weight_sum += sample_group_weights[other_i];
+                }
+            }
+            dynamics_group_count_min = std::min(dynamics_group_count_min, group_count);
+            dynamics_group_count_max = std::max(dynamics_group_count_max, group_count);
+            dynamics_group_weight_sum_min = std::min(dynamics_group_weight_sum_min, group_weight_sum);
+            dynamics_group_weight_sum_max = std::max(dynamics_group_weight_sum_max, group_weight_sum);
+        }
+        if(num_dynamics_groups == 0){
+            dynamics_group_weight_sum_min = (T)0;
+            dynamics_group_weight_sum_max = (T)0;
+        }
+        const bool dynamics_batch_balanced =
+            num_dynamics_groups > 0 &&
+            dynamics_group_count_min == dynamics_group_count_max &&
+            std::abs(dynamics_group_weight_sum_max - dynamics_group_weight_sum_min) < (T)1e-6;
         scale_sampled_dynamics_diagnostics<PARAMETERS, T, TI>(sampled_dynamics_stats, (T)1 / (T)options.batch_size);
         const T dynamics_rejection_rate = rejected_dynamics_count > 0
             ? (T)rejected_dynamics_count / ((T)rejected_dynamics_count + (T)options.batch_size)
@@ -1031,24 +1229,30 @@ int main(int argc, char** argv){
         rlt::Mode<rlt::mode::Evaluation<>> evaluation_mode;
         for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
             if(options.reset_hidden_each_step){
-                rlt::reset(device, rollout_actor, rollout_actor_state, rng);
+                rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
             }
+            rlt::set_all(device, step_observations, (T)0);
             for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
-                if(options.diff_model == DiffModel::EULER){
-                    l2f_diff::observe<T, TI>(euler_states[batch_i][horizon_i], observation_row);
-                }
-                else{
-                    rlt::observe(device, env, parameters[batch_i], states[batch_i][horizon_i], typename ENVIRONMENT::Observation{}, observation_row, rng);
-                }
+                rlt::observe(device, env, parameters[batch_i], states[batch_i][horizon_i], typename ENVIRONMENT::Observation{}, observation_row, rng);
                 for(TI observation_i = 0; observation_i < ENVIRONMENT::Observation::DIM; observation_i++){
                     const T value = rlt::get(observation_row, 0, observation_i);
                     rlt::set(device, step_observations, value, batch_i, observation_i);
                     rlt::set(device, observations, value, horizon_i, batch_i, observation_i);
                 }
+                for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+                    const T previous_action = horizon_i > 0 ? actions[batch_i][horizon_i - 1][action_i] : (T)0;
+                    rlt::set(device, step_observations, previous_action, batch_i, ENVIRONMENT::Observation::DIM + action_i);
+                    rlt::set(device, observations, previous_action, horizon_i, batch_i, ENVIRONMENT::Observation::DIM + action_i);
+                }
+                for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                    const T response_error = horizon_i > 0 ? response_errors[batch_i][horizon_i - 1][error_i] : (T)0;
+                    rlt::set(device, step_observations, response_error, batch_i, ENVIRONMENT::Observation::DIM + ENVIRONMENT::ACTION_DIM + error_i);
+                    rlt::set(device, observations, response_error, horizon_i, batch_i, ENVIRONMENT::Observation::DIM + ENVIRONMENT::ACTION_DIM + error_i);
+                }
                 rlt::set(device, reset, options.reset_hidden_each_step || horizon_i == 0, horizon_i, batch_i, 0);
             }
 
-            rlt::evaluate_step(device, rollout_actor, step_observations, rollout_actor_state, step_actions, rollout_actor_buffer, rng, evaluation_mode);
+            fp::rdac_evaluate_step(device, rollout_actor, step_observations, rollout_actor_state, step_actions, rollout_actor_buffer, rng, evaluation_mode);
 
             for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
                 T action_norm_sq = 0;
@@ -1059,6 +1263,12 @@ int main(int argc, char** argv){
                     T action_derivative;
                     bool clamped;
                     const T action = bounded_action<T>(raw_action, options.action_bound_enabled, options.action_bound_value, action_derivative, clamped);
+                    if(horizon_i == 0){
+                        single_step_action_finite = single_step_action_finite &&
+                            fp::finite_value(raw_action) &&
+                            fp::finite_value(action) &&
+                            fp::finite_value(action_derivative);
+                    }
                     actions[batch_i][horizon_i][action_i] = action;
                     action_derivatives[batch_i][horizon_i][action_i] = action_derivative;
                     raw_action_norm_sq += raw_action * raw_action;
@@ -1090,6 +1300,26 @@ int main(int argc, char** argv){
                 if(options.diff_model == DiffModel::EULER){
                     l2f_diff::EulerStepCache<T> cache;
                     l2f_diff::step<PARAMETERS, T, TI>(parameters[batch_i], euler_states[batch_i][horizon_i], actions[batch_i][horizon_i], euler_states[batch_i][horizon_i + 1], cache);
+                    rlt::step(device, env, parameters[batch_i], states[batch_i][horizon_i], action_row, states[batch_i][horizon_i + 1], rng);
+                    rlt::observe(device, env, parameters[batch_i], states[batch_i][horizon_i + 1], typename ENVIRONMENT::Observation{}, observation_row, rng);
+                    l2f_diff::observe<T, TI>(euler_states[batch_i][horizon_i + 1], predicted_observation_row);
+                    const T transition_weight = fp::LOSS_TRANSITION_CONSISTENCY_WEIGHT
+                        * sample_group_weights[batch_i]
+                        / std::max((T)1, (T)current_horizon);
+                    for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                        const T response_error = rlt::get(observation_row, 0, error_i) - rlt::get(predicted_observation_row, 0, error_i);
+                        response_errors[batch_i][horizon_i][error_i] = response_error;
+                        transition_consistency_loss += transition_weight * response_error * response_error;
+                    }
+                    if(horizon_i == 0){
+                        const bool done = compute_training_success_flag<T, TI>(euler_states[batch_i][horizon_i + 1]);
+                        single_step_state_finite = single_step_state_finite &&
+                            fp::finite_value(l2f_diff::state_norm<T, TI>(euler_states[batch_i][horizon_i + 1])) &&
+                            fp::finite_value(fp::norm3(states[batch_i][horizon_i + 1].position)) &&
+                            fp::finite_value(fp::norm3(states[batch_i][horizon_i + 1].linear_velocity)) &&
+                            fp::finite_value(fp::norm3(states[batch_i][horizon_i + 1].angular_velocity));
+                        single_step_done_finite = single_step_done_finite && (done == true || done == false);
+                    }
                     for(TI rotor_i = 0; rotor_i < ENVIRONMENT::ACTION_DIM; rotor_i++){
                         rpm_sum += cache.rpm_next[rotor_i];
                         rpm_min = std::min(rpm_min, cache.rpm_next[rotor_i]);
@@ -1110,6 +1340,19 @@ int main(int argc, char** argv){
                 }
                 else{
                     rlt::step(device, env, parameters[batch_i], states[batch_i][horizon_i], action_row, states[batch_i][horizon_i + 1], rng);
+                    if(horizon_i == 0){
+                        const T p_norm = fp::norm3(states[batch_i][horizon_i + 1].position);
+                        const T v_norm = fp::norm3(states[batch_i][horizon_i + 1].linear_velocity);
+                        const T w_norm = fp::norm3(states[batch_i][horizon_i + 1].angular_velocity);
+                        const bool done = p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
+                            v_norm < fp::SUCCESS_VELOCITY_THRESHOLD &&
+                            w_norm < fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD;
+                        single_step_state_finite = single_step_state_finite &&
+                            fp::finite_value(p_norm) &&
+                            fp::finite_value(v_norm) &&
+                            fp::finite_value(w_norm);
+                        single_step_done_finite = single_step_done_finite && (done == true || done == false);
+                    }
                 }
             }
         }
@@ -1117,6 +1360,8 @@ int main(int argc, char** argv){
         fp::ScalarTerms<T> mean_terms;
         TI training_success_count = 0;
         for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            const T sample_weight = sample_group_weights[batch_i];
+            const T diff_sample_weight = sample_weight * diff_rollout_weight;
             if(options.diff_model == DiffModel::EULER){
                 auto terms = l2f_diff::rollout_loss_and_gradients<PARAMETERS, T, TI, MAX_HORIZON>(
                     parameters[batch_i],
@@ -1128,19 +1373,19 @@ int main(int argc, char** argv){
                     euler_caches,
                     action_gradients
                 );
-                mean_terms.total += terms.total();
-                mean_terms.position += terms.position;
-                mean_terms.velocity += terms.velocity;
-                mean_terms.attitude += terms.attitude;
-                mean_terms.angular_velocity += terms.angular_velocity;
-                mean_terms.action_magnitude += terms.action_magnitude;
-                mean_terms.action_smoothness += terms.action_smoothness;
-                mean_terms.saturation += terms.saturation;
-                mean_terms.terminal += terms.terminal;
-                mean_terms.terminal_position += terms.terminal_position;
-                mean_terms.terminal_velocity += terms.terminal_velocity;
-                mean_terms.terminal_attitude += terms.terminal_attitude;
-                mean_terms.terminal_angular_velocity += terms.terminal_angular_velocity;
+                mean_terms.total += diff_sample_weight * terms.total();
+                mean_terms.position += diff_sample_weight * terms.position;
+                mean_terms.velocity += diff_sample_weight * terms.velocity;
+                mean_terms.attitude += diff_sample_weight * terms.attitude;
+                mean_terms.angular_velocity += diff_sample_weight * terms.angular_velocity;
+                mean_terms.action_magnitude += diff_sample_weight * terms.action_magnitude;
+                mean_terms.action_smoothness += diff_sample_weight * terms.action_smoothness;
+                mean_terms.saturation += diff_sample_weight * terms.saturation;
+                mean_terms.terminal += diff_sample_weight * terms.terminal;
+                mean_terms.terminal_position += diff_sample_weight * terms.terminal_position;
+                mean_terms.terminal_velocity += diff_sample_weight * terms.terminal_velocity;
+                mean_terms.terminal_attitude += diff_sample_weight * terms.terminal_attitude;
+                mean_terms.terminal_angular_velocity += diff_sample_weight * terms.terminal_angular_velocity;
                 mean_rollout_metrics.final_state_norm += l2f_diff::state_norm<T, TI>(euler_gradient_states[current_horizon]);
                 mean_rollout_metrics.final_position_norm += fp::norm3(euler_gradient_states[current_horizon].p);
                 mean_rollout_metrics.final_velocity_norm += fp::norm3(euler_gradient_states[current_horizon].v);
@@ -1158,14 +1403,14 @@ int main(int argc, char** argv){
                     action_gradients,
                     l2f_approx_weights
                 );
-                mean_terms.total += terms.total();
-                mean_terms.position += terms.position;
-                mean_terms.velocity += terms.velocity;
-                mean_terms.attitude += terms.attitude;
-                mean_terms.angular_velocity += terms.angular_velocity;
-                mean_terms.action_magnitude += terms.action_magnitude;
-                mean_terms.action_smoothness += terms.action_smoothness;
-                mean_terms.saturation += terms.saturation;
+                mean_terms.total += diff_sample_weight * terms.total();
+                mean_terms.position += diff_sample_weight * terms.position;
+                mean_terms.velocity += diff_sample_weight * terms.velocity;
+                mean_terms.attitude += diff_sample_weight * terms.attitude;
+                mean_terms.angular_velocity += diff_sample_weight * terms.angular_velocity;
+                mean_terms.action_magnitude += diff_sample_weight * terms.action_magnitude;
+                mean_terms.action_smoothness += diff_sample_weight * terms.action_smoothness;
+                mean_terms.saturation += diff_sample_weight * terms.saturation;
                 mean_rollout_metrics.final_position_norm += fp::norm3(states[batch_i][current_horizon].position);
                 mean_rollout_metrics.final_velocity_norm += fp::norm3(states[batch_i][current_horizon].linear_velocity);
                 mean_rollout_metrics.final_angular_velocity_norm += fp::norm3(states[batch_i][current_horizon].angular_velocity);
@@ -1187,26 +1432,99 @@ int main(int argc, char** argv){
             }
             for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
                 for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
-                    const T gradient = action_gradients[horizon_i][action_i] * action_derivatives[batch_i][horizon_i][action_i] / (T)options.batch_size;
+                    const T gradient = action_gradients[horizon_i][action_i] * action_derivatives[batch_i][horizon_i][action_i] * diff_sample_weight;
                     output_gradients[batch_i][horizon_i][action_i] = gradient;
                     action_gradient_norm_sq_before_clip += gradient * gradient;
                 }
             }
         }
+        constexpr T AC_GAMMA = (T)0.99;
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                T cost = 0;
+                if(options.diff_model == DiffModel::EULER){
+                    const auto& state = euler_states[batch_i][horizon_i + 1];
+                    for(TI dim_i = 0; dim_i < 3; dim_i++){
+                        cost += fp::LOSS_POSITION_WEIGHT * state.p[dim_i] * state.p[dim_i];
+                        cost += options.loss_velocity_weight * state.v[dim_i] * state.v[dim_i];
+                        cost += options.loss_angular_velocity_weight * state.omega[dim_i] * state.omega[dim_i];
+                    }
+                    for(TI row_i = 0; row_i < 3; row_i++){
+                        for(TI col_i = 0; col_i < 3; col_i++){
+                            const T target = row_i == col_i ? (T)1 : (T)0;
+                            const T e = state.R[row_i][col_i] - target;
+                            cost += fp::LOSS_ATTITUDE_WEIGHT * e * e;
+                        }
+                    }
+                }
+                else{
+                    const auto& state = states[batch_i][horizon_i + 1];
+                    const T orientation_sign = fp::sign_for_shortest_quaternion(state.orientation);
+                    for(TI dim_i = 0; dim_i < 3; dim_i++){
+                        const T e_R = (T)2 * orientation_sign * state.orientation[dim_i + 1];
+                        cost += fp::LOSS_POSITION_WEIGHT * state.position[dim_i] * state.position[dim_i];
+                        cost += options.loss_velocity_weight * state.linear_velocity[dim_i] * state.linear_velocity[dim_i];
+                        cost += fp::LOSS_ATTITUDE_WEIGHT * e_R * e_R;
+                        cost += options.loss_angular_velocity_weight * state.angular_velocity[dim_i] * state.angular_velocity[dim_i];
+                    }
+                }
+                for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+                    cost += fp::LOSS_ACTION_MAGNITUDE_WEIGHT * actions[batch_i][horizon_i][action_i] * actions[batch_i][horizon_i][action_i];
+                }
+                step_costs[batch_i][horizon_i] = cost;
+                if(horizon_i == 0){
+                    const T reward = -cost;
+                    single_step_reward_finite = single_step_reward_finite && fp::finite_value(reward);
+                }
+            }
+            T running_return = 0;
+            for(TI reverse_i = 0; reverse_i < current_horizon; reverse_i++){
+                const TI horizon_i = current_horizon - reverse_i - 1;
+                running_return = -step_costs[batch_i][horizon_i] + AC_GAMMA * running_return;
+                q_returns[batch_i][horizon_i] = running_return;
+            }
+        }
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            bool first_in_group = true;
+            for(TI previous_i = 0; previous_i < batch_i; previous_i++){
+                if(sample_group_keys[previous_i] == sample_group_keys[batch_i]){
+                    first_in_group = false;
+                    break;
+                }
+            }
+            if(!first_in_group){
+                continue;
+            }
+            T mean_return = 0;
+            T variance_return = 0;
+            TI count = 0;
+            for(TI other_i = 0; other_i < options.batch_size; other_i++){
+                if(sample_group_keys[other_i] != sample_group_keys[batch_i]) continue;
+                for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                    mean_return += q_returns[other_i][horizon_i];
+                    count++;
+                }
+            }
+            mean_return = count > 0 ? mean_return / (T)count : (T)0;
+            for(TI other_i = 0; other_i < options.batch_size; other_i++){
+                if(sample_group_keys[other_i] != sample_group_keys[batch_i]) continue;
+                for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                    const T centered = q_returns[other_i][horizon_i] - mean_return;
+                    variance_return += centered * centered;
+                }
+            }
+            const T std_return = count > 1 ? std::sqrt(std::max((T)1e-6, variance_return / (T)(count - 1))) : (T)1;
+            for(TI other_i = 0; other_i < options.batch_size; other_i++){
+                if(sample_group_keys[other_i] != sample_group_keys[batch_i]) continue;
+                const T sample_weight = sample_group_weights[other_i] / std::max((T)1, (T)current_horizon);
+                for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                    const T normalized_return = (q_returns[other_i][horizon_i] - mean_return) / std_return;
+                    rlt::set(device, q_targets, normalized_return, horizon_i, other_i, (TI)0);
+                    rlt::set(device, q_weights, sample_weight, horizon_i, other_i, (TI)0);
+                }
+            }
+        }
         const T batch_normalizer = (T)1 / (T)options.batch_size;
-        mean_terms.total *= batch_normalizer;
-        mean_terms.position *= batch_normalizer;
-        mean_terms.velocity *= batch_normalizer;
-        mean_terms.attitude *= batch_normalizer;
-        mean_terms.angular_velocity *= batch_normalizer;
-        mean_terms.action_magnitude *= batch_normalizer;
-        mean_terms.action_smoothness *= batch_normalizer;
-        mean_terms.saturation *= batch_normalizer;
-        mean_terms.terminal *= batch_normalizer;
-        mean_terms.terminal_position *= batch_normalizer;
-        mean_terms.terminal_velocity *= batch_normalizer;
-        mean_terms.terminal_attitude *= batch_normalizer;
-        mean_terms.terminal_angular_velocity *= batch_normalizer;
         mean_rollout_metrics.initial_position_norm *= batch_normalizer;
         mean_rollout_metrics.final_position_norm *= batch_normalizer;
         mean_rollout_metrics.initial_velocity_norm *= batch_normalizer;
@@ -1257,12 +1575,96 @@ int main(int argc, char** argv){
         }
         const T action_grad_norm_after_clip = std::sqrt(action_gradient_norm_sq_after_clip);
 
-        // Backprop through the GRU actor, then compute and scale actor parameter gradients.
+        // Backprop through the RDAC trunk/heads, then compute and scale parameter gradients.
         rlt::Mode<rlt::nn::layers::gru::ResetMode<rlt::mode::Default<>, rlt::nn::layers::gru::ResetModeSpecification<TI, decltype(reset)>>> training_mode;
         training_mode.reset_container = reset;
-        rlt::forward(device, actor, observations, actor_buffer, rng, training_mode);
-        rlt::zero_gradient(device, actor);
-        rlt::backward(device, actor, observations, d_output, actor_buffer, training_mode);
+        fp::rdac_forward(device, actor, observations, actor_buffer, rng, training_mode);
+        T hidden_group_means[MAX_BATCH_SIZE][fp::HIDDEN_DIM] = {};
+        T hidden_global_mean[fp::HIDDEN_DIM] = {};
+        TI hidden_group_counts[MAX_BATCH_SIZE] = {};
+        TI hidden_group_keys[MAX_BATCH_SIZE] = {};
+        TI hidden_num_groups = 0;
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            TI group_index = hidden_num_groups;
+            for(TI group_i = 0; group_i < hidden_num_groups; group_i++){
+                if(hidden_group_keys[group_i] == sample_group_keys[batch_i]){
+                    group_index = group_i;
+                    break;
+                }
+            }
+            if(group_index == hidden_num_groups){
+                hidden_group_keys[group_index] = sample_group_keys[batch_i];
+                hidden_num_groups++;
+            }
+            for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                hidden_group_counts[group_index]++;
+                for(TI hidden_i = 0; hidden_i < fp::HIDDEN_DIM; hidden_i++){
+                    const T value = rlt::get(device, actor_buffer.hidden, horizon_i, batch_i, hidden_i);
+                    hidden_group_means[group_index][hidden_i] += value;
+                    hidden_global_mean[hidden_i] += value;
+                }
+            }
+        }
+        TI hidden_total_count = 0;
+        for(TI group_i = 0; group_i < hidden_num_groups; group_i++){
+            hidden_total_count += hidden_group_counts[group_i];
+            const T inv_count = hidden_group_counts[group_i] > 0 ? (T)1 / (T)hidden_group_counts[group_i] : (T)0;
+            for(TI hidden_i = 0; hidden_i < fp::HIDDEN_DIM; hidden_i++){
+                hidden_group_means[group_i][hidden_i] *= inv_count;
+            }
+        }
+        const T hidden_inv_total = hidden_total_count > 0 ? (T)1 / (T)hidden_total_count : (T)0;
+        for(TI hidden_i = 0; hidden_i < fp::HIDDEN_DIM; hidden_i++){
+            hidden_global_mean[hidden_i] *= hidden_inv_total;
+        }
+        T hidden_dynamics_between_var = 0;
+        T hidden_dynamics_within_var = 0;
+        for(TI group_i = 0; group_i < hidden_num_groups; group_i++){
+            T group_distance_sq = 0;
+            for(TI hidden_i = 0; hidden_i < fp::HIDDEN_DIM; hidden_i++){
+                const T centered = hidden_group_means[group_i][hidden_i] - hidden_global_mean[hidden_i];
+                group_distance_sq += centered * centered;
+            }
+            hidden_dynamics_between_var += (T)hidden_group_counts[group_i] * group_distance_sq;
+        }
+        for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
+            TI group_index = 0;
+            for(TI group_i = 0; group_i < hidden_num_groups; group_i++){
+                if(hidden_group_keys[group_i] == sample_group_keys[batch_i]){
+                    group_index = group_i;
+                    break;
+                }
+            }
+            for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
+                T sample_distance_sq = 0;
+                for(TI hidden_i = 0; hidden_i < fp::HIDDEN_DIM; hidden_i++){
+                    const T centered = rlt::get(device, actor_buffer.hidden, horizon_i, batch_i, hidden_i) - hidden_group_means[group_index][hidden_i];
+                    sample_distance_sq += centered * centered;
+                }
+                hidden_dynamics_within_var += sample_distance_sq;
+            }
+        }
+        hidden_dynamics_between_var *= hidden_inv_total;
+        hidden_dynamics_within_var *= hidden_inv_total;
+        const T hidden_dynamics_separation_ratio = hidden_dynamics_between_var / std::max((T)1e-12, hidden_dynamics_within_var);
+        const bool hidden_dynamics_separable =
+            hidden_num_groups > 1 &&
+            fp::finite_value(hidden_dynamics_separation_ratio) &&
+            hidden_dynamics_separation_ratio > (T)1e-8;
+        mean_terms.total += transition_consistency_loss;
+        fp::rdac_zero_gradient(device, actor);
+        const auto rdac_ac_terms = fp::rdac_backward(
+            device,
+            actor,
+            observations,
+            d_output,
+            q_targets,
+            q_weights,
+            actor_buffer,
+            training_mode
+        );
+        const auto rdac_gradient_diag_before_clip = fp::rdac_gradient_diagnostics(device, actor);
+        mean_terms.total += rdac_ac_terms.actor_critic_actor + rdac_ac_terms.actor_critic_critic;
 
         // Actor parameter-gradient scaling: scales dL/dtheta after BPTT.
         // This is the recommended default stabilization mechanism.
@@ -1273,6 +1675,7 @@ int main(int argc, char** argv){
             options.actor_grad_clip_norm,
             options.actor_grad_eps
         );
+        const auto rdac_gradient_diag_after_clip = fp::rdac_gradient_diagnostics(device, actor);
 
         const bool finite_loss = fp::finite_scalar_terms(mean_terms);
         const bool finite_actor_gradient_before_clip = fp::finite_value(actor_grad_clip.raw_norm);
@@ -1284,7 +1687,11 @@ int main(int argc, char** argv){
             fp::finite_value(mean_rollout_metrics.final_velocity_norm) &&
             fp::finite_value(mean_rollout_metrics.initial_angular_velocity_norm) &&
             fp::finite_value(mean_rollout_metrics.final_angular_velocity_norm) &&
-            fp::finite_value(mean_rollout_metrics.action_norm);
+            fp::finite_value(mean_rollout_metrics.action_norm) &&
+            single_step_state_finite &&
+            single_step_action_finite &&
+            single_step_reward_finite &&
+            single_step_done_finite;
         const bool nan_or_inf = !finite_loss || !finite_actor_gradient_before_clip || !finite_actor_gradient_after_clip || !finite_metrics;
         valid_rollout_count = nan_or_inf ? 0 : options.batch_size;
         invalid_rollout_count = nan_or_inf ? options.batch_size : 0;
@@ -1315,7 +1722,7 @@ int main(int argc, char** argv){
             skip_reason = "nonfinite_actor_grad_after_clip";
         }
         if(!actor_step_skipped){
-            rlt::step(device, actor_optimizer, actor);
+            fp::rdac_step(device, actor_optimizer, actor);
             actor_step_applied = true;
             num_applied_steps++;
         }
@@ -1377,6 +1784,26 @@ int main(int argc, char** argv){
                   << " mean_terminal_velocity_loss=" << mean_terms.terminal_velocity
                   << " mean_terminal_attitude_loss=" << mean_terms.terminal_attitude
                   << " mean_terminal_angular_velocity_loss=" << mean_terms.terminal_angular_velocity
+                  << " transition_consistency_loss=" << transition_consistency_loss
+                  << " actor_critic_actor_loss=" << rdac_ac_terms.actor_critic_actor
+                  << " actor_critic_critic_loss=" << rdac_ac_terms.actor_critic_critic
+                  << " single_step_state_finite=" << (single_step_state_finite ? "true" : "false")
+                  << " single_step_action_finite=" << (single_step_action_finite ? "true" : "false")
+                  << " single_step_reward_finite=" << (single_step_reward_finite ? "true" : "false")
+                  << " single_step_done_finite=" << (single_step_done_finite ? "true" : "false")
+                  << " diff_rollout_loss_weight=" << diff_rollout_weight
+                  << " rdac_encoder_grad_norm_before_clip=" << rdac_gradient_diag_before_clip.encoder
+                  << " rdac_gru_grad_norm_before_clip=" << rdac_gradient_diag_before_clip.gru
+                  << " rdac_actor_head_grad_norm_before_clip=" << rdac_gradient_diag_before_clip.actor_head
+                  << " rdac_critic_head_grad_norm_before_clip=" << rdac_gradient_diag_before_clip.critic_head
+                  << " rdac_encoder_grad_norm_after_clip=" << rdac_gradient_diag_after_clip.encoder
+                  << " rdac_gru_grad_norm_after_clip=" << rdac_gradient_diag_after_clip.gru
+                  << " rdac_actor_head_grad_norm_after_clip=" << rdac_gradient_diag_after_clip.actor_head
+                  << " rdac_critic_head_grad_norm_after_clip=" << rdac_gradient_diag_after_clip.critic_head
+                  << " hidden_dynamics_separation_ratio=" << hidden_dynamics_separation_ratio
+                  << " hidden_dynamics_between_var=" << hidden_dynamics_between_var
+                  << " hidden_dynamics_within_var=" << hidden_dynamics_within_var
+                  << " hidden_dynamics_separable=" << (hidden_dynamics_separable ? "true" : "false")
                   << " mean_initial_position_norm=" << mean_rollout_metrics.initial_position_norm
                   << " mean_final_position_norm=" << mean_rollout_metrics.final_position_norm
                   << " mean_initial_velocity_norm=" << mean_rollout_metrics.initial_velocity_norm
@@ -1434,6 +1861,26 @@ int main(int argc, char** argv){
                   << " inertia_trace=" << sampled_dynamics_stats.inertia_trace
                   << " thrust_scale=" << sampled_dynamics_stats.thrust_scale
                   << " torque_scale=" << sampled_dynamics_stats.torque_scale
+                  << " balanced_dynamics_sampling=" << (options.balanced_dynamics_sampling ? "true" : "false")
+                  << " dynamics_num_groups=" << num_dynamics_groups
+                  << " dynamics_group_count_min=" << dynamics_group_count_min
+                  << " dynamics_group_count_max=" << dynamics_group_count_max
+                  << " dynamics_group_weight_sum_min=" << dynamics_group_weight_sum_min
+                  << " dynamics_group_weight_sum_max=" << dynamics_group_weight_sum_max
+                  << " dynamics_batch_balanced=" << (dynamics_batch_balanced ? "true" : "false")
+                  << " dynamics_size_mass_bin=" << sampled_dynamics_stats.dynamics_size_mass_bin
+                  << " dynamics_thrust_to_weight_bin=" << sampled_dynamics_stats.dynamics_thrust_to_weight_bin
+                  << " dynamics_torque_to_inertia_bin=" << sampled_dynamics_stats.dynamics_torque_to_inertia_bin
+                  << " dynamics_motor_delay_bin=" << sampled_dynamics_stats.dynamics_motor_delay_bin
+                  << " equivalent_dynamics_diag_thrust_to_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_to_acceleration_gain
+                  << " equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain
+                  << " equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain
+                  << " equivalent_dynamics_diag_motor_rise_time_constant=" << sampled_dynamics_stats.equivalent_dynamics_diag_motor_rise_time_constant
+                  << " equivalent_dynamics_diag_motor_fall_time_constant=" << sampled_dynamics_stats.equivalent_dynamics_diag_motor_fall_time_constant
+                  << " equivalent_dynamics_diag_thrust_curve_shape=" << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_curve_shape
+                  << " equivalent_dynamics_diag_torque_curve_shape=" << sampled_dynamics_stats.equivalent_dynamics_diag_torque_curve_shape
+                  << " equivalent_dynamics_diag_residual_force_bias=" << sampled_dynamics_stats.equivalent_dynamics_diag_residual_force_bias
+                  << " equivalent_dynamics_diag_residual_torque_bias=" << sampled_dynamics_stats.equivalent_dynamics_diag_residual_torque_bias
                   << " valid_rollout_count=" << valid_rollout_count
                   << " invalid_rollout_count=" << invalid_rollout_count
                   << " diff_model=" << fp::diff_model_name(options.diff_model)
@@ -1508,6 +1955,26 @@ int main(int argc, char** argv){
                      << sampled_dynamics_stats.inertia_trace << ","
                      << sampled_dynamics_stats.thrust_scale << ","
                      << sampled_dynamics_stats.torque_scale << ","
+                     << (options.balanced_dynamics_sampling ? "true" : "false") << ","
+                     << num_dynamics_groups << ","
+                     << dynamics_group_count_min << ","
+                     << dynamics_group_count_max << ","
+                     << dynamics_group_weight_sum_min << ","
+                     << dynamics_group_weight_sum_max << ","
+                     << (dynamics_batch_balanced ? "true" : "false") << ","
+                     << sampled_dynamics_stats.dynamics_size_mass_bin << ","
+                     << sampled_dynamics_stats.dynamics_thrust_to_weight_bin << ","
+                     << sampled_dynamics_stats.dynamics_torque_to_inertia_bin << ","
+                     << sampled_dynamics_stats.dynamics_motor_delay_bin << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_to_acceleration_gain << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_motor_rise_time_constant << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_motor_fall_time_constant << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_curve_shape << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_torque_curve_shape << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_residual_force_bias << ","
+                     << sampled_dynamics_stats.equivalent_dynamics_diag_residual_torque_bias << ","
                      << mean_terms.total << ","
                      << mean_terms.position << ","
                      << mean_terms.velocity << ","
@@ -1521,6 +1988,26 @@ int main(int argc, char** argv){
                      << mean_terms.terminal_velocity << ","
                      << mean_terms.terminal_attitude << ","
                      << mean_terms.terminal_angular_velocity << ","
+                     << transition_consistency_loss << ","
+                     << rdac_ac_terms.actor_critic_actor << ","
+                     << rdac_ac_terms.actor_critic_critic << ","
+                     << (single_step_state_finite ? "true" : "false") << ","
+                     << (single_step_action_finite ? "true" : "false") << ","
+                     << (single_step_reward_finite ? "true" : "false") << ","
+                     << (single_step_done_finite ? "true" : "false") << ","
+                     << diff_rollout_weight << ","
+                     << rdac_gradient_diag_before_clip.encoder << ","
+                     << rdac_gradient_diag_before_clip.gru << ","
+                     << rdac_gradient_diag_before_clip.actor_head << ","
+                     << rdac_gradient_diag_before_clip.critic_head << ","
+                     << rdac_gradient_diag_after_clip.encoder << ","
+                     << rdac_gradient_diag_after_clip.gru << ","
+                     << rdac_gradient_diag_after_clip.actor_head << ","
+                     << rdac_gradient_diag_after_clip.critic_head << ","
+                     << hidden_dynamics_separation_ratio << ","
+                     << hidden_dynamics_between_var << ","
+                     << hidden_dynamics_within_var << ","
+                     << (hidden_dynamics_separable ? "true" : "false") << ","
                      << action_grad_norm_before_clip << ","
                      << action_grad_norm_after_clip << ","
                      << action_gradient_scale << ","
@@ -1621,18 +2108,21 @@ int main(int argc, char** argv){
     }
 
     rlt::free(device, observation_row);
+    rlt::free(device, predicted_observation_row);
     rlt::free(device, action_row);
     rlt::free(device, reset);
+    rlt::free(device, q_weights);
+    rlt::free(device, q_targets);
     rlt::free(device, d_output);
     rlt::free(device, step_actions);
     rlt::free(device, step_observations);
     rlt::free(device, observations);
     rlt::free(device, actor_optimizer);
     rlt::free(device, rollout_actor_state);
-    rlt::free(device, rollout_actor_buffer);
-    rlt::free(device, rollout_actor);
-    rlt::free(device, actor_buffer);
-    rlt::free(device, actor);
+    fp::rdac_free_buffer<DEVICE, typename ROLLOUT_ACTOR::CAPABILITY_TYPE, fp::DYNAMIC_ALLOCATION>(device, rollout_actor_buffer);
+    fp::rdac_free(device, rollout_actor);
+    fp::rdac_free_buffer<DEVICE, typename ACTOR::CAPABILITY_TYPE, fp::DYNAMIC_ALLOCATION>(device, actor_buffer);
+    fp::rdac_free(device, actor);
     rlt::free(device, rng);
     return 0;
 }

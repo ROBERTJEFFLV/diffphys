@@ -77,6 +77,7 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         T fixed_state_difficulty = (T)-1;  // -1 = disabled, use curriculum
         bool h128_prioritized_curriculum = false;
         bool sampled_dynamics_curriculum_levels = false;
+        bool balanced_dynamics_sampling = BALANCED_DYNAMICS_SAMPLING_ENABLED;
         std::string h128_schedule = "short_warmup_12000";
         SampledDynamicsLevel sampled_dynamics_level = SampledDynamicsLevel::BROAD;
         T loss_velocity_weight = LOSS_VELOCITY_WEIGHT;
@@ -133,6 +134,7 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         std::cout << "Usage: foundation_policy_diff_pre_training [--steps N] [--horizon N] [--batch-size N] [--seed N]\n"
                   << "    [--fixed-dynamics|--sample-dynamics] [--diff-model euler|l2f_approx]\n"
                   << "    [--sampled-dynamics-level fixed|narrow|medium|broad] [--sampled-dynamics-curriculum-levels]\n"
+                  << "    [--balanced-dynamics-sampling|--disable-balanced-dynamics-sampling]\n"
                   << "    [--disable-physics-gradient] [--reset-hidden-each-step]\n"
                   << "    [--horizon-curriculum] [--state-curriculum] [--dynamics-curriculum]\n"
                   << "    [--action-grad-clip VALUE] [--disable-action-grad-clip]\n"
@@ -194,6 +196,12 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             else if(arg == "--sampled-dynamics-curriculum-levels"){
                 options.sampled_dynamics_curriculum_levels = true;
                 options.sample_dynamics = true;
+            }
+            else if(arg == "--balanced-dynamics-sampling"){
+                options.balanced_dynamics_sampling = true;
+            }
+            else if(arg == "--disable-balanced-dynamics-sampling"){
+                options.balanced_dynamics_sampling = false;
             }
             else if(arg == "--disable-physics-gradient"){
                 options.disable_physics_gradient = true;
