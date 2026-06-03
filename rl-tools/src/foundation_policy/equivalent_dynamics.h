@@ -38,6 +38,7 @@ namespace rl_tools::foundation_policy::equivalent_dynamics{
         TI thrust_to_weight = 0;
         TI torque_to_inertia = 0;
         TI motor_delay = 0;
+        TI curve_shape = 0;
     };
 
     template <typename T>
@@ -268,6 +269,7 @@ namespace rl_tools::foundation_policy::equivalent_dynamics{
         bins.thrust_to_weight = bin_index<T, TI>(thrust_to_weight_ratio<PARAMETERS>(parameters), domain.thrust_to_weight_min, domain.thrust_to_weight_max, num_bins);
         bins.torque_to_inertia = bin_index<T, TI>(roll_pitch_torque_to_inertia_gain<PARAMETERS>(parameters), domain.torque_to_inertia_min, domain.torque_to_inertia_max, num_bins);
         bins.motor_delay = bin_index<T, TI>(tau_mean, tau_min, tau_max, num_bins);
+        bins.curve_shape = bin_index<T, TI>(thrust_curve_shape<PARAMETERS>(parameters), (T)0, (T)1, num_bins);
         return bins;
     }
 }

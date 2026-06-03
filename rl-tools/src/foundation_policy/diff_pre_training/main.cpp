@@ -79,15 +79,21 @@ TI curriculum_stage_bucket(bool enabled, TI training_step, TI stage_steps, TI ma
 }
 
 template <typename TI>
-eq_dyn::DynamicsBins<TI> scheduled_balanced_dynamics_bins(TI training_step, TI batch_i, TI num_bins){
+eq_dyn::DynamicsBins<TI> scheduled_balanced_dynamics_bins(TI training_step, TI batch_i, TI batch_size, TI num_bins){
     eq_dyn::DynamicsBins<TI> bins;
     if(num_bins <= 1){
         return bins;
     }
-    bins.size_mass = (batch_i + training_step) % num_bins;
-    bins.thrust_to_weight = ((TI)3 * batch_i + training_step) % num_bins;
-    bins.torque_to_inertia = (batch_i + (TI)2 * training_step) % num_bins;
-    bins.motor_delay = ((TI)3 * batch_i + (TI)2 * training_step) % num_bins;
+    TI sample_index = training_step * std::max((TI)1, batch_size) + batch_i;
+    bins.size_mass = sample_index % num_bins;
+    sample_index /= num_bins;
+    bins.thrust_to_weight = sample_index % num_bins;
+    sample_index /= num_bins;
+    bins.torque_to_inertia = sample_index % num_bins;
+    sample_index /= num_bins;
+    bins.motor_delay = sample_index % num_bins;
+    sample_index /= num_bins;
+    bins.curve_shape = sample_index % num_bins;
     return bins;
 }
 
@@ -277,6 +283,139 @@ void motor_tau_stats(const PARAMETERS& parameters, T& mean, T& min_value, T& max
 }
 
 template <typename PARAMETERS, typename T, typename TI>
+void motor_tau_response_means(const PARAMETERS& parameters, T& rise_mean, T& fall_mean){
+    rise_mean = 0;
+    fall_mean = 0;
+    for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+        rise_mean += parameters.dynamics.rotor_time_constants_rising[rotor_i];
+        fall_mean += parameters.dynamics.rotor_time_constants_falling[rotor_i];
+    }
+    rise_mean /= (T)4;
+    fall_mean /= (T)4;
+}
+
+template <typename T, typename DEVICE, typename RNG>
+T sample_uniform_range(DEVICE& device, RNG& rng, T min_value, T max_value){
+    if(!(max_value > min_value)){
+        return min_value;
+    }
+    return rlt::random::uniform_real_distribution(device.random, min_value, max_value, rng);
+}
+
+template <typename T>
+T clamp_value(T value, T min_value, T max_value){
+    return std::max(min_value, std::min(max_value, value));
+}
+
+template <typename PARAMETERS, typename T, typename TI>
+T solve_hover_throttle_relative(const PARAMETERS& parameters){
+    const T min_action = parameters.dynamics.action_limit.min;
+    const T max_action = parameters.dynamics.action_limit.max;
+    const T action_range = std::max((T)1e-12, max_action - min_action);
+    const T gravity_norm = std::max((T)1e-6, std::abs(parameters.dynamics.gravity[2]));
+    const T hover_force = parameters.dynamics.mass * gravity_norm / (T)4;
+    const T c0 = parameters.dynamics.rotor_thrust_coefficients[0][0];
+    const T c1 = parameters.dynamics.rotor_thrust_coefficients[0][1];
+    const T c2 = parameters.dynamics.rotor_thrust_coefficients[0][2];
+    T hover_action = min_action;
+    if(std::abs(c2) > (T)1e-12){
+        const T discriminant = c1 * c1 - (T)4 * c2 * (c0 - hover_force);
+        if(discriminant >= (T)0){
+            hover_action = (-c1 + std::sqrt(discriminant)) / ((T)2 * c2);
+        }
+        else{
+            hover_action = max_action;
+        }
+    }
+    else if(std::abs(c1) > (T)1e-12){
+        hover_action = (hover_force - c0) / c1;
+    }
+    hover_action = clamp_value<T>(hover_action, min_action, max_action);
+    return clamp_value<T>((hover_action - min_action) / action_range, (T)0, (T)1);
+}
+
+template <typename PARAMETERS, typename T, typename TI>
+bool sampled_parameters_inside_allowed_ranges(const PARAMETERS& parameters, T dynamics_difficulty){
+    const auto& domain = parameters.domain_randomization;
+    const T safe_mass_max = (T)0.06 + dynamics_difficulty * (fp::SAMPLED_DYNAMICS_MAX_MASS - (T)0.06);
+    const T mass_upper = std::min(domain.mass_max, safe_mass_max);
+    const T thrust_to_weight = estimated_thrust_to_weight<PARAMETERS, T, TI>(parameters);
+    const T torque_to_inertia = estimated_torque_to_inertia_ratio<PARAMETERS, T, TI>(parameters);
+    const T range_epsilon = (T)1e-6;
+    T tau_rise;
+    T tau_fall;
+    motor_tau_response_means<PARAMETERS, T, TI>(parameters, tau_rise, tau_fall);
+    if(!fp::finite_value(parameters.dynamics.mass) ||
+       parameters.dynamics.mass < domain.mass_min - range_epsilon ||
+       parameters.dynamics.mass > mass_upper + range_epsilon){
+        return false;
+    }
+    if(!fp::finite_value(thrust_to_weight) ||
+       thrust_to_weight < domain.thrust_to_weight_min - range_epsilon ||
+       thrust_to_weight > domain.thrust_to_weight_max + range_epsilon ||
+       thrust_to_weight < fp::SAMPLED_DYNAMICS_MIN_THRUST_TO_WEIGHT){
+        return false;
+    }
+    if(!fp::finite_value(torque_to_inertia) ||
+       torque_to_inertia < domain.torque_to_inertia_min - range_epsilon ||
+       torque_to_inertia > domain.torque_to_inertia_max + range_epsilon){
+        return false;
+    }
+    if(!fp::finite_value(tau_rise) ||
+       tau_rise < domain.rotor_time_constant_rising_min - range_epsilon ||
+       tau_rise > domain.rotor_time_constant_rising_max + range_epsilon ||
+       !fp::finite_value(tau_fall) ||
+       tau_fall < domain.rotor_time_constant_falling_min - range_epsilon ||
+       tau_fall > domain.rotor_time_constant_falling_max + range_epsilon){
+        return false;
+    }
+    for(TI i = 0; i < 3; i++){
+        if(!fp::finite_value(parameters.dynamics.J[i][i]) || parameters.dynamics.J[i][i] <= (T)0) return false;
+        if(!fp::finite_value(parameters.dynamics.J_inv[i][i]) || parameters.dynamics.J_inv[i][i] <= (T)0) return false;
+    }
+    for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+        const T torque_constant = parameters.dynamics.rotor_torque_constants[rotor_i];
+        if(!fp::finite_value(torque_constant) ||
+           torque_constant < domain.rotor_torque_constant_min - range_epsilon ||
+           torque_constant > domain.rotor_torque_constant_max + range_epsilon){
+            return false;
+        }
+        const T c0 = parameters.dynamics.rotor_thrust_coefficients[rotor_i][0];
+        const T c1 = parameters.dynamics.rotor_thrust_coefficients[rotor_i][1];
+        const T c2 = parameters.dynamics.rotor_thrust_coefficients[rotor_i][2];
+        const T max_action = parameters.dynamics.action_limit.max;
+        const T max_force = c0 + c1 * max_action + c2 * max_action * max_action;
+        if(!fp::finite_value(c0) || !fp::finite_value(c1) || !fp::finite_value(c2) ||
+           !fp::finite_value(max_force) || c0 < (T)0 || c1 < (T)0 || c2 <= (T)0 || max_force <= (T)0){
+            return false;
+        }
+        if(!fp::finite_value(parameters.dynamics.rotor_time_constants_rising[rotor_i]) ||
+           !fp::finite_value(parameters.dynamics.rotor_time_constants_falling[rotor_i]) ||
+           parameters.dynamics.rotor_time_constants_rising[rotor_i] < domain.rotor_time_constant_rising_min - range_epsilon ||
+           parameters.dynamics.rotor_time_constants_rising[rotor_i] > domain.rotor_time_constant_rising_max + range_epsilon ||
+           parameters.dynamics.rotor_time_constants_falling[rotor_i] < domain.rotor_time_constant_falling_min - range_epsilon ||
+           parameters.dynamics.rotor_time_constants_falling[rotor_i] > domain.rotor_time_constant_falling_max + range_epsilon){
+            return false;
+        }
+    }
+    const T max_disturbance_multiple = std::max((T)0, thrust_to_weight - (T)1) * domain.disturbance_force_max;
+    const T max_disturbance_std = max_disturbance_multiple * thrust_to_weight * parameters.dynamics.mass / (T)3;
+    if(!fp::finite_value(parameters.disturbances.random_force.mean) ||
+       !fp::finite_value(parameters.disturbances.random_force.std) ||
+       std::abs(parameters.disturbances.random_force.mean) > (T)1e-12 ||
+       parameters.disturbances.random_force.std < (T)0 ||
+       parameters.disturbances.random_force.std > max_disturbance_std + (T)1e-9){
+        return false;
+    }
+    if(!fp::finite_value(parameters.dynamics.hovering_throttle_relative) ||
+       parameters.dynamics.hovering_throttle_relative < (T)0 ||
+       parameters.dynamics.hovering_throttle_relative > (T)1){
+        return false;
+    }
+    return true;
+}
+
+template <typename PARAMETERS, typename T, typename TI>
 struct SampledDynamicsDiagnostics{
     T mass = 0;
     T thrust_to_weight_ratio = 0;
@@ -284,6 +423,10 @@ struct SampledDynamicsDiagnostics{
     T motor_tau_mean = 0;
     T motor_tau_min = 0;
     T motor_tau_max = 0;
+    T sampled_tau_rise = 0;
+    T sampled_tau_fall = 0;
+    T sampled_curve_shape = 0;
+    T sampled_parameters_inside_allowed_ranges = 0;
     T inertia_trace = 0;
     T thrust_scale = 0;
     T torque_scale = 0;
@@ -291,6 +434,7 @@ struct SampledDynamicsDiagnostics{
     T dynamics_thrust_to_weight_bin = 0;
     T dynamics_torque_to_inertia_bin = 0;
     T dynamics_motor_delay_bin = 0;
+    T dynamics_curve_shape_bin = 0;
     T equivalent_dynamics_diag_thrust_to_acceleration_gain = 0;
     T equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain = 0;
     T equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain = 0;
@@ -306,7 +450,8 @@ template <typename PARAMETERS, typename T, typename TI>
 SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_diagnostics(
     const PARAMETERS& parameters,
     const PARAMETERS& nominal_parameters,
-    const eq_dyn::DynamicsBins<TI>& bins
+    const eq_dyn::DynamicsBins<TI>& bins,
+    T dynamics_difficulty
 ){
     SampledDynamicsDiagnostics<PARAMETERS, T, TI> stats;
     const auto equivalent_dynamics_diag = eq_dyn::normalized_target_from_parameters<PARAMETERS>(parameters, nominal_parameters);
@@ -314,6 +459,10 @@ SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_diagnostics(
     stats.thrust_to_weight_ratio = estimated_thrust_to_weight<PARAMETERS, T, TI>(parameters);
     stats.torque_to_inertia_ratio = estimated_torque_to_inertia_ratio<PARAMETERS, T, TI>(parameters);
     motor_tau_stats<PARAMETERS, T, TI>(parameters, stats.motor_tau_mean, stats.motor_tau_min, stats.motor_tau_max);
+    motor_tau_response_means<PARAMETERS, T, TI>(parameters, stats.sampled_tau_rise, stats.sampled_tau_fall);
+    stats.sampled_curve_shape = eq_dyn::thrust_curve_shape<PARAMETERS>(parameters);
+    stats.sampled_parameters_inside_allowed_ranges =
+        sampled_parameters_inside_allowed_ranges<PARAMETERS, T, TI>(parameters, dynamics_difficulty) ? (T)1 : (T)0;
     stats.inertia_trace = parameters.dynamics.J[0][0] + parameters.dynamics.J[1][1] + parameters.dynamics.J[2][2];
     stats.thrust_scale = estimated_max_thrust<PARAMETERS, T, TI>(parameters)
         / std::max((T)1e-12, estimated_max_thrust<PARAMETERS, T, TI>(nominal_parameters));
@@ -323,6 +472,7 @@ SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_diagnostics(
     stats.dynamics_thrust_to_weight_bin = (T)bins.thrust_to_weight;
     stats.dynamics_torque_to_inertia_bin = (T)bins.torque_to_inertia;
     stats.dynamics_motor_delay_bin = (T)bins.motor_delay;
+    stats.dynamics_curve_shape_bin = (T)bins.curve_shape;
     stats.equivalent_dynamics_diag_thrust_to_acceleration_gain = equivalent_dynamics_diag.thrust_to_acceleration_gain;
     stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain = equivalent_dynamics_diag.roll_pitch_torque_to_angular_acceleration_gain;
     stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain = equivalent_dynamics_diag.yaw_torque_to_angular_acceleration_gain;
@@ -346,6 +496,10 @@ void add_sampled_dynamics_diagnostics(
     accumulator.motor_tau_mean += value.motor_tau_mean;
     accumulator.motor_tau_min += value.motor_tau_min;
     accumulator.motor_tau_max += value.motor_tau_max;
+    accumulator.sampled_tau_rise += value.sampled_tau_rise;
+    accumulator.sampled_tau_fall += value.sampled_tau_fall;
+    accumulator.sampled_curve_shape += value.sampled_curve_shape;
+    accumulator.sampled_parameters_inside_allowed_ranges += value.sampled_parameters_inside_allowed_ranges;
     accumulator.inertia_trace += value.inertia_trace;
     accumulator.thrust_scale += value.thrust_scale;
     accumulator.torque_scale += value.torque_scale;
@@ -353,6 +507,7 @@ void add_sampled_dynamics_diagnostics(
     accumulator.dynamics_thrust_to_weight_bin += value.dynamics_thrust_to_weight_bin;
     accumulator.dynamics_torque_to_inertia_bin += value.dynamics_torque_to_inertia_bin;
     accumulator.dynamics_motor_delay_bin += value.dynamics_motor_delay_bin;
+    accumulator.dynamics_curve_shape_bin += value.dynamics_curve_shape_bin;
     accumulator.equivalent_dynamics_diag_thrust_to_acceleration_gain += value.equivalent_dynamics_diag_thrust_to_acceleration_gain;
     accumulator.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain += value.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain;
     accumulator.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain += value.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain;
@@ -372,6 +527,10 @@ void scale_sampled_dynamics_diagnostics(SampledDynamicsDiagnostics<PARAMETERS, T
     value.motor_tau_mean *= scale;
     value.motor_tau_min *= scale;
     value.motor_tau_max *= scale;
+    value.sampled_tau_rise *= scale;
+    value.sampled_tau_fall *= scale;
+    value.sampled_curve_shape *= scale;
+    value.sampled_parameters_inside_allowed_ranges *= scale;
     value.inertia_trace *= scale;
     value.thrust_scale *= scale;
     value.torque_scale *= scale;
@@ -379,6 +538,7 @@ void scale_sampled_dynamics_diagnostics(SampledDynamicsDiagnostics<PARAMETERS, T
     value.dynamics_thrust_to_weight_bin *= scale;
     value.dynamics_torque_to_inertia_bin *= scale;
     value.dynamics_motor_delay_bin *= scale;
+    value.dynamics_curve_shape_bin *= scale;
     value.equivalent_dynamics_diag_thrust_to_acceleration_gain *= scale;
     value.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain *= scale;
     value.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain *= scale;
@@ -453,32 +613,141 @@ fp::SampledDynamicsLevel effective_sampled_dynamics_level(const RuntimeOptions& 
 
 template <typename PARAMETERS, typename T, typename TI>
 bool sampled_parameters_safe(const PARAMETERS& parameters, T dynamics_difficulty){
-    const T max_mass = (T)0.06 + dynamics_difficulty * (fp::SAMPLED_DYNAMICS_MAX_MASS - (T)0.06);
-    if(!fp::finite_value(parameters.dynamics.mass) || parameters.dynamics.mass <= (T)0 || parameters.dynamics.mass > max_mass){
-        return false;
+    return sampled_parameters_inside_allowed_ranges<PARAMETERS, T, TI>(parameters, dynamics_difficulty);
+}
+
+template <typename ENVIRONMENT, typename T>
+void clamp_sampling_domain_to_existing_safety(ENVIRONMENT& sampling_env, T dynamics_difficulty){
+    auto& domain = sampling_env.parameters.domain_randomization;
+    const T safe_mass_max = (T)0.06 + dynamics_difficulty * (fp::SAMPLED_DYNAMICS_MAX_MASS - (T)0.06);
+    domain.mass_max = std::min(domain.mass_max, safe_mass_max);
+    domain.thrust_to_weight_min = std::max(domain.thrust_to_weight_min, fp::SAMPLED_DYNAMICS_MIN_THRUST_TO_WEIGHT);
+    if(domain.mass_max < domain.mass_min){
+        domain.mass_min = domain.mass_max;
     }
-    if(estimated_thrust_to_weight<PARAMETERS, T, TI>(parameters) < fp::SAMPLED_DYNAMICS_MIN_THRUST_TO_WEIGHT){
-        return false;
+    if(domain.thrust_to_weight_max < domain.thrust_to_weight_min){
+        domain.thrust_to_weight_min = domain.thrust_to_weight_max;
     }
-    for(TI i = 0; i < 3; i++){
-        if(!fp::finite_value(parameters.dynamics.J[i][i]) || parameters.dynamics.J[i][i] <= (T)0) return false;
-        if(!fp::finite_value(parameters.dynamics.J_inv[i][i]) || parameters.dynamics.J_inv[i][i] <= (T)0) return false;
+    if(domain.torque_to_inertia_max < domain.torque_to_inertia_min){
+        domain.torque_to_inertia_min = domain.torque_to_inertia_max;
     }
+    if(domain.rotor_time_constant_rising_max < domain.rotor_time_constant_rising_min){
+        domain.rotor_time_constant_rising_min = domain.rotor_time_constant_rising_max;
+    }
+    if(domain.rotor_time_constant_falling_max < domain.rotor_time_constant_falling_min){
+        domain.rotor_time_constant_falling_min = domain.rotor_time_constant_falling_max;
+    }
+    if(domain.rotor_torque_constant_max < domain.rotor_torque_constant_min){
+        domain.rotor_torque_constant_min = domain.rotor_torque_constant_max;
+    }
+}
+
+template <typename DEVICE, typename ENVIRONMENT, typename PARAMETERS, typename RNG, typename T, typename TI>
+void sample_equivalent_input_response_parameters(
+    DEVICE& device,
+    ENVIRONMENT& env,
+    const ENVIRONMENT& sampling_env,
+    PARAMETERS& parameters,
+    RNG& rng,
+    const eq_dyn::DynamicsBins<TI>* balanced_bins
+){
+    rlt::initial_parameters(device, env, parameters);
+    parameters.domain_randomization = sampling_env.parameters.domain_randomization;
+    const auto& domain = parameters.domain_randomization;
+    T curve_shape_min = 0;
+    T curve_shape_max = 1;
+    if(balanced_bins != nullptr){
+        eq_dyn::restrict_range_to_bin<T, TI>(curve_shape_min, curve_shape_max, balanced_bins->curve_shape, fp::DYNAMICS_BALANCE_BINS);
+    }
+
+    const T mass_size_min = std::cbrt(std::max((T)1e-12, domain.mass_min));
+    const T mass_size_max = std::cbrt(std::max((T)1e-12, domain.mass_max));
+    const T sampled_size = sample_uniform_range<T, DEVICE, RNG>(device, rng, mass_size_min, mass_size_max);
+    const T sampled_mass = clamp_value<T>(sampled_size * sampled_size * sampled_size, domain.mass_min, domain.mass_max);
+    const T sampled_thrust_to_weight = sample_uniform_range<T, DEVICE, RNG>(device, rng, domain.thrust_to_weight_min, domain.thrust_to_weight_max);
+    const T sampled_torque_to_inertia = sample_uniform_range<T, DEVICE, RNG>(device, rng, domain.torque_to_inertia_min, domain.torque_to_inertia_max);
+    const T sampled_tau_rise = sample_uniform_range<T, DEVICE, RNG>(device, rng, domain.rotor_time_constant_rising_min, domain.rotor_time_constant_rising_max);
+    const T sampled_tau_fall = sample_uniform_range<T, DEVICE, RNG>(device, rng, domain.rotor_time_constant_falling_min, domain.rotor_time_constant_falling_max);
+    const T sampled_curve_shape = sample_uniform_range<T, DEVICE, RNG>(device, rng, curve_shape_min, curve_shape_max);
+
+    parameters.dynamics.mass = sampled_mass;
+    const T nominal_mass = std::max((T)1e-12, env.parameters.dynamics.mass);
+    const T size_scale = std::cbrt(sampled_mass / nominal_mass);
+    const T geometry_factor = std::max((T)0.1, (T)1 + ((T)2 * sampled_curve_shape - (T)1) * domain.mass_size_deviation);
+    const T arm_scale = size_scale * geometry_factor;
     for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
-        if(!fp::finite_value(parameters.dynamics.rotor_time_constants_rising[rotor_i]) ||
-           !fp::finite_value(parameters.dynamics.rotor_time_constants_falling[rotor_i]) ||
-           parameters.dynamics.rotor_time_constants_rising[rotor_i] < (T)0.005 ||
-           parameters.dynamics.rotor_time_constants_falling[rotor_i] < (T)0.005 ||
-           parameters.dynamics.rotor_time_constants_rising[rotor_i] > (T)0.5 ||
-           parameters.dynamics.rotor_time_constants_falling[rotor_i] > (T)0.5){
-            return false;
-        }
-        if(!fp::finite_value(parameters.dynamics.rotor_thrust_coefficients[rotor_i][2]) ||
-           parameters.dynamics.rotor_thrust_coefficients[rotor_i][2] <= (T)0){
-            return false;
+        for(TI axis_i = 0; axis_i < 3; axis_i++){
+            parameters.dynamics.rotor_positions[rotor_i][axis_i] = env.parameters.dynamics.rotor_positions[rotor_i][axis_i] * arm_scale;
         }
     }
-    return true;
+
+    const T gravity_norm = std::max((T)1e-6, std::abs(parameters.dynamics.gravity[2]));
+    const T total_max_thrust = sampled_thrust_to_weight * sampled_mass * gravity_norm;
+    const T per_rotor_max_thrust = total_max_thrust / (T)4;
+    const T max_action = std::max((T)1e-6, parameters.dynamics.action_limit.max);
+    const T quadratic_fraction = clamp_value<T>(sampled_curve_shape, (T)0.05, (T)0.95);
+    const T remaining_fraction = std::max((T)0, (T)1 - quadratic_fraction);
+    const T offset_fraction = remaining_fraction * (T)0.20 * ((T)1 - sampled_curve_shape);
+    const T linear_fraction = std::max((T)0, remaining_fraction - offset_fraction);
+    for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+        parameters.dynamics.rotor_thrust_coefficients[rotor_i][0] = per_rotor_max_thrust * offset_fraction;
+        parameters.dynamics.rotor_thrust_coefficients[rotor_i][1] = per_rotor_max_thrust * linear_fraction / max_action;
+        parameters.dynamics.rotor_thrust_coefficients[rotor_i][2] = per_rotor_max_thrust * quadratic_fraction / (max_action * max_action);
+    }
+
+    const T rotor_distance_x = std::max((T)1e-9, std::abs(parameters.dynamics.rotor_positions[0][0]));
+    const T max_roll_pitch_torque = rotor_distance_x * (T)1.414213562373095 * per_rotor_max_thrust;
+    const T j_x = std::max((T)1e-12, max_roll_pitch_torque / std::max((T)1e-12, sampled_torque_to_inertia));
+    const T nominal_j_x = std::max((T)1e-12, env.parameters.dynamics.J[0][0]);
+    const T j_y = j_x * std::max((T)1e-6, env.parameters.dynamics.J[1][1] / nominal_j_x);
+    const T j_z = j_x * std::max((T)1e-6, env.parameters.dynamics.J[2][2] / nominal_j_x);
+    for(TI row_i = 0; row_i < 3; row_i++){
+        for(TI col_i = 0; col_i < 3; col_i++){
+            parameters.dynamics.J[row_i][col_i] = (T)0;
+            parameters.dynamics.J_inv[row_i][col_i] = (T)0;
+        }
+    }
+    parameters.dynamics.J[0][0] = j_x;
+    parameters.dynamics.J[1][1] = j_y;
+    parameters.dynamics.J[2][2] = j_z;
+    parameters.dynamics.J_inv[0][0] = (T)1 / j_x;
+    parameters.dynamics.J_inv[1][1] = (T)1 / j_y;
+    parameters.dynamics.J_inv[2][2] = (T)1 / j_z;
+
+    const T torque_to_inertia_norm = (domain.torque_to_inertia_max > domain.torque_to_inertia_min)
+        ? (sampled_torque_to_inertia - domain.torque_to_inertia_min) / (domain.torque_to_inertia_max - domain.torque_to_inertia_min)
+        : (T)0.5;
+    const T torque_curve_shape = clamp_value<T>(((T)0.5 * sampled_curve_shape) + ((T)0.5 * torque_to_inertia_norm), (T)0, (T)1);
+    const T rotor_torque_constant = domain.rotor_torque_constant_min
+        + (domain.rotor_torque_constant_max - domain.rotor_torque_constant_min) * torque_curve_shape;
+    for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+        parameters.dynamics.rotor_torque_constants[rotor_i] = rotor_torque_constant;
+        parameters.dynamics.rotor_time_constants_rising[rotor_i] = sampled_tau_rise;
+        parameters.dynamics.rotor_time_constants_falling[rotor_i] = sampled_tau_fall;
+    }
+
+    const T surplus_thrust_to_weight = std::max((T)0, sampled_thrust_to_weight - (T)1);
+    const T disturbance_multiple = sample_uniform_range<T, DEVICE, RNG>(
+        device,
+        rng,
+        (T)0,
+        surplus_thrust_to_weight * domain.disturbance_force_max
+    );
+    parameters.disturbances.random_force.mean = 0;
+    parameters.disturbances.random_force.std = disturbance_multiple * sampled_thrust_to_weight * sampled_mass / (T)3;
+    parameters.dynamics.hovering_throttle_relative = solve_hover_throttle_relative<PARAMETERS, T, TI>(parameters);
+
+    T max_rotor_distance = 0;
+    for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+        const T x = parameters.dynamics.rotor_positions[rotor_i][0];
+        const T y = parameters.dynamics.rotor_positions[rotor_i][1];
+        const T z = parameters.dynamics.rotor_positions[rotor_i][2];
+        max_rotor_distance = std::max(max_rotor_distance, std::sqrt(x * x + y * y + z * z));
+    }
+    if(max_rotor_distance > (T)0){
+        parameters.mdp.termination.position_threshold = max_rotor_distance * (T)20;
+        parameters.mdp.init.max_position = max_rotor_distance * (T)10;
+    }
 }
 
 template <typename DEVICE, typename ENVIRONMENT, typename PARAMETERS, typename RNG, typename T, typename TI>
@@ -496,8 +765,10 @@ TI sample_training_parameters(
         rlt::initial_parameters(device, env, parameters);
         return 0;
     }
+    const T safety_difficulty = options.dynamics_curriculum ? dynamics_difficulty : (T)1;
     ENVIRONMENT sampling_env = env;
     configure_sampled_dynamics_level(sampling_env, level);
+    clamp_sampling_domain_to_existing_safety<ENVIRONMENT, T>(sampling_env, safety_difficulty);
     if(options.balanced_dynamics_sampling && balanced_bins != nullptr){
         eq_dyn::restrict_domain_to_bins<typename ENVIRONMENT::Parameters::DomainRandomization, T, TI>(
             sampling_env.parameters.domain_randomization,
@@ -505,16 +776,17 @@ TI sample_training_parameters(
             fp::DYNAMICS_BALANCE_BINS
         );
     }
-    const bool level_uses_filter = level == fp::SampledDynamicsLevel::NARROW || level == fp::SampledDynamicsLevel::MEDIUM;
     if(!options.dynamics_curriculum || dynamics_difficulty <= (T)0){
         if(options.dynamics_curriculum){
             rlt::initial_parameters(device, env, parameters);
         }
-        else if(level_uses_filter){
+        else{
             TI rejected = 0;
             for(TI attempt_i = 0; attempt_i < 64; attempt_i++){
-                rlt::sample_initial_parameters(device, sampling_env, parameters, rng);
-                if(sampled_parameters_safe<PARAMETERS, T, TI>(parameters, (T)1)){
+                sample_equivalent_input_response_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(
+                    device, env, sampling_env, parameters, rng, balanced_bins
+                );
+                if(sampled_parameters_safe<PARAMETERS, T, TI>(parameters, safety_difficulty)){
                     return rejected;
                 }
                 rejected++;
@@ -522,15 +794,14 @@ TI sample_training_parameters(
             rlt::initial_parameters(device, env, parameters);
             return rejected;
         }
-        else{
-            rlt::sample_initial_parameters(device, sampling_env, parameters, rng);
-        }
         return 0;
     }
     TI rejected = 0;
     for(TI attempt_i = 0; attempt_i < 64; attempt_i++){
-        rlt::sample_initial_parameters(device, sampling_env, parameters, rng);
-        if(sampled_parameters_safe<PARAMETERS, T, TI>(parameters, dynamics_difficulty)){
+        sample_equivalent_input_response_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(
+            device, env, sampling_env, parameters, rng, balanced_bins
+        );
+        if(sampled_parameters_safe<PARAMETERS, T, TI>(parameters, safety_difficulty)){
             return rejected;
         }
         rejected++;
@@ -644,6 +915,82 @@ int main(int argc, char** argv){
     rlt::init(device, env);
     fp::rdac_init_weights(device, actor, rng);
     fp::rdac_reset_optimizer_state(device, actor_optimizer, actor);
+
+    if(options.sampler_dump_samples > 0){
+        if(options.sampler_dump_path.empty()){
+            std::cerr << "--sampler-dump-path is required when --sampler-dump-samples is positive.\n";
+            return 1;
+        }
+        std::ofstream sampler_dump(options.sampler_dump_path);
+        if(!sampler_dump.is_open()){
+            std::cerr << "Failed to open sampler dump path: " << options.sampler_dump_path << "\n";
+            return 1;
+        }
+        sampler_dump << "sample_i,training_step,batch_i,"
+                     << "dynamics_size_mass_bin,dynamics_thrust_to_weight_bin,dynamics_torque_to_inertia_bin,dynamics_motor_delay_bin,dynamics_curve_shape_bin,"
+                     << "dynamics_group_key,rejected_before_accept,"
+                     << "mass,thrust_to_weight_ratio,torque_to_inertia_ratio,sampled_tau_rise,sampled_tau_fall,sampled_curve_shape,"
+                     << "rotor_torque_constant,inertia_trace,thrust_scale,torque_scale,sampled_parameters_inside_allowed_ranges\n";
+        TI rejected_total = 0;
+        for(TI sample_i = 0; sample_i < options.sampler_dump_samples; sample_i++){
+            const TI training_step = sample_i / std::max((TI)1, options.batch_size);
+            const TI batch_i = sample_i % std::max((TI)1, options.batch_size);
+            const auto scheduled_bins = scheduled_balanced_dynamics_bins<TI>(training_step, batch_i, options.batch_size, fp::DYNAMICS_BALANCE_BINS);
+            PARAMETERS sample_parameters;
+            const TI rejected = sample_training_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(
+                device,
+                env,
+                sample_parameters,
+                rng,
+                options,
+                (T)1,
+                options.balanced_dynamics_sampling && options.sample_dynamics ? &scheduled_bins : nullptr
+            );
+            rejected_total += rejected;
+            const auto dump_bins = options.balanced_dynamics_sampling && options.sample_dynamics
+                ? scheduled_bins
+                : eq_dyn::bins_from_parameters<PARAMETERS, TI>(sample_parameters, fp::DYNAMICS_BALANCE_BINS);
+            const TI group_key = ((((dump_bins.size_mass * fp::DYNAMICS_BALANCE_BINS + dump_bins.thrust_to_weight)
+                * fp::DYNAMICS_BALANCE_BINS + dump_bins.torque_to_inertia)
+                * fp::DYNAMICS_BALANCE_BINS + dump_bins.motor_delay)
+                * fp::DYNAMICS_BALANCE_BINS + dump_bins.curve_shape);
+            const auto diag = sampled_dynamics_diagnostics<PARAMETERS, T, TI>(
+                sample_parameters,
+                env.parameters,
+                dump_bins,
+                (T)1
+            );
+            sampler_dump << sample_i << ","
+                         << training_step << ","
+                         << batch_i << ","
+                         << dump_bins.size_mass << ","
+                         << dump_bins.thrust_to_weight << ","
+                         << dump_bins.torque_to_inertia << ","
+                         << dump_bins.motor_delay << ","
+                         << dump_bins.curve_shape << ","
+                         << group_key << ","
+                         << rejected << ","
+                         << diag.mass << ","
+                         << diag.thrust_to_weight_ratio << ","
+                         << diag.torque_to_inertia_ratio << ","
+                         << diag.sampled_tau_rise << ","
+                         << diag.sampled_tau_fall << ","
+                         << diag.sampled_curve_shape << ","
+                         << average_rotor_torque_constant_abs<PARAMETERS, T, TI>(sample_parameters) << ","
+                         << diag.inertia_trace << ","
+                         << diag.thrust_scale << ","
+                         << diag.torque_scale << ","
+                         << (diag.sampled_parameters_inside_allowed_ranges > (T)0.999 ? "true" : "false")
+                         << "\n";
+        }
+        std::cout << "sampler_dump_path=" << options.sampler_dump_path
+                  << " sampler_dump_samples=" << options.sampler_dump_samples
+                  << " rejected_dynamics_count=" << rejected_total
+                  << " sampled_dynamics_level=" << fp::sampled_dynamics_level_name(options.sample_dynamics ? options.sampled_dynamics_level : fp::SampledDynamicsLevel::FIXED)
+                  << " balanced_dynamics_sampling=" << (options.balanced_dynamics_sampling ? "true" : "false")
+                  << "\n";
+        return 0;
+    }
 
     bool init_actor_loaded_flag = false;
     std::string actor_checkpoint_to_load;
@@ -1131,10 +1478,11 @@ int main(int argc, char** argv){
         bool single_step_done_finite = current_horizon > 0;
         SampledDynamicsDiagnostics<PARAMETERS, T, TI> sampled_dynamics_stats;
         for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
-            const auto dynamics_bins = scheduled_balanced_dynamics_bins<TI>(training_step, batch_i, fp::DYNAMICS_BALANCE_BINS);
+            const auto dynamics_bins = scheduled_balanced_dynamics_bins<TI>(training_step, batch_i, options.batch_size, fp::DYNAMICS_BALANCE_BINS);
             const TI sample_key_raw = (((dynamics_bins.size_mass * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.thrust_to_weight)
                 * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.torque_to_inertia)
-                * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.motor_delay);
+                * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.motor_delay)
+                * fp::DYNAMICS_BALANCE_BINS + dynamics_bins.curve_shape;
             const TI sample_key = options.sample_dynamics && options.balanced_dynamics_sampling ? sample_key_raw : (TI)0;
             sample_group_keys[batch_i] = sample_key;
             sample_group_weights[batch_i] = (T)0;
@@ -1149,7 +1497,8 @@ int main(int argc, char** argv){
                     env.parameters,
                     options.balanced_dynamics_sampling && options.sample_dynamics
                         ? dynamics_bins
-                        : eq_dyn::bins_from_parameters<PARAMETERS, TI>(parameters[batch_i], fp::DYNAMICS_BALANCE_BINS)
+                        : eq_dyn::bins_from_parameters<PARAMETERS, TI>(parameters[batch_i], fp::DYNAMICS_BALANCE_BINS),
+                    options.dynamics_curriculum ? dynamics_difficulty : (T)1
                 )
             );
             rlt::sample_initial_state(device, env, parameters[batch_i], states[batch_i][0], rng);
@@ -1858,6 +2207,10 @@ int main(int argc, char** argv){
                   << " motor_tau_mean=" << sampled_dynamics_stats.motor_tau_mean
                   << " motor_tau_min=" << sampled_dynamics_stats.motor_tau_min
                   << " motor_tau_max=" << sampled_dynamics_stats.motor_tau_max
+                  << " sampled_tau_rise=" << sampled_dynamics_stats.sampled_tau_rise
+                  << " sampled_tau_fall=" << sampled_dynamics_stats.sampled_tau_fall
+                  << " sampled_curve_shape=" << sampled_dynamics_stats.sampled_curve_shape
+                  << " sampled_parameters_inside_allowed_ranges=" << (sampled_dynamics_stats.sampled_parameters_inside_allowed_ranges > (T)0.999 ? "true" : "false")
                   << " inertia_trace=" << sampled_dynamics_stats.inertia_trace
                   << " thrust_scale=" << sampled_dynamics_stats.thrust_scale
                   << " torque_scale=" << sampled_dynamics_stats.torque_scale
@@ -1872,6 +2225,7 @@ int main(int argc, char** argv){
                   << " dynamics_thrust_to_weight_bin=" << sampled_dynamics_stats.dynamics_thrust_to_weight_bin
                   << " dynamics_torque_to_inertia_bin=" << sampled_dynamics_stats.dynamics_torque_to_inertia_bin
                   << " dynamics_motor_delay_bin=" << sampled_dynamics_stats.dynamics_motor_delay_bin
+                  << " dynamics_curve_shape_bin=" << sampled_dynamics_stats.dynamics_curve_shape_bin
                   << " equivalent_dynamics_diag_thrust_to_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_to_acceleration_gain
                   << " equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain
                   << " equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain=" << sampled_dynamics_stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain
@@ -1952,6 +2306,10 @@ int main(int argc, char** argv){
                      << sampled_dynamics_stats.motor_tau_mean << ","
                      << sampled_dynamics_stats.motor_tau_min << ","
                      << sampled_dynamics_stats.motor_tau_max << ","
+                     << sampled_dynamics_stats.sampled_tau_rise << ","
+                     << sampled_dynamics_stats.sampled_tau_fall << ","
+                     << sampled_dynamics_stats.sampled_curve_shape << ","
+                     << (sampled_dynamics_stats.sampled_parameters_inside_allowed_ranges > (T)0.999 ? "true" : "false") << ","
                      << sampled_dynamics_stats.inertia_trace << ","
                      << sampled_dynamics_stats.thrust_scale << ","
                      << sampled_dynamics_stats.torque_scale << ","
@@ -1966,6 +2324,7 @@ int main(int argc, char** argv){
                      << sampled_dynamics_stats.dynamics_thrust_to_weight_bin << ","
                      << sampled_dynamics_stats.dynamics_torque_to_inertia_bin << ","
                      << sampled_dynamics_stats.dynamics_motor_delay_bin << ","
+                     << sampled_dynamics_stats.dynamics_curve_shape_bin << ","
                      << sampled_dynamics_stats.equivalent_dynamics_diag_thrust_to_acceleration_gain << ","
                      << sampled_dynamics_stats.equivalent_dynamics_diag_roll_pitch_torque_to_angular_acceleration_gain << ","
                      << sampled_dynamics_stats.equivalent_dynamics_diag_yaw_torque_to_angular_acceleration_gain << ","

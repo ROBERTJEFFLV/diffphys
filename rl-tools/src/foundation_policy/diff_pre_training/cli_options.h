@@ -90,6 +90,8 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         std::string load_path;
         std::string init_actor_path;
         std::string log_path;
+        std::string sampler_dump_path;
+        TI sampler_dump_samples = 0;
     };
 
     inline std::string diff_model_name(DiffModel model){
@@ -151,6 +153,7 @@ namespace rl_tools::foundation_policy::diff_pre_training{
                   << "    [--curriculum-loss-spike-ratio VALUE]\n"
                   << "    [--eval-only] [--eval-model euler|l2f] [--eval-episodes N] [--eval-horizon H]\n"
                   << "    [--save-path PATH] [--load-path PATH] [--init-actor-path PATH] [--log-path PATH]\n"
+                  << "    [--sampler-dump-path PATH] [--sampler-dump-samples N]\n"
                   << "  Physics checks are available via the separate target foundation_policy_diff_physics_check.\n";
     }
 
@@ -328,6 +331,12 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             }
             else if(arg == "--log-path" && arg_i + 1 < argc){
                 options.log_path = argv[++arg_i];
+            }
+            else if(arg == "--sampler-dump-path" && arg_i + 1 < argc){
+                options.sampler_dump_path = argv[++arg_i];
+            }
+            else if(arg == "--sampler-dump-samples" && arg_i + 1 < argc){
+                options.sampler_dump_samples = std::stoll(argv[++arg_i]);
             }
             else if(arg == "--decoupled-curriculum"){
                 options.decoupled_curriculum = true;
