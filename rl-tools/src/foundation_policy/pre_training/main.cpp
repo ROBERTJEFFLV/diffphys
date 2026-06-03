@@ -49,6 +49,9 @@
 #include "config.h"
 #include "options.h"
 
+#include <limits>
+#include <sstream>
+
 namespace rlt = rl_tools;
 
 using DEVICE = rlt::devices::DEVICE_FACTORY<>;
@@ -62,6 +65,82 @@ using OPTIONS = OPTIONS_PRE_TRAINING;
 using FACTORY = builder::FACTORY<DEVICE, T, TI, RNG, OPTIONS, DYNAMIC_ALLOCATION>;
 using LOOP_CORE_CONFIG = FACTORY::LOOP_CORE_CONFIG;
 using LOOP_CONFIG = builder::LOOP_ASSEMBLY<LOOP_CORE_CONFIG>::LOOP_CONFIG;
+
+struct TeacherPreTrainingRuntimeOptions{
+    TI seed = 0;
+    TI max_steps = 0;
+    std::string output_root;
+    std::string experiment;
+    std::vector<std::string> file_paths;
+};
+
+void print_teacher_pre_training_usage(){
+    std::cout
+        << "Usage: foundation_policy_pre_training [options] [dynamics_json ...]\n"
+        << "Options:\n"
+        << "  --seed N              Training seed.\n"
+        << "  --max-steps N         Stop after N environment steps and save a final HDF5 actor checkpoint.\n"
+        << "  --output-root PATH    ExTrack base path for teacher checkpoints.\n"
+        << "  --experiment NAME     ExTrack experiment name.\n"
+        << "  --help                Show this message.\n";
+}
+
+bool parse_non_negative_ti_teacher(const std::string& option_name, const char* raw, TI& target){
+    try{
+        const long long parsed = std::stoll(raw);
+        if(parsed < 0){
+            std::cerr << option_name << " must be non-negative.\n";
+            return false;
+        }
+        target = static_cast<TI>(parsed);
+        return true;
+    }
+    catch(const std::exception&){
+        std::cerr << "Invalid integer for " << option_name << ": " << raw << "\n";
+        return false;
+    }
+}
+
+bool parse_teacher_pre_training_options(int argc, char** argv, TeacherPreTrainingRuntimeOptions& options){
+    for(int arg_i = 1; arg_i < argc; arg_i++){
+        std::string arg = argv[arg_i];
+        auto need_value = [&](const std::string& name){
+            if(arg_i + 1 >= argc){
+                std::cerr << "Missing value for " << name << "\n";
+                return false;
+            }
+            return true;
+        };
+        if(arg == "--help" || arg == "-h"){
+            print_teacher_pre_training_usage();
+            return false;
+        }
+        else if(arg == "--seed"){
+            if(!need_value(arg) || !parse_non_negative_ti_teacher(arg, argv[++arg_i], options.seed)) return false;
+        }
+        else if(arg == "--max-steps"){
+            if(!need_value(arg) || !parse_non_negative_ti_teacher(arg, argv[++arg_i], options.max_steps)) return false;
+        }
+        else if(arg == "--output-root"){
+            if(!need_value(arg)) return false;
+            options.output_root = argv[++arg_i];
+        }
+        else if(arg == "--experiment"){
+            if(!need_value(arg)) return false;
+            options.experiment = argv[++arg_i];
+        }
+        else if(!arg.empty() && arg[0] == '-'){
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_teacher_pre_training_usage();
+            return false;
+        }
+        else{
+            options.file_paths.push_back(arg);
+        }
+    }
+    return true;
+}
+
 // note: make sure that the rng_params is invoked in the exact same way in pre- as in post-training, to make sure the params used to sample parameters to generate data from the trained policy are matching the ones seen by the particular policy for the seed during pretraining
 
 int main(int argc, char** argv){
@@ -69,15 +148,15 @@ int main(int argc, char** argv){
     RNG rng;
     rlt::init(device);
     rlt::malloc(device, rng);
-    TI seed = 0;
+    TeacherPreTrainingRuntimeOptions runtime_options;
+    if(!parse_teacher_pre_training_options(argc, argv, runtime_options)){
+        return 1;
+    }
+    const TI seed = runtime_options.seed;
     rlt::init(device, rng, seed);
 
-    std::vector<std::string> file_paths;
-    if (argc > 1){
-        std::string file_path = argv[1];
-        file_paths.push_back(file_path);
-    }
-    else{
+    std::vector<std::string> file_paths = runtime_options.file_paths;
+    if (file_paths.empty()){
         // iterate dynamics_parameters directory
         std::filesystem::path dynamics_parameters_path = "./src/foundation_policy/dynamics_parameters/";
         if (!std::filesystem::exists(dynamics_parameters_path)){
@@ -93,6 +172,12 @@ int main(int argc, char** argv){
         typename LOOP_CONFIG::template State <LOOP_CONFIG> ts;
         rlt::malloc(device, ts);
         ts.extrack_config.name = "foundation-policy-pre-training";
+        if(!runtime_options.output_root.empty()){
+            ts.extrack_config.base_path = runtime_options.output_root;
+        }
+        if(!runtime_options.experiment.empty()){
+            ts.extrack_config.experiment = runtime_options.experiment;
+        }
 
         auto& base_env = rlt::get(ts.off_policy_runner.envs, 0, 0);
         std::filesystem::path file_path = file_path_string;
@@ -141,6 +226,13 @@ int main(int argc, char** argv){
             //     rl_tools::save(device, ts.actor_critic.critics[1], group_1);
             // }
             finished = rlt::step(device, ts);
+            if(runtime_options.max_steps > 0 && ts.step >= runtime_options.max_steps){
+                auto step_folder = rlt::get_step_folder(device, ts.extrack_config, ts.extrack_paths, ts.step);
+                auto& actor_checkpoint = rlt::get_actor(ts);
+                rlt::rl::loop::steps::checkpoint::save<LOOP_CONFIG::DYNAMIC_ALLOCATION, typename LOOP_CONFIG::ENVIRONMENT, typename LOOP_CONFIG::CHECKPOINT_PARAMETERS>(device, step_folder.string(), actor_checkpoint, ts.rng_checkpoint);
+                std::cout << "manual_final_checkpoint=" << (step_folder / "checkpoint.h5").string() << " step=" << ts.step << std::endl;
+                finished = true;
+            }
         }
         std::filesystem::create_directories(ts.extrack_paths.seed);
         std::ofstream return_file(ts.extrack_paths.seed / "return.json");

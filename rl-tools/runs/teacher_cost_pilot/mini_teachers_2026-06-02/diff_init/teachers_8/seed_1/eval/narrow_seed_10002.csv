@@ -1,0 +1,2 @@
+checkpoint,domain,seed,episodes,horizon,success_rate,mean_final_position_norm,mean_final_velocity_norm,mean_final_angular_velocity_norm,invalid_or_nan_rate,mean_action_norm
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/runs/teacher_cost_pilot/mini_teachers_2026-06-02/diff_init/teachers_8/seed_1/checkpoint.h5,narrow,10002,100,128,0,3.917,5.3386,1.75389,0,0.375218

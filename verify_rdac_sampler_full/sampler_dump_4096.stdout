@@ -1,0 +1,1 @@
+sampler_dump_path=/home/lvmingyang/raptor_diff_20260531_215150/diffphys/verify_rdac_sampler_full/sampler_dump_4096.csv sampler_dump_samples=4096 rejected_dynamics_count=0 sampled_dynamics_level=broad balanced_dynamics_sampling=true

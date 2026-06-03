@@ -309,9 +309,17 @@ endif()
 
 if(RL_TOOLS_ENABLE_HDF5)
     message(STATUS "HDF5 enabled")
+    enable_language(C)
     if(RL_TOOLS_HDF5_HIGHFIVE_FROM_CONAN)
         find_package(HighFive REQUIRED)
     else()
+        find_package(HDF5 REQUIRED)
+        if(NOT TARGET HDF5::HDF5)
+            add_library(HDF5::HDF5 INTERFACE IMPORTED)
+            set_target_properties(HDF5::HDF5 PROPERTIES
+                    INTERFACE_INCLUDE_DIRECTORIES "${HDF5_INCLUDE_DIRS}"
+                    INTERFACE_LINK_LIBRARIES "${HDF5_LIBRARIES}")
+        endif()
         set(HIGHFIVE_UNIT_TESTS OFF CACHE BOOL "Disable HighFive unit tests" FORCE)
         set(HIGHFIVE_USE_BOOST OFF)
         add_subdirectory(external/highfive)

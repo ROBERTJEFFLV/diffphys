@@ -49,6 +49,7 @@
 #include <rl_tools/rl/loop/steps/nn_analytics/operations_cpu.h>
 
 #include <rl_tools/rl/utils/evaluation/operations_cpu.h>
+#include <rl_tools/rl/environments/l2f/operations_cpu.h>
 
 #include "../pre_training/config.h"
 #include "../pre_training/options.h"
@@ -66,6 +67,8 @@ using T = float;
 
 #define RL_TOOLS_POST_TRAINING
 #include "config.h"
+#include "runtime_options.h"
+#include "../diff_pre_training/checkpoint_io.h"
 
 // constants derived
 constexpr TI DATASET_SIZE = (ON_POLICY ? 1 : N_EPOCH) * (1 + TEACHER_STUDENT_MIX) * NUM_TEACHERS * NUM_EPISODES * ENVIRONMENT::EPISODE_STEP_LIMIT;
@@ -117,10 +120,22 @@ int main(int argc, char** argv){
     // device init
     rlt::init(device);
 
+    PostTrainingRuntimeOptions runtime_options;
+    if(!parse_post_training_options(argc, argv, runtime_options)){
+        return 1;
+    }
+    const TI seed = runtime_options.seed;
+    const TI num_teachers = runtime_options.num_teachers;
+    const TI num_active_teachers = runtime_options.num_active_teachers;
+    if(num_teachers == 0 && runtime_options.num_epochs > 0){
+        std::cerr << "--num-teachers 0 is only valid with --epochs 0; no teacher dataset can be constructed.\n";
+        return 1;
+    }
+
     // malloc
     rlt::malloc(device, rng);
     rlt::malloc(device, actor_optimizer);
-    for (TI teacher_i=0; teacher_i < NUM_TEACHERS; ++teacher_i){
+    for (TI teacher_i=0; teacher_i < num_teachers; ++teacher_i){
         rlt::malloc(device, actor_teacher[teacher_i]);
     }
     rlt::malloc(device, actor_teacher_buffer);
@@ -139,21 +154,28 @@ int main(int argc, char** argv){
     rlt::malloc(device, batch_reset);
     rlt::malloc(device, d_output);
 
-    // init
-    TI seed = argc >= 2 ? std::stoi(argv[1]) : 0;
     TI current_episode = 0;
     TI current_index = 0;
 
     T best_return = 0;
     bool best_return_set = false;
 
-#ifdef RL_TOOLS_ENABLE_TENSORBOARD
     auto timestamp_string = rlt::utils::extrack::get_timestamp_string();
-    std::filesystem::path run_path = "logs/" + timestamp_string;
+    std::filesystem::path run_path = runtime_options.run_path.empty() ? std::filesystem::path("logs") / timestamp_string : std::filesystem::path(runtime_options.run_path);
+    std::filesystem::create_directories(run_path / "checkpoints");
+#ifdef RL_TOOLS_ENABLE_TENSORBOARD
     rlt::init(device, device.logger, run_path.string());
 #endif
     rlt::init(device, rng, seed);
     rlt::init_weights(device, actor, rng);
+    if(!runtime_options.init_actor_path.empty()){
+        if(!rlt::foundation_policy::diff_pre_training::load_actor_checkpoint(device, actor, runtime_options.init_actor_path)){
+            std::cerr << "Failed to load --init-actor-path: " << runtime_options.init_actor_path << std::endl;
+            return 1;
+        }
+        std::cout << "Loaded student actor initialization from " << runtime_options.init_actor_path << std::endl;
+    }
+    rlt::copy(device, device, actor, best_actor);
 
     //work
     rlt::utils::extrack::Path checkpoint_path;
@@ -163,13 +185,14 @@ int main(int argc, char** argv){
     // checkpoint_path.experiment = "2025-04-04_17-00-11";
     // checkpoint_path.experiment = "2025-04-07_23-12-07";
     // checkpoint_path.experiment = "2025-04-08_23-23-52";
-    checkpoint_path.experiment = "2025-04-16_20-10-58";
+    checkpoint_path.experiment = runtime_options.teacher_experiment;
     checkpoint_path.name = "foundation-policy-pre-training";
 
-    std::filesystem::path dynamics_parameters_path = "./src/foundation_policy/dynamics_parameters_" + checkpoint_path.experiment + "/";
-    std::filesystem::path dynamics_parameter_index = "./src/foundation_policy/checkpoints_" + checkpoint_path.experiment + ".txt";
+    std::filesystem::path dynamics_parameters_path = runtime_options.dynamics_parameters_path.empty() ? std::filesystem::path("./src/foundation_policy/dynamics_parameters_" + checkpoint_path.experiment + "/") : std::filesystem::path(runtime_options.dynamics_parameters_path);
+    std::filesystem::path dynamics_parameter_index = runtime_options.dynamics_parameter_index.empty() ? std::filesystem::path("./src/foundation_policy/checkpoints_" + checkpoint_path.experiment + ".txt") : std::filesystem::path(runtime_options.dynamics_parameter_index);
     // std::filesystem::path dynamics_parameter_index = "./src/foundation_policy/checkpoints_debug.txt";
 
+    if(num_teachers > 0){
     std::ifstream dynamics_parameter_index_file(dynamics_parameter_index);
     if (!dynamics_parameter_index_file){
         std::cerr << "Failed to open dynamics parameter index file: " << dynamics_parameter_index << std::endl;
@@ -184,19 +207,19 @@ int main(int argc, char** argv){
         dynamics_parameter_index_lines.push_back(dynamics_parameter_index_line);
     }
     dynamics_parameter_index_file.close();
-    if (dynamics_parameter_index_lines.size() < NUM_TEACHERS){
-        std::cerr << "Dynamic parameter index file is too small: " << dynamics_parameter_index << " " << dynamics_parameter_index_lines.size() << "/" << NUM_TEACHERS << std::endl;
+    if (dynamics_parameter_index_lines.size() < num_teachers){
+        std::cerr << "Dynamic parameter index file is too small: " << dynamics_parameter_index << " " << dynamics_parameter_index_lines.size() << "/" << num_teachers << std::endl;
         return 1;
     }
 
-    for (TI teacher_i=0; teacher_i < NUM_TEACHERS; ++teacher_i){
+    for (TI teacher_i=0; teacher_i < num_teachers; ++teacher_i){
         // load actor & critic
         auto checkpoint_info = dynamics_parameter_index_lines[dynamics_parameter_index_lines.size() - 1 - teacher_i];
         auto checkpoint_info_split = split_by_comma(checkpoint_info);
         auto cpp_copy = checkpoint_path;
         cpp_copy.attributes["dynamics-id"] = checkpoint_info_split[0]; // take from the end because we order by performance and the best are at the end
         cpp_copy.step = checkpoint_info_split[1];
-        rlt::find_latest_run(device, "1k-experiments", cpp_copy);
+        rlt::find_latest_run(device, runtime_options.teacher_search_root, cpp_copy);
         auto actor_file = HighFive::File(cpp_copy.checkpoint_path.string(), HighFive::File::ReadOnly);
         rlt::load(device, actor_teacher[teacher_i], actor_file.getGroup("actor"));
 
@@ -235,10 +258,14 @@ int main(int argc, char** argv){
         }
         rlt::free(device, data);
         std::cout << "Teacher policy (" << cpp_copy.checkpoint_path.string() << ")mean return: " << result.returns_mean << " episode length: " << result.episode_length_mean << " share terminated: " << result.share_terminated << " steady state pos correction: " << mean_position[0] << "," << mean_position[1] << "," << mean_position[2] << std::endl;
-        if (result.returns_mean < SOLVED_RETURN){
-            std::cerr << "Mean return (" << result.returns_mean << ") too low for " << checkpoint_path.checkpoint_path << std::endl;
+        if (result.returns_mean < runtime_options.min_teacher_return){
+            std::cerr << "Mean return (" << result.returns_mean << ") below --min-teacher-return " << runtime_options.min_teacher_return << " for " << cpp_copy.checkpoint_path << std::endl;
             return 1;
         }
+    }
+    }
+    else{
+        std::cout << "No teachers requested; skipping teacher checkpoint loading. Use --epochs 0 for init-only export.\n";
     }
 
     for (TI i=0; i < DATASET_SIZE; i++){
@@ -246,7 +273,7 @@ int main(int argc, char** argv){
     }
 
     rlt::reset_optimizer_state(device, actor_optimizer, actor);
-    for (TI epoch_i = 0; epoch_i < N_EPOCH; epoch_i++){
+    for (TI epoch_i = 0; epoch_i < runtime_options.num_epochs; epoch_i++){
         current_episode = ON_POLICY ? 0 : current_episode;
         current_index = ON_POLICY ? 0 : current_index; // reset dataset if ON_POLICY
         RESULT average_result;
@@ -257,14 +284,14 @@ int main(int argc, char** argv){
         average_result.share_terminated = 0;
         TI NUM_AVG = 0;
 
-        if (epoch_i < EPOCH_TEACHER_FORCING || TEACHER_STUDENT_MIX > 0){ // start with behavioral cloning (data gathering using teacher)
-            for (TI teacher_i=0; teacher_i < NUM_TEACHERS; teacher_i++){
+        if (epoch_i < runtime_options.teacher_forcing_epochs || TEACHER_STUDENT_MIX > 0){ // start with behavioral cloning (data gathering using teacher)
+            for (TI teacher_i=0; teacher_i < num_teachers; teacher_i++){
                 auto teacher_meta = rlt::get(device, teacher_metas, teacher_i);
                 constexpr TI TEACHER_EPOCHS = (TEACHER_STUDENT_MIX > 0 ? TEACHER_STUDENT_MIX : 1);
                 for (TI teacher_epoch_i = 0; teacher_epoch_i < TEACHER_EPOCHS; teacher_epoch_i++){
                     static_assert(DATASET_SIZE >= NUM_TEACHERS * TEACHER_EPOCHS * NUM_EPISODES * ENVIRONMENT::EPISODE_STEP_LIMIT);
                     auto result = gather_epoch<ENVIRONMENT_TEACHER, ENVIRONMENT_TEACHER::Observation, ENVIRONMENT::Observation, NUM_EPISODES, TEACHER_DETERMINISTIC>(device, actor_teacher[teacher_i], teacher_meta, teacher_parameters[teacher_i], actor_teacher[teacher_i], dataset_episode_start_indices, dataset_input, dataset_output_target, dataset_truncated, dataset_reset, current_episode, current_index, rng);
-                    if (epoch_i < EPOCH_TEACHER_FORCING){
+                    if (epoch_i < runtime_options.teacher_forcing_epochs){
                         NUM_AVG++;
                         average_result.returns_mean += result.returns_mean;
                         average_result.returns_std += result.returns_mean * result.returns_mean;
@@ -275,12 +302,12 @@ int main(int argc, char** argv){
                 }
             }
         }
-        if (epoch_i >= EPOCH_TEACHER_FORCING){
+        if (epoch_i >= runtime_options.teacher_forcing_epochs){
             using RESULT = rlt::rl::utils::evaluation::Result<rlt::rl::utils::evaluation::Specification<T, TI, ENVIRONMENT, NUM_EPISODES, ENVIRONMENT::EPISODE_STEP_LIMIT>>;
             RESULT results[NUM_TEACHERS];
             std::vector<std::tuple<TI, T>> active_teachers;
             rlt::rl::utils::evaluation::Data<rlt::rl::utils::evaluation::DataSpecification<RESULT::SPEC>> datas[NUM_TEACHERS];
-            for (TI teacher_i=0; teacher_i < NUM_TEACHERS; teacher_i++){
+            for (TI teacher_i=0; teacher_i < num_teachers; teacher_i++){
                 rlt::malloc(device, datas[teacher_i]);
                 auto& result = results[teacher_i];
                 auto& data = datas[teacher_i];
@@ -301,8 +328,9 @@ int main(int argc, char** argv){
                 return idx;
             };
             auto indices = argsort(active_teachers, [](const auto& a, const auto& b) { return std::get<1>(a) < std::get<1>(b); }); // ascending order
-            for (TI teacher_i=0; teacher_i < NUM_TEACHERS; teacher_i++){
-                if (indices[teacher_i] < NUM_ACTIVE_TEACHERS){
+            for (TI rank_i=0; rank_i < num_teachers; rank_i++){
+                const TI teacher_i = std::get<0>(active_teachers[indices[rank_i]]);
+                if (rank_i < num_active_teachers){
                     auto teacher_meta = rlt::get(device, teacher_metas, teacher_i);
                     add_to_dataset<ENVIRONMENT, ENVIRONMENT_TEACHER::Observation, ENVIRONMENT::Observation, TEACHER_DETERMINISTIC>(device, datas[teacher_i], actor_teacher[teacher_i], teacher_meta, dataset_episode_start_indices, dataset_input, dataset_output_target, dataset_truncated, dataset_reset, current_episode, current_index, rng);
                 }
@@ -310,6 +338,7 @@ int main(int argc, char** argv){
             }
         }
 
+        if(NUM_AVG == 0){ std::cerr << "No teacher/student evaluation samples were collected in epoch " << epoch_i << std::endl; return 1; }
         average_result.returns_mean /= NUM_AVG;
         average_result.returns_std /= NUM_AVG;
         average_result.returns_std = std::sqrt(average_result.returns_std - average_result.returns_mean * average_result.returns_mean);
@@ -322,9 +351,9 @@ int main(int argc, char** argv){
         rlt::add_scalar(device, device.logger, "evaluation/episode_length/mean", average_result.episode_length_mean);
         rlt::add_scalar(device, device.logger, "evaluation/episode_length/std", average_result.episode_length_std);
         rlt::add_scalar(device, device.logger, "evaluation/share_terminated", average_result.share_terminated);
-        rlt::log(device, device.logger, (epoch_i >= EPOCH_TEACHER_FORCING ? "Student" : "Teacher"), " Mean return: ", average_result.returns_mean, " Mean episode length: ", average_result.episode_length_mean, " Share terminated: ", average_result.share_terminated * 100, "%");
+        rlt::log(device, device.logger, (epoch_i >= runtime_options.teacher_forcing_epochs ? "Student" : "Teacher"), " Mean return: ", average_result.returns_mean, " Mean episode length: ", average_result.episode_length_mean, " Share terminated: ", average_result.share_terminated * 100, "%");
 
-        if (epoch_i >= EPOCH_TEACHER_FORCING && (!best_return_set || average_result.returns_mean > best_return)){
+        if (epoch_i >= runtime_options.teacher_forcing_epochs && (!best_return_set || average_result.returns_mean > best_return)){
             best_return = average_result.returns_mean;
             best_return_set = true;
             rlt::copy(device, device, actor, best_actor);
@@ -353,7 +382,11 @@ int main(int argc, char** argv){
         TI batch_i = 0;
         TI epoch_episode = rlt::get(device, epoch_indices, epoch_episode_index);
         TI current_sample = rlt::get(device, dataset_episode_start_indices, epoch_episode);
-        while(true){
+        TI max_batches = std::max<TI>((TI)1, N / BATCH_SIZE);
+        if(runtime_options.max_batches_per_epoch > 0){
+            max_batches = std::min(max_batches, runtime_options.max_batches_per_epoch);
+        }
+        while(batch_i < max_batches){
             for (TI sample_i=0; sample_i<BATCH_SIZE; sample_i++){
                 // TI current_epoch_index = batch_i * BATCH_SIZE + sample_i;
                 bool reset = false;
@@ -374,8 +407,7 @@ int main(int argc, char** argv){
                     }
                     else{
                         if(++epoch_episode_index >= N_EPISODE){
-                            std::cerr << "Epoch episode index exceeded after " << batch_i << " batches" << std::endl;
-                            goto end_of_epoch;
+                            epoch_episode_index = 0;
                         }
                         current_sample = rlt::get(device, dataset_episode_start_indices, rlt::get(device, epoch_indices, epoch_episode_index));
                     }
@@ -439,7 +471,7 @@ int main(int argc, char** argv){
     // malloc
     rlt::free(device, rng);
     rlt::free(device, actor_optimizer);
-    for (TI teacher_i=0; teacher_i < NUM_TEACHERS; ++teacher_i){
+    for (TI teacher_i=0; teacher_i < num_teachers; ++teacher_i){
         rlt::free(device, actor_teacher[teacher_i]);
     }
     rlt::free(device, actor_teacher_buffer);

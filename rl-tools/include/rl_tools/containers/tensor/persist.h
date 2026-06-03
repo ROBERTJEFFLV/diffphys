@@ -59,6 +59,48 @@ namespace rl_tools {
         }
     }
 
+    template<typename SOURCE_T, typename DEVICE, typename SPEC>
+    void read_ranked_dataset(DEVICE& device, HighFive::DataSet& dataset, Tensor<SPEC>& tensor, const std::vector<size_t>& dims) {
+        std::vector<SOURCE_T> flat;
+        flat.reserve(SPEC::SIZE);
+        if(dims.size() == 1){
+            std::vector<SOURCE_T> buffer(dims[0]);
+            dataset.read(buffer);
+            flat = std::move(buffer);
+        }
+        else if(dims.size() == 2){
+            std::vector<std::vector<SOURCE_T>> buffer(dims[0], std::vector<SOURCE_T>(dims[1]));
+            dataset.read(buffer);
+            for(const auto& row: buffer){
+                flat.insert(flat.end(), row.begin(), row.end());
+            }
+        }
+        else if(dims.size() == 3){
+            std::vector<std::vector<std::vector<SOURCE_T>>> buffer(dims[0], std::vector<std::vector<SOURCE_T>>(dims[1], std::vector<SOURCE_T>(dims[2])));
+            dataset.read(buffer);
+            for(const auto& plane: buffer){
+                for(const auto& row: plane){
+                    flat.insert(flat.end(), row.begin(), row.end());
+                }
+            }
+        }
+        else if(dims.size() == 4){
+            std::vector<std::vector<std::vector<std::vector<SOURCE_T>>>> buffer(dims[0], std::vector<std::vector<std::vector<SOURCE_T>>>(dims[1], std::vector<std::vector<SOURCE_T>>(dims[2], std::vector<SOURCE_T>(dims[3]))));
+            dataset.read(buffer);
+            for(const auto& block: buffer){
+                for(const auto& plane: block){
+                    for(const auto& row: plane){
+                        flat.insert(flat.end(), row.begin(), row.end());
+                    }
+                }
+            }
+        }
+        else{
+            utils::assert_exit(device, false, "Unsupported tensor rank in HDF5 tensor load");
+        }
+        from_flat_vector(device, flat, tensor);
+    }
+
     template<typename DEVICE, typename SPEC>
     auto to_vector(DEVICE& device, Tensor<SPEC>& tensor) {
         using TI = typename DEVICE::index_t;
@@ -123,15 +165,11 @@ namespace rl_tools {
             utils::assert_exit(device, dataset.getStorageSize() == data_type_size * SPEC::SIZE, "Storage size mismatch");
             if (data_type_class == HighFive::DataTypeClass::Float){
                 if(data_type_size == 4){
-                    std::vector<float> buffer(SPEC::SIZE);
-                    dataset.read(buffer.data());
-                    from_flat_vector(device, buffer, tensor);
+                    read_ranked_dataset<float>(device, dataset, tensor, dims);
                 }
                 else{
                     if(data_type_size == 8){
-                        std::vector<double> buffer(SPEC::SIZE);
-                        dataset.read(buffer.data());
-                        from_flat_vector(device, buffer, tensor);
+                        read_ranked_dataset<double>(device, dataset, tensor, dims);
                     }
                     else{
                         utils::assert_exit(device, false, "Unsupported data type size");
@@ -141,15 +179,11 @@ namespace rl_tools {
             else{
                 if(data_type_class == HighFive::DataTypeClass::Integer){
                     if(data_type_size == 4){
-                        std::vector<int32_t> buffer(SPEC::SIZE);
-                        dataset.read(buffer.data());
-                        from_flat_vector(device, buffer, tensor);
+                        read_ranked_dataset<int32_t>(device, dataset, tensor, dims);
                     }
                     else{
                         if(data_type_size == 8){
-                            std::vector<int64_t> buffer(SPEC::SIZE);
-                            dataset.read(buffer.data());
-                            from_flat_vector(device, buffer, tensor);
+                            read_ranked_dataset<int64_t>(device, dataset, tensor, dims);
                         }
                         else{
                             utils::assert_exit(device, false, "Unsupported data type size");
