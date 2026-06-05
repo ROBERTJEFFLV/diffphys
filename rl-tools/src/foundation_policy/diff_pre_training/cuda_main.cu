@@ -47,6 +47,8 @@ struct Options{
     float action_saturation_start = 0.95f;
     float loss_velocity_weight = 0.8f;
     float loss_angular_velocity_weight = 0.8f;
+    float loss_linear_acceleration_weight = 0.0f;
+    float loss_angular_acceleration_weight = 0.0f;
     float terminal_loss_scale = 1.0f;
     float terminal_velocity_weight = 4.0f;
     float terminal_angular_velocity_weight = 4.0f;
@@ -108,6 +110,7 @@ struct Options{
     std::size_t throughout_gate_start_step = 0;
     float initial_position_scale = 1.0f;
     float initial_velocity_scale = 1.0f;
+    float initial_attitude_scale = 0.0f;
     float initial_angular_velocity_scale = 1.0f;
     float initial_position_scale_local = 0.25f;
     float initial_velocity_scale_local = 0.5f;
@@ -160,6 +163,7 @@ void print_usage(){
         << "    [--success-angular-velocity-threshold VALUE]\n"
         << "    [--success-action-saturation-threshold VALUE]\n"
         << "    [--w-action-magnitude W] [--w-u W] [--w-sat W]\n"
+        << "    [--w-linear-acceleration W] [--w-angular-acceleration W]\n"
         << "    [--action-saturation-start VALUE] [--terminal-loss-scale VALUE]\n"
         << "    [--curriculum-learning-rate-scale S1,S2,...]\n"
         << "    [--curriculum-diff-loss-scale S1,S2,...]\n"
@@ -170,7 +174,8 @@ void print_usage(){
         << "    [--trajectory-mode fixed|step|circle|figure8|mixed]\n"
         << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F]\n"
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
-        << "    [--initial-position-scale S] [--initial-velocity-scale S] [--initial-angular-velocity-scale S]\n"
+        << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
+        << "    [--initial-attitude-scale S] [--initial-angular-velocity-scale S]\n"
         << "    [--initial-position-scale-local S] [--initial-velocity-scale-local S]\n"
         << "    [--initial-attitude-scale-local S] [--initial-angular-velocity-scale-local S]\n"
         << "    [--log-path PATH] [--save-path PATH] [--load-path PATH]\n"
@@ -471,6 +476,9 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--initial-velocity-scale" && i + 1 < argc){
             options.initial_velocity_scale = std::stof(argv[++i]);
         }
+        else if(arg == "--initial-attitude-scale" && i + 1 < argc){
+            options.initial_attitude_scale = std::stof(argv[++i]);
+        }
         else if(arg == "--initial-angular-velocity-scale" && i + 1 < argc){
             options.initial_angular_velocity_scale = std::stof(argv[++i]);
         }
@@ -488,6 +496,12 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--w-v" && i + 1 < argc){
             options.loss_velocity_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-linear-acceleration" && i + 1 < argc){
+            options.loss_linear_acceleration_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-angular-acceleration" && i + 1 < argc){
+            options.loss_angular_acceleration_weight = std::stof(argv[++i]);
         }
         else if(arg == "--w-action-magnitude" && i + 1 < argc){
             options.action_magnitude_weight = std::stof(argv[++i]);
@@ -712,6 +726,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
     training_options.initial_position_scale = options.initial_position_scale;
     training_options.initial_velocity_scale = options.initial_velocity_scale;
+    training_options.initial_attitude_scale = options.initial_attitude_scale;
     training_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
     training_options.success_position_threshold = options.success_position_threshold;
     training_options.success_velocity_threshold = options.success_velocity_threshold;
@@ -738,6 +753,7 @@ gpu::GpuPolicyEvalOptions make_gpu_eval_options(const Options& options){
     eval_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
     eval_options.initial_position_scale = options.initial_position_scale;
     eval_options.initial_velocity_scale = options.initial_velocity_scale;
+    eval_options.initial_attitude_scale = options.initial_attitude_scale;
     eval_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
     eval_options.success_position_threshold = options.success_position_threshold;
     eval_options.success_velocity_threshold = options.success_velocity_threshold;
@@ -926,6 +942,8 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_velocity_rmse=" << summary.velocity_rmse << "\n";
     std::cout << "gpu_eval_attitude_rmse=" << summary.attitude_rmse << "\n";
     std::cout << "gpu_eval_angular_velocity_rmse=" << summary.angular_velocity_rmse << "\n";
+    std::cout << "gpu_eval_linear_acceleration_error_rmse=" << summary.linear_acceleration_error_rmse << "\n";
+    std::cout << "gpu_eval_angular_acceleration_error_rmse=" << summary.angular_acceleration_error_rmse << "\n";
     std::cout << "gpu_eval_p90_final_position_norm=" << summary.p90_final_position_norm << "\n";
     std::cout << "gpu_eval_p90_final_velocity_norm=" << summary.p90_final_velocity_norm << "\n";
     std::cout << "gpu_eval_p90_final_attitude_error=" << summary.p90_final_attitude_error << "\n";
@@ -942,6 +960,14 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_p90_max_velocity_norm=" << summary.p90_max_velocity_norm << "\n";
     std::cout << "gpu_eval_p90_max_attitude_error=" << summary.p90_max_attitude_error << "\n";
     std::cout << "gpu_eval_p90_max_angular_velocity_norm=" << summary.p90_max_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_max_position_norm=" << summary.max_position_norm << "\n";
+    std::cout << "gpu_eval_max_velocity_norm=" << summary.max_velocity_norm << "\n";
+    std::cout << "gpu_eval_max_attitude_error=" << summary.max_attitude_error << "\n";
+    std::cout << "gpu_eval_max_angular_velocity_norm=" << summary.max_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_action_magnitude=" << summary.mean_action_magnitude << "\n";
+    std::cout << "gpu_eval_max_action_magnitude=" << summary.max_action_magnitude << "\n";
+    std::cout << "gpu_eval_mean_action_smoothness=" << summary.mean_action_smoothness << "\n";
+    std::cout << "gpu_eval_max_action_smoothness=" << summary.max_action_smoothness << "\n";
     std::cout << "gpu_eval_max_action_abs=" << summary.max_action_abs << "\n";
     std::cout << "gpu_eval_action_saturation_rate=" << summary.action_saturation_rate << "\n";
     std::cout << "gpu_eval_stability_gate_passed=" << (summary.stability_gate_passed ? "true" : "false") << "\n";
@@ -1347,6 +1373,7 @@ int main(int argc, char** argv){
     if(options.tracking_gate_mode == "local"){
         options.initial_position_scale = options.initial_position_scale_local;
         options.initial_velocity_scale = options.initial_velocity_scale_local;
+        options.initial_attitude_scale = options.initial_attitude_scale_local;
         options.initial_angular_velocity_scale = options.initial_angular_velocity_scale_local;
         options.throughout_gate_start_step = 0;
     }
@@ -1424,6 +1451,7 @@ int main(int argc, char** argv){
     std::cout << "throughout_gate_start_step=" << options.throughout_gate_start_step << "\n";
     std::cout << "initial_position_scale=" << options.initial_position_scale << "\n";
     std::cout << "initial_velocity_scale=" << options.initial_velocity_scale << "\n";
+    std::cout << "initial_attitude_scale=" << options.initial_attitude_scale << "\n";
     std::cout << "initial_attitude_scale_local=" << options.initial_attitude_scale_local << "\n";
     std::cout << "initial_angular_velocity_scale=" << options.initial_angular_velocity_scale << "\n";
     std::cout << "simulation_frequency_hz=100\n";
@@ -1436,6 +1464,8 @@ int main(int argc, char** argv){
     std::cout << "action_saturation_start=" << options.action_saturation_start << "\n";
     std::cout << "loss_velocity_weight=" << options.loss_velocity_weight << "\n";
     std::cout << "loss_angular_velocity_weight=" << options.loss_angular_velocity_weight << "\n";
+    std::cout << "loss_linear_acceleration_weight=" << options.loss_linear_acceleration_weight << "\n";
+    std::cout << "loss_angular_acceleration_weight=" << options.loss_angular_acceleration_weight << "\n";
     std::cout << "terminal_loss_scale=" << options.terminal_loss_scale << "\n";
     std::cout << "terminal_velocity_weight=" << options.terminal_velocity_weight << "\n";
     std::cout << "terminal_angular_velocity_weight=" << options.terminal_angular_velocity_weight << "\n";
@@ -1458,6 +1488,8 @@ int main(int argc, char** argv){
     weights.saturation_start = options.action_saturation_start;
     weights.velocity = options.loss_velocity_weight;
     weights.angular_velocity = options.loss_angular_velocity_weight;
+    weights.linear_acceleration = options.loss_linear_acceleration_weight;
+    weights.angular_acceleration = options.loss_angular_acceleration_weight;
     weights.terminal_loss_scale = options.terminal_loss_scale;
     weights.terminal_velocity = options.terminal_velocity_weight;
     weights.terminal_angular_velocity = options.terminal_angular_velocity_weight;
@@ -1477,7 +1509,8 @@ int main(int argc, char** argv){
         options.trajectory_frequency_hz,
         options.initial_position_scale,
         options.initial_velocity_scale,
-        options.initial_angular_velocity_scale
+        options.initial_angular_velocity_scale,
+        options.initial_attitude_scale
     );
 
     try{

@@ -15,7 +15,7 @@ constexpr std::size_t RDAC_ACTOR_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_H
 constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
-constexpr std::size_t LOSS_COMPONENT_COUNT = 12;
+constexpr std::size_t LOSS_COMPONENT_COUNT = 14;
 
 enum class TrajectoryMode : std::uint32_t{
     FIXED = 0,
@@ -30,6 +30,8 @@ struct EulerGpuLossWeights{
     float velocity = 0.8f;
     float attitude = 4.0f;
     float angular_velocity = 0.8f;
+    float linear_acceleration = 0.0f;
+    float angular_acceleration = 0.0f;
     float action_magnitude = 0.005f;
     float action_smoothness = 0.03f;
     float saturation = 0.05f;
@@ -56,6 +58,8 @@ struct LossComponentMeans{
     float velocity = 0.0f;
     float attitude = 0.0f;
     float angular_velocity = 0.0f;
+    float linear_acceleration = 0.0f;
+    float angular_acceleration = 0.0f;
     float action_magnitude = 0.0f;
     float action_smoothness = 0.0f;
     float saturation = 0.0f;
@@ -314,6 +318,7 @@ struct FullGpuTrainingOptions{
     float trajectory_frequency_hz = 0.5f;
     float initial_position_scale = 1.0f;
     float initial_velocity_scale = 1.0f;
+    float initial_attitude_scale = 0.0f;
     float initial_angular_velocity_scale = 1.0f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
@@ -359,6 +364,7 @@ struct GpuPolicyEvalOptions{
     float trajectory_frequency_hz = 0.5f;
     float initial_position_scale = 1.0f;
     float initial_velocity_scale = 1.0f;
+    float initial_attitude_scale = 0.0f;
     float initial_angular_velocity_scale = 1.0f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
@@ -384,6 +390,8 @@ struct GpuPolicyEvalSummary{
     float velocity_rmse = 0.0f;
     float attitude_rmse = 0.0f;
     float angular_velocity_rmse = 0.0f;
+    float linear_acceleration_error_rmse = 0.0f;
+    float angular_acceleration_error_rmse = 0.0f;
     float median_final_position_norm = 0.0f;
     float median_final_velocity_norm = 0.0f;
     float median_final_attitude_error = 0.0f;
@@ -404,6 +412,14 @@ struct GpuPolicyEvalSummary{
     float p90_max_velocity_norm = 0.0f;
     float p90_max_attitude_error = 0.0f;
     float p90_max_angular_velocity_norm = 0.0f;
+    float max_position_norm = 0.0f;
+    float max_velocity_norm = 0.0f;
+    float max_attitude_error = 0.0f;
+    float max_angular_velocity_norm = 0.0f;
+    float mean_action_magnitude = 0.0f;
+    float max_action_magnitude = 0.0f;
+    float mean_action_smoothness = 0.0f;
+    float max_action_smoothness = 0.0f;
     float max_action_abs = 0.0f;
     float action_saturation_rate = 0.0f;
     float invalid_or_nan_rate = 0.0f;
@@ -577,7 +593,8 @@ void generate_validation_batch(
     float trajectory_frequency_hz = 0.5f,
     float initial_position_scale = 1.0f,
     float initial_velocity_scale = 1.0f,
-    float initial_angular_velocity_scale = 1.0f
+    float initial_angular_velocity_scale = 1.0f,
+    float initial_attitude_scale = 0.0f
 );
 
 int assemble_observations_gpu(
