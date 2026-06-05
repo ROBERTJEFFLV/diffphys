@@ -241,6 +241,16 @@ gpu::TrajectoryMode parse_trajectory_mode(const std::string& value){
     throw std::runtime_error("Unknown --trajectory-mode value: " + value);
 }
 
+gpu::DynamicsRandomizationLevel parse_dynamics_randomization_level(const std::string& value){
+    if(value == "broad"){
+        return gpu::DynamicsRandomizationLevel::BROAD;
+    }
+    if(value == "small"){
+        return gpu::DynamicsRandomizationLevel::SMALL;
+    }
+    throw std::runtime_error("Unknown --sampled-dynamics-level value: " + value);
+}
+
 const char* trajectory_mode_name(gpu::TrajectoryMode mode){
     switch(mode){
         case gpu::TrajectoryMode::FIXED: return "fixed";
@@ -474,6 +484,7 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--sampled-dynamics-level" && i + 1 < argc){
             options.sampled_dynamics_level = argv[++i];
+            (void)parse_dynamics_randomization_level(options.sampled_dynamics_level);
         }
         else if(arg == "--trajectory-mode" && i + 1 < argc){
             options.trajectory_mode = parse_trajectory_mode(argv[++i]);
@@ -752,6 +763,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.reset_hidden_each_step = options.reset_hidden_each_step;
     training_options.sample_dynamics = options.sample_dynamics;
     training_options.load_optimizer_state = options.load_optimizer_state;
+    training_options.dynamics_randomization_level = parse_dynamics_randomization_level(options.sampled_dynamics_level);
     training_options.correlated_size_mass_sampling = options.correlated_size_mass_sampling;
     training_options.trajectory_mode = options.trajectory_mode;
     training_options.trajectory_amplitude = options.trajectory_amplitude;
@@ -781,6 +793,7 @@ gpu::GpuPolicyEvalOptions make_gpu_eval_options(const Options& options){
     eval_options.seed = options.seed;
     eval_options.sample_dynamics = options.sample_dynamics;
     eval_options.reset_hidden_each_step = options.reset_hidden_each_step;
+    eval_options.dynamics_randomization_level = parse_dynamics_randomization_level(options.sampled_dynamics_level);
     eval_options.correlated_size_mass_sampling = options.correlated_size_mass_sampling;
     eval_options.trajectory_mode = options.trajectory_mode;
     eval_options.trajectory_amplitude = options.trajectory_amplitude;
@@ -1601,7 +1614,8 @@ int main(int argc, char** argv){
         options.initial_angular_velocity_scale,
         options.initial_attitude_scale,
         options.near_zero_guidance_probability,
-        options.training_episode_steps
+        options.training_episode_steps,
+        parse_dynamics_randomization_level(options.sampled_dynamics_level)
     );
 
     try{

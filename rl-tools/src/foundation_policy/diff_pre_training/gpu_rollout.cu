@@ -1430,6 +1430,14 @@ const char* trajectory_mode_name(TrajectoryMode mode){
     return "unknown";
 }
 
+const char* dynamics_randomization_level_name(DynamicsRandomizationLevel level){
+    switch(level){
+        case DynamicsRandomizationLevel::BROAD: return "broad";
+        case DynamicsRandomizationLevel::SMALL: return "small";
+    }
+    return "unknown";
+}
+
 void populate_reference_trajectory(
     EulerGpuBatch& batch,
     TrajectoryMode mode,
@@ -1512,7 +1520,8 @@ void generate_validation_batch(
     float initial_angular_velocity_scale,
     float initial_attitude_scale,
     float near_zero_guidance_probability,
-    std::size_t trajectory_episode_steps
+    std::size_t trajectory_episode_steps,
+    DynamicsRandomizationLevel dynamics_randomization_level
 ){
     batch.resize(batch_size, horizon);
     std::mt19937 rng(seed);
@@ -1560,24 +1569,41 @@ void generate_validation_batch(
         constexpr float nominal_jy = nominal_jx;
         constexpr float nominal_jz = 1.10f * nominal_mass * nominal_arm * nominal_arm;
         const bool correlated_size_mass = correlated_size_mass_sampling && !nominal_dynamics;
+        const bool small_randomization = dynamics_randomization_level == DynamicsRandomizationLevel::SMALL;
+        const float mass_min = small_randomization ? 0.035f : 0.02f;
+        const float mass_max = small_randomization ? 0.075f : 0.25f;
+        const float arm_min = small_randomization ? 0.075f : 0.035f;
+        const float arm_max = small_randomization ? 0.110f : 0.215f;
+        const float thrust_to_weight_min = small_randomization ? 2.5f : 1.5f;
+        const float thrust_to_weight_max = small_randomization ? 3.8f : 5.0f;
+        const float torque_to_inertia_min = small_randomization ? 200.0f : 125.0f;
+        const float torque_to_inertia_max = small_randomization ? 320.0f : 500.0f;
+        const float torque_constant_min = small_randomization ? 0.015f : 0.005f;
+        const float torque_constant_max = small_randomization ? 0.030f : 0.05f;
+        const float tau_rise_min = small_randomization ? 0.040f : 0.03f;
+        const float tau_rise_max = small_randomization ? 0.070f : 0.10f;
+        const float tau_fall_min = small_randomization ? 0.060f : 0.03f;
+        const float tau_fall_max = small_randomization ? 0.120f : 0.30f;
 
-        float mass = nominal_dynamics ? nominal_mass : sample_binned_value(rng, unit, 0.02f, 0.25f, size_bin, balance_bins);
-        float arm = nominal_dynamics ? nominal_arm : sample_binned_value(rng, unit, 0.035f, 0.215f, balance_bins - 1u - torque_bin, balance_bins);
-        const float thrust_to_weight = nominal_dynamics ? nominal_thrust_to_weight : sample_binned_value(rng, unit, 1.5f, 5.0f, thrust_bin, balance_bins);
+        float mass = nominal_dynamics ? nominal_mass : sample_binned_value(rng, unit, mass_min, mass_max, size_bin, balance_bins);
+        float arm = nominal_dynamics ? nominal_arm : sample_binned_value(rng, unit, arm_min, arm_max, balance_bins - 1u - torque_bin, balance_bins);
+        const float thrust_to_weight = nominal_dynamics ? nominal_thrust_to_weight : sample_binned_value(rng, unit, thrust_to_weight_min, thrust_to_weight_max, thrust_bin, balance_bins);
         float per_rotor_max_thrust = thrust_to_weight * mass * G / 4.0f;
-        const float sampled_torque_to_inertia = nominal_dynamics ? nominal_torque_to_inertia : sample_binned_value(rng, unit, 125.0f, 500.0f, torque_bin, balance_bins);
-        const float torque_constant = nominal_dynamics ? nominal_torque_constant : sample_binned_value(rng, unit, 0.005f, 0.05f, torque_bin, balance_bins);
-        const float tau_rise = nominal_dynamics ? 0.05f : sample_binned_value(rng, unit, 0.03f, 0.10f, delay_bin, balance_bins);
-        const float tau_fall = nominal_dynamics ? 0.08f : sample_binned_value(rng, unit, 0.03f, 0.30f, delay_bin, balance_bins);
-        const float linear_curve_share = nominal_dynamics ? 0.15f : static_cast<float>(curve_bin) * 0.15f;
+        const float sampled_torque_to_inertia = nominal_dynamics ? nominal_torque_to_inertia : sample_binned_value(rng, unit, torque_to_inertia_min, torque_to_inertia_max, torque_bin, balance_bins);
+        const float torque_constant = nominal_dynamics ? nominal_torque_constant : sample_binned_value(rng, unit, torque_constant_min, torque_constant_max, torque_bin, balance_bins);
+        const float tau_rise = nominal_dynamics ? 0.05f : sample_binned_value(rng, unit, tau_rise_min, tau_rise_max, delay_bin, balance_bins);
+        const float tau_fall = nominal_dynamics ? 0.08f : sample_binned_value(rng, unit, tau_fall_min, tau_fall_max, delay_bin, balance_bins);
+        const float linear_curve_share = nominal_dynamics ? 0.15f : (
+            small_randomization
+                ? sample_binned_value(rng, unit, 0.08f, 0.22f, curve_bin, balance_bins)
+                : static_cast<float>(curve_bin) * 0.15f
+        );
 
         float jx = std::max(1e-6f, 0.55f * mass * arm * arm);
         float jy = std::max(1e-6f, 0.55f * mass * arm * arm);
         float jz = std::max(1e-6f, 1.10f * mass * arm * arm);
         if(correlated_size_mass){
-            constexpr float mass_min = 0.02f;
-            constexpr float mass_max = 0.25f;
-            constexpr float mass_size_deviation = 0.20f;
+            const float mass_size_deviation = small_randomization ? 0.08f : 0.20f;
             const float relative_size_min = std::cbrt(mass_min);
             const float relative_size_max = std::cbrt(mass_max);
             const float size_new = relative_size_min + unit(rng) * (relative_size_max - relative_size_min);
@@ -5750,7 +5776,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                 training_options.initial_angular_velocity_scale,
                 training_options.initial_attitude_scale,
                 training_options.near_zero_guidance_probability,
-                summary.training_episode_steps
+                summary.training_episode_steps,
+                training_options.dynamics_randomization_level
             );
         }
         allocate(d, training_options.batch_size, training_options.horizon);
@@ -5796,7 +5823,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                     training_options.initial_angular_velocity_scale,
                     training_options.initial_attitude_scale,
                     training_options.near_zero_guidance_probability,
-                    summary.training_episode_steps
+                    summary.training_episode_steps,
+                    training_options.dynamics_randomization_level
                 );
             }
             summary.final_window_start_mean = mean_trajectory_start_step(batch);
@@ -6043,7 +6071,9 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         eval_options.initial_velocity_scale,
         eval_options.initial_angular_velocity_scale,
         eval_options.initial_attitude_scale,
-        eval_options.near_zero_guidance_probability
+        eval_options.near_zero_guidance_probability,
+        0,
+        eval_options.dynamics_randomization_level
     );
 
     DeviceArrays d;
@@ -6555,7 +6585,8 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                 << "forced_bins_enabled,size_mass_bin,thrust_to_weight_bin,torque_to_inertia_bin,motor_delay_bin,curve_shape_bin\n";
             log << "euler,"
                 << (eval_options.sample_dynamics ? "sampled" : "fixed") << ","
-                << (eval_options.sample_dynamics ? "sampled" : "fixed") << ",broad,"
+                << (eval_options.sample_dynamics ? "sampled" : "fixed") << ","
+                << dynamics_randomization_level_name(eval_options.dynamics_randomization_level) << ","
                 << trajectory_mode_name(eval_options.trajectory_mode) << ","
                 << eval_options.trajectory_amplitude << "," << eval_options.trajectory_frequency_hz << ","
                 << eval_options.episodes << "," << eval_options.horizon << ","

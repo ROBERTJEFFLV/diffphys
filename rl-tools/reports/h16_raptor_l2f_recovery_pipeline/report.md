@@ -25,6 +25,9 @@ H16 is treated as the fixed BPTT window. No H64/H128 horizon curriculum or teach
 - Optional velocity observation perturbations:
   - `--velocity-observation-noise`
   - `--velocity-observation-delay-steps`
+- `--sampled-dynamics-level small|broad` now selects a real GPU sampler domain:
+  - `small` narrows mass, arm length, thrust-to-weight, torque-to-inertia, motor time constants, torque constants, and thrust-curve variation around nominal.
+  - `broad` preserves the previous wide domain.
 - RAPTOR/L2F-style eval metrics:
   - `settling_fraction_position`
   - per-episode mean error mean for position, angle, linear velocity, angular velocity, angular acceleration, action, and action relative
@@ -151,6 +154,8 @@ Smoke training:
 | fixed-dynamics task-curriculum smoke | PASS | fixed, step, circle, figure-eight, and mixed 20-step phases all completed finite with per-mode eval CSVs |
 | broad correlated mixed compatibility smoke | PASS | 5-step broad+balanced+correlated mixed run completed finite with action saturation 0 |
 | longer fixed-dynamics task-curriculum logs | PASS | fixed, step, circle, figure-eight, and mixed 1000-step phases completed finite with 500-step eval CSVs |
+| small dynamics sampler domain | PASS | `--sampled-dynamics-level small` now affects GPU batch generation and eval CSV metadata |
+| small dynamics staged run | PASS | 200-step small mixed continuation from fixed mixed checkpoint completed finite; 500-step eval finite with invalid/NaN 0 |
 | broad correlated staged log | PASS | 200-step broad+balanced+correlated mixed continuation completed finite and produced eval CSV |
 | RAPTOR/L2F eval metric logging | PASS | fixed/step/circle/figure8/mixed eval CSVs include settling, mean-error, max-error mean/std, RMSE, saturation, and NaN/Inf fields |
 | strict tracking performance | FAIL | smoke checkpoint is not a solved controller |
@@ -230,6 +235,14 @@ Broad correlated staged continuation from the mixed checkpoint:
 | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | broad correlated mixed | 200 | 1024 | broad balanced + correlated size-mass | mixed | 243.127 | 0.00666089 | 0.103719 | 0.0419464 | 0.161388 | 22.3834 | 61.6083 | 0.0614893 | 0 |
 
+Small dynamics staged continuation from the same mixed checkpoint:
+
+| Run | Steps | Batch | Dynamics | Trajectory | Window start mean | Final loss | Grad norm | Train saturation | Eval settling p | Eval position mean error mean | Eval position max error mean | Eval saturation | Invalid/NaN |
+| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| small mixed | 200 | 1024 | small balanced | mixed | 244.242 | 0.00634196 | 0.064523 | 0.0455627 | 0.160597 | 23.5142 | 66.6305 | 0.0440713 | 0 |
+
+The small/broad from-scratch 20-step validation runs are retained only to prove that the CLI level selects separate sampler domains and that CSV metadata records `small` or `broad` correctly. Those from-scratch checkpoints are not quality evidence.
+
 ## Recommended Task Curriculum
 
 Use fixed H16 BPTT throughout:
@@ -250,7 +263,7 @@ Run temporal-gradient-decay ablations at `0`, `0.25`, `0.5`, `1`, and `2`. Treat
 - The current smoke checkpoint is not a usable tracking controller.
 - Longer fixed-dynamics staged H16 recovery training has run, but long-control eval remains weak and action saturation is still nontrivial.
 - Broad correlated dynamics has only short staged evidence, not convergence training.
-- `sampled-dynamics-level small` is still not a separate implemented GPU sampling domain in this path.
+- The `small` dynamics domain exists and is smoke/stage validated, but there is no converged small-domain controller yet.
 - Current implementation samples reference windows from a long episode; it does not yet roll a persistent physical 500-step episode state and then backpropagate H16 slices from that physical trajectory.
 - H64/H128 and RAPTOR teacher/student experiments remain blocked until H16 recovery tracking is stable.
 
@@ -287,6 +300,12 @@ reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/eval_fi
 reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/eval_mixed_500.csv
 reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/train_broad_correlated_mixed_200.csv
 reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/eval_broad_correlated_mixed_500.csv
+reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/train_small_mixed_200.csv
+reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/eval_small_mixed_500.csv
+reports/h16_raptor_l2f_recovery_pipeline/small_dynamics_validation_v2/train_small_mixed_20.csv
+reports/h16_raptor_l2f_recovery_pipeline/small_dynamics_validation_v2/eval_small_mixed_500.csv
+reports/h16_raptor_l2f_recovery_pipeline/small_dynamics_validation_v2/train_broad_mixed_20.csv
+reports/h16_raptor_l2f_recovery_pipeline/small_dynamics_validation_v2/eval_broad_mixed_500.csv
 ```
 
 The smoke checkpoint is intentionally kept as a runtime artifact and should not be committed:
@@ -296,4 +315,5 @@ reports/h16_raptor_l2f_recovery_pipeline/checkpoint_fixed_fixed_smoke_20.ckpt
 reports/h16_raptor_l2f_recovery_pipeline/checkpoint_window_smoke_3.ckpt
 reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_smoke/*.ckpt
 reports/h16_raptor_l2f_recovery_pipeline/task_curriculum_long_1000_b2048/*.ckpt
+reports/h16_raptor_l2f_recovery_pipeline/small_dynamics_validation_v2/*.ckpt
 ```

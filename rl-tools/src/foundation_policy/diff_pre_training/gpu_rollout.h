@@ -25,6 +25,11 @@ enum class TrajectoryMode : std::uint32_t{
     MIXED = 4
 };
 
+enum class DynamicsRandomizationLevel : std::uint32_t{
+    BROAD = 0,
+    SMALL = 1
+};
+
 struct EulerGpuLossWeights{
     float position = 8.0f;
     float velocity = 0.8f;
@@ -319,6 +324,7 @@ struct FullGpuTrainingOptions{
     bool reset_hidden_each_step = false;
     bool sample_dynamics = true;
     bool load_optimizer_state = true;
+    DynamicsRandomizationLevel dynamics_randomization_level = DynamicsRandomizationLevel::BROAD;
     bool correlated_size_mass_sampling = false;
     TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
@@ -369,6 +375,7 @@ struct GpuPolicyEvalOptions{
     unsigned seed = 0;
     bool sample_dynamics = true;
     bool reset_hidden_each_step = false;
+    DynamicsRandomizationLevel dynamics_randomization_level = DynamicsRandomizationLevel::BROAD;
     bool correlated_size_mass_sampling = false;
     TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
@@ -652,7 +659,8 @@ void generate_validation_batch(
     float initial_angular_velocity_scale = 1.0f,
     float initial_attitude_scale = 0.0f,
     float near_zero_guidance_probability = 0.10f,
-    std::size_t trajectory_episode_steps = 0
+    std::size_t trajectory_episode_steps = 0,
+    DynamicsRandomizationLevel dynamics_randomization_level = DynamicsRandomizationLevel::BROAD
 );
 
 int assemble_observations_gpu(
