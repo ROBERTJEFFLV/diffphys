@@ -1604,6 +1604,12 @@ void generate_validation_batch(
         }
     }
     populate_reference_trajectory(batch, trajectory_mode, trajectory_amplitude, trajectory_frequency_hz, rng, unit);
+    for(std::size_t b = 0; b < batch_size; b++){
+        for(int dim = 0; dim < 3; dim++){
+            batch.initial_p[pidx3(b, dim)] += batch.reference_p_traj[idx3(0, b, dim, batch_size)];
+            batch.initial_v[pidx3(b, dim)] += batch.reference_v_traj[idx3(0, b, dim, batch_size)];
+        }
+    }
     for(std::size_t t = 0; t < horizon; t++){
         for(std::size_t b = 0; b < batch_size; b++){
             for(int a = 0; a < 4; a++){
@@ -6608,6 +6614,92 @@ Stage9SamplerParitySummary run_stage9_sampler_parity(
         summary.reset_masks_replayed &&
         summary.metadata_mismatch_count == 0 &&
         summary.finite;
+    return summary;
+}
+
+LocalInitialConditionValidationSummary validate_local_initial_conditions(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    TrajectoryMode trajectory_mode,
+    float trajectory_amplitude,
+    float trajectory_frequency_hz,
+    bool correlated_size_mass_sampling,
+    float initial_position_scale,
+    float initial_velocity_scale,
+    float initial_angular_velocity_scale,
+    float initial_attitude_scale
+){
+    LocalInitialConditionValidationSummary summary;
+    summary.samples = std::max<std::size_t>(batch_size, 16);
+    summary.horizon = std::max<std::size_t>(horizon, 1);
+
+    EulerGpuBatch batch;
+    generate_validation_batch(
+        batch,
+        summary.samples,
+        summary.horizon,
+        seed,
+        nullptr,
+        false,
+        correlated_size_mass_sampling,
+        trajectory_mode,
+        trajectory_amplitude,
+        trajectory_frequency_hz,
+        initial_position_scale,
+        initial_velocity_scale,
+        initial_angular_velocity_scale,
+        initial_attitude_scale
+    );
+
+    for(std::size_t b = 0; b < summary.samples; b++){
+        float p_error_sq = 0.0f;
+        float v_error_sq = 0.0f;
+        float omega_sq = 0.0f;
+        bool finite_sample = true;
+        for(int dim = 0; dim < 3; dim++){
+            const float p_error = batch.initial_p[pidx3(b, dim)] - batch.reference_p_traj[idx3(0, b, dim, summary.samples)];
+            const float v_error = batch.initial_v[pidx3(b, dim)] - batch.reference_v_traj[idx3(0, b, dim, summary.samples)];
+            const float omega = batch.initial_omega[pidx3(b, dim)];
+            finite_sample = finite_sample &&
+                std::isfinite(p_error) &&
+                std::isfinite(v_error) &&
+                std::isfinite(omega);
+            p_error_sq += p_error * p_error;
+            v_error_sq += v_error * v_error;
+            omega_sq += omega * omega;
+        }
+
+        const float trace =
+            batch.initial_R[pidx9(b, 0)] +
+            batch.initial_R[pidx9(b, 4)] +
+            batch.initial_R[pidx9(b, 8)];
+        const float cos_angle = std::max(-1.0f, std::min(1.0f, 0.5f * (trace - 1.0f)));
+        const float attitude_error = std::acos(cos_angle);
+        finite_sample = finite_sample && std::isfinite(attitude_error);
+        if(!finite_sample){
+            summary.nan_inf_count++;
+            continue;
+        }
+
+        summary.max_position_error = std::max(summary.max_position_error, std::sqrt(p_error_sq));
+        summary.max_velocity_error = std::max(summary.max_velocity_error, std::sqrt(v_error_sq));
+        summary.max_attitude_error = std::max(summary.max_attitude_error, attitude_error);
+        summary.max_angular_velocity_norm = std::max(summary.max_angular_velocity_norm, std::sqrt(omega_sq));
+    }
+
+    constexpr float eps = 1e-6f;
+    summary.position_ok = summary.max_position_error <= summary.position_threshold + eps;
+    summary.velocity_ok = summary.max_velocity_error <= summary.velocity_threshold + eps;
+    summary.attitude_ok = summary.max_attitude_error <= summary.attitude_threshold + eps;
+    summary.angular_velocity_ok = summary.max_angular_velocity_norm <= summary.angular_velocity_threshold + eps;
+    summary.finite = summary.nan_inf_count == 0;
+    summary.passed =
+        summary.finite &&
+        summary.position_ok &&
+        summary.velocity_ok &&
+        summary.attitude_ok &&
+        summary.angular_velocity_ok;
     return summary;
 }
 

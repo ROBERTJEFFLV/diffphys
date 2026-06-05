@@ -30,6 +30,7 @@ struct Options{
     bool validate_adam_update = false;
     bool validate_correlated_size_mass_sampler = false;
     bool validate_trajectory_sampler = false;
+    bool validate_local_initial_conditions = false;
     bool validate_deployment_adapter = false;
     bool validate_against_cpu = false;
     bool benchmark = false;
@@ -112,7 +113,7 @@ struct Options{
     float initial_velocity_scale = 1.0f;
     float initial_attitude_scale = 0.0f;
     float initial_angular_velocity_scale = 1.0f;
-    float initial_position_scale_local = 0.25f;
+    float initial_position_scale_local = 0.14f;
     float initial_velocity_scale_local = 0.5f;
     float initial_attitude_scale_local = 1.0f;
     float initial_angular_velocity_scale_local = 1.0f;
@@ -138,6 +139,7 @@ void print_usage(){
         << "    [--gpu-validate-adam-update]\n"
         << "    [--gpu-validate-correlated-size-mass-sampler]\n"
         << "    [--gpu-validate-trajectory-sampler]\n"
+        << "    [--gpu-validate-local-initial-conditions]\n"
         << "    [--gpu-validate-deployment-adapter] [--validation-step N]\n"
         << "    [--gpu-stage9-debug] [--stage9-debug-steps N] [--stage9-debug-replay-path PATH]\n"
         << "    [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
@@ -334,6 +336,10 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--gpu-validate-trajectory-sampler"){
             options.validate_trajectory_sampler = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--gpu-validate-local-initial-conditions"){
+            options.validate_local_initial_conditions = true;
             options.gpu_rollout = true;
         }
         else if(arg == "--gpu-validate-deployment-adapter"){
@@ -1267,6 +1273,26 @@ void print_trajectory_sampler_validation(const gpu::TrajectorySamplerValidationS
     std::cout << "trajectory_sampler_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
 
+void print_local_initial_condition_validation(const gpu::LocalInitialConditionValidationSummary& summary){
+    std::cout << "local_initial_condition_validation_passed=" << (summary.passed ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_position_ok=" << (summary.position_ok ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_velocity_ok=" << (summary.velocity_ok ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_attitude_ok=" << (summary.attitude_ok ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_angular_velocity_ok=" << (summary.angular_velocity_ok ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_finite=" << (summary.finite ? "true" : "false") << "\n";
+    std::cout << "local_initial_condition_samples=" << summary.samples << "\n";
+    std::cout << "local_initial_condition_horizon=" << summary.horizon << "\n";
+    std::cout << "local_initial_condition_position_threshold=" << summary.position_threshold << "\n";
+    std::cout << "local_initial_condition_velocity_threshold=" << summary.velocity_threshold << "\n";
+    std::cout << "local_initial_condition_attitude_threshold=" << summary.attitude_threshold << "\n";
+    std::cout << "local_initial_condition_angular_velocity_threshold=" << summary.angular_velocity_threshold << "\n";
+    std::cout << "local_initial_condition_max_position_error=" << summary.max_position_error << "\n";
+    std::cout << "local_initial_condition_max_velocity_error=" << summary.max_velocity_error << "\n";
+    std::cout << "local_initial_condition_max_attitude_error=" << summary.max_attitude_error << "\n";
+    std::cout << "local_initial_condition_max_angular_velocity_norm=" << summary.max_angular_velocity_norm << "\n";
+    std::cout << "local_initial_condition_nan_inf_count=" << summary.nan_inf_count << "\n";
+}
+
 void print_stage9_eval_parity_summary(const gpu::Stage9EvalParitySummary& summary){
     std::cout << "stage9_6_eval_parity_passed=" << (summary.passed ? "true" : "false") << "\n";
     std::cout << "stage9_6_eval_replay_written=" << (summary.replay_written ? "true" : "false") << "\n";
@@ -1685,6 +1711,25 @@ int main(int argc, char** argv){
                 return 1;
             }
         }
+        if(options.validate_local_initial_conditions){
+            auto local_initial_validation = gpu::validate_local_initial_conditions(
+                options.batch_size,
+                options.horizon,
+                options.seed,
+                options.trajectory_mode,
+                options.trajectory_amplitude,
+                options.trajectory_frequency_hz,
+                options.correlated_size_mass_sampling,
+                options.initial_position_scale,
+                options.initial_velocity_scale,
+                options.initial_angular_velocity_scale,
+                options.initial_attitude_scale
+            );
+            print_local_initial_condition_validation(local_initial_validation);
+            if(!local_initial_validation.passed){
+                return 1;
+            }
+        }
         if(options.validate_observation){
             auto observation_validation = gpu::validate_observations_against_cpu(
                 batch,
@@ -1806,6 +1851,7 @@ int main(int argc, char** argv){
            !options.validate_action_gradient_injection && !options.validate_actor_backward &&
            !options.validate_critic_backward && !options.validate_adam_update &&
            !options.validate_correlated_size_mass_sampler && !options.validate_trajectory_sampler &&
+           !options.validate_local_initial_conditions &&
            !options.validate_deployment_adapter &&
            !options.validate_against_cpu && !options.benchmark && !options.stage9_debug){
             gpu::EulerGpuResult result;

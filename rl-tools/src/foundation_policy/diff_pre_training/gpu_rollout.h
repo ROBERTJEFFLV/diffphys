@@ -529,6 +529,26 @@ struct TrajectorySamplerValidationSummary{
     bool passed = false;
 };
 
+struct LocalInitialConditionValidationSummary{
+    std::size_t samples = 0;
+    std::size_t horizon = 0;
+    std::size_t nan_inf_count = 0;
+    float position_threshold = 0.05f;
+    float velocity_threshold = 0.1f;
+    float attitude_threshold = 0.0872664626f;
+    float angular_velocity_threshold = 0.2f;
+    float max_position_error = 0.0f;
+    float max_velocity_error = 0.0f;
+    float max_attitude_error = 0.0f;
+    float max_angular_velocity_norm = 0.0f;
+    bool position_ok = false;
+    bool velocity_ok = false;
+    bool attitude_ok = false;
+    bool angular_velocity_ok = false;
+    bool finite = false;
+    bool passed = false;
+};
+
 struct Stage9EvalParitySummary{
     float max_final_state_abs_error = 0.0f;
     float max_loss_abs_error = 0.0f;
@@ -694,6 +714,20 @@ TrajectorySamplerValidationSummary validate_trajectory_sampler(
     unsigned seed,
     float amplitude,
     float frequency_hz
+);
+
+LocalInitialConditionValidationSummary validate_local_initial_conditions(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    TrajectoryMode trajectory_mode,
+    float trajectory_amplitude,
+    float trajectory_frequency_hz,
+    bool correlated_size_mass_sampling,
+    float initial_position_scale,
+    float initial_velocity_scale,
+    float initial_angular_velocity_scale,
+    float initial_attitude_scale
 );
 
 Stage9EvalParitySummary run_stage9_eval_parity(

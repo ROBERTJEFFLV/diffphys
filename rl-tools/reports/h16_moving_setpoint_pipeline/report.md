@@ -4,7 +4,7 @@
 
 This pass upgrades the CUDA differentiable motor-policy path from fixed-reference stabilization toward time-indexed moving-setpoint tracking while preserving the existing force/torque rigid-body rollout, CUDA VJP chain, GRU actor, and exactly four normalized motor-command outputs.
 
-The implementation is smoke-validated only. The strict H16 moving-setpoint throughout gate is not yet solved, so no H64/H128 or teacher/student experiments were run from this pipeline.
+The implementation is validated through smoke tests, CPU/CUDA parity gates, local initial-condition checks, and an initial fixed-dynamics/fixed-trajectory H16 local training run. The strict H16 moving-setpoint throughout gate under broad correlated dynamics is not yet solved, so no H64/H128 or teacher/student experiments were run from this pipeline.
 
 ## Implemented
 
@@ -29,6 +29,8 @@ The implementation is smoke-validated only. The strict H16 moving-setpoint throu
   - `--w-angular-acceleration`
 - Added eval metrics for linear acceleration error RMSE, angular acceleration error RMSE, global max tracking errors, action magnitude, and action smoothness.
 - Added local initial attitude perturbation sampling for strict local-window H16 checks.
+- Local tracking initial states are now sampled around `reference_p_traj[0]` and `reference_v_traj[0]`, not around world zero, so moving-reference local eval starts near the current trajectory setpoint.
+- Added `--gpu-validate-local-initial-conditions` to verify local samples satisfy the strict tube at t=0.
 - Added local/recovery gate plumbing:
   - `--tracking-gate-mode local|recovery`
   - `--throughout-gate-start-step`
@@ -125,6 +127,18 @@ cmake --build /tmp/raptor_stage96_cuda_build --target foundation_policy_diff_pre
   --action-saturation-start 0.85 \
   --w-linear-acceleration 0.001 \
   --w-angular-acceleration 0.0001
+
+/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
+  --gpu-rollout \
+  --gpu-validate-local-initial-conditions \
+  --tracking-gate-mode local \
+  --batch-size 4096 \
+  --horizon 16 \
+  --seed 9301 \
+  --trajectory-mode mixed \
+  --trajectory-amplitude 0.02 \
+  --trajectory-frequency-hz 0.4 \
+  --correlated-size-mass-sampling
 ```
 
 Smoke training:
@@ -183,6 +197,8 @@ Eval was run separately for `fixed`, `step`, `circle`, and `figure8` with `--eva
 | acceleration loss CPU/CUDA parity | PASS | nonzero linear/angular acceleration weights passed moving-reference loss/action-gradient parity |
 | acceleration/action eval metrics | PASS | `eval_local_fixed_metrics_check.csv` writes acceleration RMSE, global max errors, action magnitude, and action smoothness |
 | local initial attitude sampling | PASS | local smoke ran with `initial_attitude_scale=1` and finite rollout/gradients |
+| local initial-condition strict tube | PASS | 4096 mixed samples: max p/v/attitude/w = 0.0456943/0.0416643/0.0828115/0.0336794, all below 0.05/0.1/0.0872665/0.2 |
+| fixed-dynamics fixed-trajectory local training | PARTIAL | best 4096-episode eval throughout success 0.90625, saturation 0, invalid/NaN 0 |
 | H16 strict throughout tracking gate | FAIL | throughout success 0 in trajectory eval |
 
 ## Smoke Training Result
@@ -209,11 +225,22 @@ Eval was run separately for `fixed`, `step`, `circle`, and `figure8` with `--eva
 | circle | 0.000000 | 0.000000 | 0.200978 | 0.158613 | 0.026541 | 0.401760 | 0 | 0 |
 | figure8 | 0.000000 | 0.000000 | 0.200914 | 0.160968 | 0.027411 | 0.414351 | 0 | 0 |
 
+## Fixed Local Fixed-Trajectory Progress
+
+The first staged training step was run only on fixed nominal dynamics with the fixed trajectory mode. This is not the final broad-correlated moving-trajectory result, but it verifies that the corrected local initialization and strict H16 local gate are trainable without action saturation.
+
+| Run | Eval episodes | Final success | Throughout success | Position RMSE | Velocity RMSE | Attitude RMSE | Angular velocity RMSE | Max p | Max v | Max attitude | Max w | Saturation | Invalid |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed local checkpoint 2000 | 4096 | 0.885254 | 0.885254 | 0.028453 | 0.0434195 | 0.0469639 | 0.0246006 | 0.0528287 | 0.15424 | 0.0833874 | 0.0710718 | 0 | 0 |
+| fixed local checkpoint 5000 lr1e-4 | 4096 | 0.906494 | 0.906250 | 0.0284419 | 0.0421142 | 0.045596 | 0.0443425 | 0.052958 | 0.149351 | 0.0831466 | 0.207445 | 0 | 0 |
+
+The remaining failures in the best fixed-local run are tail failures against the strict max thresholds, mainly max position slightly above 0.05 m and max angular velocity slightly above 0.2 rad/s. The interrupted `rate2` continuation was stopped and is not used as evidence.
+
 ## Current Blockers
 
 - Strict H16 throughout tracking under broad correlated dynamics is not achieved yet.
-- Long H16 staged training has not been run after the new local/recovery and acceleration diagnostics.
-- No long H16 training was started from this smoke checkpoint.
+- Fixed-dynamics fixed-trajectory local tracking is not yet at full strict-window success; best current throughout success is 0.90625.
+- Step, circle, figure-eight, mixed, and broad correlated-size-mass stages still need staged training after the fixed-local gate is solved.
 - No H64/H128 or RAPTOR teacher/student experiment is allowed from this moving-setpoint pipeline until the strict H16 gate passes.
 
 ## Artifacts
@@ -227,6 +254,10 @@ reports/h16_moving_setpoint_pipeline/eval_figure8_h16.csv
 reports/h16_moving_setpoint_pipeline/train_component_check_1.csv
 reports/h16_moving_setpoint_pipeline/train_accel_component_check_1.csv
 reports/h16_moving_setpoint_pipeline/eval_local_fixed_metrics_check.csv
+reports/h16_moving_setpoint_pipeline/fixed_local_fixedtraj/train_2000.csv
+reports/h16_moving_setpoint_pipeline/fixed_local_fixedtraj/eval_2000_fixed_h16.csv
+reports/h16_moving_setpoint_pipeline/fixed_local_fixedtraj/train_2000_to_5000_lr1e4.csv
+reports/h16_moving_setpoint_pipeline/fixed_local_fixedtraj/eval_5000_lr1e4_fixed_h16.csv
 ```
 
 The smoke checkpoint is intentionally kept as a runtime artifact and should not be committed:
