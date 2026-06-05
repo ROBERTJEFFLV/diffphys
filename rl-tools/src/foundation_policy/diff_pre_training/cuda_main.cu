@@ -81,10 +81,6 @@ struct Options{
     bool stage9_6_checkpoint_parity = false;
     std::size_t stage9_6_steps = 1000;
     std::string stage9_6_replay_path;
-    bool stage11 = false;
-    std::size_t stage11_steps = 200000;
-    float stage11_success_threshold = 0.8f;
-    float stage11_velocity_threshold = 0.5f;
     bool eval_only = false;
     bool failure_analysis = false;
     std::string eval_model = "euler";
@@ -95,16 +91,6 @@ struct Options{
     float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
     float success_action_saturation_threshold = 1.0f;
-    bool horizon_curriculum_enabled = false;
-    std::vector<std::size_t> horizon_curriculum;
-    std::vector<float> curriculum_success_thresholds;
-    std::vector<std::size_t> curriculum_min_steps;
-    std::vector<float> curriculum_learning_rate_scales;
-    std::vector<float> curriculum_diff_loss_scales;
-    std::vector<float> curriculum_terminal_loss_scales;
-    std::vector<float> curriculum_actor_grad_clip_norms;
-    bool reset_optimizer_on_curriculum_transition = false;
-    std::size_t curriculum_gate_check_interval = 1000;
     gpu::ForcedDynamicsBins forced_bins;
     bool balanced_dynamics_sampling = false;
     std::string sampled_dynamics_level = "broad";
@@ -204,26 +190,6 @@ std::vector<std::string> split_csv(const std::string& value){
     std::string item;
     while(std::getline(stream, item, ',')){
         result.push_back(trim(item));
-    }
-    return result;
-}
-
-std::vector<std::size_t> parse_size_list(const std::string& value){
-    std::vector<std::size_t> result;
-    for(const auto& item: split_csv(value)){
-        if(!item.empty()){
-            result.push_back(static_cast<std::size_t>(std::stoull(item)));
-        }
-    }
-    return result;
-}
-
-std::vector<float> parse_float_list(const std::string& value){
-    std::vector<float> result;
-    for(const auto& item: split_csv(value)){
-        if(!item.empty()){
-            result.push_back(std::stof(item));
-        }
     }
     return result;
 }
@@ -599,28 +565,6 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--stage9-6-replay-path" && i + 1 < argc){
             options.stage9_6_replay_path = argv[++i];
         }
-        else if(arg == "--stage11" || arg == "--stage-11"){
-            options.stage11 = true;
-            options.gpu_rollout = true;
-            options.sample_dynamics = true;
-            options.balanced_dynamics_sampling = true;
-            options.sampled_dynamics_level = "broad";
-        }
-        else if((arg == "--stage11-steps" || arg == "--stage-11-steps") && i + 1 < argc){
-            options.stage11_steps = std::stoull(argv[++i]);
-            options.stage11 = true;
-            options.gpu_rollout = true;
-        }
-        else if((arg == "--stage11-success-threshold" || arg == "--success-threshold") && i + 1 < argc){
-            options.stage11_success_threshold = std::stof(argv[++i]);
-            options.stage11 = true;
-            options.gpu_rollout = true;
-        }
-        else if((arg == "--stage11-velocity-threshold" || arg == "--velocity-threshold") && i + 1 < argc){
-            options.stage11_velocity_threshold = std::stof(argv[++i]);
-            options.stage11 = true;
-            options.gpu_rollout = true;
-        }
         else if(arg == "--eval-only"){
             options.eval_only = true;
             options.gpu_rollout = true;
@@ -665,38 +609,6 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--success-action-saturation-threshold" && i + 1 < argc){
             options.success_action_saturation_threshold = std::stof(argv[++i]);
-        }
-        else if(arg == "--horizon-curriculum"){
-            options.horizon_curriculum_enabled = true;
-            options.gpu_rollout = true;
-            if(has_next_value(argc, argv, i)){
-                options.horizon_curriculum = parse_size_list(argv[++i]);
-            }
-        }
-        else if(arg == "--curriculum-success-threshold" && i + 1 < argc){
-            options.curriculum_success_thresholds = parse_float_list(argv[++i]);
-        }
-        else if(arg == "--curriculum-min-steps" && i + 1 < argc){
-            options.curriculum_min_steps = parse_size_list(argv[++i]);
-        }
-        else if(arg == "--curriculum-learning-rate-scale" && i + 1 < argc){
-            options.curriculum_learning_rate_scales = parse_float_list(argv[++i]);
-        }
-        else if(arg == "--curriculum-diff-loss-scale" && i + 1 < argc){
-            options.curriculum_diff_loss_scales = parse_float_list(argv[++i]);
-        }
-        else if(arg == "--curriculum-terminal-loss-scale" && i + 1 < argc){
-            options.curriculum_terminal_loss_scales = parse_float_list(argv[++i]);
-        }
-        else if(arg == "--curriculum-actor-grad-clip-norm" && i + 1 < argc){
-            options.curriculum_actor_grad_clip_norms = parse_float_list(argv[++i]);
-            options.actor_grad_clip_enabled = true;
-        }
-        else if(arg == "--reset-optimizer-on-curriculum-transition"){
-            options.reset_optimizer_on_curriculum_transition = true;
-        }
-        else if(arg == "--curriculum-gate-check-interval" && i + 1 < argc){
-            options.curriculum_gate_check_interval = std::stoull(argv[++i]);
         }
         else if(arg == "--force-dynamics-bins" && i + 1 < argc){
             if(!parse_force_bins_spec(argv[++i], options.forced_bins)){
@@ -811,10 +723,6 @@ gpu::GpuPolicyEvalOptions make_gpu_eval_options(const Options& options){
     eval_options.load_path = options.load_path;
     eval_options.log_path = options.log_path;
     return eval_options;
-}
-
-std::string stage11_phase_suffix(std::size_t horizon, const std::string& suffix){
-    return std::string("_h") + std::to_string(horizon) + suffix;
 }
 
 void print_validation(const gpu::ValidationSummary& summary){
@@ -1045,222 +953,6 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
 
-float curriculum_threshold_for_stage(const Options& options, std::size_t stage){
-    if(options.curriculum_success_thresholds.empty()){
-        return options.stage11_success_threshold;
-    }
-    if(options.curriculum_success_thresholds.size() == 1){
-        return options.curriculum_success_thresholds[0];
-    }
-    return options.curriculum_success_thresholds[std::min(stage, options.curriculum_success_thresholds.size() - 1)];
-}
-
-std::size_t curriculum_min_steps_for_stage(const Options& options, std::size_t stage){
-    if(options.curriculum_min_steps.empty()){
-        return 0;
-    }
-    return options.curriculum_min_steps[std::min(stage, options.curriculum_min_steps.size() - 1)];
-}
-
-float stage_scale_or_default(const std::vector<float>& values, std::size_t stage, float fallback){
-    if(values.empty()){
-        return fallback;
-    }
-    return values[std::min(stage, values.size() - 1)];
-}
-
-std::string curriculum_chunk_log_path(const std::string& summary_log_path, std::size_t chunk_index){
-    const std::string prefix = summary_log_path.empty()
-        ? std::string("/tmp/gpu_horizon_curriculum")
-        : summary_log_path;
-    return prefix + ".chunk_" + std::to_string(chunk_index) + ".csv";
-}
-
-std::string curriculum_chunk_checkpoint_path(const std::string& checkpoint_path, std::size_t chunk_index, std::size_t horizon){
-    const std::string prefix = checkpoint_path.empty()
-        ? std::string("/tmp/gpu_horizon_curriculum_final.ckpt")
-        : checkpoint_path;
-    return prefix + ".chunk_" + std::to_string(chunk_index) + "_h" + std::to_string(horizon) + ".ckpt";
-}
-
-bool copy_file(const std::string& src, const std::string& dst){
-    std::ifstream in(src, std::ios::binary);
-    if(!in){
-        return false;
-    }
-    std::ofstream out(dst, std::ios::binary);
-    if(!out){
-        return false;
-    }
-    out << in.rdbuf();
-    return static_cast<bool>(out);
-}
-
-float read_chunk_mean_success_rate(const std::string& chunk_log_path, float fallback){
-    std::ifstream in(chunk_log_path);
-    if(!in){
-        return fallback;
-    }
-    std::string line;
-    if(!std::getline(in, line)){
-        return fallback;
-    }
-    double sum = 0.0;
-    std::size_t count = 0;
-    while(std::getline(in, line)){
-        const auto columns = split_csv(line);
-        if(columns.size() <= 12 || columns[12].empty()){
-            continue;
-        }
-        sum += std::stod(columns[12]);
-        count++;
-    }
-    return count > 0 ? static_cast<float>(sum / static_cast<double>(count)) : fallback;
-}
-
-bool run_horizon_curriculum(const Options& options, const gpu::EulerGpuLossWeights& weights){
-    if(options.horizon_curriculum.empty()){
-        throw std::runtime_error("Horizon curriculum was enabled but no horizons were provided");
-    }
-    if(options.steps == 0){
-        throw std::runtime_error("Horizon curriculum requires --steps > 0");
-    }
-    if(options.curriculum_gate_check_interval == 0){
-        throw std::runtime_error("Horizon curriculum requires --curriculum-gate-check-interval > 0");
-    }
-    const std::string summary_log_path = options.log_path.empty()
-        ? std::string("/tmp/gpu_horizon_curriculum_summary.csv")
-        : options.log_path;
-    const std::string checkpoint_path = options.save_path.empty()
-        ? std::string("/tmp/gpu_horizon_curriculum_final.ckpt")
-        : options.save_path;
-    std::ofstream summary_log(summary_log_path);
-    if(!summary_log){
-        throw std::runtime_error("Failed to open horizon curriculum summary log: " + summary_log_path);
-    }
-    summary_log
-        << "global_step,chunk_index,horizon,chunk_steps,stage_steps,success_threshold,min_stage_steps,"
-        << "learning_rate,diff_rollout_loss_weight,terminal_loss_scale,actor_grad_clip_norm,"
-        << "optimizer_state_loaded,"
-        << "loss,grad_norm,critic_loss,critic_error_norm,success_rate_batch,action_saturation_rate,"
-        << "chunk_mean_success_rate,"
-        << "final_position_norm_mean,final_velocity_norm_mean,final_angular_velocity_norm_mean,"
-        << "finite,checkpoint_saved,checkpoint_loaded,latest_checkpoint_copied,transitioned,checkpoint_path,latest_checkpoint_path,chunk_log_path\n";
-
-    std::cout << "horizon_curriculum_enabled=true\n";
-    std::cout << "horizon_curriculum_sequence=";
-    for(std::size_t i = 0; i < options.horizon_curriculum.size(); i++){
-        std::cout << (i == 0 ? "" : ",") << options.horizon_curriculum[i];
-    }
-    std::cout << "\n";
-    std::cout << "horizon_curriculum_summary_log_path=" << summary_log_path << "\n";
-    std::cout << "horizon_curriculum_checkpoint_path=" << checkpoint_path << "\n";
-
-    std::string previous_checkpoint = options.load_path;
-    std::size_t stage = 0;
-    std::size_t stage_steps = 0;
-    std::size_t completed_steps = 0;
-    std::size_t chunk_index = 0;
-    bool previous_chunk_transitioned = false;
-    bool passed = true;
-    while(completed_steps < options.steps){
-        const std::size_t remaining = options.steps - completed_steps;
-        const std::size_t chunk_steps = std::min(options.curriculum_gate_check_interval, remaining);
-        const std::size_t horizon = options.horizon_curriculum[stage];
-        const float threshold = curriculum_threshold_for_stage(options, stage);
-        const std::size_t min_stage_steps = curriculum_min_steps_for_stage(options, stage);
-        const std::string chunk_log = curriculum_chunk_log_path(summary_log_path, chunk_index);
-        const std::string chunk_checkpoint = curriculum_chunk_checkpoint_path(checkpoint_path, chunk_index, horizon);
-        const float lr_scale = stage_scale_or_default(options.curriculum_learning_rate_scales, stage, 1.0f);
-        const float diff_scale = stage_scale_or_default(options.curriculum_diff_loss_scales, stage, 1.0f);
-        const float terminal_scale = stage_scale_or_default(options.curriculum_terminal_loss_scales, stage, 1.0f);
-        const float stage_actor_grad_clip_norm = stage_scale_or_default(options.curriculum_actor_grad_clip_norms, stage, options.actor_grad_clip_norm);
-
-        gpu::FullGpuTrainingOptions phase_options = make_full_training_options(options);
-        phase_options.horizon = horizon;
-        phase_options.steps = chunk_steps;
-        phase_options.seed = options.seed + static_cast<unsigned>(completed_steps);
-        phase_options.load_path = previous_checkpoint;
-        phase_options.save_path = chunk_checkpoint;
-        phase_options.log_path = chunk_log;
-        phase_options.learning_rate = options.learning_rate * lr_scale;
-        phase_options.diff_rollout_loss_weight = options.diff_rollout_loss_weight * diff_scale;
-        phase_options.actor_grad_clip_norm = stage_actor_grad_clip_norm;
-        phase_options.load_optimizer_state = options.load_optimizer_state &&
-            !(options.reset_optimizer_on_curriculum_transition && previous_chunk_transitioned);
-
-        std::cout << "curriculum_chunk_index=" << chunk_index << "\n";
-        std::cout << "curriculum_chunk_horizon=" << horizon << "\n";
-        std::cout << "curriculum_chunk_steps=" << chunk_steps << "\n";
-        std::cout << "curriculum_chunk_learning_rate=" << phase_options.learning_rate << "\n";
-        std::cout << "curriculum_chunk_diff_rollout_loss_weight=" << phase_options.diff_rollout_loss_weight << "\n";
-        std::cout << "curriculum_chunk_terminal_loss_scale=" << terminal_scale << "\n";
-        std::cout << "curriculum_chunk_actor_grad_clip_norm=" << phase_options.actor_grad_clip_norm << "\n";
-        std::cout << "curriculum_chunk_load_optimizer_state=" << (phase_options.load_optimizer_state ? "true" : "false") << "\n";
-        std::cout << "curriculum_chunk_log_path=" << chunk_log << "\n";
-        std::cout << "curriculum_chunk_checkpoint_path=" << chunk_checkpoint << "\n";
-        if(!phase_options.load_path.empty()){
-            std::cout << "curriculum_chunk_load_path=" << phase_options.load_path << "\n";
-        }
-        gpu::EulerGpuLossWeights chunk_weights = weights;
-        chunk_weights.terminal_loss_scale *= terminal_scale;
-        auto phase_summary = gpu::run_full_gpu_training(phase_options, chunk_weights);
-        print_full_gpu_training_summary(phase_summary);
-        const float chunk_mean_success_rate = read_chunk_mean_success_rate(chunk_log, phase_summary.final_success_rate);
-        const bool latest_checkpoint_copied = phase_summary.checkpoint_saved && copy_file(chunk_checkpoint, checkpoint_path);
-
-        completed_steps += chunk_steps;
-        stage_steps += chunk_steps;
-        bool transitioned = false;
-        if(stage + 1 < options.horizon_curriculum.size() &&
-           stage_steps >= min_stage_steps &&
-           chunk_mean_success_rate > threshold){
-            stage++;
-            stage_steps = 0;
-            transitioned = true;
-        }
-
-        summary_log
-            << completed_steps << "," << chunk_index << "," << horizon << "," << chunk_steps << "," << stage_steps << ","
-            << threshold << "," << min_stage_steps << ","
-            << phase_options.learning_rate << "," << phase_options.diff_rollout_loss_weight << ","
-            << chunk_weights.terminal_loss_scale << "," << phase_options.actor_grad_clip_norm << ","
-            << (phase_options.load_optimizer_state ? "true" : "false") << ","
-            << phase_summary.final_loss << "," << phase_summary.final_grad_norm << ","
-            << phase_summary.final_critic_loss << "," << phase_summary.final_critic_error_norm << ","
-            << phase_summary.final_success_rate << "," << phase_summary.final_action_saturation << ","
-            << chunk_mean_success_rate << ","
-            << phase_summary.final_position_norm_mean << "," << phase_summary.final_velocity_norm_mean << ","
-            << phase_summary.final_angular_velocity_norm_mean << ","
-            << (phase_summary.finite ? "true" : "false") << ","
-            << (phase_summary.checkpoint_saved ? "true" : "false") << ","
-            << (phase_summary.checkpoint_loaded ? "true" : "false") << ","
-            << (latest_checkpoint_copied ? "true" : "false") << ","
-            << (transitioned ? "true" : "false") << ","
-            << chunk_checkpoint << "," << checkpoint_path << "," << chunk_log << "\n";
-        summary_log.flush();
-
-        std::cout << "curriculum_global_step=" << completed_steps << "\n";
-        std::cout << "curriculum_success_threshold=" << threshold << "\n";
-        std::cout << "curriculum_chunk_mean_success_rate=" << chunk_mean_success_rate << "\n";
-        std::cout << "curriculum_stage_transitioned=" << (transitioned ? "true" : "false") << "\n";
-        std::cout << "curriculum_current_horizon=" << options.horizon_curriculum[stage] << "\n";
-
-        passed = passed && phase_summary.passed && phase_summary.checkpoint_saved && latest_checkpoint_copied;
-        if(!phase_summary.passed || !phase_summary.checkpoint_saved || !latest_checkpoint_copied){
-            std::cout << "horizon_curriculum_passed=false\n";
-            return false;
-        }
-        previous_checkpoint = chunk_checkpoint;
-        previous_chunk_transitioned = transitioned;
-        chunk_index++;
-    }
-    std::cout << "horizon_curriculum_final_horizon=" << options.horizon_curriculum[stage] << "\n";
-    std::cout << "horizon_curriculum_final_checkpoint_path=" << checkpoint_path << "\n";
-    std::cout << "horizon_curriculum_passed=" << (passed ? "true" : "false") << "\n";
-    return passed;
-}
-
 void print_stage9_replay_debug_summary(const gpu::Stage9ReplayDebugSummary& summary){
     std::cout << "gpu_stage9_replay_debug_passed=" << (summary.passed ? "true" : "false") << "\n";
     std::cout << "gpu_stage9_replay_debug_finite=" << (summary.finite ? "true" : "false") << "\n";
@@ -1467,27 +1159,7 @@ int main(int argc, char** argv){
         options.initial_angular_velocity_scale = options.initial_angular_velocity_scale_local;
         options.throughout_gate_start_step = 0;
     }
-    const bool active_training_requested = options.steps > 0 || options.stage11;
-    const bool removed_curriculum_requested =
-        options.horizon_curriculum_enabled ||
-        !options.horizon_curriculum.empty() ||
-        !options.curriculum_success_thresholds.empty() ||
-        !options.curriculum_min_steps.empty() ||
-        !options.curriculum_learning_rate_scales.empty() ||
-        !options.curriculum_diff_loss_scales.empty() ||
-        !options.curriculum_terminal_loss_scales.empty() ||
-        !options.curriculum_actor_grad_clip_norms.empty() ||
-        options.reset_optimizer_on_curriculum_transition;
-    if(options.stage11){
-        std::cerr << "Stage 11/H64/H128 curriculum has been removed from the active CUDA training pipeline. "
-                  << "Use fixed-H16 origin recovery training only.\n";
-        return 1;
-    }
-    if(removed_curriculum_requested){
-        std::cerr << "Curriculum flags are not allowed in the active CUDA training pipeline. "
-                  << "The active task is fixed-H16 origin recovery.\n";
-        return 1;
-    }
+    const bool active_training_requested = options.steps > 0;
     if(active_training_requested && options.horizon != ACTIVE_TRAINING_HORIZON){
         std::cerr << "Active CUDA training requires --horizon " << ACTIVE_TRAINING_HORIZON
                   << " for fixed-H16 origin recovery.\n";
@@ -1526,8 +1198,6 @@ int main(int argc, char** argv){
     std::cout << "eval_only=" << (options.eval_only ? "true" : "false") << "\n";
     std::cout << "eval_model=" << options.eval_model << "\n";
     std::cout << "failure_analysis=" << (options.failure_analysis ? "true" : "false") << "\n";
-    std::cout << "curriculum_enabled=false\n";
-    std::cout << "h64_h128_training_enabled=false\n";
     std::cout << "success_position_threshold=" << options.success_position_threshold << "\n";
     std::cout << "success_velocity_threshold=" << options.success_velocity_threshold << "\n";
     std::cout << "success_attitude_threshold=" << options.success_attitude_threshold << "\n";
@@ -1584,7 +1254,6 @@ int main(int argc, char** argv){
     std::cout << "disable_physics_gradient=" << (options.disable_physics_gradient ? "true" : "false") << "\n";
     std::cout << "reset_hidden_each_step=" << (options.reset_hidden_each_step ? "true" : "false") << "\n";
     std::cout << "load_optimizer_state=" << (options.load_optimizer_state ? "true" : "false") << "\n";
-    std::cout << "reset_optimizer_on_curriculum_transition=false\n";
 
     gpu::EulerGpuBatch batch;
     gpu::EulerGpuLossWeights weights;
@@ -1651,87 +1320,6 @@ int main(int argc, char** argv){
             debug_options.log_path = options.log_path;
             return debug_options;
         };
-        if(options.stage11){
-            const std::vector<std::size_t> horizons = {16, 32, 64, 128};
-            const std::size_t phase_count = horizons.size();
-            const std::size_t base_steps = options.stage11_steps / phase_count;
-            const std::size_t extra_steps = options.stage11_steps % phase_count;
-            const std::string log_prefix = options.log_path.empty()
-                ? std::string("/tmp/stage11_gpu_curriculum")
-                : options.log_path;
-            const std::string checkpoint_prefix = options.save_path.empty()
-                ? std::string("/tmp/stage11_gpu_curriculum")
-                : options.save_path;
-            const std::string final_checkpoint = options.save_path.empty()
-                ? std::string("/tmp/stage11_gpu_curriculum_final.ckpt")
-                : options.save_path;
-            const std::string summary_log_path = log_prefix + "_summary.csv";
-            std::ofstream stage11_log(summary_log_path);
-            if(!stage11_log){
-                throw std::runtime_error("Failed to open Stage 11 summary log: " + summary_log_path);
-            }
-            stage11_log
-                << "phase,horizon,steps,checkpoint,loaded_checkpoint,passed,checkpoint_saved,checkpoint_loaded,"
-                << "final_loss,final_grad_norm,final_critic_loss,final_critic_error_norm,nan_inf_count\n";
-            std::cout << "stage11_horizon_curriculum=16,32,64,128\n";
-            std::cout << "stage11_batch_size=128\n";
-            std::cout << "stage11_sampled_dynamics=broad\n";
-            std::cout << "stage11_balanced_dynamics_sampling=true\n";
-            std::cout << "stage11_w_v=3\n";
-            std::cout << "stage11_w_terminal_v=20\n";
-            std::cout << "stage11_summary_log_path=" << summary_log_path << "\n";
-
-            std::string previous_checkpoint = options.load_path;
-            bool stage11_passed = true;
-            for(std::size_t phase = 0; phase < phase_count; phase++){
-                const std::size_t horizon = horizons[phase];
-                const std::size_t phase_steps = base_steps + (phase < extra_steps ? 1 : 0);
-                if(phase_steps == 0){
-                    continue;
-                }
-                gpu::FullGpuTrainingOptions phase_options = make_full_training_options(options);
-                phase_options.batch_size = 128;
-                phase_options.horizon = horizon;
-                phase_options.steps = phase_steps;
-                phase_options.seed = options.seed + static_cast<unsigned>(phase * 100000u);
-                phase_options.sample_dynamics = true;
-                phase_options.load_path = previous_checkpoint;
-                phase_options.save_path = phase + 1 == phase_count
-                    ? final_checkpoint
-                    : checkpoint_prefix + stage11_phase_suffix(horizon, ".ckpt");
-                phase_options.log_path = log_prefix + stage11_phase_suffix(horizon, ".csv");
-                std::cout << "stage11_phase=" << (phase + 1) << "\n";
-                std::cout << "stage11_phase_horizon=" << horizon << "\n";
-                std::cout << "stage11_phase_steps=" << phase_steps << "\n";
-                std::cout << "stage11_phase_log_path=" << phase_options.log_path << "\n";
-                std::cout << "stage11_phase_checkpoint_path=" << phase_options.save_path << "\n";
-                if(!phase_options.load_path.empty()){
-                    std::cout << "stage11_phase_load_path=" << phase_options.load_path << "\n";
-                }
-                auto phase_summary = gpu::run_full_gpu_training(phase_options, weights);
-                print_full_gpu_training_summary(phase_summary);
-                stage11_log
-                    << (phase + 1) << "," << horizon << "," << phase_steps << ","
-                    << phase_options.save_path << "," << phase_options.load_path << ","
-                    << (phase_summary.passed ? "true" : "false") << ","
-                    << (phase_summary.checkpoint_saved ? "true" : "false") << ","
-                    << (phase_summary.checkpoint_loaded ? "true" : "false") << ","
-                    << phase_summary.final_loss << ","
-                    << phase_summary.final_grad_norm << ","
-                    << phase_summary.final_critic_loss << ","
-                    << phase_summary.final_critic_error_norm << ","
-                    << phase_summary.nan_inf_count << "\n";
-                stage11_passed = stage11_passed && phase_summary.passed && phase_summary.checkpoint_saved;
-                if(!phase_summary.passed || !phase_summary.checkpoint_saved){
-                    std::cout << "stage11_passed=false\n";
-                    return 1;
-                }
-                previous_checkpoint = phase_options.save_path;
-            }
-            std::cout << "stage11_final_checkpoint_path=" << final_checkpoint << "\n";
-            std::cout << "stage11_passed=" << (stage11_passed ? "true" : "false") << "\n";
-            return stage11_passed ? 0 : 1;
-        }
         if(options.eval_only){
             auto eval_options = make_gpu_eval_options(options);
             auto eval_summary = gpu::run_gpu_policy_eval(eval_options, weights);
@@ -1740,10 +1328,6 @@ int main(int argc, char** argv){
                 return 1;
             }
             return 0;
-        }
-        if(options.horizon_curriculum_enabled){
-            const bool curriculum_passed = run_horizon_curriculum(options, weights);
-            return curriculum_passed ? 0 : 1;
         }
         if(options.stage9_6_checkpoint_parity){
             formal_gate_run = true;
