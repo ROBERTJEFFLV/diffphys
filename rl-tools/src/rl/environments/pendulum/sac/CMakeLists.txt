@@ -1,6 +1,6 @@
 add_subdirectory(arm)
 add_subdirectory(cpu)
-if(RL_TOOLS_BACKEND_ENABLE_CUDA)
+if(RL_TOOLS_BACKEND_ENABLE_CUDA AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
     add_subdirectory(cuda)
 endif()
 add_subdirectory(wasm)

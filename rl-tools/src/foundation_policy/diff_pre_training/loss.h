@@ -2,6 +2,7 @@
 
 #include "config.h"
 
+#include <rl_tools/rl/environments/l2f/diff_euler_model.h>
 #include <rl_tools/rl/environments/l2f/operations_generic/65_transition_linearization.h>
 
 namespace rl_tools::foundation_policy::diff_pre_training{
@@ -70,7 +71,8 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         const STATE (&states)[HORIZON + 1],
         const T (&actions)[HORIZON][4],
         T (&action_gradients)[HORIZON][4],
-        const LossWeights<T>& weights
+        const LossWeights<T>& weights,
+        const rl::environments::l2f::diff::TrackingReference<T>& ref
     ){
         namespace l2f = rl_tools::rl::environments::l2f;
         LossTerms<T> terms;
@@ -137,8 +139,8 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             T attitude_error[3];
             const T orientation_sign = sign_for_shortest_quaternion(state.orientation);
             for(TI dim_i = 0; dim_i < 3; dim_i++){
-                const T p = state.position[dim_i];
-                const T v = state.linear_velocity[dim_i];
+                const T p = state.position[dim_i] - ref.p[dim_i];
+                const T v = state.linear_velocity[dim_i] - ref.v[dim_i];
                 const T e_R = (T)2 * orientation_sign * state.orientation[dim_i + 1];
                 const T w = state.angular_velocity[dim_i];
                 attitude_error[dim_i] = e_R;
@@ -180,5 +182,18 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             }
         }
         return terms;
+    }
+
+    template <typename DEVICE, typename PARAMETERS, typename STATE, typename T, typename TI, TI HORIZON>
+    LossTerms<T> stabilization_loss_and_action_gradients(
+        DEVICE& device,
+        const PARAMETERS& parameters,
+        const STATE (&states)[HORIZON + 1],
+        const T (&actions)[HORIZON][4],
+        T (&action_gradients)[HORIZON][4],
+        const LossWeights<T>& weights
+    ){
+        const auto ref = rl::environments::l2f::diff::zero_tracking_reference<T>();
+        return stabilization_loss_and_action_gradients<DEVICE, PARAMETERS, STATE, T, TI, HORIZON>(device, parameters, states, actions, action_gradients, weights, ref);
     }
 }

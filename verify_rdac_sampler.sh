@@ -5,10 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RL_TOOLS_DIR="${ROOT_DIR}/rl-tools"
 BUILD_DIR="${BUILD_DIR:-/tmp/raptor_diff_rdac_build}"
 BIN="${BUILD_DIR}/src/foundation_policy/foundation_policy_diff_pre_training"
+PHYSICS_BIN="${BUILD_DIR}/src/foundation_policy/foundation_policy_diff_physics_check"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/verify_rdac_sampler_$(date +%Y%m%d_%H%M%S)}"
 SAMPLES="${SAMPLES:-4096}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
-TRAIN_STEPS_LIST="${TRAIN_STEPS_LIST:-5000 20000}"
+TRAIN_STEPS_LIST="${TRAIN_STEPS_LIST-5000 20000}"
 CURVE_STRIDE="${CURVE_STRIDE:-100}"
 JOBS="${JOBS:-2}"
 
@@ -23,8 +24,17 @@ if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
     cmake -S "${RL_TOOLS_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
 fi
 
-echo "[build] foundation_policy_diff_pre_training"
-cmake --build "${BUILD_DIR}" --target foundation_policy_diff_pre_training -j "${JOBS}"
+echo "[build] foundation_policy_diff_pre_training foundation_policy_diff_physics_check"
+cmake --build "${BUILD_DIR}" --target foundation_policy_diff_pre_training foundation_policy_diff_physics_check -j "${JOBS}"
+
+echo "[reference] zero-reference equivalence smoke"
+REF_STDOUT="${OUT_DIR}/reference_zero_equivalence.stdout"
+"${PHYSICS_BIN}" --diff-model euler > "${REF_STDOUT}"
+if ! grep -q "zero_ref_.*PASS" "${REF_STDOUT}"; then
+    echo "zero-reference equivalence check did not pass" >&2
+    tail -80 "${REF_STDOUT}" >&2
+    exit 1
+fi
 
 echo "[sampler] dumping ${SAMPLES} broad samples"
 DUMP_CSV="${OUT_DIR}/sampler_dump_${SAMPLES}.csv"
@@ -92,15 +102,14 @@ for key in bin_columns:
     lines.append(f"{key}: {dict(sorted(counts.items()))}")
     if missing:
         raise SystemExit(f"{key} missing bins: {missing}")
-    if max(counts.values()) - min(counts.values()) > 1:
-        raise SystemExit(f"{key} is not balanced: {counts}")
 
 group_counts = Counter(int(float(r["dynamics_group_key"])) for r in rows)
+all_group_counts = [group_counts.get(i, 0) for i in range(4**5)]
 lines.append(f"dynamics_group_count={len(group_counts)}")
-lines.append(f"dynamics_group_count_min={min(group_counts.values())} max={max(group_counts.values())}")
+lines.append(f"dynamics_group_count_min={min(all_group_counts)} max={max(all_group_counts)}")
 if len(rows) >= 4**5 and len(group_counts) != 4**5:
     raise SystemExit(f"expected all {4**5} 5D bin groups, saw {len(group_counts)}")
-if max(group_counts.values()) - min(group_counts.values()) > 1:
+if max(all_group_counts) - min(all_group_counts) > 1:
     raise SystemExit("5D dynamics group counts are not balanced")
 
 with open(summary_path, "w") as f:

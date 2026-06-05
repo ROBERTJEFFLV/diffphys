@@ -32,6 +32,21 @@ namespace rl_tools::rl::environments::l2f::diff{
     }
 
     template <typename T>
+    struct EulerObservationBuffer{
+        T data[22] = {};
+    };
+
+    template <typename T, typename ROW_TI, typename COL_TI, typename VALUE>
+    void set(EulerObservationBuffer<T>& observation, ROW_TI, COL_TI col, VALUE value){
+        observation.data[col] = (T)value;
+    }
+
+    template <typename T, typename ROW_TI, typename COL_TI>
+    T get(const EulerObservationBuffer<T>& observation, ROW_TI, COL_TI col){
+        return observation.data[col];
+    }
+
+    template <typename T>
     void rotation_delta_vjp_fd_reference_double(
         T dt,
         const T omega_next[3],
@@ -257,6 +272,72 @@ namespace rl_tools::rl::environments::l2f::diff{
             ok = ok && rel < (T)5e-3;
         }
         std::cout << (ok ? "PASS" : "FAIL") << " euler_local_derivative_checks\n";
+        return ok;
+    }
+
+    template <typename PARAMETERS, typename T, typename TI>
+    bool euler_reference_zero_equivalence_check(const PARAMETERS& parameters, const EulerLossWeights<T>& weights){
+        std::cout << "\n[Euler reference] Zero-reference equivalence check\n";
+        EulerState<T, TI> initial_state;
+        configure_check_state<PARAMETERS, T, TI>(parameters, initial_state);
+        const auto zero_ref = zero_tracking_reference<T>();
+
+        EulerObservationBuffer<T> legacy_observation;
+        EulerObservationBuffer<T> reference_observation;
+        observe<T, TI>(initial_state, legacy_observation);
+        observe_with_reference<T, TI>(initial_state, zero_ref, reference_observation);
+        T max_observation_error = 0;
+        for(TI i = 0; i < 22; i++){
+            max_observation_error = std::max(max_observation_error, std::abs(legacy_observation.data[i] - reference_observation.data[i]));
+        }
+
+        constexpr TI H = 4;
+        T actions[H][4];
+        const T base = hover_normalized_action_from_parameters<PARAMETERS, T>(parameters);
+        for(TI step_i = 0; step_i < H; step_i++){
+            actions[step_i][0] = base + (T)0.17 + (T)0.0020 * step_i;
+            actions[step_i][1] = base + (T)0.11 - (T)0.0010 * step_i;
+            actions[step_i][2] = base + (T)0.15 + (T)0.0015 * step_i;
+            actions[step_i][3] = base + (T)0.13 - (T)0.0005 * step_i;
+        }
+
+        EulerState<T, TI> legacy_states[H + 1];
+        EulerState<T, TI> reference_states[H + 1];
+        EulerStepCache<T> legacy_caches[H];
+        EulerStepCache<T> reference_caches[H];
+        T legacy_gradients[H][4];
+        T reference_gradients[H][4];
+        const auto legacy_terms = rollout_loss_and_gradients<PARAMETERS, T, TI, H>(parameters, initial_state, actions, H, weights, legacy_states, legacy_caches, legacy_gradients);
+        const auto reference_terms = rollout_loss_and_gradients<PARAMETERS, T, TI, H>(parameters, initial_state, actions, H, weights, zero_ref, reference_states, reference_caches, reference_gradients);
+
+        T max_state_error = 0;
+        for(TI step_i = 0; step_i <= H; step_i++){
+            for(TI dim_i = 0; dim_i < 3; dim_i++){
+                max_state_error = std::max(max_state_error, std::abs(legacy_states[step_i].p[dim_i] - reference_states[step_i].p[dim_i]));
+                max_state_error = std::max(max_state_error, std::abs(legacy_states[step_i].v[dim_i] - reference_states[step_i].v[dim_i]));
+                max_state_error = std::max(max_state_error, std::abs(legacy_states[step_i].omega[dim_i] - reference_states[step_i].omega[dim_i]));
+                for(TI dim_j = 0; dim_j < 3; dim_j++){
+                    max_state_error = std::max(max_state_error, std::abs(legacy_states[step_i].R[dim_i][dim_j] - reference_states[step_i].R[dim_i][dim_j]));
+                }
+            }
+            for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
+                max_state_error = std::max(max_state_error, std::abs(legacy_states[step_i].rpm[rotor_i] - reference_states[step_i].rpm[rotor_i]));
+            }
+        }
+
+        T max_gradient_error = 0;
+        for(TI step_i = 0; step_i < H; step_i++){
+            for(TI action_i = 0; action_i < 4; action_i++){
+                max_gradient_error = std::max(max_gradient_error, std::abs(legacy_gradients[step_i][action_i] - reference_gradients[step_i][action_i]));
+            }
+        }
+        const T loss_error = std::abs(legacy_terms.total() - reference_terms.total());
+        const bool ok = max_observation_error < (T)1e-7 && loss_error < (T)1e-6 && max_gradient_error < (T)1e-6 && max_state_error < (T)1e-7;
+        std::cout << "zero_ref_observation_max_error=" << max_observation_error
+                  << " zero_ref_loss_error=" << loss_error
+                  << " zero_ref_action_gradient_max_error=" << max_gradient_error
+                  << " zero_ref_state_max_error=" << max_state_error
+                  << " " << (ok ? "PASS" : "FAIL") << "\n";
         return ok;
     }
 
@@ -770,6 +851,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         const bool vjp_ok = so3_expmap_vjp_check<PARAMETERS, T, TI>(parameters);
         const bool trans_ok = euler_transition_vjp_check<PARAMETERS, T, TI>(parameters);
         const EulerLossWeights<T> weights{(T)8.0, (T)0.8, (T)4.0, (T)0.8, (T)0.005, (T)0.03, (T)0.05, (T)4.0, (T)12.0, (T)4.0, (T)8.0, (T)4.0};
+        const bool reference_ok = euler_reference_zero_equivalence_check<PARAMETERS, T, TI>(parameters, weights);
         const bool h1 = euler_rollout_gradient_check_one<PARAMETERS, T, TI, 1>(parameters, weights, summary);
         const bool h4 = euler_rollout_gradient_check_one<PARAMETERS, T, TI, 4>(parameters, weights, summary);
         const bool h16 = euler_rollout_gradient_check_one<PARAMETERS, T, TI, 16>(parameters, weights, summary);
@@ -778,10 +860,10 @@ namespace rl_tools::rl::environments::l2f::diff{
         const bool rotation_ok = euler_rotation_drift_check<PARAMETERS, T, TI>(parameters);
         euler_coordinate_frame_report();
 
-        const bool strict = local_ok && vjp_ok && trans_ok && h1 && h4 && h16 && sign_ok && rotation_ok;
+        const bool strict = local_ok && vjp_ok && trans_ok && reference_ok && h1 && h4 && h16 && sign_ok && rotation_ok;
         const char* overall;
         if(strict) overall = "STRICT_PASS";
-        else if(local_ok && vjp_ok && trans_ok && h1 && h4 && h16 && sign_ok && rotation_ok) overall = "DIRECTIONAL_PASS";
+        else if(local_ok && vjp_ok && trans_ok && reference_ok && h1 && h4 && h16 && sign_ok && rotation_ok) overall = "DIRECTIONAL_PASS";
         else overall = "FAIL";
 
         std::cout << "\n[Euler summary]\n";
@@ -789,7 +871,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         if(strict){
             std::cout << "Euler model is safe for short fixed-dynamics training.\n";
         }
-        else if(local_ok && vjp_ok && trans_ok && h1 && h4 && h16){
+        else if(local_ok && vjp_ok && trans_ok && reference_ok && h1 && h4 && h16){
             std::cout << "Euler model is safe for short fixed-dynamics training (DIRECTIONAL_PASS).\n";
             std::cout << "H=64 has correct gradient direction but FD-reference scale noise. Actor-grad clipping reduces risk.\n";
         }

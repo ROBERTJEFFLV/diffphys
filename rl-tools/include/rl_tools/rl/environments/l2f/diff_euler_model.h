@@ -15,6 +15,30 @@ namespace rl_tools::rl::environments::l2f::diff{
     };
 
     template <typename T>
+    struct TrackingReference{
+        T p[3];
+        T v[3];
+    };
+
+    template <typename T>
+    TrackingReference<T> zero_tracking_reference(){
+        TrackingReference<T> ref{};
+        for(int i = 0; i < 3; i++){
+            ref.p[i] = (T)0;
+            ref.v[i] = (T)0;
+        }
+        return ref;
+    }
+
+    template <typename T>
+    void set_zero(TrackingReference<T>& ref){
+        for(int i = 0; i < 3; i++){
+            ref.p[i] = (T)0;
+            ref.v[i] = (T)0;
+        }
+    }
+
+    template <typename T>
     struct EulerStepCache{
         T normalized_action[4];
         T setpoint[4];
@@ -332,10 +356,10 @@ namespace rl_tools::rl::environments::l2f::diff{
     }
 
     template <typename T, typename TI, typename OBS_MATRIX>
-    void observe(const EulerState<T, TI>& state, OBS_MATRIX& observation){
+    void observe_with_reference(const EulerState<T, TI>& state, const TrackingReference<T>& ref, OBS_MATRIX& observation){
         TI idx = 0;
         for(TI i = 0; i < 3; i++){
-            set(observation, 0, idx++, state.p[i]);
+            set(observation, 0, idx++, state.p[i] - ref.p[i]);
         }
         for(TI i = 0; i < 3; i++){
             for(TI j = 0; j < 3; j++){
@@ -343,13 +367,29 @@ namespace rl_tools::rl::environments::l2f::diff{
             }
         }
         for(TI i = 0; i < 3; i++){
-            set(observation, 0, idx++, state.v[i]);
+            set(observation, 0, idx++, state.v[i] - ref.v[i]);
         }
         for(TI i = 0; i < 3; i++){
             set(observation, 0, idx++, state.omega[i]);
         }
         for(TI i = 0; i < 4; i++){
             set(observation, 0, idx++, state.previous_action[i]);
+        }
+    }
+
+    template <typename T, typename TI, typename OBS_MATRIX>
+    void observe(const EulerState<T, TI>& state, OBS_MATRIX& observation){
+        const auto ref = zero_tracking_reference<T>();
+        observe_with_reference<T, TI>(state, ref, observation);
+    }
+
+    template <typename T, typename TI, typename OBS_MATRIX>
+    void apply_reference_error_to_observation(OBS_MATRIX& observation, const TrackingReference<T>& ref){
+        constexpr TI POSITION_OFFSET = 0;
+        constexpr TI VELOCITY_OFFSET = 3 + 9;
+        for(TI i = 0; i < 3; i++){
+            set(observation, 0, POSITION_OFFSET + i, get(observation, 0, POSITION_OFFSET + i) - ref.p[i]);
+            set(observation, 0, VELOCITY_OFFSET + i, get(observation, 0, VELOCITY_OFFSET + i) - ref.v[i]);
         }
     }
 

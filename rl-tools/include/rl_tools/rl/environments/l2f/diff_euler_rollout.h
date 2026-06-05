@@ -70,16 +70,19 @@ namespace rl_tools::rl::environments::l2f::diff{
     template <typename T, typename TI>
     void add_state_loss(
         const EulerState<T, TI>& state,
+        const TrackingReference<T>& ref,
         const EulerLossWeights<T>& weights,
         T normalizer,
         EulerLossTerms<T>& terms,
         EulerStateAdjoint<T>& lambda
     ){
         for(TI i = 0; i < 3; i++){
-            terms.position += normalizer * weights.position * state.p[i] * state.p[i];
-            lambda.p[i] += normalizer * (T)2 * weights.position * state.p[i];
-            terms.velocity += normalizer * weights.velocity * state.v[i] * state.v[i];
-            lambda.v[i] += normalizer * (T)2 * weights.velocity * state.v[i];
+            const T e_p = state.p[i] - ref.p[i];
+            const T e_v = state.v[i] - ref.v[i];
+            terms.position += normalizer * weights.position * e_p * e_p;
+            lambda.p[i] += normalizer * (T)2 * weights.position * e_p;
+            terms.velocity += normalizer * weights.velocity * e_v * e_v;
+            lambda.v[i] += normalizer * (T)2 * weights.velocity * e_v;
             terms.angular_velocity += normalizer * weights.angular_velocity * state.omega[i] * state.omega[i];
             lambda.omega[i] += normalizer * (T)2 * weights.angular_velocity * state.omega[i];
         }
@@ -94,8 +97,21 @@ namespace rl_tools::rl::environments::l2f::diff{
     }
 
     template <typename T, typename TI>
+    void add_state_loss(
+        const EulerState<T, TI>& state,
+        const EulerLossWeights<T>& weights,
+        T normalizer,
+        EulerLossTerms<T>& terms,
+        EulerStateAdjoint<T>& lambda
+    ){
+        const auto ref = zero_tracking_reference<T>();
+        add_state_loss<T, TI>(state, ref, weights, normalizer, terms, lambda);
+    }
+
+    template <typename T, typename TI>
     void add_terminal_loss(
         const EulerState<T, TI>& state,
+        const TrackingReference<T>& ref,
         const EulerLossWeights<T>& weights,
         EulerLossTerms<T>& terms,
         EulerStateAdjoint<T>& lambda
@@ -105,15 +121,17 @@ namespace rl_tools::rl::environments::l2f::diff{
         const T wR = weights.terminal_loss_weight * weights.terminal_attitude;
         const T ww = weights.terminal_loss_weight * weights.terminal_angular_velocity;
         for(TI i = 0; i < 3; i++){
-            const T p_loss = wp * state.p[i] * state.p[i];
-            const T v_loss = wv * state.v[i] * state.v[i];
+            const T e_p = state.p[i] - ref.p[i];
+            const T e_v = state.v[i] - ref.v[i];
+            const T p_loss = wp * e_p * e_p;
+            const T v_loss = wv * e_v * e_v;
             const T w_loss = ww * state.omega[i] * state.omega[i];
             terms.terminal_position += p_loss;
             terms.terminal_velocity += v_loss;
             terms.terminal_angular_velocity += w_loss;
             terms.terminal += p_loss + v_loss + w_loss;
-            lambda.p[i] += (T)2 * wp * state.p[i];
-            lambda.v[i] += (T)2 * wv * state.v[i];
+            lambda.p[i] += (T)2 * wp * e_p;
+            lambda.v[i] += (T)2 * wv * e_v;
             lambda.omega[i] += (T)2 * ww * state.omega[i];
         }
         for(TI i = 0; i < 3; i++){
@@ -126,6 +144,17 @@ namespace rl_tools::rl::environments::l2f::diff{
                 lambda.R[i][j] += (T)2 * wR * error;
             }
         }
+    }
+
+    template <typename T, typename TI>
+    void add_terminal_loss(
+        const EulerState<T, TI>& state,
+        const EulerLossWeights<T>& weights,
+        EulerLossTerms<T>& terms,
+        EulerStateAdjoint<T>& lambda
+    ){
+        const auto ref = zero_tracking_reference<T>();
+        add_terminal_loss<T, TI>(state, ref, weights, terms, lambda);
     }
 
     template <typename T, typename TI, TI MAX_HORIZON>
@@ -172,6 +201,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         const T (&actions)[MAX_HORIZON][4],
         TI horizon,
         const EulerLossWeights<T>& weights,
+        const TrackingReference<T>& ref,
         EulerState<T, TI> (&states)[MAX_HORIZON + 1],
         EulerStepCache<T> (&caches)[MAX_HORIZON]
     ){
@@ -186,14 +216,28 @@ namespace rl_tools::rl::environments::l2f::diff{
         for(TI step_i = 0; step_i < horizon; step_i++){
             EulerStateAdjoint<T> state_loss;
             zero(state_loss);
-            add_state_loss<T, TI>(states[step_i + 1], weights, normalizer, terms, state_loss);
+            add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, state_loss);
         }
         T dummy_gradients[MAX_HORIZON][4] = {};
         add_action_loss<T, TI, MAX_HORIZON>(initial_state, actions, horizon, weights, normalizer, terms, dummy_gradients);
         EulerStateAdjoint<T> terminal_loss;
         zero(terminal_loss);
-        add_terminal_loss<T, TI>(states[horizon], weights, terms, terminal_loss);
+        add_terminal_loss<T, TI>(states[horizon], ref, weights, terms, terminal_loss);
         return terms;
+    }
+
+    template <typename PARAMETERS, typename T, typename TI, TI MAX_HORIZON>
+    EulerLossTerms<T> rollout_loss(
+        const PARAMETERS& parameters,
+        const EulerState<T, TI>& initial_state,
+        const T (&actions)[MAX_HORIZON][4],
+        TI horizon,
+        const EulerLossWeights<T>& weights,
+        EulerState<T, TI> (&states)[MAX_HORIZON + 1],
+        EulerStepCache<T> (&caches)[MAX_HORIZON]
+    ){
+        const auto ref = zero_tracking_reference<T>();
+        return rollout_loss<PARAMETERS, T, TI, MAX_HORIZON>(parameters, initial_state, actions, horizon, weights, ref, states, caches);
     }
 
     template <typename PARAMETERS, typename T, typename TI, TI MAX_HORIZON>
@@ -203,6 +247,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         const T (&actions)[MAX_HORIZON][4],
         TI horizon,
         const EulerLossWeights<T>& weights,
+        const TrackingReference<T>& ref,
         EulerState<T, TI> (&states)[MAX_HORIZON + 1],
         EulerStepCache<T> (&caches)[MAX_HORIZON],
         T (&action_gradients)[MAX_HORIZON][4]
@@ -226,9 +271,9 @@ namespace rl_tools::rl::environments::l2f::diff{
         EulerLossTerms<T> terms;
         const T normalizer = horizon > 0 ? (T)1 / (T)horizon : (T)1;
         for(TI step_i = 0; step_i < horizon; step_i++){
-            add_state_loss<T, TI>(states[step_i + 1], weights, normalizer, terms, lambdas[step_i + 1]);
+            add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, lambdas[step_i + 1]);
         }
-        add_terminal_loss<T, TI>(states[horizon], weights, terms, lambdas[horizon]);
+        add_terminal_loss<T, TI>(states[horizon], ref, weights, terms, lambdas[horizon]);
         add_action_loss<T, TI, MAX_HORIZON>(initial_state, actions, horizon, weights, normalizer, terms, action_gradients);
 
         for(TI reverse_i = 0; reverse_i < horizon; reverse_i++){
@@ -252,6 +297,21 @@ namespace rl_tools::rl::environments::l2f::diff{
             }
         }
         return terms;
+    }
+
+    template <typename PARAMETERS, typename T, typename TI, TI MAX_HORIZON>
+    EulerLossTerms<T> rollout_loss_and_gradients(
+        const PARAMETERS& parameters,
+        const EulerState<T, TI>& initial_state,
+        const T (&actions)[MAX_HORIZON][4],
+        TI horizon,
+        const EulerLossWeights<T>& weights,
+        EulerState<T, TI> (&states)[MAX_HORIZON + 1],
+        EulerStepCache<T> (&caches)[MAX_HORIZON],
+        T (&action_gradients)[MAX_HORIZON][4]
+    ){
+        const auto ref = zero_tracking_reference<T>();
+        return rollout_loss_and_gradients<PARAMETERS, T, TI, MAX_HORIZON>(parameters, initial_state, actions, horizon, weights, ref, states, caches, action_gradients);
     }
 
     template <typename T, typename TI, TI MAX_HORIZON>

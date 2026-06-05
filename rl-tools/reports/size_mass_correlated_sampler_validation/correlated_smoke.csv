@@ -1,0 +1,3 @@
+step,horizon,loss,diff_rollout_loss_scaled,critic_loss_raw,critic_loss_weight,critic_loss_scaled,critic_output_mean,critic_target_mean,critic_error_mean,critic_error_norm,grad_norm,success_rate_batch,action_saturation_rate,final_position_norm_mean,final_velocity_norm_mean,final_angular_velocity_norm_mean,finite
+0,16,0.0671415,0.0173715,0.4977,0.1,0.04977,0.00666872,3.78349e-10,0.00666872,90.3013,2.57072,0.998047,0,0.194153,0.232477,1.07664,true
+1,16,0.0669805,0.0171984,0.497821,0.1,0.0497821,0.00589075,2.23043e-10,0.00589075,90.3122,2.64839,1,0,0.194609,0.33079,1.04978,true

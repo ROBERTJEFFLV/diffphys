@@ -123,11 +123,49 @@ namespace rl_tools::foundation_policy::diff_pre_training{
     namespace l2f_diff = rl_tools::rl::environments::l2f::diff;
 
     template <typename T, typename TI>
-    ScalarTerms<T> euler_state_loss_terms(const l2f_diff::EulerState<T, TI>& state, const l2f_diff::EulerLossWeights<T>& weights){
+    T euler_position_error_norm(const l2f_diff::EulerState<T, TI>& state, const l2f_diff::TrackingReference<T>& ref){
+        T error[3];
+        for(TI i = 0; i < 3; i++){
+            error[i] = state.p[i] - ref.p[i];
+        }
+        return norm3(error);
+    }
+
+    template <typename T, typename TI>
+    T euler_velocity_error_norm(const l2f_diff::EulerState<T, TI>& state, const l2f_diff::TrackingReference<T>& ref){
+        T error[3];
+        for(TI i = 0; i < 3; i++){
+            error[i] = state.v[i] - ref.v[i];
+        }
+        return norm3(error);
+    }
+
+    template <typename STATE, typename T, typename TI>
+    T l2f_position_error_norm(const STATE& state, const l2f_diff::TrackingReference<T>& ref){
+        T error[3];
+        for(TI i = 0; i < 3; i++){
+            error[i] = state.position[i] - ref.p[i];
+        }
+        return norm3(error);
+    }
+
+    template <typename STATE, typename T, typename TI>
+    T l2f_velocity_error_norm(const STATE& state, const l2f_diff::TrackingReference<T>& ref){
+        T error[3];
+        for(TI i = 0; i < 3; i++){
+            error[i] = state.linear_velocity[i] - ref.v[i];
+        }
+        return norm3(error);
+    }
+
+    template <typename T, typename TI>
+    ScalarTerms<T> euler_state_loss_terms(const l2f_diff::EulerState<T, TI>& state, const l2f_diff::TrackingReference<T>& ref, const l2f_diff::EulerLossWeights<T>& weights){
         ScalarTerms<T> terms;
         for(TI i = 0; i < 3; i++){
-            terms.position += weights.position * state.p[i] * state.p[i];
-            terms.velocity += weights.velocity * state.v[i] * state.v[i];
+            const T e_p = state.p[i] - ref.p[i];
+            const T e_v = state.v[i] - ref.v[i];
+            terms.position += weights.position * e_p * e_p;
+            terms.velocity += weights.velocity * e_v * e_v;
             terms.angular_velocity += weights.angular_velocity * state.omega[i] * state.omega[i];
         }
         for(TI i = 0; i < 3; i++){
@@ -141,18 +179,32 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         return terms;
     }
 
+    template <typename T, typename TI>
+    ScalarTerms<T> euler_state_loss_terms(const l2f_diff::EulerState<T, TI>& state, const l2f_diff::EulerLossWeights<T>& weights){
+        const auto ref = l2f_diff::zero_tracking_reference<T>();
+        return euler_state_loss_terms<T, TI>(state, ref, weights);
+    }
+
     template <typename STATE, typename T, typename TI>
-    ScalarTerms<T> l2f_state_loss_terms(const STATE& state, const LossWeights<T>& weights){
+    ScalarTerms<T> l2f_state_loss_terms(const STATE& state, const l2f_diff::TrackingReference<T>& ref, const LossWeights<T>& weights){
         ScalarTerms<T> terms;
         const T orientation_sign = state.orientation[0] >= (T)0 ? (T)1 : (T)-1;
         for(TI i = 0; i < 3; i++){
+            const T e_p = state.position[i] - ref.p[i];
+            const T e_v = state.linear_velocity[i] - ref.v[i];
             const T e_R = (T)2 * orientation_sign * state.orientation[i + 1];
-            terms.position += weights.position * state.position[i] * state.position[i];
-            terms.velocity += weights.velocity * state.linear_velocity[i] * state.linear_velocity[i];
+            terms.position += weights.position * e_p * e_p;
+            terms.velocity += weights.velocity * e_v * e_v;
             terms.attitude += weights.attitude * e_R * e_R;
             terms.angular_velocity += weights.angular_velocity * state.angular_velocity[i] * state.angular_velocity[i];
         }
         terms.total = terms.position + terms.velocity + terms.attitude + terms.angular_velocity;
         return terms;
+    }
+
+    template <typename STATE, typename T, typename TI>
+    ScalarTerms<T> l2f_state_loss_terms(const STATE& state, const LossWeights<T>& weights){
+        const auto ref = l2f_diff::zero_tracking_reference<T>();
+        return l2f_state_loss_terms<STATE, T, TI>(state, ref, weights);
     }
 }

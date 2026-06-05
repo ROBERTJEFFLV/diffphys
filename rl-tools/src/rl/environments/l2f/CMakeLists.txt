@@ -1,5 +1,5 @@
 add_subdirectory(sac)
-if(RL_TOOLS_BACKEND_ENABLE_CUDA)
+if(RL_TOOLS_BACKEND_ENABLE_CUDA AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
     add_subdirectory(cuda)
 endif()
 

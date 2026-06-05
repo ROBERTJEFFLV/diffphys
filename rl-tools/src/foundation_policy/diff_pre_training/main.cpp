@@ -49,6 +49,20 @@ std::string sibling_output_path(const std::string& anchor_path, const std::strin
     return anchor_path.substr(0, separator + 1) + filename;
 }
 
+void write_production_objective_trace_header(std::ostream& out){
+    out << "step,seed,batch_size,horizon,sample_mode,fixed_or_sampled_dynamics,"
+        << "sampled_dynamics_level,balanced_dynamics_sampling_enabled,"
+        << "total_loss_for_backprop,diff_rollout_loss_raw,diff_rollout_loss_weight,diff_rollout_loss_scaled,"
+        << "position_loss,velocity_loss,attitude_loss,angular_velocity_loss,"
+        << "terminal_loss,terminal_position_loss,terminal_velocity_loss,terminal_attitude_loss,terminal_angular_velocity_loss,"
+        << "action_magnitude_loss,action_smoothness_loss,saturation_loss,"
+        << "critic_loss,actor_critic_loss,transition_consistency_loss,value_loss,entropy_loss,teacher_loss,other_loss_terms,"
+        << "action_grad_norm_before_scale,action_grad_norm_after_diff_weight,action_grad_norm_after_action_clip,"
+        << "actor_grad_norm_before_clip,actor_grad_norm_after_clip,actor_grad_skip_triggered,"
+        << "actor_update_norm,adam_step,adam_m_norm,adam_v_norm,"
+        << "success_rate_batch,final_position_norm_mean,final_velocity_norm_mean,final_angular_velocity_norm_mean,action_saturation_rate\n";
+}
+
 template <typename TI>
 void decode_dynamics_group_key(TI key, TI num_bins, TI& size_mass, TI& thrust_to_weight, TI& torque_to_inertia, TI& motor_delay, TI& curve_shape){
     curve_shape = key % num_bins;
@@ -163,14 +177,23 @@ const char* check_curriculum_gate(
 
 template <typename T, typename TI>
 bool compute_training_success_flag(
-    const l2f_diff::EulerState<T, TI>& final_state
+    const l2f_diff::EulerState<T, TI>& final_state,
+    const l2f_diff::TrackingReference<T>& ref
 ){
-    const T p_norm = std::sqrt(final_state.p[0]*final_state.p[0] + final_state.p[1]*final_state.p[1] + final_state.p[2]*final_state.p[2]);
-    const T v_norm = std::sqrt(final_state.v[0]*final_state.v[0] + final_state.v[1]*final_state.v[1] + final_state.v[2]*final_state.v[2]);
-    const T w_norm = std::sqrt(final_state.omega[0]*final_state.omega[0] + final_state.omega[1]*final_state.omega[1] + final_state.omega[2]*final_state.omega[2]);
+    const T p_norm = fp::euler_position_error_norm<T, TI>(final_state, ref);
+    const T v_norm = fp::euler_velocity_error_norm<T, TI>(final_state, ref);
+    const T w_norm = fp::norm3(final_state.omega);
     return p_norm < fp::SUCCESS_POSITION_THRESHOLD
         && v_norm < fp::SUCCESS_VELOCITY_THRESHOLD
         && w_norm < fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD;
+}
+
+template <typename T, typename TI>
+bool compute_training_success_flag(
+    const l2f_diff::EulerState<T, TI>& final_state
+){
+    const auto ref = l2f_diff::zero_tracking_reference<T>();
+    return compute_training_success_flag<T, TI>(final_state, ref);
 }
 
 // H128-prioritized curriculum schedule
@@ -866,6 +889,11 @@ int main(int argc, char** argv){
     if(!fp::parse_options(argc, argv, options)){
         return 1;
     }
+    if(options.gpu_rollout || options.gpu_validate_against_cpu || options.gpu_benchmark){
+        std::cerr << "WARNING: foundation_policy_diff_pre_training is the CPU baseline target. "
+                  << "Use foundation_policy_diff_pre_training_cuda for --gpu-rollout validation and benchmarks. "
+                  << "Continuing with the unchanged CPU rollout path.\n";
+    }
     if(options.horizon == 0 || options.horizon > MAX_HORIZON){
         std::cerr << "--horizon must be in [1, " << MAX_HORIZON << "] for this build.\n";
         return 1;
@@ -1013,6 +1041,39 @@ int main(int argc, char** argv){
         return 0;
     }
 
+    if(options.checkpoint_inspect){
+        const std::string inspect_path = !options.checkpoint_inspect_path.empty()
+            ? options.checkpoint_inspect_path
+            : options.load_path;
+        if(inspect_path.empty()){
+            std::cerr << "--checkpoint-inspect requires a path or --load-path\n";
+            return 1;
+        }
+        return fp::inspect_checkpoint_file(inspect_path) ? 0 : 1;
+    }
+
+    if(options.checkpoint_convert_old){
+        const std::string source_path = !options.checkpoint_convert_old_path.empty()
+            ? options.checkpoint_convert_old_path
+            : options.load_path;
+        const std::string target_path = !options.save_path.empty()
+            ? options.save_path
+            : source_path + ".v4";
+        if(source_path.empty()){
+            std::cerr << "--checkpoint-convert-old requires a source path or --load-path\n";
+            return 1;
+        }
+        if(!fp::load_actor_checkpoint(device, actor, source_path)){
+            return 1;
+        }
+        if(!fp::save_actor_optimizer_checkpoint(device, actor, actor_optimizer, target_path)){
+            return 1;
+        }
+        std::cout << "checkpoint_converted_from=" << source_path
+                  << " checkpoint_converted_to=" << target_path << "\n";
+        return 0;
+    }
+
     bool init_actor_loaded_flag = false;
     std::string actor_checkpoint_to_load;
     if(options.eval_only){
@@ -1026,10 +1087,17 @@ int main(int argc, char** argv){
         actor_checkpoint_to_load = options.load_path;
     }
     if(!actor_checkpoint_to_load.empty()){
-        if(!fp::load_actor_checkpoint(device, actor, actor_checkpoint_to_load)){
+        const bool loaded_ok = options.load_optimizer
+            ? fp::load_actor_optimizer_checkpoint(device, actor, actor_optimizer, actor_checkpoint_to_load, true)
+            : fp::load_actor_checkpoint(device, actor, actor_checkpoint_to_load);
+        if(!loaded_ok){
             return 1;
         }
         std::cout << "loaded_actor_checkpoint=" << actor_checkpoint_to_load << "\n";
+        if(options.load_optimizer){
+            std::cout << "loaded_optimizer_state=true optimizer_age="
+                      << rlt::get(device, actor_optimizer.age, 0) << "\n";
+        }
         if(init_actor_loaded_flag){
             std::cout << "init_actor_loaded=true init_actor_path=" << options.init_actor_path << "\n";
         }
@@ -1058,6 +1126,7 @@ int main(int argc, char** argv){
         fp::TERMINAL_ATTITUDE_WEIGHT,
         options.terminal_angular_velocity_weight
     };
+    const auto tracking_reference = l2f_diff::zero_tracking_reference<T>();
 
     auto run_evaluation = [&](){
         fp::rdac_copy(device, device, actor, rollout_actor);
@@ -1099,10 +1168,11 @@ int main(int argc, char** argv){
                     rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
                 }
                 if(options.eval_model == EvalModel::EULER){
-                    l2f_diff::observe<T, TI>(euler_state, observation_row);
+                    l2f_diff::observe_with_reference<T, TI>(euler_state, tracking_reference, observation_row);
                 }
                 else{
                     rlt::observe(device, env, parameters, state, typename ENVIRONMENT::Observation{}, observation_row, rng);
+                    l2f_diff::apply_reference_error_to_observation<T, TI>(observation_row, tracking_reference);
                 }
                 rlt::set_all(device, step_observations, (T)0);
                 for(TI observation_i = 0; observation_i < ENVIRONMENT::Observation::DIM; observation_i++){
@@ -1137,14 +1207,14 @@ int main(int argc, char** argv){
                     l2f_diff::EulerStepCache<T> cache;
                     l2f_diff::step<PARAMETERS, T, TI>(parameters, euler_state, action, next_state, cache);
                     euler_state = next_state;
-                    auto terms = fp::euler_state_loss_terms<T, TI>(euler_state, euler_weights);
+                    auto terms = fp::euler_state_loss_terms<T, TI>(euler_state, tracking_reference, euler_weights);
                     episode_terms.total += terms.total / (T)options.eval_horizon;
                 }
                 else{
                     STATE next_state;
                     rlt::step(device, env, parameters, state, action_row, next_state, rng);
                     state = next_state;
-                    auto terms = fp::l2f_state_loss_terms<STATE, T, TI>(state, l2f_approx_weights);
+                    auto terms = fp::l2f_state_loss_terms<STATE, T, TI>(state, tracking_reference, l2f_approx_weights);
                     episode_terms.total += terms.total / (T)options.eval_horizon;
                 }
             }
@@ -1153,13 +1223,13 @@ int main(int argc, char** argv){
             T final_v = 0;
             T final_w = 0;
             if(options.eval_model == EvalModel::EULER){
-                final_p = fp::norm3(euler_state.p);
-                final_v = fp::norm3(euler_state.v);
+                final_p = fp::euler_position_error_norm<T, TI>(euler_state, tracking_reference);
+                final_v = fp::euler_velocity_error_norm<T, TI>(euler_state, tracking_reference);
                 final_w = fp::norm3(euler_state.omega);
             }
             else{
-                final_p = fp::norm3(state.position);
-                final_v = fp::norm3(state.linear_velocity);
+                final_p = fp::l2f_position_error_norm<STATE, T, TI>(state, tracking_reference);
+                final_v = fp::l2f_velocity_error_norm<STATE, T, TI>(state, tracking_reference);
                 final_w = fp::norm3(state.angular_velocity);
             }
             invalid = invalid || !fp::finite_value(episode_terms.total) || !fp::finite_value(final_p) || !fp::finite_value(final_v) || !fp::finite_value(final_w);
@@ -1258,12 +1328,279 @@ int main(int argc, char** argv){
         return eval_metrics.invalid_or_nan_rate == (T)1 ? 1 : 0;
     };
 
+    auto run_failure_analysis = [&](){
+        fp::rdac_copy(device, device, actor, rollout_actor);
+        rlt::Mode<rlt::mode::Evaluation<>> evaluation_mode;
+        RuntimeOptions analysis_options = options;
+        if(options.force_dynamics_bins){
+            analysis_options.sample_dynamics = true;
+            analysis_options.balanced_dynamics_sampling = true;
+        }
+        eq_dyn::DynamicsBins<TI> forced_bins;
+        forced_bins.size_mass = options.force_size_mass_bin;
+        forced_bins.thrust_to_weight = options.force_thrust_to_weight_bin;
+        forced_bins.torque_to_inertia = options.force_torque_to_inertia_bin;
+        forced_bins.motor_delay = options.force_motor_delay_bin;
+        forced_bins.curve_shape = options.force_curve_shape_bin;
+        const eq_dyn::DynamicsBins<TI>* bins_ptr = options.force_dynamics_bins ? &forced_bins : nullptr;
+        const std::string output_path = !options.failure_analysis_path.empty()
+            ? options.failure_analysis_path
+            : (!options.log_path.empty() ? options.log_path : std::string("failure_analysis.csv"));
+        std::ofstream episode_log(output_path);
+        if(!episode_log.is_open()){
+            std::cerr << "Failed to open failure analysis path: " << output_path << "\n";
+            return 1;
+        }
+        episode_log << "episode,success,primary_failure,final_p_norm,final_v_norm,final_w_norm,final_attitude_error,"
+                    << "initial_p_norm,initial_v_norm,mid_p_norm,mid_v_norm,max_p_norm,max_v_norm,max_w_norm,max_attitude_error,"
+                    << "action_saturation_ratio,max_action_abs,attitude_turn_failure,speed_not_braked,position_overshoot,action_saturation_failure,horizon_still_improving,"
+                    << "size_mass_bin,thrust_to_weight_bin,torque_to_inertia_bin,motor_delay_bin,curve_shape_bin\n";
+
+        auto attitude_error_from_state = [](const STATE& state){
+            const T orientation_sign = fp::sign_for_shortest_quaternion(state.orientation);
+            T sum = 0;
+            for(TI dim_i = 0; dim_i < 3; dim_i++){
+                const T e = (T)2 * orientation_sign * state.orientation[dim_i + 1];
+                sum += e * e;
+            }
+            return std::sqrt(sum);
+        };
+        auto position_error_norm = [&](const STATE& state){
+            return fp::l2f_position_error_norm<STATE, T, TI>(state, tracking_reference);
+        };
+        auto velocity_error_norm = [&](const STATE& state){
+            return fp::l2f_velocity_error_norm<STATE, T, TI>(state, tracking_reference);
+        };
+
+        TI success_count = 0;
+        TI invalid_count = 0;
+        TI attitude_failure_count = 0;
+        TI speed_failure_count = 0;
+        TI overshoot_failure_count = 0;
+        TI saturation_failure_count = 0;
+        TI horizon_improving_count = 0;
+        TI primary_attitude = 0;
+        TI primary_speed = 0;
+        TI primary_overshoot = 0;
+        TI primary_saturation = 0;
+        TI primary_horizon = 0;
+        TI primary_other = 0;
+        T sum_final_p = 0;
+        T sum_final_v = 0;
+        T sum_final_w = 0;
+        T sum_final_attitude = 0;
+        T sum_saturation_ratio = 0;
+        T sum_max_action_abs = 0;
+
+        for(TI episode_i = 0; episode_i < options.eval_episodes; episode_i++){
+            PARAMETERS parameters;
+            if(analysis_options.sample_dynamics){
+                sample_training_parameters<DEVICE, ENVIRONMENT, PARAMETERS, RNG, T, TI>(device, env, parameters, rng, analysis_options, (T)1, bins_ptr);
+            }
+            else{
+                rlt::initial_parameters(device, env, parameters);
+            }
+            STATE state;
+            rlt::sample_initial_state(device, env, parameters, state, rng);
+            l2f_diff::EulerState<T, TI> euler_state;
+            l2f_diff::from_l2f_state<STATE, T, TI>(state, euler_state);
+            rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
+            T previous_action[ENVIRONMENT::ACTION_DIM] = {};
+            T previous_response_error[fp::RESPONSE_ERROR_DIM] = {};
+
+            const T initial_p_norm = position_error_norm(state);
+            const T initial_v_norm = velocity_error_norm(state);
+            T mid_p_norm = initial_p_norm;
+            T mid_v_norm = initial_v_norm;
+            T max_p_norm = initial_p_norm;
+            T max_v_norm = initial_v_norm;
+            T max_w_norm = fp::norm3(state.angular_velocity);
+            T max_attitude_error = attitude_error_from_state(state);
+            T max_action_abs = 0;
+            TI saturation_count = 0;
+            TI action_count = 0;
+            T initial_p[3];
+            for(TI dim_i = 0; dim_i < 3; dim_i++){
+                initial_p[dim_i] = state.position[dim_i] - tracking_reference.p[dim_i];
+            }
+
+            for(TI step_i = 0; step_i < options.eval_horizon; step_i++){
+                if(options.reset_hidden_each_step){
+                    rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
+                }
+                rlt::observe(device, env, parameters, state, typename ENVIRONMENT::Observation{}, observation_row, rng);
+                l2f_diff::apply_reference_error_to_observation<T, TI>(observation_row, tracking_reference);
+                rlt::set_all(device, step_observations, (T)0);
+                for(TI observation_i = 0; observation_i < ENVIRONMENT::Observation::DIM; observation_i++){
+                    rlt::set(device, step_observations, rlt::get(observation_row, 0, observation_i), 0, observation_i);
+                }
+                for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+                    rlt::set(device, step_observations, previous_action[action_i], 0, ENVIRONMENT::Observation::DIM + action_i);
+                }
+                for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                    rlt::set(device, step_observations, previous_response_error[error_i], 0, ENVIRONMENT::Observation::DIM + ENVIRONMENT::ACTION_DIM + error_i);
+                }
+                fp::rdac_evaluate_step(device, rollout_actor, step_observations, rollout_actor_state, step_actions, rollout_actor_buffer, rng, evaluation_mode);
+
+                T action[4];
+                for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+                    T derivative;
+                    bool clamped;
+                    action[action_i] = bounded_action<T>(
+                        rlt::get(device, step_actions, 0, action_i),
+                        options.action_bound_enabled,
+                        options.action_bound_value,
+                        derivative,
+                        clamped
+                    );
+                    max_action_abs = std::max(max_action_abs, std::abs(action[action_i]));
+                    if(std::abs(action[action_i]) > (T)0.98){
+                        saturation_count++;
+                    }
+                    action_count++;
+                    previous_action[action_i] = action[action_i];
+                    rlt::set(action_row, 0, action_i, action[action_i]);
+                }
+
+                STATE next_state;
+                rlt::step(device, env, parameters, state, action_row, next_state, rng);
+                l2f_diff::EulerState<T, TI> next_euler_state;
+                l2f_diff::EulerStepCache<T> euler_cache;
+                l2f_diff::step<PARAMETERS, T, TI>(parameters, euler_state, action, next_euler_state, euler_cache);
+                rlt::observe(device, env, parameters, next_state, typename ENVIRONMENT::Observation{}, observation_row, rng);
+                l2f_diff::apply_reference_error_to_observation<T, TI>(observation_row, tracking_reference);
+                l2f_diff::observe_with_reference<T, TI>(next_euler_state, tracking_reference, predicted_observation_row);
+                for(TI error_i = 0; error_i < fp::RESPONSE_ERROR_DIM; error_i++){
+                    previous_response_error[error_i] = rlt::get(observation_row, 0, error_i) - rlt::get(predicted_observation_row, 0, error_i);
+                }
+                state = next_state;
+                euler_state = next_euler_state;
+
+                const T p_norm = position_error_norm(state);
+                const T v_norm = velocity_error_norm(state);
+                const T w_norm = fp::norm3(state.angular_velocity);
+                const T attitude_error = attitude_error_from_state(state);
+                max_p_norm = std::max(max_p_norm, p_norm);
+                max_v_norm = std::max(max_v_norm, v_norm);
+                max_w_norm = std::max(max_w_norm, w_norm);
+                max_attitude_error = std::max(max_attitude_error, attitude_error);
+                if(step_i + 1 == options.eval_horizon / 2){
+                    mid_p_norm = p_norm;
+                    mid_v_norm = v_norm;
+                }
+            }
+
+            const T final_p_norm = position_error_norm(state);
+            const T final_v_norm = velocity_error_norm(state);
+            const T final_w_norm = fp::norm3(state.angular_velocity);
+            const T final_attitude_error = attitude_error_from_state(state);
+            const T saturation_ratio = action_count > 0 ? (T)saturation_count / (T)action_count : (T)0;
+            T final_p[3];
+            T initial_final_dot = 0;
+            for(TI dim_i = 0; dim_i < 3; dim_i++){
+                final_p[dim_i] = state.position[dim_i] - tracking_reference.p[dim_i];
+                initial_final_dot += initial_p[dim_i] * final_p[dim_i];
+            }
+            const bool finite = fp::finite_value(final_p_norm) && fp::finite_value(final_v_norm) && fp::finite_value(final_w_norm) && fp::finite_value(final_attitude_error);
+            const bool success = finite &&
+                final_p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
+                final_v_norm < fp::SUCCESS_VELOCITY_THRESHOLD &&
+                final_w_norm < fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD;
+            const bool attitude_turn_failure = !success && (final_attitude_error > (T)0.75 || final_w_norm >= fp::SUCCESS_ANGULAR_VELOCITY_THRESHOLD);
+            const bool speed_not_braked = !success && final_v_norm >= fp::SUCCESS_VELOCITY_THRESHOLD;
+            const bool position_overshoot = !success && ((initial_final_dot < (T)0 && final_p_norm >= fp::SUCCESS_POSITION_THRESHOLD) || max_p_norm > std::max((T)1, initial_p_norm) * (T)1.25);
+            const bool action_saturation_failure = !success && saturation_ratio > (T)0.05;
+            const bool horizon_still_improving = !success && final_p_norm < mid_p_norm && final_v_norm < mid_v_norm;
+            const char* primary_failure = "success";
+            if(!success){
+                if(action_saturation_failure){ primary_failure = "action_saturation"; primary_saturation++; }
+                else if(attitude_turn_failure){ primary_failure = "attitude_turn"; primary_attitude++; }
+                else if(speed_not_braked){ primary_failure = "speed_not_braked"; primary_speed++; }
+                else if(position_overshoot){ primary_failure = "position_overshoot"; primary_overshoot++; }
+                else if(horizon_still_improving){ primary_failure = "horizon_still_improving"; primary_horizon++; }
+                else{ primary_failure = "other"; primary_other++; }
+            }
+            success_count += success ? 1 : 0;
+            invalid_count += finite ? 0 : 1;
+            attitude_failure_count += attitude_turn_failure ? 1 : 0;
+            speed_failure_count += speed_not_braked ? 1 : 0;
+            overshoot_failure_count += position_overshoot ? 1 : 0;
+            saturation_failure_count += action_saturation_failure ? 1 : 0;
+            horizon_improving_count += horizon_still_improving ? 1 : 0;
+            sum_final_p += final_p_norm;
+            sum_final_v += final_v_norm;
+            sum_final_w += final_w_norm;
+            sum_final_attitude += final_attitude_error;
+            sum_saturation_ratio += saturation_ratio;
+            sum_max_action_abs += max_action_abs;
+            episode_log << episode_i << "," << (success ? "true" : "false") << "," << primary_failure << ","
+                        << final_p_norm << "," << final_v_norm << "," << final_w_norm << "," << final_attitude_error << ","
+                        << initial_p_norm << "," << initial_v_norm << "," << mid_p_norm << "," << mid_v_norm << ","
+                        << max_p_norm << "," << max_v_norm << "," << max_w_norm << "," << max_attitude_error << ","
+                        << saturation_ratio << "," << max_action_abs << ","
+                        << (attitude_turn_failure ? "true" : "false") << ","
+                        << (speed_not_braked ? "true" : "false") << ","
+                        << (position_overshoot ? "true" : "false") << ","
+                        << (action_saturation_failure ? "true" : "false") << ","
+                        << (horizon_still_improving ? "true" : "false") << ","
+                        << (options.force_dynamics_bins ? options.force_size_mass_bin : (TI)-1) << ","
+                        << (options.force_dynamics_bins ? options.force_thrust_to_weight_bin : (TI)-1) << ","
+                        << (options.force_dynamics_bins ? options.force_torque_to_inertia_bin : (TI)-1) << ","
+                        << (options.force_dynamics_bins ? options.force_motor_delay_bin : (TI)-1) << ","
+                        << (options.force_dynamics_bins ? options.force_curve_shape_bin : (TI)-1) << "\n";
+        }
+        const T normalizer = options.eval_episodes > 0 ? (T)1 / (T)options.eval_episodes : (T)1;
+        std::cout << "failure_analysis"
+                  << " episodes=" << options.eval_episodes
+                  << " eval_horizon=" << options.eval_horizon
+                  << " output_path=" << output_path
+                  << " force_dynamics_bins=" << (options.force_dynamics_bins ? "true" : "false")
+                  << " size_mass_bin=" << (options.force_dynamics_bins ? options.force_size_mass_bin : (TI)-1)
+                  << " thrust_to_weight_bin=" << (options.force_dynamics_bins ? options.force_thrust_to_weight_bin : (TI)-1)
+                  << " torque_to_inertia_bin=" << (options.force_dynamics_bins ? options.force_torque_to_inertia_bin : (TI)-1)
+                  << " motor_delay_bin=" << (options.force_dynamics_bins ? options.force_motor_delay_bin : (TI)-1)
+                  << " curve_shape_bin=" << (options.force_dynamics_bins ? options.force_curve_shape_bin : (TI)-1)
+                  << " success_rate=" << (T)success_count * normalizer
+                  << " invalid_rate=" << (T)invalid_count * normalizer
+                  << " mean_final_p=" << sum_final_p * normalizer
+                  << " mean_final_v=" << sum_final_v * normalizer
+                  << " mean_final_w=" << sum_final_w * normalizer
+                  << " mean_final_attitude=" << sum_final_attitude * normalizer
+                  << " mean_action_saturation_ratio=" << sum_saturation_ratio * normalizer
+                  << " mean_max_action_abs=" << sum_max_action_abs * normalizer
+                  << " attitude_turn_failure_rate=" << (T)attitude_failure_count * normalizer
+                  << " speed_not_braked_rate=" << (T)speed_failure_count * normalizer
+                  << " position_overshoot_rate=" << (T)overshoot_failure_count * normalizer
+                  << " action_saturation_failure_rate=" << (T)saturation_failure_count * normalizer
+                  << " horizon_still_improving_rate=" << (T)horizon_improving_count * normalizer
+                  << " primary_action_saturation=" << primary_saturation
+                  << " primary_attitude=" << primary_attitude
+                  << " primary_speed=" << primary_speed
+                  << " primary_overshoot=" << primary_overshoot
+                  << " primary_horizon=" << primary_horizon
+                  << " primary_other=" << primary_other
+                  << "\n";
+        return invalid_count == options.eval_episodes ? 1 : 0;
+    };
+
+    if(options.stage9_6_objective_parity || options.stage9_6_sampler_parity || options.stage9_6_eval_parity || options.stage9_6_checkpoint_parity){
+        std::cerr << "Stage 9.6 parity orchestration is blocked: production sampler replay, "
+                  << "unified CPU/CUDA checkpoint cross-load, objective replay parity, and eval parity "
+                  << "are not fully implemented yet.\n";
+        return 1;
+    }
+
+    if(options.failure_analysis){
+        return run_failure_analysis();
+    }
+
     if(options.eval_only){
         return run_evaluation();
     }
 
     std::ofstream log_file;
     std::ofstream batch_bin_counts_file;
+    std::ofstream objective_trace_file;
     if(!options.log_path.empty()){
         log_file.open(options.log_path);
         fp::write_training_csv_header(log_file);
@@ -1277,6 +1614,18 @@ int main(int argc, char** argv){
             for(TI bin_i = 0; bin_i < fp::DYNAMICS_BALANCE_BINS; bin_i++) batch_bin_counts_file << ",curve_shape_bin_" << bin_i;
             batch_bin_counts_file << "\n";
         }
+    }
+    if(options.production_objective_trace){
+        const std::string trace_path = !options.objective_trace_path.empty()
+            ? options.objective_trace_path
+            : (!options.log_path.empty() ? sibling_output_path(options.log_path, "objective_trace_cpu.csv") : std::string("objective_trace_cpu.csv"));
+        objective_trace_file.open(trace_path);
+        if(!objective_trace_file.is_open()){
+            std::cerr << "Failed to open production objective trace: " << trace_path << "\n";
+            return 1;
+        }
+        write_production_objective_trace_header(objective_trace_file);
+        std::cout << "production_objective_trace_path=" << trace_path << "\n";
     }
 
     std::cout << "foundation_policy_diff_pre_training\n";
@@ -1471,6 +1820,7 @@ int main(int argc, char** argv){
         TI rejected_dynamics_count = 0;
         TI valid_rollout_count = 0;
         TI invalid_rollout_count = 0;
+        T action_gradient_norm_sq_before_scale = 0;
         T action_gradient_norm_sq_before_clip = 0;
         T action_gradient_norm_sq_after_clip = 0;
         bool action_gradient_clipped = false;
@@ -1552,8 +1902,8 @@ int main(int argc, char** argv){
                 apply_state_curriculum<STATE, T>(states[batch_i][0], state_difficulty);
             }
             l2f_diff::from_l2f_state<STATE, T, TI>(states[batch_i][0], euler_states[batch_i][0]);
-            mean_rollout_metrics.initial_position_norm += fp::norm3(states[batch_i][0].position);
-            mean_rollout_metrics.initial_velocity_norm += fp::norm3(states[batch_i][0].linear_velocity);
+            mean_rollout_metrics.initial_position_norm += fp::l2f_position_error_norm<STATE, T, TI>(states[batch_i][0], tracking_reference);
+            mean_rollout_metrics.initial_velocity_norm += fp::l2f_velocity_error_norm<STATE, T, TI>(states[batch_i][0], tracking_reference);
             mean_rollout_metrics.initial_angular_velocity_norm += fp::norm3(states[batch_i][0].angular_velocity);
         }
         TI num_dynamics_groups = 0;
@@ -1658,6 +2008,7 @@ int main(int argc, char** argv){
             rlt::set_all(device, step_observations, (T)0);
             for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
                 rlt::observe(device, env, parameters[batch_i], states[batch_i][horizon_i], typename ENVIRONMENT::Observation{}, observation_row, rng);
+                l2f_diff::apply_reference_error_to_observation<T, TI>(observation_row, tracking_reference);
                 for(TI observation_i = 0; observation_i < ENVIRONMENT::Observation::DIM; observation_i++){
                     const T value = rlt::get(observation_row, 0, observation_i);
                     rlt::set(device, step_observations, value, batch_i, observation_i);
@@ -1728,7 +2079,8 @@ int main(int argc, char** argv){
                     l2f_diff::step<PARAMETERS, T, TI>(parameters[batch_i], euler_states[batch_i][horizon_i], actions[batch_i][horizon_i], euler_states[batch_i][horizon_i + 1], cache);
                     rlt::step(device, env, parameters[batch_i], states[batch_i][horizon_i], action_row, states[batch_i][horizon_i + 1], rng);
                     rlt::observe(device, env, parameters[batch_i], states[batch_i][horizon_i + 1], typename ENVIRONMENT::Observation{}, observation_row, rng);
-                    l2f_diff::observe<T, TI>(euler_states[batch_i][horizon_i + 1], predicted_observation_row);
+                    l2f_diff::apply_reference_error_to_observation<T, TI>(observation_row, tracking_reference);
+                    l2f_diff::observe_with_reference<T, TI>(euler_states[batch_i][horizon_i + 1], tracking_reference, predicted_observation_row);
                     const T transition_weight = fp::LOSS_TRANSITION_CONSISTENCY_WEIGHT
                         * sample_group_weights[batch_i]
                         / std::max((T)1, (T)current_horizon);
@@ -1738,7 +2090,7 @@ int main(int argc, char** argv){
                         transition_consistency_loss += transition_weight * response_error * response_error;
                     }
                     if(horizon_i == 0){
-                        const bool done = compute_training_success_flag<T, TI>(euler_states[batch_i][horizon_i + 1]);
+                        const bool done = compute_training_success_flag<T, TI>(euler_states[batch_i][horizon_i + 1], tracking_reference);
                         single_step_state_finite = single_step_state_finite &&
                             fp::finite_value(l2f_diff::state_norm<T, TI>(euler_states[batch_i][horizon_i + 1])) &&
                             fp::finite_value(fp::norm3(states[batch_i][horizon_i + 1].position)) &&
@@ -1767,8 +2119,8 @@ int main(int argc, char** argv){
                 else{
                     rlt::step(device, env, parameters[batch_i], states[batch_i][horizon_i], action_row, states[batch_i][horizon_i + 1], rng);
                     if(horizon_i == 0){
-                        const T p_norm = fp::norm3(states[batch_i][horizon_i + 1].position);
-                        const T v_norm = fp::norm3(states[batch_i][horizon_i + 1].linear_velocity);
+                        const T p_norm = fp::l2f_position_error_norm<STATE, T, TI>(states[batch_i][horizon_i + 1], tracking_reference);
+                        const T v_norm = fp::l2f_velocity_error_norm<STATE, T, TI>(states[batch_i][horizon_i + 1], tracking_reference);
                         const T w_norm = fp::norm3(states[batch_i][horizon_i + 1].angular_velocity);
                         const bool done = p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
                             v_norm < fp::SUCCESS_VELOCITY_THRESHOLD &&
@@ -1784,6 +2136,8 @@ int main(int argc, char** argv){
         }
 
         fp::ScalarTerms<T> mean_terms;
+        T diff_rollout_loss_raw = 0;
+        T diff_rollout_loss_scaled = 0;
         TI training_success_count = 0;
         for(TI batch_i = 0; batch_i < options.batch_size; batch_i++){
             const T sample_weight = sample_group_weights[batch_i];
@@ -1800,10 +2154,13 @@ int main(int argc, char** argv){
                     actions[batch_i],
                     current_horizon,
                     step_euler_weights,
+                    tracking_reference,
                     euler_gradient_states,
                     euler_caches,
                     action_gradients
                 );
+                diff_rollout_loss_raw += sample_weight * terms.total();
+                diff_rollout_loss_scaled += diff_sample_weight * terms.total();
                 mean_terms.total += diff_sample_weight * terms.total();
                 mean_terms.position += diff_sample_weight * terms.position;
                 mean_terms.velocity += diff_sample_weight * terms.velocity;
@@ -1819,10 +2176,10 @@ int main(int argc, char** argv){
                 mean_terms.terminal_angular_velocity += diff_sample_weight * terms.terminal_angular_velocity;
                 sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
                 mean_rollout_metrics.final_state_norm += l2f_diff::state_norm<T, TI>(euler_gradient_states[current_horizon]);
-                mean_rollout_metrics.final_position_norm += fp::norm3(euler_gradient_states[current_horizon].p);
-                mean_rollout_metrics.final_velocity_norm += fp::norm3(euler_gradient_states[current_horizon].v);
+                mean_rollout_metrics.final_position_norm += fp::euler_position_error_norm<T, TI>(euler_gradient_states[current_horizon], tracking_reference);
+                mean_rollout_metrics.final_velocity_norm += fp::euler_velocity_error_norm<T, TI>(euler_gradient_states[current_horizon], tracking_reference);
                 mean_rollout_metrics.final_angular_velocity_norm += fp::norm3(euler_gradient_states[current_horizon].omega);
-                sample_success_for_bin = compute_training_success_flag<T, TI>(euler_gradient_states[current_horizon]);
+                sample_success_for_bin = compute_training_success_flag<T, TI>(euler_gradient_states[current_horizon], tracking_reference);
                 if(sample_success_for_bin){
                     training_success_count++;
                 }
@@ -1834,8 +2191,11 @@ int main(int argc, char** argv){
                     states[batch_i],
                     actions[batch_i],
                     action_gradients,
-                    l2f_approx_weights
+                    l2f_approx_weights,
+                    tracking_reference
                 );
+                diff_rollout_loss_raw += sample_weight * terms.total();
+                diff_rollout_loss_scaled += diff_sample_weight * terms.total();
                 mean_terms.total += diff_sample_weight * terms.total();
                 mean_terms.position += diff_sample_weight * terms.position;
                 mean_terms.velocity += diff_sample_weight * terms.velocity;
@@ -1844,11 +2204,11 @@ int main(int argc, char** argv){
                 mean_terms.action_magnitude += diff_sample_weight * terms.action_magnitude;
                 mean_terms.action_smoothness += diff_sample_weight * terms.action_smoothness;
                 mean_terms.saturation += diff_sample_weight * terms.saturation;
-                mean_rollout_metrics.final_position_norm += fp::norm3(states[batch_i][current_horizon].position);
-                mean_rollout_metrics.final_velocity_norm += fp::norm3(states[batch_i][current_horizon].linear_velocity);
+                mean_rollout_metrics.final_position_norm += fp::l2f_position_error_norm<STATE, T, TI>(states[batch_i][current_horizon], tracking_reference);
+                mean_rollout_metrics.final_velocity_norm += fp::l2f_velocity_error_norm<STATE, T, TI>(states[batch_i][current_horizon], tracking_reference);
                 mean_rollout_metrics.final_angular_velocity_norm += fp::norm3(states[batch_i][current_horizon].angular_velocity);
-                const T p_norm = fp::norm3(states[batch_i][current_horizon].position);
-                const T v_norm = fp::norm3(states[batch_i][current_horizon].linear_velocity);
+                const T p_norm = fp::l2f_position_error_norm<STATE, T, TI>(states[batch_i][current_horizon], tracking_reference);
+                const T v_norm = fp::l2f_velocity_error_norm<STATE, T, TI>(states[batch_i][current_horizon], tracking_reference);
                 const T w_norm = fp::norm3(states[batch_i][current_horizon].angular_velocity);
                 sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
                 sample_success_for_bin = p_norm < fp::SUCCESS_POSITION_THRESHOLD &&
@@ -1874,8 +2234,10 @@ int main(int argc, char** argv){
             }
             for(TI horizon_i = 0; horizon_i < current_horizon; horizon_i++){
                 for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
-                    const T gradient = action_gradients[horizon_i][action_i] * action_derivatives[batch_i][horizon_i][action_i] * diff_sample_weight;
+                    const T raw_gradient = action_gradients[horizon_i][action_i] * action_derivatives[batch_i][horizon_i][action_i];
+                    const T gradient = raw_gradient * diff_sample_weight;
                     output_gradients[batch_i][horizon_i][action_i] = gradient;
+                    action_gradient_norm_sq_before_scale += raw_gradient * raw_gradient;
                     action_gradient_norm_sq_before_clip += gradient * gradient;
                 }
             }
@@ -1887,8 +2249,10 @@ int main(int argc, char** argv){
                 if(options.diff_model == DiffModel::EULER){
                     const auto& state = euler_states[batch_i][horizon_i + 1];
                     for(TI dim_i = 0; dim_i < 3; dim_i++){
-                        cost += fp::LOSS_POSITION_WEIGHT * state.p[dim_i] * state.p[dim_i];
-                        cost += options.loss_velocity_weight * state.v[dim_i] * state.v[dim_i];
+                        const T e_p = state.p[dim_i] - tracking_reference.p[dim_i];
+                        const T e_v = state.v[dim_i] - tracking_reference.v[dim_i];
+                        cost += fp::LOSS_POSITION_WEIGHT * e_p * e_p;
+                        cost += options.loss_velocity_weight * e_v * e_v;
                         cost += options.loss_angular_velocity_weight * state.omega[dim_i] * state.omega[dim_i];
                     }
                     for(TI row_i = 0; row_i < 3; row_i++){
@@ -1903,9 +2267,11 @@ int main(int argc, char** argv){
                     const auto& state = states[batch_i][horizon_i + 1];
                     const T orientation_sign = fp::sign_for_shortest_quaternion(state.orientation);
                     for(TI dim_i = 0; dim_i < 3; dim_i++){
+                        const T e_p = state.position[dim_i] - tracking_reference.p[dim_i];
+                        const T e_v = state.linear_velocity[dim_i] - tracking_reference.v[dim_i];
                         const T e_R = (T)2 * orientation_sign * state.orientation[dim_i + 1];
-                        cost += fp::LOSS_POSITION_WEIGHT * state.position[dim_i] * state.position[dim_i];
-                        cost += options.loss_velocity_weight * state.linear_velocity[dim_i] * state.linear_velocity[dim_i];
+                        cost += fp::LOSS_POSITION_WEIGHT * e_p * e_p;
+                        cost += options.loss_velocity_weight * e_v * e_v;
                         cost += fp::LOSS_ATTITUDE_WEIGHT * e_R * e_R;
                         cost += options.loss_angular_velocity_weight * state.angular_velocity[dim_i] * state.angular_velocity[dim_i];
                     }
@@ -2210,6 +2576,65 @@ int main(int argc, char** argv){
                     sg_num_stage_advances++;
                 }
             }
+        }
+
+        if(objective_trace_file.is_open()){
+            const T action_grad_norm_before_scale = std::sqrt(action_gradient_norm_sq_before_scale);
+            const T critic_loss = rdac_ac_terms.actor_critic_critic;
+            const T actor_critic_loss = rdac_ac_terms.actor_critic_actor + rdac_ac_terms.actor_critic_critic;
+            const T value_loss = critic_loss;
+            const T entropy_loss = (T)0;
+            const T teacher_loss = (T)0;
+            const T other_loss_terms = (T)0;
+            const T actor_update_norm = diagnostic_nan;
+            const T adam_m_norm = diagnostic_nan;
+            const T adam_v_norm = diagnostic_nan;
+            objective_trace_file << training_step << ","
+                                 << options.seed << ","
+                                 << options.batch_size << ","
+                                 << current_horizon << ","
+                                 << (options.sample_dynamics ? "sampled" : "fixed") << ","
+                                 << (options.sample_dynamics ? "sampled" : "fixed") << ","
+                                 << fp::sampled_dynamics_level_name(options.sample_dynamics ? effective_sampled_dynamics_level<T>(options, dynamics_difficulty) : fp::SampledDynamicsLevel::FIXED) << ","
+                                 << (options.balanced_dynamics_sampling ? "true" : "false") << ","
+                                 << mean_terms.total << ","
+                                 << diff_rollout_loss_raw << ","
+                                 << diff_rollout_weight << ","
+                                 << diff_rollout_loss_scaled << ","
+                                 << mean_terms.position << ","
+                                 << mean_terms.velocity << ","
+                                 << mean_terms.attitude << ","
+                                 << mean_terms.angular_velocity << ","
+                                 << mean_terms.terminal << ","
+                                 << mean_terms.terminal_position << ","
+                                 << mean_terms.terminal_velocity << ","
+                                 << mean_terms.terminal_attitude << ","
+                                 << mean_terms.terminal_angular_velocity << ","
+                                 << mean_terms.action_magnitude << ","
+                                 << mean_terms.action_smoothness << ","
+                                 << mean_terms.saturation << ","
+                                 << critic_loss << ","
+                                 << actor_critic_loss << ","
+                                 << transition_consistency_loss << ","
+                                 << value_loss << ","
+                                 << entropy_loss << ","
+                                 << teacher_loss << ","
+                                 << other_loss_terms << ","
+                                 << action_grad_norm_before_scale << ","
+                                 << action_grad_norm_before_clip << ","
+                                 << action_grad_norm_after_clip << ","
+                                 << actor_grad_clip.raw_norm << ","
+                                 << actor_grad_clip.scaled_norm << ","
+                                 << (actor_step_skipped ? "true" : "false") << ","
+                                 << actor_update_norm << ","
+                                 << num_applied_steps << ","
+                                 << adam_m_norm << ","
+                                 << adam_v_norm << ","
+                                 << training_success_rate << ","
+                                 << mean_rollout_metrics.final_position_norm << ","
+                                 << mean_rollout_metrics.final_velocity_norm << ","
+                                 << mean_rollout_metrics.final_angular_velocity_norm << ","
+                                 << action_saturation_ratio << "\n";
         }
 
         std::cout << "training_step=" << training_step
@@ -2589,10 +3014,17 @@ int main(int argc, char** argv){
             std::cerr << "Not saving actor checkpoint because training encountered NaN/Inf.\n";
             return 1;
         }
-        if(!fp::save_actor_checkpoint(device, actor, options.save_path)){
+        const bool saved_ok = options.save_optimizer
+            ? fp::save_actor_optimizer_checkpoint(device, actor, actor_optimizer, options.save_path)
+            : fp::save_actor_checkpoint(device, actor, options.save_path);
+        if(!saved_ok){
             return 1;
         }
         std::cout << "saved_actor_checkpoint=" << options.save_path << "\n";
+        if(options.save_optimizer){
+            std::cout << "saved_optimizer_state=true optimizer_age="
+                      << rlt::get(device, actor_optimizer.age, 0) << "\n";
+        }
     }
 
     rlt::free(device, observation_row);

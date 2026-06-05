@@ -92,6 +92,34 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         std::string log_path;
         std::string sampler_dump_path;
         TI sampler_dump_samples = 0;
+        bool failure_analysis = false;
+        std::string failure_analysis_path;
+        bool force_dynamics_bins = false;
+        TI force_size_mass_bin = 0;
+        TI force_thrust_to_weight_bin = 0;
+        TI force_torque_to_inertia_bin = 0;
+        TI force_motor_delay_bin = 0;
+        TI force_curve_shape_bin = 0;
+        bool gpu_rollout = false;
+        TI gpu_device = 0;
+        TI gpu_batch_size = 0;
+        bool gpu_validate_against_cpu = false;
+        bool gpu_benchmark = false;
+        TI gpu_benchmark_iterations = 20;
+        bool production_objective_trace = false;
+        std::string objective_trace_path;
+        bool stage9_6_objective_parity = false;
+        bool stage9_6_sampler_parity = false;
+        bool stage9_6_eval_parity = false;
+        bool stage9_6_checkpoint_parity = false;
+        TI stage9_6_steps = 1000;
+        std::string stage9_6_replay_path;
+        bool save_optimizer = false;
+        bool load_optimizer = false;
+        bool checkpoint_inspect = false;
+        std::string checkpoint_inspect_path;
+        bool checkpoint_convert_old = false;
+        std::string checkpoint_convert_old_path;
     };
 
     inline std::string diff_model_name(DiffModel model){
@@ -152,7 +180,13 @@ namespace rl_tools::foundation_policy::diff_pre_training{
                   << "    [--curriculum-min-stage-steps N] [--curriculum-max-stage-steps N]\n"
                   << "    [--curriculum-loss-spike-ratio VALUE]\n"
                   << "    [--eval-only] [--eval-model euler|l2f] [--eval-episodes N] [--eval-horizon H]\n"
+                  << "    [--failure-analysis] [--failure-analysis-path PATH] [--force-dynamics-bins S T Q D C]\n"
+                  << "    [--gpu-rollout] [--gpu-device N] [--gpu-batch-size N]\n"
+                  << "    [--gpu-validate-against-cpu] [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
                   << "    [--save-path PATH] [--load-path PATH] [--init-actor-path PATH] [--log-path PATH]\n"
+                  << "    [--production-objective-trace] [--objective-trace-path PATH]\n"
+                  << "    [--stage9-6-objective-parity] [--stage9-6-sampler-parity] [--stage9-6-eval-parity]\n"
+                  << "    [--stage9-6-steps N] [--stage9-6-replay-path PATH]\n"
                   << "    [--sampler-dump-path PATH] [--sampler-dump-samples N]\n"
                   << "  Physics checks are available via the separate target foundation_policy_diff_physics_check.\n";
     }
@@ -329,6 +363,41 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             else if(arg == "--eval-only"){
                 options.eval_only = true;
             }
+            else if(arg == "--failure-analysis"){
+                options.failure_analysis = true;
+            }
+            else if(arg == "--failure-analysis-path" && arg_i + 1 < argc){
+                options.failure_analysis_path = argv[++arg_i];
+            }
+            else if(arg == "--force-dynamics-bins" && arg_i + 5 < argc){
+                options.force_dynamics_bins = true;
+                options.force_size_mass_bin = std::stoll(argv[++arg_i]);
+                options.force_thrust_to_weight_bin = std::stoll(argv[++arg_i]);
+                options.force_torque_to_inertia_bin = std::stoll(argv[++arg_i]);
+                options.force_motor_delay_bin = std::stoll(argv[++arg_i]);
+                options.force_curve_shape_bin = std::stoll(argv[++arg_i]);
+            }
+            else if(arg == "--gpu-rollout"){
+                options.gpu_rollout = true;
+            }
+            else if(arg == "--gpu-device" && arg_i + 1 < argc){
+                options.gpu_device = std::stoll(argv[++arg_i]);
+            }
+            else if(arg == "--gpu-batch-size" && arg_i + 1 < argc){
+                options.gpu_batch_size = std::stoll(argv[++arg_i]);
+                options.gpu_rollout = true;
+            }
+            else if(arg == "--gpu-validate-against-cpu"){
+                options.gpu_validate_against_cpu = true;
+                options.gpu_rollout = true;
+            }
+            else if(arg == "--gpu-benchmark"){
+                options.gpu_benchmark = true;
+                options.gpu_rollout = true;
+            }
+            else if(arg == "--gpu-benchmark-iterations" && arg_i + 1 < argc){
+                options.gpu_benchmark_iterations = std::stoll(argv[++arg_i]);
+            }
             else if(arg == "--log-path" && arg_i + 1 < argc){
                 options.log_path = argv[++arg_i];
             }
@@ -337,6 +406,50 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             }
             else if(arg == "--sampler-dump-samples" && arg_i + 1 < argc){
                 options.sampler_dump_samples = std::stoll(argv[++arg_i]);
+            }
+            else if(arg == "--production-objective-trace"){
+                options.production_objective_trace = true;
+            }
+            else if(arg == "--objective-trace-path" && arg_i + 1 < argc){
+                options.objective_trace_path = argv[++arg_i];
+                options.production_objective_trace = true;
+            }
+            else if(arg == "--stage9-6-objective-parity"){
+                options.stage9_6_objective_parity = true;
+                options.production_objective_trace = true;
+            }
+            else if(arg == "--stage9-6-sampler-parity"){
+                options.stage9_6_sampler_parity = true;
+            }
+            else if(arg == "--stage9-6-eval-parity"){
+                options.stage9_6_eval_parity = true;
+            }
+            else if(arg == "--stage9-6-checkpoint-parity"){
+                options.stage9_6_checkpoint_parity = true;
+            }
+            else if(arg == "--stage9-6-steps" && arg_i + 1 < argc){
+                options.stage9_6_steps = std::stoll(argv[++arg_i]);
+            }
+            else if(arg == "--stage9-6-replay-path" && arg_i + 1 < argc){
+                options.stage9_6_replay_path = argv[++arg_i];
+            }
+            else if(arg == "--save-optimizer"){
+                options.save_optimizer = true;
+            }
+            else if(arg == "--load-optimizer"){
+                options.load_optimizer = true;
+            }
+            else if(arg == "--checkpoint-inspect"){
+                options.checkpoint_inspect = true;
+                if(arg_i + 1 < argc && argv[arg_i + 1][0] != '-'){
+                    options.checkpoint_inspect_path = argv[++arg_i];
+                }
+            }
+            else if(arg == "--checkpoint-convert-old"){
+                options.checkpoint_convert_old = true;
+                if(arg_i + 1 < argc && argv[arg_i + 1][0] != '-'){
+                    options.checkpoint_convert_old_path = argv[++arg_i];
+                }
             }
             else if(arg == "--decoupled-curriculum"){
                 options.decoupled_curriculum = true;
