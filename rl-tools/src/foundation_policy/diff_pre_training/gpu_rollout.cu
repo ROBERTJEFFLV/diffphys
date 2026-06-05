@@ -372,6 +372,69 @@ __global__ void observation_kernel(DeviceArrays d, std::size_t batch_size, std::
     }
 }
 
+__host__ __device__ inline float deterministic_unit_noise(std::uint32_t seed){
+    seed ^= seed >> 16;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15;
+    seed *= 0x846ca68bu;
+    seed ^= seed >> 16;
+    return static_cast<float>(seed & 0x00ffffffu) / static_cast<float>(0x01000000u);
+}
+
+__host__ __device__ inline float deterministic_symmetric_noise(std::size_t step_i, std::size_t b, int dim){
+    const std::uint32_t seed =
+        static_cast<std::uint32_t>((step_i + 1u) * 73856093u) ^
+        static_cast<std::uint32_t>((b + 1u) * 19349663u) ^
+        static_cast<std::uint32_t>((dim + 1) * 83492791u);
+    return 2.0f * deterministic_unit_noise(seed) - 1.0f;
+}
+
+__global__ void observation_kernel_with_options(
+    DeviceArrays d,
+    std::size_t batch_size,
+    std::size_t step_i,
+    float velocity_observation_noise,
+    std::size_t velocity_observation_delay_steps
+){
+    const std::size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if(b >= batch_size){
+        return;
+    }
+    const std::size_t velocity_step = step_i > velocity_observation_delay_steps
+        ? step_i - velocity_observation_delay_steps
+        : 0u;
+    std::size_t out = 0;
+    for(int dim = 0; dim < 3; dim++){
+        d.observations[idx_obs(step_i, b, out++, batch_size)] =
+            d.p[idx3(step_i, b, dim, batch_size)] - d.reference_p_traj[idx3(step_i, b, dim, batch_size)];
+    }
+    for(int r = 0; r < 3; r++){
+        for(int c = 0; c < 3; c++){
+            d.observations[idx_obs(step_i, b, out++, batch_size)] =
+                d.R[idx9(step_i, b, r * 3 + c, batch_size)];
+        }
+    }
+    for(int dim = 0; dim < 3; dim++){
+        const float noise = velocity_observation_noise > 0.0f
+            ? velocity_observation_noise * deterministic_symmetric_noise(step_i, b, dim)
+            : 0.0f;
+        d.observations[idx_obs(step_i, b, out++, batch_size)] =
+            d.v[idx3(velocity_step, b, dim, batch_size)] -
+            d.reference_v_traj[idx3(step_i, b, dim, batch_size)] +
+            noise;
+    }
+    for(int dim = 0; dim < 3; dim++){
+        d.observations[idx_obs(step_i, b, out++, batch_size)] =
+            d.omega[idx3(step_i, b, dim, batch_size)];
+    }
+    for(int a = 0; a < 4; a++){
+        const float previous_action = step_i == 0
+            ? d.initial_previous_action[pidx4(b, a)]
+            : d.actions[idx4(step_i - 1, b, a, batch_size)];
+        d.observations[idx_obs(step_i, b, out++, batch_size)] = previous_action;
+    }
+}
+
 __global__ void forward_step_kernel(DeviceArrays d, std::size_t batch_size, std::size_t step_i){
     const std::size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if(b >= batch_size){
@@ -711,7 +774,7 @@ __global__ void rollout_diagnostics_kernel(
     }
 }
 
-__global__ void backward_step_kernel(DeviceArrays d, std::size_t batch_size, std::size_t step_i){
+__global__ void backward_step_kernel(DeviceArrays d, std::size_t batch_size, std::size_t step_i, float temporal_decay_factor){
     const std::size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if(b >= batch_size){
         return;
@@ -727,10 +790,10 @@ __global__ void backward_step_kernel(DeviceArrays d, std::size_t batch_size, std
     float lambda_v_next[3];
     float lambda_omega_next[3];
     for(int i = 0; i < 3; i++){
-        const float lp_next = d.lambda_p[idx3(step_i + 1, b, i, batch_size)];
+        const float lp_next = temporal_decay_factor * d.lambda_p[idx3(step_i + 1, b, i, batch_size)];
         lambda_state_p[i] += lp_next;
-        lambda_v_next[i] = d.lambda_v[idx3(step_i + 1, b, i, batch_size)] + DT * lp_next;
-        lambda_omega_next[i] = d.lambda_omega[idx3(step_i + 1, b, i, batch_size)];
+        lambda_v_next[i] = temporal_decay_factor * d.lambda_v[idx3(step_i + 1, b, i, batch_size)] + DT * lp_next;
+        lambda_omega_next[i] = temporal_decay_factor * d.lambda_omega[idx3(step_i + 1, b, i, batch_size)];
     }
 
     float state_R[9];
@@ -745,7 +808,7 @@ __global__ void backward_step_kernel(DeviceArrays d, std::size_t batch_size, std
         for(int k = 0; k < 3; k++){
             float value = 0.0f;
             for(int j = 0; j < 3; j++){
-                const float lambda_next_R = d.lambda_R[idx9(step_i + 1, b, i * 3 + j, batch_size)];
+                const float lambda_next_R = temporal_decay_factor * d.lambda_R[idx9(step_i + 1, b, i * 3 + j, batch_size)];
                 value += lambda_next_R * rotation_update[k * 3 + j];
                 lambda_delta[k * 3 + j] += state_R[i * 3 + k] * lambda_next_R;
             }
@@ -816,7 +879,7 @@ __global__ void backward_step_kernel(DeviceArrays d, std::size_t batch_size, std
 
     float lambda_rpm_next[4];
     for(int r = 0; r < 4; r++){
-        lambda_rpm_next[r] = d.lambda_rpm[idx4(step_i + 1, b, r, batch_size)];
+        lambda_rpm_next[r] = temporal_decay_factor * d.lambda_rpm[idx4(step_i + 1, b, r, batch_size)];
     }
     for(int r = 0; r < 4; r++){
         float lambda_force = 0.0f;
@@ -961,7 +1024,12 @@ CpuSimpleParameters cpu_parameters_from_batch(const EulerGpuBatch& batch, std::s
     return parameters;
 }
 
-void run_cpu_reference(const EulerGpuBatch& batch, const EulerGpuLossWeights& gpu_weights, EulerGpuResult& result){
+void run_cpu_reference(
+    const EulerGpuBatch& batch,
+    const EulerGpuLossWeights& gpu_weights,
+    EulerGpuResult& result,
+    float temporal_gradient_decay_alpha = 0.0f
+){
     namespace diff = rl_tools::rl::environments::l2f::diff;
     using TI = std::uint64_t;
     if(batch.horizon > CPU_MAX_HORIZON){
@@ -1100,13 +1168,26 @@ void run_cpu_reference(const EulerGpuBatch& batch, const EulerGpuLossWeights& gp
         for(std::size_t reverse_i = 0; reverse_i < batch.horizon; reverse_i++){
             const std::size_t step_i = batch.horizon - 1 - reverse_i;
             diff::EulerStateAdjoint<float> lambda_state;
+            diff::EulerStateAdjoint<float> propagated_lambda = lambdas[step_i + 1];
+            const float temporal_decay = std::exp(-std::max(0.0f, temporal_gradient_decay_alpha));
+            for(int dim = 0; dim < 3; dim++){
+                propagated_lambda.p[dim] *= temporal_decay;
+                propagated_lambda.v[dim] *= temporal_decay;
+                propagated_lambda.omega[dim] *= temporal_decay;
+                for(int inner = 0; inner < 3; inner++){
+                    propagated_lambda.R[dim][inner] *= temporal_decay;
+                }
+            }
+            for(int rotor = 0; rotor < 4; rotor++){
+                propagated_lambda.rpm[rotor] *= temporal_decay;
+            }
             float transition_grad[4];
             diff::step_vjp<CpuSimpleParameters, float, TI>(
                 parameters,
                 states[step_i],
                 actions[step_i],
                 caches[step_i],
-                lambdas[step_i + 1],
+                propagated_lambda,
                 lambda_state,
                 transition_grad
             );
@@ -1271,7 +1352,7 @@ int run_euler_gpu_rollout(
         if(options.compute_action_gradients){
             for(std::size_t reverse_i = 0; reverse_i < batch.horizon; reverse_i++){
                 const std::size_t step_i = batch.horizon - 1 - reverse_i;
-                backward_step_kernel<<<grid, block>>>(d, batch.batch_size, step_i);
+                backward_step_kernel<<<grid, block>>>(d, batch.batch_size, step_i, std::exp(-std::max(0.0f, options.temporal_gradient_decay_alpha)));
                 CUDA_CHECK(cudaGetLastError());
             }
         }
@@ -1414,7 +1495,8 @@ void generate_validation_batch(
     float initial_position_scale,
     float initial_velocity_scale,
     float initial_angular_velocity_scale,
-    float initial_attitude_scale
+    float initial_attitude_scale,
+    float near_zero_guidance_probability
 ){
     batch.resize(batch_size, horizon);
     std::mt19937 rng(seed);
@@ -1424,9 +1506,7 @@ void generate_validation_batch(
     const float velocity_scale = std::max(0.0f, initial_velocity_scale);
     const float angular_velocity_scale = std::max(0.0f, initial_angular_velocity_scale);
     const float attitude_scale = std::max(0.0f, initial_attitude_scale);
-    std::uniform_real_distribution<float> pos_dist(-0.2f * position_scale, 0.2f * position_scale);
-    std::uniform_real_distribution<float> vel_dist(-0.05f * velocity_scale, 0.05f * velocity_scale);
-    std::uniform_real_distribution<float> omega_dist(-0.02f * angular_velocity_scale, 0.02f * angular_velocity_scale);
+    const float guidance_probability = std::max(0.0f, std::min(1.0f, near_zero_guidance_probability));
     constexpr float max_rpm = 22000.0f;
     constexpr std::uint32_t balance_bins = 4u;
     batch.replay_schema_version = 3u;
@@ -1449,6 +1529,11 @@ void generate_validation_batch(
         batch.dynamics_curve_shape_bin[b] = curve_bin;
         batch.dynamics_group_key[b] = group_key;
         batch.rejected_before_accept[b] = 0u;
+        const bool near_zero_guidance = unit(rng) < guidance_probability;
+        const float sample_position_scale = near_zero_guidance ? std::min(position_scale, 0.10f) : position_scale;
+        const float sample_velocity_scale = near_zero_guidance ? std::min(velocity_scale, 1.0f) : velocity_scale;
+        const float sample_angular_velocity_scale = near_zero_guidance ? std::min(angular_velocity_scale, 2.5f) : angular_velocity_scale;
+        const float sample_attitude_scale = near_zero_guidance ? std::min(attitude_scale, 1.0f) : attitude_scale;
 
         constexpr float nominal_mass = 0.05f;
         constexpr float nominal_arm = 0.09f;
@@ -1541,9 +1626,9 @@ void generate_validation_batch(
         }
 
         for(int i = 0; i < 3; i++){
-            batch.initial_p[pidx3(b, i)] = pos_dist(rng);
-            batch.initial_v[pidx3(b, i)] = vel_dist(rng);
-            batch.initial_omega[pidx3(b, i)] = omega_dist(rng);
+            batch.initial_p[pidx3(b, i)] = (2.0f * unit(rng) - 1.0f) * 0.2f * sample_position_scale;
+            batch.initial_v[pidx3(b, i)] = (2.0f * unit(rng) - 1.0f) * 0.05f * sample_velocity_scale;
+            batch.initial_omega[pidx3(b, i)] = (2.0f * unit(rng) - 1.0f) * 0.02f * sample_angular_velocity_scale;
             batch.reference_p[pidx3(b, i)] = 0.0f;
             batch.reference_v[pidx3(b, i)] = 0.0f;
         }
@@ -1551,9 +1636,9 @@ void generate_validation_batch(
             batch.initial_R[pidx9(b, i)] = 0.0f;
         }
         float initial_R[9];
-        if(attitude_scale > 0.0f){
+        if(sample_attitude_scale > 0.0f){
             constexpr float five_degrees_rad = 0.08726646259971647f;
-            const float max_angle = 0.95f * five_degrees_rad * attitude_scale;
+            const float max_angle = 0.95f * five_degrees_rad * sample_attitude_scale;
             float axis[3] = {
                 2.0f * unit(rng) - 1.0f,
                 2.0f * unit(rng) - 1.0f,
@@ -1930,7 +2015,13 @@ int assemble_observations_gpu(
             forward_step_kernel<<<grid, block>>>(d, batch.batch_size, t);
             CUDA_CHECK(cudaGetLastError());
         }
-        observation_kernel<<<grid, block>>>(d, batch.batch_size, step_i);
+        observation_kernel_with_options<<<grid, block>>>(
+            d,
+            batch.batch_size,
+            step_i,
+            options.velocity_observation_noise,
+            options.velocity_observation_delay_steps
+        );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         observations.assign(batch.batch_size * EULER_OBSERVATION_DIM, 0.0f);
@@ -1983,6 +2074,8 @@ ObservationValidationSummary validate_observations_against_cpu(
             state.previous_action[i] = batch.initial_previous_action[pidx4(b, i)];
         }
         diff::EulerStepCache<float> cache{};
+        std::vector<diff::EulerState<float, TI>> state_history(step_i + 1);
+        state_history[0] = state;
         for(std::size_t t = 0; t < step_i; t++){
             float action[4];
             for(int a = 0; a < 4; a++){
@@ -1991,6 +2084,7 @@ ObservationValidationSummary validate_observations_against_cpu(
             diff::EulerState<float, TI> next{};
             diff::step<CpuSimpleParameters, float, TI>(parameters, state, action, next, cache);
             state = next;
+            state_history[t + 1] = state;
         }
         std::size_t out = 0;
         for(int i = 0; i < 3; i++){
@@ -2002,9 +2096,17 @@ ObservationValidationSummary validate_observations_against_cpu(
                 cpu_observations[b * EULER_OBSERVATION_DIM + out++] = state.R[i][j];
             }
         }
+        const std::size_t velocity_step = step_i > options.velocity_observation_delay_steps
+            ? step_i - options.velocity_observation_delay_steps
+            : 0u;
         for(int i = 0; i < 3; i++){
+            const float noise = options.velocity_observation_noise > 0.0f
+                ? options.velocity_observation_noise * deterministic_symmetric_noise(step_i, b, i)
+                : 0.0f;
             cpu_observations[b * EULER_OBSERVATION_DIM + out++] =
-                state.v[i] - batch.reference_v_traj[idx3(step_i, b, i, batch.batch_size)];
+                state_history[velocity_step].v[i] -
+                batch.reference_v_traj[idx3(step_i, b, i, batch.batch_size)] +
+                noise;
         }
         for(int i = 0; i < 3; i++){
             cpu_observations[b * EULER_OBSERVATION_DIM + out++] = state.omega[i];
@@ -4173,7 +4275,7 @@ Stage9StepMetrics gpu_stage9_replay_step(
     CUDA_CHECK(cudaGetLastError());
     for(std::size_t reverse_i = 0; reverse_i < batch.horizon; reverse_i++){
         const std::size_t step_i = batch.horizon - 1 - reverse_i;
-        backward_step_kernel<<<grid, block>>>(d, batch.batch_size, step_i);
+        backward_step_kernel<<<grid, block>>>(d, batch.batch_size, step_i, 1.0f);
         CUDA_CHECK(cudaGetLastError());
     }
     const int grad_grid = static_cast<int>((gradient_count + block - 1) / block);
@@ -4482,7 +4584,13 @@ ClosedLoopValidationSummary validate_closed_loop_against_cpu(
         const int block = 256;
         const int grid = static_cast<int>((batch_size + block - 1) / block);
         for(std::size_t t = 0; t < horizon; t++){
-            observation_kernel<<<grid, block>>>(d, batch_size, t);
+            observation_kernel_with_options<<<grid, block>>>(
+                d,
+                batch_size,
+                t,
+                options.velocity_observation_noise,
+                options.velocity_observation_delay_steps
+            );
             CUDA_CHECK(cudaGetLastError());
             build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, batch_size, t);
             CUDA_CHECK(cudaGetLastError());
@@ -4716,7 +4824,13 @@ ActionGradientInjectionValidationSummary validate_action_gradient_injection_agai
         const int block = 256;
         const int grid = static_cast<int>((batch_size + block - 1) / block);
         for(std::size_t t = 0; t < horizon; t++){
-            observation_kernel<<<grid, block>>>(d, batch_size, t);
+            observation_kernel_with_options<<<grid, block>>>(
+                d,
+                batch_size,
+                t,
+                options.velocity_observation_noise,
+                options.velocity_observation_delay_steps
+            );
             CUDA_CHECK(cudaGetLastError());
             build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, batch_size, t);
             CUDA_CHECK(cudaGetLastError());
@@ -4744,7 +4858,7 @@ ActionGradientInjectionValidationSummary validate_action_gradient_injection_agai
         CUDA_CHECK(cudaGetLastError());
         for(std::size_t reverse_i = 0; reverse_i < horizon; reverse_i++){
             const std::size_t step_i = horizon - 1 - reverse_i;
-            backward_step_kernel<<<grid, block>>>(d, batch_size, step_i);
+            backward_step_kernel<<<grid, block>>>(d, batch_size, step_i, std::exp(-std::max(0.0f, options.temporal_gradient_decay_alpha)));
             CUDA_CHECK(cudaGetLastError());
         }
         const int grad_grid = static_cast<int>((gradient_count + block - 1) / block);
@@ -4958,7 +5072,13 @@ ActorBackwardValidationSummary validate_actor_backward_against_cpu(
         const int block = 256;
         const int grid = static_cast<int>((batch_size + block - 1) / block);
         for(std::size_t t = 0; t < horizon; t++){
-            observation_kernel<<<grid, block>>>(d, batch_size, t);
+            observation_kernel_with_options<<<grid, block>>>(
+                d,
+                batch_size,
+                t,
+                options.velocity_observation_noise,
+                options.velocity_observation_delay_steps
+            );
             CUDA_CHECK(cudaGetLastError());
             build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, batch_size, t);
             CUDA_CHECK(cudaGetLastError());
@@ -4987,7 +5107,7 @@ ActorBackwardValidationSummary validate_actor_backward_against_cpu(
         CUDA_CHECK(cudaGetLastError());
         for(std::size_t reverse_i = 0; reverse_i < horizon; reverse_i++){
             const std::size_t step_i = horizon - 1 - reverse_i;
-            backward_step_kernel<<<grid, block>>>(d, batch_size, step_i);
+            backward_step_kernel<<<grid, block>>>(d, batch_size, step_i, std::exp(-std::max(0.0f, options.temporal_gradient_decay_alpha)));
             CUDA_CHECK(cudaGetLastError());
         }
         const int grad_grid = static_cast<int>((gradient_count + block - 1) / block);
@@ -5235,7 +5355,13 @@ CriticBackwardValidationSummary validate_critic_backward_against_cpu(
         const int block = 256;
         const int grid = static_cast<int>((batch_size + block - 1) / block);
         for(std::size_t t = 0; t < horizon; t++){
-            observation_kernel<<<grid, block>>>(d, batch_size, t);
+            observation_kernel_with_options<<<grid, block>>>(
+                d,
+                batch_size,
+                t,
+                options.velocity_observation_noise,
+                options.velocity_observation_delay_steps
+            );
             CUDA_CHECK(cudaGetLastError());
             build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, batch_size, t);
             CUDA_CHECK(cudaGetLastError());
@@ -5585,7 +5711,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                 training_options.initial_position_scale,
                 training_options.initial_velocity_scale,
                 training_options.initial_angular_velocity_scale,
-                training_options.initial_attitude_scale
+                training_options.initial_attitude_scale,
+                training_options.near_zero_guidance_probability
             );
         }
         allocate(d, training_options.batch_size, training_options.horizon);
@@ -5629,7 +5756,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                     training_options.initial_position_scale,
                     training_options.initial_velocity_scale,
                     training_options.initial_angular_velocity_scale,
-                    training_options.initial_attitude_scale
+                    training_options.initial_attitude_scale,
+                    training_options.near_zero_guidance_probability
                 );
             }
             copy_input_to_device(batch, d);
@@ -5649,7 +5777,13 @@ FullGpuTrainingSummary run_full_gpu_training(
             CUDA_CHECK(cudaMemset(d_actor_buffers.critic_output_gradient, 0, sizeof(float) * critic_count));
 
             for(std::size_t t = 0; t < training_options.horizon; t++){
-                observation_kernel<<<grid, block>>>(d, training_options.batch_size, t);
+                observation_kernel_with_options<<<grid, block>>>(
+                    d,
+                    training_options.batch_size,
+                    t,
+                    training_options.velocity_observation_noise,
+                    training_options.velocity_observation_delay_steps
+                );
                 CUDA_CHECK(cudaGetLastError());
                 build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, training_options.batch_size, t);
                 CUDA_CHECK(cudaGetLastError());
@@ -5664,7 +5798,7 @@ FullGpuTrainingSummary run_full_gpu_training(
             CUDA_CHECK(cudaGetLastError());
             for(std::size_t reverse_i = 0; reverse_i < training_options.horizon; reverse_i++){
                 const std::size_t step_i = training_options.horizon - 1 - reverse_i;
-                backward_step_kernel<<<grid, block>>>(d, training_options.batch_size, step_i);
+                backward_step_kernel<<<grid, block>>>(d, training_options.batch_size, step_i, std::exp(-std::max(0.0f, training_options.temporal_gradient_decay_alpha)));
                 CUDA_CHECK(cudaGetLastError());
             }
             const int grad_grid = static_cast<int>((gradient_count + block - 1) / block);
@@ -5866,7 +6000,8 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         eval_options.initial_position_scale,
         eval_options.initial_velocity_scale,
         eval_options.initial_angular_velocity_scale,
-        eval_options.initial_attitude_scale
+        eval_options.initial_attitude_scale,
+        eval_options.near_zero_guidance_probability
     );
 
     DeviceArrays d;
@@ -5893,7 +6028,13 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         CUDA_CHECK(cudaMemset(d.loss_components, 0, sizeof(float) * eval_options.episodes * LOSS_COMPONENT_COUNT));
         CUDA_CHECK(cudaMemset(d_actor_buffers.raw_action_gradient, 0, sizeof(float) * gradient_count));
         for(std::size_t t = 0; t < eval_options.horizon; t++){
-            observation_kernel<<<grid, block>>>(d, eval_options.episodes, t);
+            observation_kernel_with_options<<<grid, block>>>(
+                d,
+                eval_options.episodes,
+                t,
+                eval_options.velocity_observation_noise,
+                eval_options.velocity_observation_delay_steps
+            );
             CUDA_CHECK(cudaGetLastError());
             build_policy_input_from_observation_kernel<<<grid, block>>>(d, d_actor_buffers, eval_options.episodes, t);
             CUDA_CHECK(cudaGetLastError());
@@ -5949,6 +6090,16 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         std::vector<float> max_v_norms;
         std::vector<float> max_attitude_errors;
         std::vector<float> max_w_norms;
+        std::vector<float> position_mean_errors;
+        std::vector<float> angle_mean_errors;
+        std::vector<float> linear_velocity_mean_errors;
+        std::vector<float> angular_velocity_mean_errors;
+        std::vector<float> angular_acceleration_mean_errors;
+        std::vector<float> action_mean_errors;
+        std::vector<float> action_relative_mean_errors;
+        std::vector<float> angular_acceleration_max_errors;
+        std::vector<float> action_max_errors;
+        std::vector<float> action_relative_max_errors;
         p_norms.reserve(eval_options.episodes);
         v_norms.reserve(eval_options.episodes);
         attitude_errors.reserve(eval_options.episodes);
@@ -5957,6 +6108,16 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         max_v_norms.reserve(eval_options.episodes);
         max_attitude_errors.reserve(eval_options.episodes);
         max_w_norms.reserve(eval_options.episodes);
+        position_mean_errors.reserve(eval_options.episodes);
+        angle_mean_errors.reserve(eval_options.episodes);
+        linear_velocity_mean_errors.reserve(eval_options.episodes);
+        angular_velocity_mean_errors.reserve(eval_options.episodes);
+        angular_acceleration_mean_errors.reserve(eval_options.episodes);
+        action_mean_errors.reserve(eval_options.episodes);
+        action_relative_mean_errors.reserve(eval_options.episodes);
+        angular_acceleration_max_errors.reserve(eval_options.episodes);
+        action_max_errors.reserve(eval_options.episodes);
+        action_relative_max_errors.reserve(eval_options.episodes);
         double loss_sum = 0.0;
         std::size_t loss_count = 0;
         std::size_t near_p_count = 0;
@@ -5967,6 +6128,8 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         std::size_t first_failure_count = 0;
         double inside_fraction_sum = 0.0;
         double first_failure_time_sum = 0.0;
+        std::size_t position_settled_steps = 0;
+        std::size_t position_settled_total = 0;
         double position_rmse_sum = 0.0;
         double velocity_rmse_sum = 0.0;
         double attitude_rmse_sum = 0.0;
@@ -6056,6 +6219,19 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             float max_v_norm = 0.0f;
             float max_attitude_error = 0.0f;
             float max_w_norm = 0.0f;
+            float max_angular_acceleration_error = 0.0f;
+            float max_episode_action = 0.0f;
+            float max_episode_action_relative = 0.0f;
+            double episode_position_error_sum = 0.0;
+            double episode_angle_error_sum = 0.0;
+            double episode_linear_velocity_error_sum = 0.0;
+            double episode_angular_velocity_error_sum = 0.0;
+            double episode_angular_acceleration_error_sum = 0.0;
+            double episode_action_error_sum = 0.0;
+            double episode_action_relative_error_sum = 0.0;
+            std::size_t episode_state_count = 0;
+            std::size_t episode_acceleration_count = 0;
+            std::size_t episode_action_count = 0;
             std::size_t inside_steps = 0;
             bool failed = false;
             bool post_burnin_failed = false;
@@ -6095,10 +6271,19 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                     attitude_rmse_sum += static_cast<double>(step_attitude_error) * static_cast<double>(step_attitude_error);
                     angular_velocity_rmse_sum += step_w_sq;
                     rmse_count++;
+                    episode_position_error_sum += step_p_norm;
+                    episode_angle_error_sum += step_attitude_error;
+                    episode_linear_velocity_error_sum += step_v_norm;
+                    episode_angular_velocity_error_sum += step_w_norm;
+                    episode_state_count++;
+                    position_settled_steps += step_p_norm < eval_options.success_position_threshold ? 1u : 0u;
+                    position_settled_total++;
                 }
                 if(t < eval_options.horizon){
                     double linear_acceleration_error_sq = 0.0;
                     double angular_acceleration_error_sq = 0.0;
+                    double action_magnitude_sq = 0.0;
+                    double action_relative_sq = 0.0;
                     bool acceleration_finite = true;
                     for(int dim = 0; dim < 3; dim++){
                         const float v_now = host_v[idx3(t, b, dim, eval_options.episodes)];
@@ -6117,10 +6302,37 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                         linear_acceleration_error_sq += static_cast<double>(acceleration_error) * acceleration_error;
                         angular_acceleration_error_sq += static_cast<double>(angular_acceleration_error) * angular_acceleration_error;
                     }
+                    bool action_finite = true;
+                    for(std::size_t a = 0; a < RDAC_ACTION_DIM; a++){
+                        const float action = host_actions[idx4(t, b, a, eval_options.episodes)];
+                        const float previous_action = t == 0
+                            ? batch.initial_previous_action[pidx4(b, a)]
+                            : host_actions[idx4(t - 1, b, a, eval_options.episodes)];
+                        const float relative_action = action - previous_action;
+                        action_finite = action_finite &&
+                            std::isfinite(action) &&
+                            std::isfinite(previous_action) &&
+                            std::isfinite(relative_action);
+                        action_magnitude_sq += static_cast<double>(action) * action;
+                        action_relative_sq += static_cast<double>(relative_action) * relative_action;
+                    }
                     if(acceleration_finite){
                         linear_acceleration_error_rmse_sum += linear_acceleration_error_sq;
                         angular_acceleration_error_rmse_sum += angular_acceleration_error_sq;
                         acceleration_rmse_count++;
+                        const float angular_acceleration_error_norm = static_cast<float>(std::sqrt(angular_acceleration_error_sq));
+                        episode_angular_acceleration_error_sum += angular_acceleration_error_norm;
+                        max_angular_acceleration_error = std::max(max_angular_acceleration_error, angular_acceleration_error_norm);
+                        episode_acceleration_count++;
+                    }
+                    if(action_finite){
+                        const float action_norm = static_cast<float>(std::sqrt(action_magnitude_sq));
+                        const float action_relative_norm = static_cast<float>(std::sqrt(action_relative_sq));
+                        episode_action_error_sum += action_norm;
+                        episode_action_relative_error_sum += action_relative_norm;
+                        max_episode_action = std::max(max_episode_action, action_norm);
+                        max_episode_action_relative = std::max(max_episode_action_relative, action_relative_norm);
+                        episode_action_count++;
                     }
                 }
                 max_p_norm = std::max(max_p_norm, step_p_norm);
@@ -6146,6 +6358,19 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             max_v_norms.push_back(max_v_norm);
             max_attitude_errors.push_back(max_attitude_error);
             max_w_norms.push_back(max_w_norm);
+            const double inv_episode_state_count = 1.0 / std::max(1.0, static_cast<double>(episode_state_count));
+            const double inv_episode_acceleration_count = 1.0 / std::max(1.0, static_cast<double>(episode_acceleration_count));
+            const double inv_episode_action_count = 1.0 / std::max(1.0, static_cast<double>(episode_action_count));
+            position_mean_errors.push_back(static_cast<float>(episode_position_error_sum * inv_episode_state_count));
+            angle_mean_errors.push_back(static_cast<float>(episode_angle_error_sum * inv_episode_state_count));
+            linear_velocity_mean_errors.push_back(static_cast<float>(episode_linear_velocity_error_sum * inv_episode_state_count));
+            angular_velocity_mean_errors.push_back(static_cast<float>(episode_angular_velocity_error_sum * inv_episode_state_count));
+            angular_acceleration_mean_errors.push_back(static_cast<float>(episode_angular_acceleration_error_sum * inv_episode_acceleration_count));
+            action_mean_errors.push_back(static_cast<float>(episode_action_error_sum * inv_episode_action_count));
+            action_relative_mean_errors.push_back(static_cast<float>(episode_action_relative_error_sum * inv_episode_action_count));
+            angular_acceleration_max_errors.push_back(max_angular_acceleration_error);
+            action_max_errors.push_back(max_episode_action);
+            action_relative_max_errors.push_back(max_episode_action_relative);
             inside_fraction_sum += static_cast<double>(inside_steps) / static_cast<double>(eval_options.horizon + 1);
             if(!failed){
                 throughout_success_count++;
@@ -6169,6 +6394,16 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             const std::size_t index = static_cast<std::size_t>(std::min<double>(values.size() - 1, std::floor(q * static_cast<double>(values.size() - 1))));
             return values[index];
         };
+        auto stddev = [&](const std::vector<float>& values){
+            if(values.empty()) return 0.0f;
+            const float m = mean(values);
+            double sq = 0.0;
+            for(float value: values){
+                const double delta = static_cast<double>(value) - static_cast<double>(m);
+                sq += delta * delta;
+            }
+            return static_cast<float>(std::sqrt(sq / static_cast<double>(values.size())));
+        };
         summary.mean_total_loss = loss_count > 0 ? static_cast<float>(loss_sum / static_cast<double>(loss_count)) : 0.0f;
         const double inv_rmse_count = 1.0 / std::max(1.0, static_cast<double>(rmse_count));
         summary.position_rmse = static_cast<float>(std::sqrt(position_rmse_sum * inv_rmse_count));
@@ -6178,6 +6413,30 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         const double inv_acceleration_rmse_count = 1.0 / std::max(1.0, static_cast<double>(acceleration_rmse_count));
         summary.linear_acceleration_error_rmse = static_cast<float>(std::sqrt(linear_acceleration_error_rmse_sum * inv_acceleration_rmse_count));
         summary.angular_acceleration_error_rmse = static_cast<float>(std::sqrt(angular_acceleration_error_rmse_sum * inv_acceleration_rmse_count));
+        summary.settling_fraction_position = position_settled_total > 0
+            ? static_cast<float>(position_settled_steps) / static_cast<float>(position_settled_total)
+            : 0.0f;
+        summary.position_mean_error_mean = mean(position_mean_errors);
+        summary.angle_mean_error_mean = mean(angle_mean_errors);
+        summary.linear_velocity_mean_error_mean = mean(linear_velocity_mean_errors);
+        summary.angular_velocity_mean_error_mean = mean(angular_velocity_mean_errors);
+        summary.angular_acceleration_mean_error_mean = mean(angular_acceleration_mean_errors);
+        summary.action_mean_error_mean = mean(action_mean_errors);
+        summary.action_relative_mean_error_mean = mean(action_relative_mean_errors);
+        summary.position_max_error_mean = mean(max_p_norms);
+        summary.angle_max_error_mean = mean(max_attitude_errors);
+        summary.linear_velocity_max_error_mean = mean(max_v_norms);
+        summary.angular_velocity_max_error_mean = mean(max_w_norms);
+        summary.angular_acceleration_max_error_mean = mean(angular_acceleration_max_errors);
+        summary.action_max_error_mean = mean(action_max_errors);
+        summary.action_relative_max_error_mean = mean(action_relative_max_errors);
+        summary.position_max_error_std = stddev(max_p_norms);
+        summary.angle_max_error_std = stddev(max_attitude_errors);
+        summary.linear_velocity_max_error_std = stddev(max_v_norms);
+        summary.angular_velocity_max_error_std = stddev(max_w_norms);
+        summary.angular_acceleration_max_error_std = stddev(angular_acceleration_max_errors);
+        summary.action_max_error_std = stddev(action_max_errors);
+        summary.action_relative_max_error_std = stddev(action_relative_max_errors);
         summary.mean_final_position_norm = mean(p_norms);
         summary.mean_final_velocity_norm = mean(v_norms);
         summary.mean_final_attitude_error = mean(attitude_errors);
@@ -6236,7 +6495,13 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             log << "eval_model,mode_fixed_or_sampled,eval_dynamics_mode,eval_sampled_dynamics_level,trajectory_mode,"
                 << "trajectory_amplitude,trajectory_frequency_hz,eval_episodes,eval_horizon,"
                 << "success_rate,near_success_rate_p,near_success_rate_pv,mean_total_loss,position_rmse,velocity_rmse,"
-                << "attitude_rmse,angular_velocity_rmse,linear_acceleration_error_rmse,angular_acceleration_error_rmse,mean_final_position_norm,"
+                << "attitude_rmse,angular_velocity_rmse,linear_acceleration_error_rmse,angular_acceleration_error_rmse,"
+                << "settling_fraction_position,position_mean_error_mean,angle_mean_error_mean,linear_velocity_mean_error_mean,"
+                << "angular_velocity_mean_error_mean,angular_acceleration_mean_error_mean,action_mean_error_mean,action_relative_mean_error_mean,"
+                << "position_max_error_mean,angle_max_error_mean,linear_velocity_max_error_mean,angular_velocity_max_error_mean,"
+                << "angular_acceleration_max_error_mean,action_max_error_mean,action_relative_max_error_mean,"
+                << "position_max_error_std,angle_max_error_std,linear_velocity_max_error_std,angular_velocity_max_error_std,"
+                << "angular_acceleration_max_error_std,action_max_error_std,action_relative_max_error_std,mean_final_position_norm,"
                 << "mean_final_velocity_norm,mean_final_attitude_error,mean_final_angular_velocity_norm,median_final_position_norm,"
                 << "median_final_velocity_norm,median_final_attitude_error,median_final_angular_velocity_norm,p90_final_position_norm,"
                 << "p90_final_velocity_norm,p90_final_attitude_error,p90_final_angular_velocity_norm,throughout_gate_start_step,throughout_success_rate,post_burnin_throughout_success_rate,mean_time_inside_fraction,"
@@ -6256,6 +6521,19 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                 << summary.mean_total_loss << "," << summary.position_rmse << "," << summary.velocity_rmse << ","
                 << summary.attitude_rmse << "," << summary.angular_velocity_rmse << ","
                 << summary.linear_acceleration_error_rmse << "," << summary.angular_acceleration_error_rmse << ","
+                << summary.settling_fraction_position << ","
+                << summary.position_mean_error_mean << "," << summary.angle_mean_error_mean << ","
+                << summary.linear_velocity_mean_error_mean << "," << summary.angular_velocity_mean_error_mean << ","
+                << summary.angular_acceleration_mean_error_mean << "," << summary.action_mean_error_mean << ","
+                << summary.action_relative_mean_error_mean << ","
+                << summary.position_max_error_mean << "," << summary.angle_max_error_mean << ","
+                << summary.linear_velocity_max_error_mean << "," << summary.angular_velocity_max_error_mean << ","
+                << summary.angular_acceleration_max_error_mean << "," << summary.action_max_error_mean << ","
+                << summary.action_relative_max_error_mean << ","
+                << summary.position_max_error_std << "," << summary.angle_max_error_std << ","
+                << summary.linear_velocity_max_error_std << "," << summary.angular_velocity_max_error_std << ","
+                << summary.angular_acceleration_max_error_std << "," << summary.action_max_error_std << ","
+                << summary.action_relative_max_error_std << ","
                 << summary.mean_final_position_norm << ","
                 << summary.mean_final_velocity_norm << "," << summary.mean_final_attitude_error << "," << summary.mean_final_angular_velocity_norm << ","
                 << summary.median_final_position_norm << "," << summary.median_final_velocity_norm << ","
@@ -6628,7 +6906,8 @@ LocalInitialConditionValidationSummary validate_local_initial_conditions(
     float initial_position_scale,
     float initial_velocity_scale,
     float initial_angular_velocity_scale,
-    float initial_attitude_scale
+    float initial_attitude_scale,
+    float near_zero_guidance_probability
 ){
     LocalInitialConditionValidationSummary summary;
     summary.samples = std::max<std::size_t>(batch_size, 16);
@@ -6649,7 +6928,8 @@ LocalInitialConditionValidationSummary validate_local_initial_conditions(
         initial_position_scale,
         initial_velocity_scale,
         initial_angular_velocity_scale,
-        initial_attitude_scale
+        initial_attitude_scale,
+        near_zero_guidance_probability
     );
 
     for(std::size_t b = 0; b < summary.samples; b++){
@@ -6905,7 +7185,7 @@ ValidationSummary validate_against_cpu(
         throw std::runtime_error("GPU rollout failed during validation");
     }
     EulerGpuResult cpu_result;
-    run_cpu_reference(batch, weights, cpu_result);
+    run_cpu_reference(batch, weights, cpu_result, options.temporal_gradient_decay_alpha);
 
     ValidationSummary summary;
     auto update_abs = [](float& value, float candidate){

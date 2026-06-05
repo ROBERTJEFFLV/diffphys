@@ -50,7 +50,7 @@ struct Options{
     float loss_angular_velocity_weight = 0.8f;
     float loss_linear_acceleration_weight = 0.0f;
     float loss_angular_acceleration_weight = 0.0f;
-    float terminal_loss_scale = 1.0f;
+    float terminal_loss_scale = 0.0f;
     float terminal_velocity_weight = 4.0f;
     float terminal_angular_velocity_weight = 4.0f;
     float diff_rollout_loss_weight = 5e-4f;
@@ -60,6 +60,9 @@ struct Options{
     float actor_grad_clip_norm = 100.0f;
     float actor_grad_skip_norm = 1e12f;
     float actor_grad_eps = 1e-6f;
+    float temporal_gradient_decay_alpha = 0.0f;
+    float velocity_observation_noise = 0.0f;
+    std::size_t velocity_observation_delay_steps = 0;
     bool disable_physics_gradient = false;
     bool reset_hidden_each_step = false;
     bool load_optimizer_state = true;
@@ -109,10 +112,11 @@ struct Options{
     float trajectory_frequency_hz = 0.5f;
     std::string tracking_gate_mode = "recovery";
     std::size_t throughout_gate_start_step = 0;
-    float initial_position_scale = 1.0f;
-    float initial_velocity_scale = 1.0f;
-    float initial_attitude_scale = 0.0f;
-    float initial_angular_velocity_scale = 1.0f;
+    float initial_position_scale = 2.5f;
+    float initial_velocity_scale = 20.0f;
+    float initial_attitude_scale = 18.947368f;
+    float initial_angular_velocity_scale = 50.0f;
+    float near_zero_guidance_probability = 0.10f;
     float initial_position_scale_local = 0.14f;
     float initial_velocity_scale_local = 0.5f;
     float initial_attitude_scale_local = 1.0f;
@@ -145,6 +149,8 @@ void print_usage(){
         << "    [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
         << "    [--steps N] [--learning-rate LR]\n"
         << "    [--diff-rollout-loss-weight W] [--disable-physics-gradient]\n"
+        << "    [--temporal-gradient-decay-alpha A]\n"
+        << "    [--velocity-observation-noise STD] [--velocity-observation-delay-steps N]\n"
         << "    [--action-grad-clip VALUE] [--disable-action-grad-clip]\n"
         << "    [--actor-grad-clip VALUE] [--disable-actor-grad-clip] [--actor-grad-skip-norm VALUE]\n"
         << "    [--reset-hidden-each-step]\n"
@@ -178,6 +184,7 @@ void print_usage(){
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
         << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
         << "    [--initial-attitude-scale S] [--initial-angular-velocity-scale S]\n"
+        << "    [--near-zero-guidance-probability P]\n"
         << "    [--initial-position-scale-local S] [--initial-velocity-scale-local S]\n"
         << "    [--initial-attitude-scale-local S] [--initial-angular-velocity-scale-local S]\n"
         << "    [--log-path PATH] [--save-path PATH] [--load-path PATH]\n"
@@ -433,6 +440,15 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--actor-grad-eps" && i + 1 < argc){
             options.actor_grad_eps = std::stof(argv[++i]);
         }
+        else if(arg == "--temporal-gradient-decay-alpha" && i + 1 < argc){
+            options.temporal_gradient_decay_alpha = std::stof(argv[++i]);
+        }
+        else if(arg == "--velocity-observation-noise" && i + 1 < argc){
+            options.velocity_observation_noise = std::stof(argv[++i]);
+        }
+        else if(arg == "--velocity-observation-delay-steps" && i + 1 < argc){
+            options.velocity_observation_delay_steps = std::stoull(argv[++i]);
+        }
         else if(arg == "--reset-hidden-each-step"){
             options.reset_hidden_each_step = true;
         }
@@ -487,6 +503,9 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--initial-angular-velocity-scale" && i + 1 < argc){
             options.initial_angular_velocity_scale = std::stof(argv[++i]);
+        }
+        else if(arg == "--near-zero-guidance-probability" && i + 1 < argc){
+            options.near_zero_guidance_probability = std::stof(argv[++i]);
         }
         else if(arg == "--initial-position-scale-local" && i + 1 < argc){
             options.initial_position_scale_local = std::stof(argv[++i]);
@@ -722,6 +741,9 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.actor_grad_clip_norm = options.actor_grad_clip_norm;
     training_options.actor_grad_skip_norm = options.actor_grad_skip_norm;
     training_options.actor_grad_eps = options.actor_grad_eps;
+    training_options.temporal_gradient_decay_alpha = options.temporal_gradient_decay_alpha;
+    training_options.velocity_observation_noise = options.velocity_observation_noise;
+    training_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
     training_options.disable_physics_gradient = options.disable_physics_gradient;
     training_options.reset_hidden_each_step = options.reset_hidden_each_step;
     training_options.sample_dynamics = options.sample_dynamics;
@@ -734,6 +756,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.initial_velocity_scale = options.initial_velocity_scale;
     training_options.initial_attitude_scale = options.initial_attitude_scale;
     training_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
+    training_options.near_zero_guidance_probability = options.near_zero_guidance_probability;
     training_options.success_position_threshold = options.success_position_threshold;
     training_options.success_velocity_threshold = options.success_velocity_threshold;
     training_options.success_attitude_threshold = options.success_attitude_threshold;
@@ -761,12 +784,15 @@ gpu::GpuPolicyEvalOptions make_gpu_eval_options(const Options& options){
     eval_options.initial_velocity_scale = options.initial_velocity_scale;
     eval_options.initial_attitude_scale = options.initial_attitude_scale;
     eval_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
+    eval_options.near_zero_guidance_probability = options.near_zero_guidance_probability;
     eval_options.success_position_threshold = options.success_position_threshold;
     eval_options.success_velocity_threshold = options.success_velocity_threshold;
     eval_options.success_attitude_threshold = options.success_attitude_threshold;
     eval_options.success_angular_velocity_threshold = options.success_angular_velocity_threshold;
     eval_options.success_action_saturation_threshold = options.success_action_saturation_threshold;
     eval_options.throughout_gate_start_step = options.throughout_gate_start_step;
+    eval_options.velocity_observation_noise = options.velocity_observation_noise;
+    eval_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
     eval_options.forced_bins = options.forced_bins;
     eval_options.load_path = options.load_path;
     eval_options.log_path = options.log_path;
@@ -950,6 +976,28 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_angular_velocity_rmse=" << summary.angular_velocity_rmse << "\n";
     std::cout << "gpu_eval_linear_acceleration_error_rmse=" << summary.linear_acceleration_error_rmse << "\n";
     std::cout << "gpu_eval_angular_acceleration_error_rmse=" << summary.angular_acceleration_error_rmse << "\n";
+    std::cout << "gpu_eval_settling_fraction_position=" << summary.settling_fraction_position << "\n";
+    std::cout << "gpu_eval_position_mean_error_mean=" << summary.position_mean_error_mean << "\n";
+    std::cout << "gpu_eval_angle_mean_error_mean=" << summary.angle_mean_error_mean << "\n";
+    std::cout << "gpu_eval_linear_velocity_mean_error_mean=" << summary.linear_velocity_mean_error_mean << "\n";
+    std::cout << "gpu_eval_angular_velocity_mean_error_mean=" << summary.angular_velocity_mean_error_mean << "\n";
+    std::cout << "gpu_eval_angular_acceleration_mean_error_mean=" << summary.angular_acceleration_mean_error_mean << "\n";
+    std::cout << "gpu_eval_action_mean_error_mean=" << summary.action_mean_error_mean << "\n";
+    std::cout << "gpu_eval_action_relative_mean_error_mean=" << summary.action_relative_mean_error_mean << "\n";
+    std::cout << "gpu_eval_position_max_error_mean=" << summary.position_max_error_mean << "\n";
+    std::cout << "gpu_eval_angle_max_error_mean=" << summary.angle_max_error_mean << "\n";
+    std::cout << "gpu_eval_linear_velocity_max_error_mean=" << summary.linear_velocity_max_error_mean << "\n";
+    std::cout << "gpu_eval_angular_velocity_max_error_mean=" << summary.angular_velocity_max_error_mean << "\n";
+    std::cout << "gpu_eval_angular_acceleration_max_error_mean=" << summary.angular_acceleration_max_error_mean << "\n";
+    std::cout << "gpu_eval_action_max_error_mean=" << summary.action_max_error_mean << "\n";
+    std::cout << "gpu_eval_action_relative_max_error_mean=" << summary.action_relative_max_error_mean << "\n";
+    std::cout << "gpu_eval_position_max_error_std=" << summary.position_max_error_std << "\n";
+    std::cout << "gpu_eval_angle_max_error_std=" << summary.angle_max_error_std << "\n";
+    std::cout << "gpu_eval_linear_velocity_max_error_std=" << summary.linear_velocity_max_error_std << "\n";
+    std::cout << "gpu_eval_angular_velocity_max_error_std=" << summary.angular_velocity_max_error_std << "\n";
+    std::cout << "gpu_eval_angular_acceleration_max_error_std=" << summary.angular_acceleration_max_error_std << "\n";
+    std::cout << "gpu_eval_action_max_error_std=" << summary.action_max_error_std << "\n";
+    std::cout << "gpu_eval_action_relative_max_error_std=" << summary.action_relative_max_error_std << "\n";
     std::cout << "gpu_eval_p90_final_position_norm=" << summary.p90_final_position_norm << "\n";
     std::cout << "gpu_eval_p90_final_velocity_norm=" << summary.p90_final_velocity_norm << "\n";
     std::cout << "gpu_eval_p90_final_attitude_error=" << summary.p90_final_attitude_error << "\n";
@@ -1480,6 +1528,7 @@ int main(int argc, char** argv){
     std::cout << "initial_attitude_scale=" << options.initial_attitude_scale << "\n";
     std::cout << "initial_attitude_scale_local=" << options.initial_attitude_scale_local << "\n";
     std::cout << "initial_angular_velocity_scale=" << options.initial_angular_velocity_scale << "\n";
+    std::cout << "near_zero_guidance_probability=" << options.near_zero_guidance_probability << "\n";
     std::cout << "simulation_frequency_hz=100\n";
     std::cout << "dt=0.01\n";
     std::cout << "sample_dynamics=" << (options.sample_dynamics ? "true" : "false") << "\n";
@@ -1496,6 +1545,9 @@ int main(int argc, char** argv){
     std::cout << "terminal_velocity_weight=" << options.terminal_velocity_weight << "\n";
     std::cout << "terminal_angular_velocity_weight=" << options.terminal_angular_velocity_weight << "\n";
     std::cout << "diff_rollout_loss_weight=" << options.diff_rollout_loss_weight << "\n";
+    std::cout << "temporal_gradient_decay_alpha=" << options.temporal_gradient_decay_alpha << "\n";
+    std::cout << "velocity_observation_noise=" << options.velocity_observation_noise << "\n";
+    std::cout << "velocity_observation_delay_steps=" << options.velocity_observation_delay_steps << "\n";
     std::cout << "action_grad_clip_enabled=" << (options.action_grad_clip_enabled ? "true" : "false") << "\n";
     std::cout << "action_grad_clip_norm=" << options.action_grad_clip_norm << "\n";
     std::cout << "actor_grad_clip_enabled=" << (options.actor_grad_clip_enabled ? "true" : "false") << "\n";
@@ -1522,6 +1574,9 @@ int main(int argc, char** argv){
     gpu::EulerGpuRunOptions run_options;
     run_options.device = options.gpu_device;
     run_options.compute_action_gradients = true;
+    run_options.temporal_gradient_decay_alpha = options.temporal_gradient_decay_alpha;
+    run_options.velocity_observation_noise = options.velocity_observation_noise;
+    run_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
     gpu::generate_validation_batch(
         batch,
         options.batch_size,
@@ -1536,7 +1591,8 @@ int main(int argc, char** argv){
         options.initial_position_scale,
         options.initial_velocity_scale,
         options.initial_angular_velocity_scale,
-        options.initial_attitude_scale
+        options.initial_attitude_scale,
+        options.near_zero_guidance_probability
     );
 
     try{
@@ -1723,7 +1779,8 @@ int main(int argc, char** argv){
                 options.initial_position_scale,
                 options.initial_velocity_scale,
                 options.initial_angular_velocity_scale,
-                options.initial_attitude_scale
+                options.initial_attitude_scale,
+                options.near_zero_guidance_probability
             );
             print_local_initial_condition_validation(local_initial_validation);
             if(!local_initial_validation.passed){

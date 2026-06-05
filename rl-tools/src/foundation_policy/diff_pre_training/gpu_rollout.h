@@ -37,7 +37,7 @@ struct EulerGpuLossWeights{
     float saturation = 0.05f;
     float saturation_start = 0.95f;
     float terminal_loss_weight = 4.0f;
-    float terminal_loss_scale = 1.0f;
+    float terminal_loss_scale = 0.0f;
     float terminal_position = 12.0f;
     float terminal_velocity = 4.0f;
     float terminal_attitude = 8.0f;
@@ -148,6 +148,9 @@ void build_deployment_observation(
 struct EulerGpuRunOptions{
     int device = 0;
     bool compute_action_gradients = true;
+    float temporal_gradient_decay_alpha = 0.0f;
+    float velocity_observation_noise = 0.0f;
+    std::size_t velocity_observation_delay_steps = 0;
 };
 
 struct ForcedDynamicsBins{
@@ -308,6 +311,9 @@ struct FullGpuTrainingOptions{
     float actor_grad_clip_norm = 100.0f;
     float actor_grad_skip_norm = 1e12f;
     float actor_grad_eps = 1e-6f;
+    float temporal_gradient_decay_alpha = 0.0f;
+    float velocity_observation_noise = 0.0f;
+    std::size_t velocity_observation_delay_steps = 0;
     bool disable_physics_gradient = false;
     bool reset_hidden_each_step = false;
     bool sample_dynamics = true;
@@ -316,10 +322,11 @@ struct FullGpuTrainingOptions{
     TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
     float trajectory_frequency_hz = 0.5f;
-    float initial_position_scale = 1.0f;
-    float initial_velocity_scale = 1.0f;
-    float initial_attitude_scale = 0.0f;
-    float initial_angular_velocity_scale = 1.0f;
+    float initial_position_scale = 2.5f;
+    float initial_velocity_scale = 20.0f;
+    float initial_attitude_scale = 18.947368f;
+    float initial_angular_velocity_scale = 50.0f;
+    float near_zero_guidance_probability = 0.10f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
     float success_attitude_threshold = 3.14159265358979323846f;
@@ -362,16 +369,19 @@ struct GpuPolicyEvalOptions{
     TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
     float trajectory_frequency_hz = 0.5f;
-    float initial_position_scale = 1.0f;
-    float initial_velocity_scale = 1.0f;
-    float initial_attitude_scale = 0.0f;
-    float initial_angular_velocity_scale = 1.0f;
+    float initial_position_scale = 2.5f;
+    float initial_velocity_scale = 20.0f;
+    float initial_attitude_scale = 18.947368f;
+    float initial_angular_velocity_scale = 50.0f;
+    float near_zero_guidance_probability = 0.10f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
     float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
     float success_action_saturation_threshold = 1.0f;
     std::size_t throughout_gate_start_step = 0;
+    float velocity_observation_noise = 0.0f;
+    std::size_t velocity_observation_delay_steps = 0;
     ForcedDynamicsBins forced_bins;
     std::string load_path;
     std::string log_path;
@@ -392,6 +402,28 @@ struct GpuPolicyEvalSummary{
     float angular_velocity_rmse = 0.0f;
     float linear_acceleration_error_rmse = 0.0f;
     float angular_acceleration_error_rmse = 0.0f;
+    float settling_fraction_position = 0.0f;
+    float position_mean_error_mean = 0.0f;
+    float angle_mean_error_mean = 0.0f;
+    float linear_velocity_mean_error_mean = 0.0f;
+    float angular_velocity_mean_error_mean = 0.0f;
+    float angular_acceleration_mean_error_mean = 0.0f;
+    float action_mean_error_mean = 0.0f;
+    float action_relative_mean_error_mean = 0.0f;
+    float position_max_error_mean = 0.0f;
+    float angle_max_error_mean = 0.0f;
+    float linear_velocity_max_error_mean = 0.0f;
+    float angular_velocity_max_error_mean = 0.0f;
+    float angular_acceleration_max_error_mean = 0.0f;
+    float action_max_error_mean = 0.0f;
+    float action_relative_max_error_mean = 0.0f;
+    float position_max_error_std = 0.0f;
+    float angle_max_error_std = 0.0f;
+    float linear_velocity_max_error_std = 0.0f;
+    float angular_velocity_max_error_std = 0.0f;
+    float angular_acceleration_max_error_std = 0.0f;
+    float action_max_error_std = 0.0f;
+    float action_relative_max_error_std = 0.0f;
     float median_final_position_norm = 0.0f;
     float median_final_velocity_norm = 0.0f;
     float median_final_attitude_error = 0.0f;
@@ -614,7 +646,8 @@ void generate_validation_batch(
     float initial_position_scale = 1.0f,
     float initial_velocity_scale = 1.0f,
     float initial_angular_velocity_scale = 1.0f,
-    float initial_attitude_scale = 0.0f
+    float initial_attitude_scale = 0.0f,
+    float near_zero_guidance_probability = 0.10f
 );
 
 int assemble_observations_gpu(
@@ -727,7 +760,8 @@ LocalInitialConditionValidationSummary validate_local_initial_conditions(
     float initial_position_scale,
     float initial_velocity_scale,
     float initial_angular_velocity_scale,
-    float initial_attitude_scale
+    float initial_attitude_scale,
+    float near_zero_guidance_probability = 0.10f
 );
 
 Stage9EvalParitySummary run_stage9_eval_parity(
