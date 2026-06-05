@@ -24,6 +24,7 @@ constexpr float DT = 0.01f;
 constexpr float G = 9.81f;
 constexpr std::uint64_t CPU_MAX_HORIZON = 256;
 constexpr std::uint64_t GPU_EVAL_MAX_HORIZON = 4096;
+constexpr std::size_t DIAGNOSTICS_SIZE = 9;
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err__ = (call); \
@@ -58,6 +59,11 @@ __host__ __device__ inline std::size_t pidx4(std::size_t b, std::size_t d){
 
 __host__ __device__ inline std::size_t pidx9(std::size_t b, std::size_t d){
     return b * 9 + d;
+}
+
+__host__ __device__ inline float rotation_angle_from_trace(float trace){
+    const float cos_angle = fminf(1.0f, fmaxf(-1.0f, 0.5f * (trace - 1.0f)));
+    return acosf(cos_angle);
 }
 
 __host__ __device__ inline std::size_t rotor3(std::size_t b, std::size_t r, std::size_t d){
@@ -215,6 +221,8 @@ struct DeviceArrays{
     float* initial_previous_action = nullptr;
     float* reference_p = nullptr;
     float* reference_v = nullptr;
+    float* reference_p_traj = nullptr;
+    float* reference_v_traj = nullptr;
     float* mass = nullptr;
     float* gravity = nullptr;
     float* J = nullptr;
@@ -248,7 +256,8 @@ struct DeviceArrays{
 
 void cuda_free(DeviceArrays& d){
     float* ptrs[] = {
-        d.p, d.v, d.R, d.omega, d.rpm, d.actions, d.initial_previous_action, d.reference_p, d.reference_v,
+        d.p, d.v, d.R, d.omega, d.rpm, d.actions, d.initial_previous_action,
+        d.reference_p, d.reference_v, d.reference_p_traj, d.reference_v_traj,
         d.mass, d.gravity, d.J, d.J_inv, d.rotor_positions, d.rotor_thrust_directions, d.rotor_torque_directions,
         d.rotor_torque_constants, d.rotor_time_rising, d.rotor_time_falling, d.rotor_thrust_coeffs, d.action_min,
         d.action_max, d.cache_alpha, d.cache_d_setpoint_d_action, d.cache_d_force_d_rpm, d.cache_thrust_body,
@@ -279,6 +288,8 @@ void allocate(DeviceArrays& d, std::size_t batch_size, std::size_t horizon){
     cuda_alloc(d.initial_previous_action, batch_size * 4);
     cuda_alloc(d.reference_p, batch_size * 3);
     cuda_alloc(d.reference_v, batch_size * 3);
+    cuda_alloc(d.reference_p_traj, state_count * 3);
+    cuda_alloc(d.reference_v_traj, state_count * 3);
     cuda_alloc(d.mass, batch_size);
     cuda_alloc(d.gravity, batch_size * 3);
     cuda_alloc(d.J, batch_size * 9);
@@ -307,7 +318,7 @@ void allocate(DeviceArrays& d, std::size_t batch_size, std::size_t horizon){
     cuda_alloc(d.loss, batch_size);
     cuda_alloc(d.action_gradients, step_count * 4);
     cuda_alloc(d.observations, state_count * EULER_OBSERVATION_DIM);
-    cuda_alloc(d.diagnostics, 8);
+    cuda_alloc(d.diagnostics, DIAGNOSTICS_SIZE);
 }
 
 __global__ void observation_kernel(DeviceArrays d, std::size_t batch_size, std::size_t step_i){
@@ -318,7 +329,7 @@ __global__ void observation_kernel(DeviceArrays d, std::size_t batch_size, std::
     std::size_t out = 0;
     for(int dim = 0; dim < 3; dim++){
         d.observations[idx_obs(step_i, b, out++, batch_size)] =
-            d.p[idx3(step_i, b, dim, batch_size)] - d.reference_p[pidx3(b, dim)];
+            d.p[idx3(step_i, b, dim, batch_size)] - d.reference_p_traj[idx3(step_i, b, dim, batch_size)];
     }
     for(int r = 0; r < 3; r++){
         for(int c = 0; c < 3; c++){
@@ -328,7 +339,7 @@ __global__ void observation_kernel(DeviceArrays d, std::size_t batch_size, std::
     }
     for(int dim = 0; dim < 3; dim++){
         d.observations[idx_obs(step_i, b, out++, batch_size)] =
-            d.v[idx3(step_i, b, dim, batch_size)] - d.reference_v[pidx3(b, dim)];
+            d.v[idx3(step_i, b, dim, batch_size)] - d.reference_v_traj[idx3(step_i, b, dim, batch_size)];
     }
     for(int dim = 0; dim < 3; dim++){
         d.observations[idx_obs(step_i, b, out++, batch_size)] =
@@ -472,8 +483,8 @@ __global__ void loss_and_action_kernel(DeviceArrays d, EulerGpuLossWeights weigh
     for(std::size_t step_i = 0; step_i < horizon; step_i++){
         const std::size_t state_step = step_i + 1;
         for(int dim = 0; dim < 3; dim++){
-            const float e_p = d.p[idx3(state_step, b, dim, batch_size)] - d.reference_p[pidx3(b, dim)];
-            const float e_v = d.v[idx3(state_step, b, dim, batch_size)] - d.reference_v[pidx3(b, dim)];
+            const float e_p = d.p[idx3(state_step, b, dim, batch_size)] - d.reference_p_traj[idx3(state_step, b, dim, batch_size)];
+            const float e_v = d.v[idx3(state_step, b, dim, batch_size)] - d.reference_v_traj[idx3(state_step, b, dim, batch_size)];
             const float omega = d.omega[idx3(state_step, b, dim, batch_size)];
             total += normalizer * weights.position * e_p * e_p;
             total += normalizer * weights.velocity * e_v * e_v;
@@ -500,8 +511,8 @@ __global__ void loss_and_action_kernel(DeviceArrays d, EulerGpuLossWeights weigh
     const float wR = terminal_scale * weights.terminal_loss_weight * weights.terminal_attitude;
     const float ww = terminal_scale * weights.terminal_loss_weight * weights.terminal_angular_velocity;
     for(int dim = 0; dim < 3; dim++){
-        const float e_p = d.p[idx3(terminal, b, dim, batch_size)] - d.reference_p[pidx3(b, dim)];
-        const float e_v = d.v[idx3(terminal, b, dim, batch_size)] - d.reference_v[pidx3(b, dim)];
+        const float e_p = d.p[idx3(terminal, b, dim, batch_size)] - d.reference_p_traj[idx3(terminal, b, dim, batch_size)];
+        const float e_v = d.v[idx3(terminal, b, dim, batch_size)] - d.reference_v_traj[idx3(terminal, b, dim, batch_size)];
         const float omega = d.omega[idx3(terminal, b, dim, batch_size)];
         total += wp * e_p * e_p + wv * e_v * e_v + ww * omega * omega;
         d.lambda_p[idx3(terminal, b, dim, batch_size)] += 2.0f * wp * e_p;
@@ -554,6 +565,7 @@ __global__ void rollout_diagnostics_kernel(
     std::size_t horizon,
     float position_threshold,
     float velocity_threshold,
+    float attitude_threshold,
     float angular_velocity_threshold
 ){
     const std::size_t b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -563,20 +575,31 @@ __global__ void rollout_diagnostics_kernel(
     float p_norm_sq = 0.0f;
     float v_norm_sq = 0.0f;
     float w_norm_sq = 0.0f;
+    float trace_R = 0.0f;
     bool finite = true;
     for(int dim = 0; dim < 3; dim++){
-        const float p = d.p[idx3(horizon, b, dim, batch_size)];
-        const float v = d.v[idx3(horizon, b, dim, batch_size)];
+        const float p = d.p[idx3(horizon, b, dim, batch_size)] -
+            d.reference_p_traj[idx3(horizon, b, dim, batch_size)];
+        const float v = d.v[idx3(horizon, b, dim, batch_size)] -
+            d.reference_v_traj[idx3(horizon, b, dim, batch_size)];
         const float w = d.omega[idx3(horizon, b, dim, batch_size)];
         p_norm_sq += p * p;
         v_norm_sq += v * v;
         w_norm_sq += w * w;
         finite = finite && isfinite(p) && isfinite(v) && isfinite(w);
     }
+    for(int flat = 0; flat < 9; flat++){
+        const float R = d.R[idx9(horizon, b, flat, batch_size)];
+        finite = finite && isfinite(R);
+        if(flat == 0 || flat == 4 || flat == 8){
+            trace_R += R;
+        }
+    }
     const float p_norm = sqrtf(p_norm_sq);
     const float v_norm = sqrtf(v_norm_sq);
     const float w_norm = sqrtf(w_norm_sq);
-    finite = finite && isfinite(d.loss[b]) && isfinite(p_norm) && isfinite(v_norm) && isfinite(w_norm);
+    const float attitude_error = rotation_angle_from_trace(trace_R);
+    finite = finite && isfinite(d.loss[b]) && isfinite(p_norm) && isfinite(v_norm) && isfinite(w_norm) && isfinite(attitude_error);
 
     std::uint32_t saturation_count = 0;
     for(std::size_t t = 0; t < horizon; t++){
@@ -589,6 +612,7 @@ __global__ void rollout_diagnostics_kernel(
     if(finite){
         const bool success = p_norm < position_threshold &&
             v_norm < velocity_threshold &&
+            attitude_error < attitude_threshold &&
             w_norm < angular_velocity_threshold;
         atomicAdd(&d.diagnostics[0], success ? 1.0f : 0.0f);
         atomicAdd(&d.diagnostics[1], 1.0f);
@@ -597,6 +621,7 @@ __global__ void rollout_diagnostics_kernel(
         atomicAdd(&d.diagnostics[5], p_norm);
         atomicAdd(&d.diagnostics[6], v_norm);
         atomicAdd(&d.diagnostics[7], w_norm);
+        atomicAdd(&d.diagnostics[8], attitude_error);
     }
     else{
         atomicAdd(&d.diagnostics[2], 1.0f);
@@ -761,6 +786,8 @@ void copy_input_to_device(const EulerGpuBatch& batch, DeviceArrays& d){
     CUDA_CHECK(cudaMemcpy(d.initial_previous_action, batch.initial_previous_action.data(), sizeof(float) * B * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.reference_p, batch.reference_p.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.reference_v, batch.reference_v.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d.reference_p_traj, batch.reference_p_traj.data(), sizeof(float) * (H + 1) * B * 3, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d.reference_v_traj, batch.reference_v_traj.data(), sizeof(float) * (H + 1) * B * 3, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.mass, batch.mass.data(), sizeof(float) * B, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.gravity, batch.gravity.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.J, batch.J.data(), sizeof(float) * B * 9, cudaMemcpyHostToDevice));
@@ -938,6 +965,8 @@ void EulerGpuBatch::resize(std::size_t new_batch_size, std::size_t new_horizon){
     initial_previous_action.assign(batch_size * 4, 0.0f);
     reference_p.assign(batch_size * 3, 0.0f);
     reference_v.assign(batch_size * 3, 0.0f);
+    reference_p_traj.assign((horizon + 1) * batch_size * 3, 0.0f);
+    reference_v_traj.assign((horizon + 1) * batch_size * 3, 0.0f);
     actions.assign(horizon * batch_size * 4, 0.0f);
     mass.assign(batch_size, 0.0f);
     gravity.assign(batch_size * 3, 0.0f);
@@ -972,6 +1001,28 @@ void EulerGpuResult::resize(std::size_t batch_size, std::size_t horizon){
     final_rpm.assign(batch_size * 4, 0.0f);
     loss.assign(batch_size, 0.0f);
     action_gradients.assign(horizon * batch_size * 4, 0.0f);
+}
+
+void build_deployment_observation(
+    const DeploymentAdapterInput& input,
+    float observation[EULER_OBSERVATION_DIM]
+){
+    std::size_t out = 0;
+    for(int dim = 0; dim < 3; dim++){
+        observation[out++] = input.p[dim] - input.reference_p[dim];
+    }
+    for(int i = 0; i < 9; i++){
+        observation[out++] = input.R[i];
+    }
+    for(int dim = 0; dim < 3; dim++){
+        observation[out++] = input.v[dim] - input.reference_v[dim];
+    }
+    for(int dim = 0; dim < 3; dim++){
+        observation[out++] = input.omega[dim];
+    }
+    for(int a = 0; a < 4; a++){
+        observation[out++] = input.previous_action[a];
+    }
 }
 
 int run_euler_gpu_rollout(
@@ -1079,6 +1130,81 @@ float sample_reciprocal_randomization_factor(std::mt19937& rng, std::uniform_rea
     return lower + unit(rng) * (upper - lower);
 }
 
+TrajectoryMode concrete_trajectory_mode(TrajectoryMode mode, std::size_t b){
+    if(mode != TrajectoryMode::MIXED){
+        return mode;
+    }
+    switch(b % 4u){
+        case 0u: return TrajectoryMode::FIXED;
+        case 1u: return TrajectoryMode::STEP;
+        case 2u: return TrajectoryMode::CIRCLE;
+        default: return TrajectoryMode::FIGURE8;
+    }
+}
+
+const char* trajectory_mode_name(TrajectoryMode mode){
+    switch(mode){
+        case TrajectoryMode::FIXED: return "fixed";
+        case TrajectoryMode::STEP: return "step";
+        case TrajectoryMode::CIRCLE: return "circle";
+        case TrajectoryMode::FIGURE8: return "figure8";
+        case TrajectoryMode::MIXED: return "mixed";
+    }
+    return "unknown";
+}
+
+void populate_reference_trajectory(
+    EulerGpuBatch& batch,
+    TrajectoryMode mode,
+    float amplitude,
+    float frequency_hz,
+    std::mt19937& rng,
+    std::uniform_real_distribution<float>& unit
+){
+    const float base_amplitude = std::max(0.0f, amplitude);
+    const float base_frequency = std::max(0.0f, frequency_hz);
+    constexpr float two_pi = 6.28318530717958647692f;
+    batch.trajectory_mode = static_cast<std::uint32_t>(mode);
+    for(std::size_t b = 0; b < batch.batch_size; b++){
+        const TrajectoryMode sample_mode = concrete_trajectory_mode(mode, b);
+        const float sample_amplitude = base_amplitude * (0.5f + 0.5f * unit(rng));
+        const float sample_frequency = base_frequency * (0.75f + 0.5f * unit(rng));
+        const float omega_ref = two_pi * sample_frequency;
+        const float step_value = sample_amplitude * (unit(rng) < 0.5f ? -1.0f : 1.0f);
+        const int step_axis = static_cast<int>(b % 2u);
+        for(std::size_t t = 0; t <= batch.horizon; t++){
+            const float time = static_cast<float>(t) * DT;
+            float p_ref[3] = {0.0f, 0.0f, 0.0f};
+            float v_ref[3] = {0.0f, 0.0f, 0.0f};
+            if(sample_mode == TrajectoryMode::STEP){
+                if(t >= batch.horizon / 2u){
+                    p_ref[step_axis] = step_value;
+                }
+            }
+            else if(sample_mode == TrajectoryMode::CIRCLE){
+                p_ref[0] = sample_amplitude * (std::cos(omega_ref * time) - 1.0f);
+                p_ref[1] = sample_amplitude * std::sin(omega_ref * time);
+                v_ref[0] = -sample_amplitude * omega_ref * std::sin(omega_ref * time);
+                v_ref[1] = sample_amplitude * omega_ref * std::cos(omega_ref * time);
+            }
+            else if(sample_mode == TrajectoryMode::FIGURE8){
+                p_ref[0] = sample_amplitude * std::sin(omega_ref * time);
+                p_ref[1] = 0.5f * sample_amplitude * std::sin(2.0f * omega_ref * time);
+                v_ref[0] = sample_amplitude * omega_ref * std::cos(omega_ref * time);
+                v_ref[1] = sample_amplitude * omega_ref * std::cos(2.0f * omega_ref * time);
+            }
+            for(int dim = 0; dim < 3; dim++){
+                batch.reference_p_traj[idx3(t, b, dim, batch.batch_size)] = p_ref[dim];
+                batch.reference_v_traj[idx3(t, b, dim, batch.batch_size)] = v_ref[dim];
+            }
+        }
+        for(int dim = 0; dim < 3; dim++){
+            batch.reference_p[pidx3(b, dim)] = batch.reference_p_traj[idx3(0, b, dim, batch.batch_size)];
+            batch.reference_v[pidx3(b, dim)] = batch.reference_v_traj[idx3(0, b, dim, batch.batch_size)];
+        }
+    }
+}
+
 void generate_validation_batch(
     EulerGpuBatch& batch,
     std::size_t batch_size,
@@ -1086,18 +1212,27 @@ void generate_validation_batch(
     unsigned seed,
     const ForcedDynamicsBins* forced_bins,
     bool nominal_dynamics,
-    bool correlated_size_mass_sampling
+    bool correlated_size_mass_sampling,
+    TrajectoryMode trajectory_mode,
+    float trajectory_amplitude,
+    float trajectory_frequency_hz,
+    float initial_position_scale,
+    float initial_velocity_scale,
+    float initial_angular_velocity_scale
 ){
     batch.resize(batch_size, horizon);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.0f, 1.0f);
     std::uniform_real_distribution<float> action_delta_dist(-0.03f, 0.03f);
-    std::uniform_real_distribution<float> pos_dist(-0.2f, 0.2f);
-    std::uniform_real_distribution<float> vel_dist(-0.05f, 0.05f);
-    std::uniform_real_distribution<float> omega_dist(-0.02f, 0.02f);
+    const float position_scale = std::max(0.0f, initial_position_scale);
+    const float velocity_scale = std::max(0.0f, initial_velocity_scale);
+    const float angular_velocity_scale = std::max(0.0f, initial_angular_velocity_scale);
+    std::uniform_real_distribution<float> pos_dist(-0.2f * position_scale, 0.2f * position_scale);
+    std::uniform_real_distribution<float> vel_dist(-0.05f * velocity_scale, 0.05f * velocity_scale);
+    std::uniform_real_distribution<float> omega_dist(-0.02f * angular_velocity_scale, 0.02f * angular_velocity_scale);
     constexpr float max_rpm = 22000.0f;
     constexpr std::uint32_t balance_bins = 4u;
-    batch.replay_schema_version = 2u;
+    batch.replay_schema_version = 3u;
     batch.sampler_seed = seed;
     batch.sampler_balance_bins = balance_bins;
 
@@ -1239,6 +1374,7 @@ void generate_validation_batch(
             batch.initial_previous_action[pidx4(b, r)] = hover_action;
         }
     }
+    populate_reference_trajectory(batch, trajectory_mode, trajectory_amplitude, trajectory_frequency_hz, rng, unit);
     for(std::size_t t = 0; t < horizon; t++){
         for(std::size_t b = 0; b < batch_size; b++){
             for(int a = 0; a < 4; a++){
@@ -1422,6 +1558,119 @@ CorrelatedSizeMassSamplerValidationSummary validate_correlated_size_mass_sampler
         summary.fixed_nominal_unchanged &&
         summary.correlated_formula_close &&
         summary.finite;
+    return summary;
+}
+
+TrajectorySamplerValidationSummary validate_trajectory_sampler(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    float amplitude,
+    float frequency_hz
+){
+    TrajectorySamplerValidationSummary summary;
+    summary.samples = std::max<std::size_t>(batch_size, 16);
+    summary.horizon = std::max<std::size_t>(horizon, 1);
+
+    EulerGpuBatch fixed_batch;
+    EulerGpuBatch first_mixed_batch;
+    EulerGpuBatch second_mixed_batch;
+    generate_validation_batch(
+        fixed_batch,
+        summary.samples,
+        summary.horizon,
+        seed,
+        nullptr,
+        false,
+        false,
+        TrajectoryMode::FIXED,
+        amplitude,
+        frequency_hz
+    );
+    generate_validation_batch(
+        first_mixed_batch,
+        summary.samples,
+        summary.horizon,
+        seed,
+        nullptr,
+        false,
+        false,
+        TrajectoryMode::MIXED,
+        amplitude,
+        frequency_hz
+    );
+    generate_validation_batch(
+        second_mixed_batch,
+        summary.samples,
+        summary.horizon,
+        seed,
+        nullptr,
+        false,
+        false,
+        TrajectoryMode::MIXED,
+        amplitude,
+        frequency_hz
+    );
+
+    for(std::size_t t = 0; t <= summary.horizon; t++){
+        for(std::size_t b = 0; b < summary.samples; b++){
+            summary.mixed_mode_coverage_mask |= 1u << static_cast<unsigned>(concrete_trajectory_mode(TrajectoryMode::MIXED, b));
+            for(int dim = 0; dim < 3; dim++){
+                const std::size_t id = idx3(t, b, dim, summary.samples);
+                const float fixed_p = fixed_batch.reference_p_traj[id];
+                const float fixed_v = fixed_batch.reference_v_traj[id];
+                const float mixed_p_0 = first_mixed_batch.reference_p_traj[id];
+                const float mixed_v_0 = first_mixed_batch.reference_v_traj[id];
+                const float mixed_p_1 = second_mixed_batch.reference_p_traj[id];
+                const float mixed_v_1 = second_mixed_batch.reference_v_traj[id];
+                summary.fixed_reference_max_abs = std::max(summary.fixed_reference_max_abs, std::fabs(fixed_p));
+                summary.fixed_reference_max_abs = std::max(summary.fixed_reference_max_abs, std::fabs(fixed_v));
+                summary.deterministic_max_abs = std::max(summary.deterministic_max_abs, std::fabs(mixed_p_0 - mixed_p_1));
+                summary.deterministic_max_abs = std::max(summary.deterministic_max_abs, std::fabs(mixed_v_0 - mixed_v_1));
+                summary.max_reference_abs = std::max(summary.max_reference_abs, std::fabs(mixed_p_0));
+                summary.max_reference_velocity_abs = std::max(summary.max_reference_velocity_abs, std::fabs(mixed_v_0));
+                if(!std::isfinite(fixed_p) || !std::isfinite(fixed_v) ||
+                   !std::isfinite(mixed_p_0) || !std::isfinite(mixed_v_0) ||
+                   !std::isfinite(mixed_p_1) || !std::isfinite(mixed_v_1)){
+                    summary.nan_inf_count++;
+                }
+            }
+        }
+    }
+
+    for(std::size_t b = 0; b < summary.samples; b++){
+        for(int dim = 0; dim < 3; dim++){
+            const std::size_t legacy_id = pidx3(b, dim);
+            const std::size_t traj_id = idx3(0, b, dim, summary.samples);
+            summary.fixed_reference_max_abs = std::max(
+                summary.fixed_reference_max_abs,
+                std::fabs(fixed_batch.reference_p[legacy_id] - fixed_batch.reference_p_traj[traj_id])
+            );
+            summary.fixed_reference_max_abs = std::max(
+                summary.fixed_reference_max_abs,
+                std::fabs(fixed_batch.reference_v[legacy_id] - fixed_batch.reference_v_traj[traj_id])
+            );
+        }
+    }
+
+    summary.fixed_backward_compatible = summary.fixed_reference_max_abs <= 1e-7f;
+    summary.deterministic = summary.deterministic_max_abs <= 1e-7f;
+    summary.finite = summary.nan_inf_count == 0;
+    summary.mixed_covers_all_modes =
+        (summary.mixed_mode_coverage_mask &
+         ((1u << static_cast<unsigned>(TrajectoryMode::FIXED)) |
+          (1u << static_cast<unsigned>(TrajectoryMode::STEP)) |
+          (1u << static_cast<unsigned>(TrajectoryMode::CIRCLE)) |
+          (1u << static_cast<unsigned>(TrajectoryMode::FIGURE8)))) ==
+        ((1u << static_cast<unsigned>(TrajectoryMode::FIXED)) |
+         (1u << static_cast<unsigned>(TrajectoryMode::STEP)) |
+         (1u << static_cast<unsigned>(TrajectoryMode::CIRCLE)) |
+         (1u << static_cast<unsigned>(TrajectoryMode::FIGURE8)));
+    summary.passed =
+        summary.fixed_backward_compatible &&
+        summary.deterministic &&
+        summary.finite &&
+        summary.mixed_covers_all_modes;
     return summary;
 }
 
@@ -2912,9 +3161,9 @@ CriticLossMetrics compute_critic_targets_and_gradients(
         for(std::size_t reverse_i = 0; reverse_i < H; reverse_i++){
             const std::size_t t = H - reverse_i - 1;
             float cost = 0.0f;
-            for(int dim = 0; dim < 3; dim++){
-                const float e_p = host_p[idx3(t + 1, b, dim, B)] - batch.reference_p[pidx3(b, dim)];
-                const float e_v = host_v[idx3(t + 1, b, dim, B)] - batch.reference_v[pidx3(b, dim)];
+                for(int dim = 0; dim < 3; dim++){
+                    const float e_p = host_p[idx3(t + 1, b, dim, B)] - batch.reference_p_traj[idx3(t + 1, b, dim, B)];
+                    const float e_v = host_v[idx3(t + 1, b, dim, B)] - batch.reference_v_traj[idx3(t + 1, b, dim, B)];
                 cost += weights.position * e_p * e_p;
                 cost += weights.velocity * e_v * e_v;
                 cost += weights.angular_velocity * host_omega[idx3(t + 1, b, dim, B)] * host_omega[idx3(t + 1, b, dim, B)];
@@ -3019,6 +3268,8 @@ void write_replay_batch(std::ostream& out, const EulerGpuBatch& batch){
     write_float_vector(out, batch.initial_previous_action);
     write_float_vector(out, batch.reference_p);
     write_float_vector(out, batch.reference_v);
+    write_float_vector(out, batch.reference_p_traj);
+    write_float_vector(out, batch.reference_v_traj);
     write_float_vector(out, batch.actions);
     write_float_vector(out, batch.mass);
     write_float_vector(out, batch.gravity);
@@ -3047,6 +3298,7 @@ void write_replay_batch(std::ostream& out, const EulerGpuBatch& batch){
     out.write(reinterpret_cast<const char*>(&batch.sampler_seed), sizeof(batch.sampler_seed));
     out.write(reinterpret_cast<const char*>(&batch.sampler_balance_bins), sizeof(batch.sampler_balance_bins));
     out.write(reinterpret_cast<const char*>(&batch.hidden_reset_enabled), sizeof(batch.hidden_reset_enabled));
+    out.write(reinterpret_cast<const char*>(&batch.trajectory_mode), sizeof(batch.trajectory_mode));
 }
 
 void read_replay_batch(std::istream& in, EulerGpuBatch& batch){
@@ -3058,6 +3310,8 @@ void read_replay_batch(std::istream& in, EulerGpuBatch& batch){
     read_float_vector(in, batch.initial_previous_action);
     read_float_vector(in, batch.reference_p);
     read_float_vector(in, batch.reference_v);
+    read_float_vector(in, batch.reference_p_traj);
+    read_float_vector(in, batch.reference_v_traj);
     read_float_vector(in, batch.actions);
     read_float_vector(in, batch.mass);
     read_float_vector(in, batch.gravity);
@@ -3086,6 +3340,7 @@ void read_replay_batch(std::istream& in, EulerGpuBatch& batch){
     in.read(reinterpret_cast<char*>(&batch.sampler_seed), sizeof(batch.sampler_seed));
     in.read(reinterpret_cast<char*>(&batch.sampler_balance_bins), sizeof(batch.sampler_balance_bins));
     in.read(reinterpret_cast<char*>(&batch.hidden_reset_enabled), sizeof(batch.hidden_reset_enabled));
+    in.read(reinterpret_cast<char*>(&batch.trajectory_mode), sizeof(batch.trajectory_mode));
 }
 
 bool write_stage9_replay_file(
@@ -3103,7 +3358,7 @@ bool write_stage9_replay_file(
         return false;
     }
     const std::uint32_t magic = 0x52394744u; // R9GD
-    const std::uint32_t version = 2u;
+    const std::uint32_t version = 3u;
     const std::uint64_t saved_steps = static_cast<std::uint64_t>(steps);
     const std::uint64_t saved_batch = static_cast<std::uint64_t>(batch_size);
     const std::uint64_t saved_horizon = static_cast<std::uint64_t>(horizon);
@@ -3145,7 +3400,7 @@ bool open_stage9_replay_file(
     in.read(reinterpret_cast<char*>(&batch_size), sizeof(batch_size));
     in.read(reinterpret_cast<char*>(&horizon), sizeof(horizon));
     return magic == 0x52394744u &&
-        version == 2u &&
+        version == 3u &&
         steps == expected_steps &&
         batch_size == expected_batch_size &&
         horizon == expected_horizon &&
@@ -4928,7 +5183,7 @@ FullGpuTrainingSummary run_full_gpu_training(
         log << "step,horizon,loss,diff_rollout_loss_scaled,critic_loss_raw,critic_loss_weight,critic_loss_scaled,"
             << "critic_output_mean,critic_target_mean,critic_error_mean,critic_error_norm,grad_norm,"
             << "success_rate_batch,action_saturation_rate,final_position_norm_mean,final_velocity_norm_mean,"
-            << "final_angular_velocity_norm_mean,finite\n";
+            << "final_attitude_error_mean,final_angular_velocity_norm_mean,finite\n";
     }
 
     EulerGpuBatch batch;
@@ -4942,7 +5197,21 @@ FullGpuTrainingSummary run_full_gpu_training(
         CUDA_CHECK(cudaSetDevice(training_options.device));
         batch.resize(training_options.batch_size, training_options.horizon);
         if(!training_options.sample_dynamics){
-            generate_validation_batch(batch, training_options.batch_size, training_options.horizon, training_options.seed, nullptr, true);
+            generate_validation_batch(
+                batch,
+                training_options.batch_size,
+                training_options.horizon,
+                training_options.seed,
+                nullptr,
+                true,
+                false,
+                training_options.trajectory_mode,
+                training_options.trajectory_amplitude,
+                training_options.trajectory_frequency_hz,
+                training_options.initial_position_scale,
+                training_options.initial_velocity_scale,
+                training_options.initial_angular_velocity_scale
+            );
         }
         allocate(d, training_options.batch_size, training_options.horizon);
         actor_allocate(d_actor_weights, d_actor_buffers, training_options.batch_size, training_options.horizon);
@@ -4966,7 +5235,7 @@ FullGpuTrainingSummary run_full_gpu_training(
         const std::size_t gradient_count = step_count * RDAC_ACTION_DIM;
         const std::size_t critic_count = step_count * RDAC_CRITIC_DIM;
         std::vector<float> host_loss(training_options.batch_size, 0.0f);
-        std::vector<float> host_diagnostics(8, 0.0f);
+        std::vector<float> host_diagnostics(DIAGNOSTICS_SIZE, 0.0f);
         ActorWeightsHost host_gradients;
         for(std::size_t step = 0; step < training_options.steps; step++){
             if(training_options.sample_dynamics){
@@ -4977,7 +5246,13 @@ FullGpuTrainingSummary run_full_gpu_training(
                     training_options.seed + static_cast<unsigned>(step),
                     nullptr,
                     false,
-                    training_options.correlated_size_mass_sampling
+                    training_options.correlated_size_mass_sampling,
+                    training_options.trajectory_mode,
+                    training_options.trajectory_amplitude,
+                    training_options.trajectory_frequency_hz,
+                    training_options.initial_position_scale,
+                    training_options.initial_velocity_scale,
+                    training_options.initial_angular_velocity_scale
                 );
             }
             copy_input_to_device(batch, d);
@@ -5050,6 +5325,7 @@ FullGpuTrainingSummary run_full_gpu_training(
                 training_options.horizon,
                 training_options.success_position_threshold,
                 training_options.success_velocity_threshold,
+                training_options.success_attitude_threshold,
                 training_options.success_angular_velocity_threshold
             );
             CUDA_CHECK(cudaGetLastError());
@@ -5082,6 +5358,7 @@ FullGpuTrainingSummary run_full_gpu_training(
             summary.final_position_norm_mean = host_diagnostics[5] / valid_count;
             summary.final_velocity_norm_mean = host_diagnostics[6] / valid_count;
             summary.final_angular_velocity_norm_mean = host_diagnostics[7] / valid_count;
+            summary.final_attitude_error_mean = host_diagnostics[8] / valid_count;
             if(host_diagnostics[2] > 0.0f){
                 summary.nan_inf_count += static_cast<std::size_t>(host_diagnostics[2]);
             }
@@ -5104,7 +5381,7 @@ FullGpuTrainingSummary run_full_gpu_training(
                         << summary.final_grad_norm << ","
                         << summary.final_success_rate << "," << summary.final_action_saturation << ","
                         << summary.final_position_norm_mean << "," << summary.final_velocity_norm_mean << ","
-                        << summary.final_angular_velocity_norm_mean << ",false\n";
+                        << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean << ",false\n";
                 }
                 break;
             }
@@ -5130,7 +5407,7 @@ FullGpuTrainingSummary run_full_gpu_training(
                     << summary.final_grad_norm << ","
                     << summary.final_success_rate << "," << summary.final_action_saturation << ","
                     << summary.final_position_norm_mean << "," << summary.final_velocity_norm_mean << ","
-                    << summary.final_angular_velocity_norm_mean << ",true\n";
+                    << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean << ",true\n";
             }
             summary.finite = true;
         }
@@ -5197,7 +5474,13 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         eval_options.seed,
         eval_options.forced_bins.enabled ? &eval_options.forced_bins : nullptr,
         !eval_options.sample_dynamics && !eval_options.forced_bins.enabled,
-        eval_options.correlated_size_mass_sampling
+        eval_options.correlated_size_mass_sampling,
+        eval_options.trajectory_mode,
+        eval_options.trajectory_amplitude,
+        eval_options.trajectory_frequency_hz,
+        eval_options.initial_position_scale,
+        eval_options.initial_velocity_scale,
+        eval_options.initial_angular_velocity_scale
     );
 
     DeviceArrays d;
@@ -5236,13 +5519,14 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         }
         loss_and_action_kernel<<<grid, block>>>(d, weights, eval_options.episodes, eval_options.horizon);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemset(d.diagnostics, 0, sizeof(float) * 8));
+        CUDA_CHECK(cudaMemset(d.diagnostics, 0, sizeof(float) * DIAGNOSTICS_SIZE));
         rollout_diagnostics_kernel<<<grid, block>>>(
             d,
             eval_options.episodes,
             eval_options.horizon,
             eval_options.success_position_threshold,
             eval_options.success_velocity_threshold,
+            eval_options.success_attitude_threshold,
             eval_options.success_angular_velocity_threshold
         );
         CUDA_CHECK(cudaGetLastError());
@@ -5250,14 +5534,16 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
 
         EulerGpuResult result;
         copy_output_to_host(batch, d, result);
-        std::vector<float> host_diagnostics(8, 0.0f);
+        std::vector<float> host_diagnostics(DIAGNOSTICS_SIZE, 0.0f);
         CUDA_CHECK(cudaMemcpy(host_diagnostics.data(), d.diagnostics, sizeof(float) * host_diagnostics.size(), cudaMemcpyDeviceToHost));
         std::vector<float> host_p(state_count * 3, 0.0f);
         std::vector<float> host_v(state_count * 3, 0.0f);
+        std::vector<float> host_R(state_count * 9, 0.0f);
         std::vector<float> host_omega(state_count * 3, 0.0f);
         std::vector<float> host_actions(step_count * RDAC_ACTION_DIM, 0.0f);
         CUDA_CHECK(cudaMemcpy(host_p.data(), d.p, sizeof(float) * host_p.size(), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(host_v.data(), d.v, sizeof(float) * host_v.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_R.data(), d.R, sizeof(float) * host_R.size(), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(host_omega.data(), d.omega, sizeof(float) * host_omega.size(), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(host_actions.data(), d.actions, sizeof(float) * host_actions.size(), cudaMemcpyDeviceToHost));
         const float valid_count = host_diagnostics[1];
@@ -5270,15 +5556,19 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
 
         std::vector<float> p_norms;
         std::vector<float> v_norms;
+        std::vector<float> attitude_errors;
         std::vector<float> w_norms;
         std::vector<float> max_p_norms;
         std::vector<float> max_v_norms;
+        std::vector<float> max_attitude_errors;
         std::vector<float> max_w_norms;
         p_norms.reserve(eval_options.episodes);
         v_norms.reserve(eval_options.episodes);
+        attitude_errors.reserve(eval_options.episodes);
         w_norms.reserve(eval_options.episodes);
         max_p_norms.reserve(eval_options.episodes);
         max_v_norms.reserve(eval_options.episodes);
+        max_attitude_errors.reserve(eval_options.episodes);
         max_w_norms.reserve(eval_options.episodes);
         double loss_sum = 0.0;
         std::size_t loss_count = 0;
@@ -5289,6 +5579,11 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
         std::size_t first_failure_count = 0;
         double inside_fraction_sum = 0.0;
         double first_failure_time_sum = 0.0;
+        double position_rmse_sum = 0.0;
+        double velocity_rmse_sum = 0.0;
+        double attitude_rmse_sum = 0.0;
+        double angular_velocity_rmse_sum = 0.0;
+        std::size_t rmse_count = 0;
         float max_action_abs = 0.0f;
         for(std::size_t t = 0; t < eval_options.horizon; t++){
             for(std::size_t b = 0; b < eval_options.episodes; b++){
@@ -5304,17 +5599,28 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             double p_sq = 0.0;
             double v_sq = 0.0;
             double w_sq = 0.0;
+            float trace_R = 0.0f;
             bool finite = true;
             for(int dim = 0; dim < 3; dim++){
-                const float p = result.final_p[pidx3(b, dim)];
-                const float v = result.final_v[pidx3(b, dim)];
+                const float p = result.final_p[pidx3(b, dim)] -
+                    batch.reference_p_traj[idx3(eval_options.horizon, b, dim, eval_options.episodes)];
+                const float v = result.final_v[pidx3(b, dim)] -
+                    batch.reference_v_traj[idx3(eval_options.horizon, b, dim, eval_options.episodes)];
                 const float w = result.final_omega[pidx3(b, dim)];
                 finite = finite && std::isfinite(p) && std::isfinite(v) && std::isfinite(w);
                 p_sq += static_cast<double>(p) * p;
                 v_sq += static_cast<double>(v) * v;
                 w_sq += static_cast<double>(w) * w;
             }
-            finite = finite && std::isfinite(result.loss[b]);
+            for(int flat = 0; flat < 9; flat++){
+                const float R = result.final_R[pidx9(b, flat)];
+                finite = finite && std::isfinite(R);
+                if(flat == 0 || flat == 4 || flat == 8){
+                    trace_R += R;
+                }
+            }
+            const float attitude_error = rotation_angle_from_trace(trace_R);
+            finite = finite && std::isfinite(result.loss[b]) && std::isfinite(attitude_error);
             if(!finite){
                 summary.nan_inf_count++;
                 continue;
@@ -5324,6 +5630,7 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             const float w_norm = static_cast<float>(std::sqrt(w_sq));
             p_norms.push_back(p_norm);
             v_norms.push_back(v_norm);
+            attitude_errors.push_back(attitude_error);
             w_norms.push_back(w_norm);
             near_p_count += p_norm < eval_options.success_position_threshold ? 1u : 0u;
             near_pv_count += (p_norm < eval_options.success_position_threshold && v_norm < eval_options.success_velocity_threshold) ? 1u : 0u;
@@ -5332,6 +5639,7 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
 
             float max_p_norm = 0.0f;
             float max_v_norm = 0.0f;
+            float max_attitude_error = 0.0f;
             float max_w_norm = 0.0f;
             std::size_t inside_steps = 0;
             bool failed = false;
@@ -5340,25 +5648,45 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                 double step_p_sq = 0.0;
                 double step_v_sq = 0.0;
                 double step_w_sq = 0.0;
+                float step_trace_R = 0.0f;
                 bool step_finite = true;
                 for(int dim = 0; dim < 3; dim++){
-                    const float p = host_p[idx3(t, b, dim, eval_options.episodes)];
-                    const float v = host_v[idx3(t, b, dim, eval_options.episodes)];
+                    const float p = host_p[idx3(t, b, dim, eval_options.episodes)] -
+                        batch.reference_p_traj[idx3(t, b, dim, eval_options.episodes)];
+                    const float v = host_v[idx3(t, b, dim, eval_options.episodes)] -
+                        batch.reference_v_traj[idx3(t, b, dim, eval_options.episodes)];
                     const float w = host_omega[idx3(t, b, dim, eval_options.episodes)];
                     step_finite = step_finite && std::isfinite(p) && std::isfinite(v) && std::isfinite(w);
                     step_p_sq += static_cast<double>(p) * p;
                     step_v_sq += static_cast<double>(v) * v;
                     step_w_sq += static_cast<double>(w) * w;
                 }
+                for(int flat = 0; flat < 9; flat++){
+                    const float R = host_R[idx9(t, b, flat, eval_options.episodes)];
+                    step_finite = step_finite && std::isfinite(R);
+                    if(flat == 0 || flat == 4 || flat == 8){
+                        step_trace_R += R;
+                    }
+                }
                 const float step_p_norm = step_finite ? static_cast<float>(std::sqrt(step_p_sq)) : std::numeric_limits<float>::infinity();
                 const float step_v_norm = step_finite ? static_cast<float>(std::sqrt(step_v_sq)) : std::numeric_limits<float>::infinity();
                 const float step_w_norm = step_finite ? static_cast<float>(std::sqrt(step_w_sq)) : std::numeric_limits<float>::infinity();
+                const float step_attitude_error = step_finite ? rotation_angle_from_trace(step_trace_R) : std::numeric_limits<float>::infinity();
+                if(step_finite){
+                    position_rmse_sum += step_p_sq;
+                    velocity_rmse_sum += step_v_sq;
+                    attitude_rmse_sum += static_cast<double>(step_attitude_error) * static_cast<double>(step_attitude_error);
+                    angular_velocity_rmse_sum += step_w_sq;
+                    rmse_count++;
+                }
                 max_p_norm = std::max(max_p_norm, step_p_norm);
                 max_v_norm = std::max(max_v_norm, step_v_norm);
+                max_attitude_error = std::max(max_attitude_error, step_attitude_error);
                 max_w_norm = std::max(max_w_norm, step_w_norm);
                 const bool inside = step_finite &&
                     step_p_norm < eval_options.success_position_threshold &&
                     step_v_norm < eval_options.success_velocity_threshold &&
+                    step_attitude_error < eval_options.success_attitude_threshold &&
                     step_w_norm < eval_options.success_angular_velocity_threshold;
                 inside_steps += inside ? 1u : 0u;
                 if(!inside && !failed){
@@ -5369,6 +5697,7 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             valid_trajectory_count++;
             max_p_norms.push_back(max_p_norm);
             max_v_norms.push_back(max_v_norm);
+            max_attitude_errors.push_back(max_attitude_error);
             max_w_norms.push_back(max_w_norm);
             inside_fraction_sum += static_cast<double>(inside_steps) / static_cast<double>(eval_options.horizon + 1);
             if(!failed){
@@ -5391,14 +5720,22 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             return values[index];
         };
         summary.mean_total_loss = loss_count > 0 ? static_cast<float>(loss_sum / static_cast<double>(loss_count)) : 0.0f;
+        const double inv_rmse_count = 1.0 / std::max(1.0, static_cast<double>(rmse_count));
+        summary.position_rmse = static_cast<float>(std::sqrt(position_rmse_sum * inv_rmse_count));
+        summary.velocity_rmse = static_cast<float>(std::sqrt(velocity_rmse_sum * inv_rmse_count));
+        summary.attitude_rmse = static_cast<float>(std::sqrt(attitude_rmse_sum * inv_rmse_count));
+        summary.angular_velocity_rmse = static_cast<float>(std::sqrt(angular_velocity_rmse_sum * inv_rmse_count));
         summary.mean_final_position_norm = mean(p_norms);
         summary.mean_final_velocity_norm = mean(v_norms);
+        summary.mean_final_attitude_error = mean(attitude_errors);
         summary.mean_final_angular_velocity_norm = mean(w_norms);
         summary.median_final_position_norm = percentile(p_norms, 0.5);
         summary.median_final_velocity_norm = percentile(v_norms, 0.5);
+        summary.median_final_attitude_error = percentile(attitude_errors, 0.5);
         summary.median_final_angular_velocity_norm = percentile(w_norms, 0.5);
         summary.p90_final_position_norm = percentile(p_norms, 0.9);
         summary.p90_final_velocity_norm = percentile(v_norms, 0.9);
+        summary.p90_final_attitude_error = percentile(attitude_errors, 0.9);
         summary.p90_final_angular_velocity_norm = percentile(w_norms, 0.9);
         const float valid_trajectory_float = std::max(1.0f, static_cast<float>(valid_trajectory_count));
         summary.throughout_success_rate = static_cast<float>(throughout_success_count) / valid_trajectory_float;
@@ -5410,15 +5747,22 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             : static_cast<float>(eval_options.horizon) * DT;
         summary.mean_max_position_norm = mean(max_p_norms);
         summary.mean_max_velocity_norm = mean(max_v_norms);
+        summary.mean_max_attitude_error = mean(max_attitude_errors);
         summary.mean_max_angular_velocity_norm = mean(max_w_norms);
         summary.p90_max_position_norm = percentile(max_p_norms, 0.9);
         summary.p90_max_velocity_norm = percentile(max_v_norms, 0.9);
+        summary.p90_max_attitude_error = percentile(max_attitude_errors, 0.9);
         summary.p90_max_angular_velocity_norm = percentile(max_w_norms, 0.9);
         summary.max_action_abs = max_action_abs;
         const float valid_eval_count = std::max(1.0f, static_cast<float>(p_norms.size()));
         summary.near_success_rate_p = static_cast<float>(near_p_count) / valid_eval_count;
         summary.near_success_rate_pv = static_cast<float>(near_pv_count) / valid_eval_count;
         summary.finite = summary.nan_inf_count == 0;
+        summary.stability_gate_passed = summary.checkpoint_loaded &&
+            summary.finite &&
+            summary.success_rate >= 1.0f &&
+            summary.throughout_success_rate >= 1.0f &&
+            summary.action_saturation_rate < eval_options.success_action_saturation_threshold;
         summary.passed = summary.checkpoint_loaded && summary.finite;
 
         if(!eval_options.log_path.empty()){
@@ -5426,31 +5770,37 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
             if(!log){
                 throw std::runtime_error("Failed to open GPU eval log path: " + eval_options.log_path);
             }
-            log << "eval_model,mode_fixed_or_sampled,eval_dynamics_mode,eval_sampled_dynamics_level,eval_episodes,eval_horizon,"
-                << "success_rate,near_success_rate_p,near_success_rate_pv,mean_total_loss,mean_final_position_norm,"
-                << "mean_final_velocity_norm,mean_final_angular_velocity_norm,median_final_position_norm,"
-                << "median_final_velocity_norm,median_final_angular_velocity_norm,p90_final_position_norm,"
-                << "p90_final_velocity_norm,p90_final_angular_velocity_norm,throughout_success_rate,mean_time_inside_fraction,"
-                << "mean_first_failure_time_s,mean_max_position_norm,mean_max_velocity_norm,mean_max_angular_velocity_norm,"
-                << "p90_max_position_norm,p90_max_velocity_norm,p90_max_angular_velocity_norm,max_action_abs,"
-                << "action_saturation_rate,invalid_or_nan_rate,"
+            log << "eval_model,mode_fixed_or_sampled,eval_dynamics_mode,eval_sampled_dynamics_level,trajectory_mode,"
+                << "trajectory_amplitude,trajectory_frequency_hz,eval_episodes,eval_horizon,"
+                << "success_rate,near_success_rate_p,near_success_rate_pv,mean_total_loss,position_rmse,velocity_rmse,"
+                << "attitude_rmse,angular_velocity_rmse,mean_final_position_norm,"
+                << "mean_final_velocity_norm,mean_final_attitude_error,mean_final_angular_velocity_norm,median_final_position_norm,"
+                << "median_final_velocity_norm,median_final_attitude_error,median_final_angular_velocity_norm,p90_final_position_norm,"
+                << "p90_final_velocity_norm,p90_final_attitude_error,p90_final_angular_velocity_norm,throughout_success_rate,mean_time_inside_fraction,"
+                << "mean_first_failure_time_s,mean_max_position_norm,mean_max_velocity_norm,mean_max_attitude_error,mean_max_angular_velocity_norm,"
+                << "p90_max_position_norm,p90_max_velocity_norm,p90_max_attitude_error,p90_max_angular_velocity_norm,max_action_abs,"
+                << "action_saturation_rate,success_action_saturation_threshold,stability_gate_passed,invalid_or_nan_rate,"
                 << "forced_bins_enabled,size_mass_bin,thrust_to_weight_bin,torque_to_inertia_bin,motor_delay_bin,curve_shape_bin\n";
             log << "euler,"
                 << (eval_options.sample_dynamics ? "sampled" : "fixed") << ","
                 << (eval_options.sample_dynamics ? "sampled" : "fixed") << ",broad,"
+                << trajectory_mode_name(eval_options.trajectory_mode) << ","
+                << eval_options.trajectory_amplitude << "," << eval_options.trajectory_frequency_hz << ","
                 << eval_options.episodes << "," << eval_options.horizon << ","
                 << summary.success_rate << "," << summary.near_success_rate_p << "," << summary.near_success_rate_pv << ","
-                << summary.mean_total_loss << "," << summary.mean_final_position_norm << ","
-                << summary.mean_final_velocity_norm << "," << summary.mean_final_angular_velocity_norm << ","
+                << summary.mean_total_loss << "," << summary.position_rmse << "," << summary.velocity_rmse << ","
+                << summary.attitude_rmse << "," << summary.angular_velocity_rmse << "," << summary.mean_final_position_norm << ","
+                << summary.mean_final_velocity_norm << "," << summary.mean_final_attitude_error << "," << summary.mean_final_angular_velocity_norm << ","
                 << summary.median_final_position_norm << "," << summary.median_final_velocity_norm << ","
-                << summary.median_final_angular_velocity_norm << "," << summary.p90_final_position_norm << ","
-                << summary.p90_final_velocity_norm << "," << summary.p90_final_angular_velocity_norm << ","
+                << summary.median_final_attitude_error << "," << summary.median_final_angular_velocity_norm << "," << summary.p90_final_position_norm << ","
+                << summary.p90_final_velocity_norm << "," << summary.p90_final_attitude_error << "," << summary.p90_final_angular_velocity_norm << ","
                 << summary.throughout_success_rate << "," << summary.mean_time_inside_fraction << ","
                 << summary.mean_first_failure_time_s << "," << summary.mean_max_position_norm << ","
-                << summary.mean_max_velocity_norm << "," << summary.mean_max_angular_velocity_norm << ","
-                << summary.p90_max_position_norm << "," << summary.p90_max_velocity_norm << ","
+                << summary.mean_max_velocity_norm << "," << summary.mean_max_attitude_error << "," << summary.mean_max_angular_velocity_norm << ","
+                << summary.p90_max_position_norm << "," << summary.p90_max_velocity_norm << "," << summary.p90_max_attitude_error << ","
                 << summary.p90_max_angular_velocity_norm << "," << summary.max_action_abs << ","
-                << summary.action_saturation_rate << "," << summary.invalid_or_nan_rate << ","
+                << summary.action_saturation_rate << "," << eval_options.success_action_saturation_threshold << ","
+                << (summary.stability_gate_passed ? "true" : "false") << "," << summary.invalid_or_nan_rate << ","
                 << (eval_options.forced_bins.enabled ? "true" : "false") << ","
                 << eval_options.forced_bins.size_mass << "," << eval_options.forced_bins.thrust_to_weight << ","
                 << eval_options.forced_bins.torque_to_inertia << "," << eval_options.forced_bins.motor_delay << ","
@@ -5701,8 +6051,8 @@ Stage9SamplerParitySummary run_stage9_sampler_parity(
             break;
         }
         summary.metadata_present = summary.metadata_present ||
-            (batch.replay_schema_version == 2u && batch.sampler_balance_bins == bins);
-        if(batch.replay_schema_version != 2u || batch.sampler_balance_bins != bins){
+            (batch.replay_schema_version == 3u && batch.sampler_balance_bins == bins);
+        if(batch.replay_schema_version != 3u || batch.sampler_balance_bins != bins){
             summary.metadata_mismatch_count++;
         }
         std::vector<std::uint32_t> unique_groups;

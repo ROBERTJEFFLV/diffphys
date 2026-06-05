@@ -29,6 +29,7 @@ struct Options{
     bool validate_actor_backward = false;
     bool validate_adam_update = false;
     bool validate_correlated_size_mass_sampler = false;
+    bool validate_trajectory_sampler = false;
     bool validate_against_cpu = false;
     bool benchmark = false;
     bool stage9_debug = false;
@@ -81,7 +82,9 @@ struct Options{
     std::size_t eval_horizon = 128;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
+    float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
+    float success_action_saturation_threshold = 1.0f;
     bool horizon_curriculum_enabled = false;
     std::vector<std::size_t> horizon_curriculum;
     std::vector<float> curriculum_success_thresholds;
@@ -96,6 +99,12 @@ struct Options{
     bool balanced_dynamics_sampling = false;
     std::string sampled_dynamics_level = "broad";
     bool correlated_size_mass_sampling = false;
+    gpu::TrajectoryMode trajectory_mode = gpu::TrajectoryMode::FIXED;
+    float trajectory_amplitude = 0.03f;
+    float trajectory_frequency_hz = 0.5f;
+    float initial_position_scale = 1.0f;
+    float initial_velocity_scale = 1.0f;
+    float initial_angular_velocity_scale = 1.0f;
     bool save_optimizer = false;
     bool load_optimizer = false;
     bool checkpoint_inspect = false;
@@ -117,6 +126,7 @@ void print_usage(){
         << "    [--gpu-validate-actor-backward]\n"
         << "    [--gpu-validate-adam-update]\n"
         << "    [--gpu-validate-correlated-size-mass-sampler]\n"
+        << "    [--gpu-validate-trajectory-sampler]\n"
         << "    [--gpu-stage9-debug] [--stage9-debug-steps N] [--stage9-debug-replay-path PATH]\n"
         << "    [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
         << "    [--steps N] [--learning-rate LR]\n"
@@ -135,8 +145,11 @@ void print_usage(){
         << "    [--curriculum-min-steps N[,N...]] [--curriculum-gate-check-interval N]\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
         << "    [--failure-analysis] [--force-dynamics-bins size_mass=3,thrust_to_weight=3,...]\n"
+        << "    [--strict-stability-thresholds]\n"
         << "    [--success-position-threshold VALUE] [--success-velocity-threshold VALUE]\n"
+        << "    [--success-attitude-threshold RAD] [--success-attitude-threshold-deg DEG]\n"
         << "    [--success-angular-velocity-threshold VALUE]\n"
+        << "    [--success-action-saturation-threshold VALUE]\n"
         << "    [--w-action-magnitude W] [--w-u W] [--w-sat W]\n"
         << "    [--action-saturation-start VALUE] [--terminal-loss-scale VALUE]\n"
         << "    [--curriculum-learning-rate-scale S1,S2,...]\n"
@@ -145,6 +158,9 @@ void print_usage(){
         << "    [--curriculum-actor-grad-clip-norm N1,N2,...]\n"
         << "    [--reset-optimizer-on-curriculum-transition] [--no-load-optimizer]\n"
         << "    [--correlated-size-mass-sampling]\n"
+        << "    [--trajectory-mode fixed|step|circle|figure8|mixed]\n"
+        << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F]\n"
+        << "    [--initial-position-scale S] [--initial-velocity-scale S] [--initial-angular-velocity-scale S]\n"
         << "    [--log-path PATH] [--save-path PATH] [--load-path PATH]\n"
         << "\n"
         << "This CUDA target implements batched differentiable Euler rollout, physics VJP,\n"
@@ -187,6 +203,26 @@ std::vector<float> parse_float_list(const std::string& value){
         }
     }
     return result;
+}
+
+gpu::TrajectoryMode parse_trajectory_mode(const std::string& value){
+    if(value == "fixed") return gpu::TrajectoryMode::FIXED;
+    if(value == "step") return gpu::TrajectoryMode::STEP;
+    if(value == "circle") return gpu::TrajectoryMode::CIRCLE;
+    if(value == "figure8" || value == "figure-eight") return gpu::TrajectoryMode::FIGURE8;
+    if(value == "mixed") return gpu::TrajectoryMode::MIXED;
+    throw std::runtime_error("Unknown --trajectory-mode value: " + value);
+}
+
+const char* trajectory_mode_name(gpu::TrajectoryMode mode){
+    switch(mode){
+        case gpu::TrajectoryMode::FIXED: return "fixed";
+        case gpu::TrajectoryMode::STEP: return "step";
+        case gpu::TrajectoryMode::CIRCLE: return "circle";
+        case gpu::TrajectoryMode::FIGURE8: return "figure8";
+        case gpu::TrajectoryMode::MIXED: return "mixed";
+    }
+    return "unknown";
 }
 
 std::uint32_t parse_bin_value(const std::string& value){
@@ -277,6 +313,10 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--gpu-validate-correlated-size-mass-sampler"){
             options.validate_correlated_size_mass_sampler = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--gpu-validate-trajectory-sampler"){
+            options.validate_trajectory_sampler = true;
             options.gpu_rollout = true;
         }
         else if(arg == "--gpu-stage9-debug"){
@@ -388,6 +428,24 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--sampled-dynamics-level" && i + 1 < argc){
             options.sampled_dynamics_level = argv[++i];
         }
+        else if(arg == "--trajectory-mode" && i + 1 < argc){
+            options.trajectory_mode = parse_trajectory_mode(argv[++i]);
+        }
+        else if(arg == "--trajectory-amplitude" && i + 1 < argc){
+            options.trajectory_amplitude = std::stof(argv[++i]);
+        }
+        else if(arg == "--trajectory-frequency-hz" && i + 1 < argc){
+            options.trajectory_frequency_hz = std::stof(argv[++i]);
+        }
+        else if(arg == "--initial-position-scale" && i + 1 < argc){
+            options.initial_position_scale = std::stof(argv[++i]);
+        }
+        else if(arg == "--initial-velocity-scale" && i + 1 < argc){
+            options.initial_velocity_scale = std::stof(argv[++i]);
+        }
+        else if(arg == "--initial-angular-velocity-scale" && i + 1 < argc){
+            options.initial_angular_velocity_scale = std::stof(argv[++i]);
+        }
         else if(arg == "--w-v" && i + 1 < argc){
             options.loss_velocity_weight = std::stof(argv[++i]);
         }
@@ -493,14 +551,30 @@ bool parse_options(int argc, char** argv, Options& options){
             options.eval_horizon = std::stoull(argv[++i]);
             options.gpu_rollout = true;
         }
+        else if(arg == "--strict-stability-thresholds"){
+            options.success_position_threshold = 0.05f;
+            options.success_velocity_threshold = 0.1f;
+            options.success_attitude_threshold = 5.0f * 3.14159265358979323846f / 180.0f;
+            options.success_angular_velocity_threshold = 0.2f;
+            options.success_action_saturation_threshold = 0.01f;
+        }
         else if(arg == "--success-position-threshold" && i + 1 < argc){
             options.success_position_threshold = std::stof(argv[++i]);
         }
         else if(arg == "--success-velocity-threshold" && i + 1 < argc){
             options.success_velocity_threshold = std::stof(argv[++i]);
         }
+        else if(arg == "--success-attitude-threshold" && i + 1 < argc){
+            options.success_attitude_threshold = std::stof(argv[++i]);
+        }
+        else if(arg == "--success-attitude-threshold-deg" && i + 1 < argc){
+            options.success_attitude_threshold = std::stof(argv[++i]) * 3.14159265358979323846f / 180.0f;
+        }
         else if(arg == "--success-angular-velocity-threshold" && i + 1 < argc){
             options.success_angular_velocity_threshold = std::stof(argv[++i]);
+        }
+        else if(arg == "--success-action-saturation-threshold" && i + 1 < argc){
+            options.success_action_saturation_threshold = std::stof(argv[++i]);
         }
         else if(arg == "--horizon-curriculum"){
             options.horizon_curriculum_enabled = true;
@@ -593,9 +667,17 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.sample_dynamics = options.sample_dynamics;
     training_options.load_optimizer_state = options.load_optimizer_state;
     training_options.correlated_size_mass_sampling = options.correlated_size_mass_sampling;
+    training_options.trajectory_mode = options.trajectory_mode;
+    training_options.trajectory_amplitude = options.trajectory_amplitude;
+    training_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
+    training_options.initial_position_scale = options.initial_position_scale;
+    training_options.initial_velocity_scale = options.initial_velocity_scale;
+    training_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
     training_options.success_position_threshold = options.success_position_threshold;
     training_options.success_velocity_threshold = options.success_velocity_threshold;
+    training_options.success_attitude_threshold = options.success_attitude_threshold;
     training_options.success_angular_velocity_threshold = options.success_angular_velocity_threshold;
+    training_options.success_action_saturation_threshold = options.success_action_saturation_threshold;
     training_options.log_path = options.log_path;
     training_options.save_path = options.save_path;
     training_options.load_path = options.load_path;
@@ -611,9 +693,17 @@ gpu::GpuPolicyEvalOptions make_gpu_eval_options(const Options& options){
     eval_options.sample_dynamics = options.sample_dynamics;
     eval_options.reset_hidden_each_step = options.reset_hidden_each_step;
     eval_options.correlated_size_mass_sampling = options.correlated_size_mass_sampling;
+    eval_options.trajectory_mode = options.trajectory_mode;
+    eval_options.trajectory_amplitude = options.trajectory_amplitude;
+    eval_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
+    eval_options.initial_position_scale = options.initial_position_scale;
+    eval_options.initial_velocity_scale = options.initial_velocity_scale;
+    eval_options.initial_angular_velocity_scale = options.initial_angular_velocity_scale;
     eval_options.success_position_threshold = options.success_position_threshold;
     eval_options.success_velocity_threshold = options.success_velocity_threshold;
+    eval_options.success_attitude_threshold = options.success_attitude_threshold;
     eval_options.success_angular_velocity_threshold = options.success_angular_velocity_threshold;
+    eval_options.success_action_saturation_threshold = options.success_action_saturation_threshold;
     eval_options.forced_bins = options.forced_bins;
     eval_options.load_path = options.load_path;
     eval_options.log_path = options.log_path;
@@ -763,6 +853,7 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_final_action_saturation=" << summary.final_action_saturation << "\n";
     std::cout << "gpu_full_training_final_position_norm_mean=" << summary.final_position_norm_mean << "\n";
     std::cout << "gpu_full_training_final_velocity_norm_mean=" << summary.final_velocity_norm_mean << "\n";
+    std::cout << "gpu_full_training_final_attitude_error_mean=" << summary.final_attitude_error_mean << "\n";
     std::cout << "gpu_full_training_final_angular_velocity_norm_mean=" << summary.final_angular_velocity_norm_mean << "\n";
     std::cout << "gpu_full_training_nan_inf_count=" << summary.nan_inf_count << "\n";
     std::cout << "gpu_checkpoint_saved=" << (summary.checkpoint_saved ? "true" : "false") << "\n";
@@ -779,21 +870,30 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_mean_total_loss=" << summary.mean_total_loss << "\n";
     std::cout << "gpu_eval_mean_final_position_norm=" << summary.mean_final_position_norm << "\n";
     std::cout << "gpu_eval_mean_final_velocity_norm=" << summary.mean_final_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_final_attitude_error=" << summary.mean_final_attitude_error << "\n";
     std::cout << "gpu_eval_mean_final_angular_velocity_norm=" << summary.mean_final_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_position_rmse=" << summary.position_rmse << "\n";
+    std::cout << "gpu_eval_velocity_rmse=" << summary.velocity_rmse << "\n";
+    std::cout << "gpu_eval_attitude_rmse=" << summary.attitude_rmse << "\n";
+    std::cout << "gpu_eval_angular_velocity_rmse=" << summary.angular_velocity_rmse << "\n";
     std::cout << "gpu_eval_p90_final_position_norm=" << summary.p90_final_position_norm << "\n";
     std::cout << "gpu_eval_p90_final_velocity_norm=" << summary.p90_final_velocity_norm << "\n";
+    std::cout << "gpu_eval_p90_final_attitude_error=" << summary.p90_final_attitude_error << "\n";
     std::cout << "gpu_eval_p90_final_angular_velocity_norm=" << summary.p90_final_angular_velocity_norm << "\n";
     std::cout << "gpu_eval_throughout_success_rate=" << summary.throughout_success_rate << "\n";
     std::cout << "gpu_eval_mean_time_inside_fraction=" << summary.mean_time_inside_fraction << "\n";
     std::cout << "gpu_eval_mean_first_failure_time_s=" << summary.mean_first_failure_time_s << "\n";
     std::cout << "gpu_eval_mean_max_position_norm=" << summary.mean_max_position_norm << "\n";
     std::cout << "gpu_eval_mean_max_velocity_norm=" << summary.mean_max_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_max_attitude_error=" << summary.mean_max_attitude_error << "\n";
     std::cout << "gpu_eval_mean_max_angular_velocity_norm=" << summary.mean_max_angular_velocity_norm << "\n";
     std::cout << "gpu_eval_p90_max_position_norm=" << summary.p90_max_position_norm << "\n";
     std::cout << "gpu_eval_p90_max_velocity_norm=" << summary.p90_max_velocity_norm << "\n";
+    std::cout << "gpu_eval_p90_max_attitude_error=" << summary.p90_max_attitude_error << "\n";
     std::cout << "gpu_eval_p90_max_angular_velocity_norm=" << summary.p90_max_angular_velocity_norm << "\n";
     std::cout << "gpu_eval_max_action_abs=" << summary.max_action_abs << "\n";
     std::cout << "gpu_eval_action_saturation_rate=" << summary.action_saturation_rate << "\n";
+    std::cout << "gpu_eval_stability_gate_passed=" << (summary.stability_gate_passed ? "true" : "false") << "\n";
     std::cout << "gpu_eval_invalid_or_nan_rate=" << summary.invalid_or_nan_rate << "\n";
     std::cout << "gpu_eval_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
@@ -1074,6 +1174,22 @@ void print_correlated_size_mass_sampler_validation(const gpu::CorrelatedSizeMass
     std::cout << "correlated_size_mass_sampler_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
 
+void print_trajectory_sampler_validation(const gpu::TrajectorySamplerValidationSummary& summary){
+    std::cout << "trajectory_sampler_validation_passed=" << (summary.passed ? "true" : "false") << "\n";
+    std::cout << "trajectory_sampler_fixed_backward_compatible=" << (summary.fixed_backward_compatible ? "true" : "false") << "\n";
+    std::cout << "trajectory_sampler_deterministic=" << (summary.deterministic ? "true" : "false") << "\n";
+    std::cout << "trajectory_sampler_finite=" << (summary.finite ? "true" : "false") << "\n";
+    std::cout << "trajectory_sampler_mixed_covers_all_modes=" << (summary.mixed_covers_all_modes ? "true" : "false") << "\n";
+    std::cout << "trajectory_sampler_samples=" << summary.samples << "\n";
+    std::cout << "trajectory_sampler_horizon=" << summary.horizon << "\n";
+    std::cout << "trajectory_sampler_fixed_reference_max_abs=" << summary.fixed_reference_max_abs << "\n";
+    std::cout << "trajectory_sampler_deterministic_max_abs=" << summary.deterministic_max_abs << "\n";
+    std::cout << "trajectory_sampler_max_reference_abs=" << summary.max_reference_abs << "\n";
+    std::cout << "trajectory_sampler_max_reference_velocity_abs=" << summary.max_reference_velocity_abs << "\n";
+    std::cout << "trajectory_sampler_mixed_mode_coverage_mask=" << summary.mixed_mode_coverage_mask << "\n";
+    std::cout << "trajectory_sampler_nan_inf_count=" << summary.nan_inf_count << "\n";
+}
+
 void print_stage9_eval_parity_summary(const gpu::Stage9EvalParitySummary& summary){
     std::cout << "stage9_6_eval_parity_passed=" << (summary.passed ? "true" : "false") << "\n";
     std::cout << "stage9_6_eval_replay_written=" << (summary.replay_written ? "true" : "false") << "\n";
@@ -1230,7 +1346,9 @@ int main(int argc, char** argv){
     std::cout << "curriculum_gate_check_interval=" << options.curriculum_gate_check_interval << "\n";
     std::cout << "success_position_threshold=" << options.success_position_threshold << "\n";
     std::cout << "success_velocity_threshold=" << options.success_velocity_threshold << "\n";
+    std::cout << "success_attitude_threshold=" << options.success_attitude_threshold << "\n";
     std::cout << "success_angular_velocity_threshold=" << options.success_angular_velocity_threshold << "\n";
+    std::cout << "success_action_saturation_threshold=" << options.success_action_saturation_threshold << "\n";
     std::cout << "forced_dynamics_bins_enabled=" << (options.forced_bins.enabled ? "true" : "false") << "\n";
     if(options.forced_bins.enabled){
         std::cout << "forced_dynamics_bins=size_mass=" << options.forced_bins.size_mass
@@ -1242,6 +1360,12 @@ int main(int argc, char** argv){
     std::cout << "balanced_dynamics_sampling=" << (options.balanced_dynamics_sampling ? "true" : "false") << "\n";
     std::cout << "sampled_dynamics_level=" << options.sampled_dynamics_level << "\n";
     std::cout << "correlated_size_mass_sampling=" << (options.correlated_size_mass_sampling ? "true" : "false") << "\n";
+    std::cout << "trajectory_mode=" << trajectory_mode_name(options.trajectory_mode) << "\n";
+    std::cout << "trajectory_amplitude=" << options.trajectory_amplitude << "\n";
+    std::cout << "trajectory_frequency_hz=" << options.trajectory_frequency_hz << "\n";
+    std::cout << "initial_position_scale=" << options.initial_position_scale << "\n";
+    std::cout << "initial_velocity_scale=" << options.initial_velocity_scale << "\n";
+    std::cout << "initial_angular_velocity_scale=" << options.initial_angular_velocity_scale << "\n";
     std::cout << "simulation_frequency_hz=100\n";
     std::cout << "dt=0.01\n";
     std::cout << "sample_dynamics=" << (options.sample_dynamics ? "true" : "false") << "\n";
@@ -1280,7 +1404,21 @@ int main(int argc, char** argv){
     gpu::EulerGpuRunOptions run_options;
     run_options.device = options.gpu_device;
     run_options.compute_action_gradients = true;
-    gpu::generate_validation_batch(batch, options.batch_size, options.horizon, options.seed);
+    gpu::generate_validation_batch(
+        batch,
+        options.batch_size,
+        options.horizon,
+        options.seed,
+        nullptr,
+        !options.sample_dynamics,
+        options.correlated_size_mass_sampling,
+        options.trajectory_mode,
+        options.trajectory_amplitude,
+        options.trajectory_frequency_hz,
+        options.initial_position_scale,
+        options.initial_velocity_scale,
+        options.initial_angular_velocity_scale
+    );
 
     try{
         bool formal_gate_run = false;
@@ -1441,6 +1579,19 @@ int main(int argc, char** argv){
                 return 1;
             }
         }
+        if(options.validate_trajectory_sampler){
+            auto trajectory_validation = gpu::validate_trajectory_sampler(
+                options.batch_size,
+                options.horizon,
+                options.seed,
+                options.trajectory_amplitude,
+                options.trajectory_frequency_hz
+            );
+            print_trajectory_sampler_validation(trajectory_validation);
+            if(!trajectory_validation.passed){
+                return 1;
+            }
+        }
         if(options.validate_observation){
             auto observation_validation = gpu::validate_observations_against_cpu(batch, run_options, 0);
             print_observation_validation(observation_validation);
@@ -1541,7 +1692,9 @@ int main(int argc, char** argv){
         }
         if(options.steps == 0 && !options.validate_observation && !options.validate_actor_forward && !options.validate_closed_loop &&
            !options.validate_action_gradient_injection && !options.validate_actor_backward &&
-           !options.validate_critic_backward && !options.validate_adam_update && !options.validate_against_cpu && !options.benchmark && !options.stage9_debug){
+           !options.validate_critic_backward && !options.validate_adam_update &&
+           !options.validate_correlated_size_mass_sampler && !options.validate_trajectory_sampler &&
+           !options.validate_against_cpu && !options.benchmark && !options.stage9_debug){
             gpu::EulerGpuResult result;
             gpu::EulerGpuTimings timings;
             const int status = gpu::run_euler_gpu_rollout(batch, weights, run_options, result, timings);

@@ -16,6 +16,14 @@ constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
 
+enum class TrajectoryMode : std::uint32_t{
+    FIXED = 0,
+    STEP = 1,
+    CIRCLE = 2,
+    FIGURE8 = 3,
+    MIXED = 4
+};
+
 struct EulerGpuLossWeights{
     float position = 8.0f;
     float velocity = 0.8f;
@@ -52,8 +60,10 @@ struct EulerGpuBatch{
     std::vector<float> initial_omega;           // [B, 3]
     std::vector<float> initial_rpm;             // [B, 4]
     std::vector<float> initial_previous_action; // [B, 4]
-    std::vector<float> reference_p;             // [B, 3]
-    std::vector<float> reference_v;             // [B, 3]
+    std::vector<float> reference_p;             // [B, 3], fixed-reference compatibility metadata
+    std::vector<float> reference_v;             // [B, 3], fixed-reference compatibility metadata
+    std::vector<float> reference_p_traj;        // [H + 1, B, 3]
+    std::vector<float> reference_v_traj;        // [H + 1, B, 3]
     std::vector<float> actions;                 // [H, B, 4]
 
     std::vector<float> mass;                    // [B]
@@ -83,6 +93,7 @@ struct EulerGpuBatch{
     std::uint32_t sampler_seed = 0;
     std::uint32_t sampler_balance_bins = 4;
     std::uint32_t hidden_reset_enabled = 0;
+    std::uint32_t trajectory_mode = static_cast<std::uint32_t>(TrajectoryMode::FIXED);
 
     void resize(std::size_t new_batch_size, std::size_t new_horizon);
 };
@@ -98,6 +109,21 @@ struct EulerGpuResult{
 
     void resize(std::size_t batch_size, std::size_t horizon);
 };
+
+struct DeploymentAdapterInput{
+    float p[3] = {};
+    float v[3] = {};
+    float R[9] = {};
+    float omega[3] = {};
+    float previous_action[4] = {};
+    float reference_p[3] = {};
+    float reference_v[3] = {};
+};
+
+void build_deployment_observation(
+    const DeploymentAdapterInput& input,
+    float observation[EULER_OBSERVATION_DIM]
+);
 
 struct EulerGpuRunOptions{
     int device = 0;
@@ -258,9 +284,17 @@ struct FullGpuTrainingOptions{
     bool sample_dynamics = true;
     bool load_optimizer_state = true;
     bool correlated_size_mass_sampling = false;
+    TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
+    float trajectory_amplitude = 0.03f;
+    float trajectory_frequency_hz = 0.5f;
+    float initial_position_scale = 1.0f;
+    float initial_velocity_scale = 1.0f;
+    float initial_angular_velocity_scale = 1.0f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
+    float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
+    float success_action_saturation_threshold = 1.0f;
     std::string log_path;
     std::string save_path;
     std::string load_path;
@@ -277,6 +311,7 @@ struct FullGpuTrainingSummary{
     float final_action_saturation = 0.0f;
     float final_position_norm_mean = 0.0f;
     float final_velocity_norm_mean = 0.0f;
+    float final_attitude_error_mean = 0.0f;
     float final_angular_velocity_norm_mean = 0.0f;
     std::size_t nan_inf_count = 0;
     bool finite = false;
@@ -293,9 +328,17 @@ struct GpuPolicyEvalOptions{
     bool sample_dynamics = true;
     bool reset_hidden_each_step = false;
     bool correlated_size_mass_sampling = false;
+    TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
+    float trajectory_amplitude = 0.03f;
+    float trajectory_frequency_hz = 0.5f;
+    float initial_position_scale = 1.0f;
+    float initial_velocity_scale = 1.0f;
+    float initial_angular_velocity_scale = 1.0f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
+    float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
+    float success_action_saturation_threshold = 1.0f;
     ForcedDynamicsBins forced_bins;
     std::string load_path;
     std::string log_path;
@@ -308,21 +351,30 @@ struct GpuPolicyEvalSummary{
     float mean_total_loss = 0.0f;
     float mean_final_position_norm = 0.0f;
     float mean_final_velocity_norm = 0.0f;
+    float mean_final_attitude_error = 0.0f;
     float mean_final_angular_velocity_norm = 0.0f;
+    float position_rmse = 0.0f;
+    float velocity_rmse = 0.0f;
+    float attitude_rmse = 0.0f;
+    float angular_velocity_rmse = 0.0f;
     float median_final_position_norm = 0.0f;
     float median_final_velocity_norm = 0.0f;
+    float median_final_attitude_error = 0.0f;
     float median_final_angular_velocity_norm = 0.0f;
     float p90_final_position_norm = 0.0f;
     float p90_final_velocity_norm = 0.0f;
+    float p90_final_attitude_error = 0.0f;
     float p90_final_angular_velocity_norm = 0.0f;
     float throughout_success_rate = 0.0f;
     float mean_time_inside_fraction = 0.0f;
     float mean_first_failure_time_s = 0.0f;
     float mean_max_position_norm = 0.0f;
     float mean_max_velocity_norm = 0.0f;
+    float mean_max_attitude_error = 0.0f;
     float mean_max_angular_velocity_norm = 0.0f;
     float p90_max_position_norm = 0.0f;
     float p90_max_velocity_norm = 0.0f;
+    float p90_max_attitude_error = 0.0f;
     float p90_max_angular_velocity_norm = 0.0f;
     float max_action_abs = 0.0f;
     float action_saturation_rate = 0.0f;
@@ -330,6 +382,7 @@ struct GpuPolicyEvalSummary{
     std::size_t nan_inf_count = 0;
     bool checkpoint_loaded = false;
     bool finite = false;
+    bool stability_gate_passed = false;
     bool passed = false;
 };
 
@@ -416,6 +469,22 @@ struct CorrelatedSizeMassSamplerValidationSummary{
     bool passed = false;
 };
 
+struct TrajectorySamplerValidationSummary{
+    std::size_t samples = 0;
+    std::size_t horizon = 0;
+    std::size_t nan_inf_count = 0;
+    std::uint32_t mixed_mode_coverage_mask = 0u;
+    float fixed_reference_max_abs = 0.0f;
+    float deterministic_max_abs = 0.0f;
+    float max_reference_abs = 0.0f;
+    float max_reference_velocity_abs = 0.0f;
+    bool fixed_backward_compatible = false;
+    bool deterministic = false;
+    bool finite = false;
+    bool mixed_covers_all_modes = false;
+    bool passed = false;
+};
+
 struct Stage9EvalParitySummary{
     float max_final_state_abs_error = 0.0f;
     float max_loss_abs_error = 0.0f;
@@ -474,7 +543,13 @@ void generate_validation_batch(
     unsigned seed,
     const ForcedDynamicsBins* forced_bins = nullptr,
     bool nominal_dynamics = false,
-    bool correlated_size_mass_sampling = false
+    bool correlated_size_mass_sampling = false,
+    TrajectoryMode trajectory_mode = TrajectoryMode::FIXED,
+    float trajectory_amplitude = 0.03f,
+    float trajectory_frequency_hz = 0.5f,
+    float initial_position_scale = 1.0f,
+    float initial_velocity_scale = 1.0f,
+    float initial_angular_velocity_scale = 1.0f
 );
 
 int assemble_observations_gpu(
@@ -556,6 +631,14 @@ CorrelatedSizeMassSamplerValidationSummary validate_correlated_size_mass_sampler
     std::size_t batch_size,
     std::size_t horizon,
     unsigned seed
+);
+
+TrajectorySamplerValidationSummary validate_trajectory_sampler(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    float amplitude,
+    float frequency_hz
 );
 
 Stage9EvalParitySummary run_stage9_eval_parity(
