@@ -21,6 +21,17 @@ The implementation is smoke-validated only. The strict H16 moving-setpoint throu
 - Kept broad dynamics randomization compatible with `--correlated-size-mass-sampling`.
 - Added eval RMSE/statistics for position, velocity, attitude, angular velocity, final success, throughout success, max errors, action saturation, and invalid/NaN rate.
 - Added a deployment observation adapter that converts external `p_ref(t), v_ref(t)` setpoints into relative offsets for the same GRU actor. The actor still outputs exactly four motor commands.
+- Added moving-reference CPU/CUDA rollout loss and action-gradient parity. The CPU validation path now uses the same `reference_p_traj/reference_v_traj` as CUDA instead of the legacy fixed `TrackingReference`.
+- Added CUDA training CSV component logging for position, velocity, attitude, angular velocity, action magnitude, action smoothness, saturation, terminal loss, terminal subterms, and component ratios.
+- Added deterministic deployment-adapter validation against the CUDA training observation path.
+- Added local/recovery gate plumbing:
+  - `--tracking-gate-mode local|recovery`
+  - `--throughout-gate-start-step`
+  - `--initial-position-scale-local`
+  - `--initial-velocity-scale-local`
+  - `--initial-attitude-scale-local`
+  - `--initial-angular-velocity-scale-local`
+  - eval reports both full-window `throughout_success_rate` and `post_burnin_throughout_success_rate`.
 
 ## Validation Commands
 
@@ -61,6 +72,40 @@ cmake --build /tmp/raptor_stage96_cuda_build --target foundation_policy_diff_pre
   --trajectory-mode circle \
   --trajectory-amplitude 0.02 \
   --trajectory-frequency-hz 0.4
+
+/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
+  --gpu-rollout \
+  --gpu-validate-against-cpu \
+  --batch-size 64 \
+  --horizon 16 \
+  --seed 9101 \
+  --trajectory-mode circle \
+  --trajectory-amplitude 0.02 \
+  --trajectory-frequency-hz 0.4 \
+  --terminal-loss-scale 0.2 \
+  --action-saturation-start 0.85
+
+/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
+  --gpu-rollout \
+  --gpu-validate-observation \
+  --batch-size 64 \
+  --horizon 16 \
+  --seed 9102 \
+  --trajectory-mode figure8 \
+  --trajectory-amplitude 0.02 \
+  --trajectory-frequency-hz 0.4 \
+  --validation-step 8
+
+/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
+  --gpu-rollout \
+  --gpu-validate-deployment-adapter \
+  --batch-size 64 \
+  --horizon 16 \
+  --seed 9103 \
+  --trajectory-mode mixed \
+  --trajectory-amplitude 0.02 \
+  --trajectory-frequency-hz 0.4 \
+  --validation-step 8
 ```
 
 Smoke training:
@@ -109,9 +154,13 @@ Eval was run separately for `fixed`, `step`, `circle`, and `figure8` with `--eva
 | moving-reference observation parity | PASS | circle observation max/mean error 0 |
 | H16 broad correlated smoke training | PASS | finite, checkpoint saved, NaN/Inf count 0 |
 | action saturation safety in smoke/eval | PASS | saturation rate 0 |
+| moving-reference CPU/CUDA loss/VJP parity | PASS | circle trajectory, terminal scale 0.2, saturation start 0.85, loss/action-gradient parity passed |
+| nonzero-step moving observation parity | PASS | figure8 trajectory at step 8, max error 1.82353e-06 |
+| deployment adapter parity | PASS | mixed trajectory at step 8, max error 2.93925e-06 |
+| CUDA component loss ratios in training CSV | PASS | component columns and raw-loss ratios written in `train_component_check_1.csv` |
+| local/recovery gate CLI plumbing | PASS | local mode applies local initial scales; eval reports post-burn-in throughout success |
 | H16 strict throughout tracking gate | FAIL | throughout success 0 in trajectory eval |
-| moving-reference full CPU/CUDA loss parity | FAIL | CPU validation path still uses fixed `TrackingReference` |
-| CUDA component loss ratios in training CSV | FAIL | total/critic/final metrics logged; per-component ratios still missing |
+| linear/angular acceleration error metrics | FAIL | not implemented yet |
 
 ## Smoke Training Result
 
@@ -140,8 +189,8 @@ Eval was run separately for `fixed`, `step`, `circle`, and `figure8` with `--eva
 ## Current Blockers
 
 - Strict H16 throughout tracking under broad correlated dynamics is not achieved yet.
-- Moving-reference CPU/CUDA full loss/VJP parity needs a CPU moving-trajectory reference path, not only fixed-reference parity and moving observation parity.
-- CUDA training CSV still needs per-component loss terms and ratios for position, velocity, attitude, rate, action magnitude, smoothness, saturation, and terminal terms.
+- Eval still needs linear acceleration error and angular acceleration error metrics.
+- Initial attitude local-scale CLI exists, but initial attitude perturbation sampling is still identity-only.
 - No long H16 training was started from this smoke checkpoint.
 - No H64/H128 or RAPTOR teacher/student experiment is allowed from this moving-setpoint pipeline until the strict H16 gate passes.
 
@@ -153,6 +202,7 @@ reports/h16_moving_setpoint_pipeline/eval_fixed_h16.csv
 reports/h16_moving_setpoint_pipeline/eval_step_h16.csv
 reports/h16_moving_setpoint_pipeline/eval_circle_h16.csv
 reports/h16_moving_setpoint_pipeline/eval_figure8_h16.csv
+reports/h16_moving_setpoint_pipeline/train_component_check_1.csv
 ```
 
 The smoke checkpoint is intentionally kept as a runtime artifact and should not be committed:

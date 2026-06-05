@@ -15,6 +15,7 @@ constexpr std::size_t RDAC_ACTOR_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_H
 constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
+constexpr std::size_t LOSS_COMPONENT_COUNT = 12;
 
 enum class TrajectoryMode : std::uint32_t{
     FIXED = 0,
@@ -48,6 +49,21 @@ struct EulerGpuTimings{
     float backward_vjp_ms = 0.0f;
     float device_to_host_ms = 0.0f;
     float total_ms = 0.0f;
+};
+
+struct LossComponentMeans{
+    float position = 0.0f;
+    float velocity = 0.0f;
+    float attitude = 0.0f;
+    float angular_velocity = 0.0f;
+    float action_magnitude = 0.0f;
+    float action_smoothness = 0.0f;
+    float saturation = 0.0f;
+    float terminal = 0.0f;
+    float terminal_position = 0.0f;
+    float terminal_velocity = 0.0f;
+    float terminal_attitude = 0.0f;
+    float terminal_angular_velocity = 0.0f;
 };
 
 struct EulerGpuBatch{
@@ -158,6 +174,15 @@ struct ObservationValidationSummary{
     float max_abs_error = 0.0f;
     float mean_abs_error = 0.0f;
     std::size_t nan_inf_count = 0;
+    bool passed = false;
+};
+
+struct DeploymentAdapterValidationSummary{
+    float max_abs_error = 0.0f;
+    float mean_abs_error = 0.0f;
+    std::size_t nan_inf_count = 0;
+    bool deterministic = false;
+    bool relative_offsets_close = false;
     bool passed = false;
 };
 
@@ -313,6 +338,7 @@ struct FullGpuTrainingSummary{
     float final_velocity_norm_mean = 0.0f;
     float final_attitude_error_mean = 0.0f;
     float final_angular_velocity_norm_mean = 0.0f;
+    LossComponentMeans final_loss_components;
     std::size_t nan_inf_count = 0;
     bool finite = false;
     bool checkpoint_saved = false;
@@ -339,6 +365,7 @@ struct GpuPolicyEvalOptions{
     float success_attitude_threshold = 3.14159265358979323846f;
     float success_angular_velocity_threshold = 5.0f;
     float success_action_saturation_threshold = 1.0f;
+    std::size_t throughout_gate_start_step = 0;
     ForcedDynamicsBins forced_bins;
     std::string load_path;
     std::string log_path;
@@ -366,6 +393,7 @@ struct GpuPolicyEvalSummary{
     float p90_final_attitude_error = 0.0f;
     float p90_final_angular_velocity_norm = 0.0f;
     float throughout_success_rate = 0.0f;
+    float post_burnin_throughout_success_rate = 0.0f;
     float mean_time_inside_fraction = 0.0f;
     float mean_first_failure_time_s = 0.0f;
     float mean_max_position_norm = 0.0f;
@@ -562,6 +590,16 @@ int assemble_observations_gpu(
 ObservationValidationSummary validate_observations_against_cpu(
     const EulerGpuBatch& batch,
     const EulerGpuRunOptions& options,
+    std::size_t step_i
+);
+
+DeploymentAdapterValidationSummary validate_deployment_adapter(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    TrajectoryMode trajectory_mode,
+    float trajectory_amplitude,
+    float trajectory_frequency_hz,
     std::size_t step_i
 );
 
