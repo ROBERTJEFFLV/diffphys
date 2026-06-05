@@ -25,7 +25,7 @@ constexpr float G = 9.81f;
 constexpr std::uint64_t ACTIVE_TRAINING_HORIZON = 16;
 constexpr std::uint64_t CPU_MAX_HORIZON = 256;
 constexpr std::uint64_t GPU_EVAL_MAX_HORIZON = 4096;
-constexpr std::size_t DIAGNOSTICS_SIZE = 9;
+constexpr std::size_t DIAGNOSTICS_SIZE = 23;
 
 enum LossComponentIndex : std::size_t{
     LOSS_POSITION = 0,
@@ -706,6 +706,22 @@ __global__ void loss_and_action_kernel(DeviceArrays d, EulerGpuLossWeights weigh
     d.loss_components[b * LOSS_COMPONENT_COUNT + LOSS_TERMINAL_ANGULAR_VELOCITY] = terminal_angular_velocity_loss;
 }
 
+__device__ void atomic_max_float(float* address, float value){
+    if(value <= 0.0f || !isfinite(value)){
+        return;
+    }
+    int* address_as_int = reinterpret_cast<int*>(address);
+    int old = *address_as_int;
+    int assumed;
+    while(value > __int_as_float(old)){
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed, __float_as_int(value));
+        if(assumed == old){
+            break;
+        }
+    }
+}
+
 __global__ void rollout_diagnostics_kernel(
     DeviceArrays d,
     std::size_t batch_size,
@@ -719,34 +735,65 @@ __global__ void rollout_diagnostics_kernel(
     if(b >= batch_size){
         return;
     }
-    float p_norm_sq = 0.0f;
-    float v_norm_sq = 0.0f;
-    float w_norm_sq = 0.0f;
-    float trace_R = 0.0f;
     bool finite = true;
-    for(int dim = 0; dim < 3; dim++){
-        const float p = d.p[idx3(horizon, b, dim, batch_size)] -
-            d.reference_p_traj[idx3(horizon, b, dim, batch_size)];
-        const float v = d.v[idx3(horizon, b, dim, batch_size)] -
-            d.reference_v_traj[idx3(horizon, b, dim, batch_size)];
-        const float w = d.omega[idx3(horizon, b, dim, batch_size)];
-        p_norm_sq += p * p;
-        v_norm_sq += v * v;
-        w_norm_sq += w * w;
-        finite = finite && isfinite(p) && isfinite(v) && isfinite(w);
-    }
-    for(int flat = 0; flat < 9; flat++){
-        const float R = d.R[idx9(horizon, b, flat, batch_size)];
-        finite = finite && isfinite(R);
-        if(flat == 0 || flat == 4 || flat == 8){
-            trace_R += R;
+    float final_p_norm = 0.0f;
+    float final_v_norm = 0.0f;
+    float final_w_norm = 0.0f;
+    float final_attitude_error = 0.0f;
+    float p_norm_sum = 0.0f;
+    float v_norm_sum = 0.0f;
+    float w_norm_sum = 0.0f;
+    float attitude_error_sum = 0.0f;
+    float p_norm_max = 0.0f;
+    float v_norm_max = 0.0f;
+    float w_norm_max = 0.0f;
+    float attitude_error_max = 0.0f;
+    std::uint32_t position_settled_steps = 0;
+    for(std::size_t t = 0; t <= horizon; t++){
+        float p_norm_sq = 0.0f;
+        float v_norm_sq = 0.0f;
+        float w_norm_sq = 0.0f;
+        float trace_R = 0.0f;
+        for(int dim = 0; dim < 3; dim++){
+            const float p = d.p[idx3(t, b, dim, batch_size)] -
+                d.reference_p_traj[idx3(t, b, dim, batch_size)];
+            const float v = d.v[idx3(t, b, dim, batch_size)] -
+                d.reference_v_traj[idx3(t, b, dim, batch_size)];
+            const float w = d.omega[idx3(t, b, dim, batch_size)];
+            p_norm_sq += p * p;
+            v_norm_sq += v * v;
+            w_norm_sq += w * w;
+            finite = finite && isfinite(p) && isfinite(v) && isfinite(w);
+        }
+        for(int flat = 0; flat < 9; flat++){
+            const float R = d.R[idx9(t, b, flat, batch_size)];
+            finite = finite && isfinite(R);
+            if(flat == 0 || flat == 4 || flat == 8){
+                trace_R += R;
+            }
+        }
+        const float p_norm = sqrtf(p_norm_sq);
+        const float v_norm = sqrtf(v_norm_sq);
+        const float w_norm = sqrtf(w_norm_sq);
+        const float attitude_error = rotation_angle_from_trace(trace_R);
+        finite = finite && isfinite(p_norm) && isfinite(v_norm) && isfinite(w_norm) && isfinite(attitude_error);
+        p_norm_sum += p_norm;
+        v_norm_sum += v_norm;
+        w_norm_sum += w_norm;
+        attitude_error_sum += attitude_error;
+        p_norm_max = fmaxf(p_norm_max, p_norm);
+        v_norm_max = fmaxf(v_norm_max, v_norm);
+        w_norm_max = fmaxf(w_norm_max, w_norm);
+        attitude_error_max = fmaxf(attitude_error_max, attitude_error);
+        position_settled_steps += p_norm < position_threshold ? 1u : 0u;
+        if(t == horizon){
+            final_p_norm = p_norm;
+            final_v_norm = v_norm;
+            final_w_norm = w_norm;
+            final_attitude_error = attitude_error;
         }
     }
-    const float p_norm = sqrtf(p_norm_sq);
-    const float v_norm = sqrtf(v_norm_sq);
-    const float w_norm = sqrtf(w_norm_sq);
-    const float attitude_error = rotation_angle_from_trace(trace_R);
-    finite = finite && isfinite(d.loss[b]) && isfinite(p_norm) && isfinite(v_norm) && isfinite(w_norm) && isfinite(attitude_error);
+    finite = finite && isfinite(d.loss[b]);
 
     std::uint32_t saturation_count = 0;
     for(std::size_t t = 0; t < horizon; t++){
@@ -757,18 +804,33 @@ __global__ void rollout_diagnostics_kernel(
         }
     }
     if(finite){
-        const bool success = p_norm < position_threshold &&
-            v_norm < velocity_threshold &&
-            attitude_error < attitude_threshold &&
-            w_norm < angular_velocity_threshold;
+        const float inv_state_count = 1.0f / static_cast<float>(horizon + 1);
+        const bool success = final_p_norm < position_threshold &&
+            final_v_norm < velocity_threshold &&
+            final_attitude_error < attitude_threshold &&
+            final_w_norm < angular_velocity_threshold;
         atomicAdd(&d.diagnostics[0], success ? 1.0f : 0.0f);
         atomicAdd(&d.diagnostics[1], 1.0f);
         atomicAdd(&d.diagnostics[3], static_cast<float>(saturation_count));
         atomicAdd(&d.diagnostics[4], static_cast<float>(horizon * 4));
-        atomicAdd(&d.diagnostics[5], p_norm);
-        atomicAdd(&d.diagnostics[6], v_norm);
-        atomicAdd(&d.diagnostics[7], w_norm);
-        atomicAdd(&d.diagnostics[8], attitude_error);
+        atomicAdd(&d.diagnostics[5], final_p_norm);
+        atomicAdd(&d.diagnostics[6], final_v_norm);
+        atomicAdd(&d.diagnostics[7], final_w_norm);
+        atomicAdd(&d.diagnostics[8], final_attitude_error);
+        atomicAdd(&d.diagnostics[9], p_norm_sum * inv_state_count);
+        atomicAdd(&d.diagnostics[10], v_norm_sum * inv_state_count);
+        atomicAdd(&d.diagnostics[11], w_norm_sum * inv_state_count);
+        atomicAdd(&d.diagnostics[12], attitude_error_sum * inv_state_count);
+        atomicAdd(&d.diagnostics[13], p_norm_max);
+        atomicAdd(&d.diagnostics[14], v_norm_max);
+        atomicAdd(&d.diagnostics[15], w_norm_max);
+        atomicAdd(&d.diagnostics[16], attitude_error_max);
+        atomicAdd(&d.diagnostics[17], static_cast<float>(position_settled_steps));
+        atomicAdd(&d.diagnostics[18], static_cast<float>(horizon + 1));
+        atomic_max_float(&d.diagnostics[19], p_norm_max);
+        atomic_max_float(&d.diagnostics[20], v_norm_max);
+        atomic_max_float(&d.diagnostics[21], w_norm_max);
+        atomic_max_float(&d.diagnostics[22], attitude_error_max);
     }
     else{
         atomicAdd(&d.diagnostics[2], 1.0f);
@@ -5747,6 +5809,10 @@ FullGpuTrainingSummary run_full_gpu_training(
             << "critic_output_mean,critic_target_mean,critic_error_mean,critic_error_norm,grad_norm,"
             << "success_rate_batch,action_saturation_rate,final_position_norm_mean,final_velocity_norm_mean,"
             << "final_attitude_error_mean,final_angular_velocity_norm_mean,"
+            << "window_position_norm_mean,window_velocity_norm_mean,window_attitude_error_mean,window_angular_velocity_norm_mean,"
+            << "window_position_norm_max_mean,window_velocity_norm_max_mean,window_attitude_error_max_mean,window_angular_velocity_norm_max_mean,"
+            << "window_position_norm_max,window_velocity_norm_max,window_attitude_error_max,window_angular_velocity_norm_max,"
+            << "settling_fraction_position,invalid_or_nan_rate,"
             << "loss_position_mean,loss_velocity_mean,loss_attitude_mean,loss_angular_velocity_mean,"
             << "loss_linear_acceleration_mean,loss_angular_acceleration_mean,"
             << "loss_action_magnitude_mean,loss_action_smoothness_mean,loss_saturation_mean,loss_terminal_mean,"
@@ -5951,6 +6017,21 @@ FullGpuTrainingSummary run_full_gpu_training(
             summary.final_velocity_norm_mean = host_diagnostics[6] / valid_count;
             summary.final_angular_velocity_norm_mean = host_diagnostics[7] / valid_count;
             summary.final_attitude_error_mean = host_diagnostics[8] / valid_count;
+            summary.window_position_norm_mean = host_diagnostics[9] / valid_count;
+            summary.window_velocity_norm_mean = host_diagnostics[10] / valid_count;
+            summary.window_angular_velocity_norm_mean = host_diagnostics[11] / valid_count;
+            summary.window_attitude_error_mean = host_diagnostics[12] / valid_count;
+            summary.window_position_norm_max_mean = host_diagnostics[13] / valid_count;
+            summary.window_velocity_norm_max_mean = host_diagnostics[14] / valid_count;
+            summary.window_angular_velocity_norm_max_mean = host_diagnostics[15] / valid_count;
+            summary.window_attitude_error_max_mean = host_diagnostics[16] / valid_count;
+            summary.settling_fraction_position = host_diagnostics[18] > 0.0f ? host_diagnostics[17] / host_diagnostics[18] : 0.0f;
+            summary.window_position_norm_max = host_diagnostics[19];
+            summary.window_velocity_norm_max = host_diagnostics[20];
+            summary.window_angular_velocity_norm_max = host_diagnostics[21];
+            summary.window_attitude_error_max = host_diagnostics[22];
+            const float diagnostic_count = host_diagnostics[1] + host_diagnostics[2];
+            summary.invalid_or_nan_rate = diagnostic_count > 0.0f ? host_diagnostics[2] / diagnostic_count : 0.0f;
             if(host_diagnostics[2] > 0.0f){
                 summary.nan_inf_count += static_cast<std::size_t>(host_diagnostics[2]);
             }
@@ -5974,7 +6055,14 @@ FullGpuTrainingSummary run_full_gpu_training(
                         << summary.final_grad_norm << ","
                         << summary.final_success_rate << "," << summary.final_action_saturation << ","
                         << summary.final_position_norm_mean << "," << summary.final_velocity_norm_mean << ","
-                        << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean;
+                        << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean << ","
+                        << summary.window_position_norm_mean << "," << summary.window_velocity_norm_mean << ","
+                        << summary.window_attitude_error_mean << "," << summary.window_angular_velocity_norm_mean << ","
+                        << summary.window_position_norm_max_mean << "," << summary.window_velocity_norm_max_mean << ","
+                        << summary.window_attitude_error_max_mean << "," << summary.window_angular_velocity_norm_max_mean << ","
+                        << summary.window_position_norm_max << "," << summary.window_velocity_norm_max << ","
+                        << summary.window_attitude_error_max << "," << summary.window_angular_velocity_norm_max << ","
+                        << summary.settling_fraction_position << "," << summary.invalid_or_nan_rate;
                     append_loss_component_csv(log, summary.final_loss_components, rollout_loss_mean, false);
                 }
                 break;
@@ -6002,7 +6090,14 @@ FullGpuTrainingSummary run_full_gpu_training(
                     << summary.final_grad_norm << ","
                     << summary.final_success_rate << "," << summary.final_action_saturation << ","
                     << summary.final_position_norm_mean << "," << summary.final_velocity_norm_mean << ","
-                    << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean;
+                    << summary.final_attitude_error_mean << "," << summary.final_angular_velocity_norm_mean << ","
+                    << summary.window_position_norm_mean << "," << summary.window_velocity_norm_mean << ","
+                    << summary.window_attitude_error_mean << "," << summary.window_angular_velocity_norm_mean << ","
+                    << summary.window_position_norm_max_mean << "," << summary.window_velocity_norm_max_mean << ","
+                    << summary.window_attitude_error_max_mean << "," << summary.window_angular_velocity_norm_max_mean << ","
+                    << summary.window_position_norm_max << "," << summary.window_velocity_norm_max << ","
+                    << summary.window_attitude_error_max << "," << summary.window_angular_velocity_norm_max << ","
+                    << summary.settling_fraction_position << "," << summary.invalid_or_nan_rate;
                 append_loss_component_csv(log, summary.final_loss_components, rollout_loss_mean, true);
             }
             summary.finite = true;
