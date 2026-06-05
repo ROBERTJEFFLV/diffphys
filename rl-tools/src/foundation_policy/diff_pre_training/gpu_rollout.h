@@ -106,6 +106,7 @@ struct EulerGpuBatch{
     std::vector<std::uint32_t> dynamics_curve_shape_bin;        // [B]
     std::vector<std::uint32_t> dynamics_group_key;              // [B]
     std::vector<std::uint32_t> rejected_before_accept;          // [B]
+    std::vector<std::uint32_t> trajectory_start_step;           // [B]
     std::vector<float> group_weight;                            // [B]
     std::vector<std::uint32_t> reset_mask;                      // [H, B]
     std::vector<std::uint32_t> hidden_reset_mask;               // [H, B]
@@ -322,6 +323,7 @@ struct FullGpuTrainingOptions{
     TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
     float trajectory_frequency_hz = 0.5f;
+    std::size_t training_episode_steps = 500;
     float initial_position_scale = 2.5f;
     float initial_velocity_scale = 20.0f;
     float initial_attitude_scale = 18.947368f;
@@ -352,6 +354,8 @@ struct FullGpuTrainingSummary{
     float final_angular_velocity_norm_mean = 0.0f;
     LossComponentMeans final_loss_components;
     std::size_t nan_inf_count = 0;
+    float final_window_start_mean = 0.0f;
+    std::size_t training_episode_steps = 0;
     bool finite = false;
     bool checkpoint_saved = false;
     bool checkpoint_loaded = false;
@@ -647,7 +651,8 @@ void generate_validation_batch(
     float initial_velocity_scale = 1.0f,
     float initial_angular_velocity_scale = 1.0f,
     float initial_attitude_scale = 0.0f,
-    float near_zero_guidance_probability = 0.10f
+    float near_zero_guidance_probability = 0.10f,
+    std::size_t trajectory_episode_steps = 0
 );
 
 int assemble_observations_gpu(

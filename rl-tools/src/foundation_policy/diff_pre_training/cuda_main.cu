@@ -110,6 +110,7 @@ struct Options{
     gpu::TrajectoryMode trajectory_mode = gpu::TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
     float trajectory_frequency_hz = 0.5f;
+    std::size_t training_episode_steps = 500;
     std::string tracking_gate_mode = "recovery";
     std::size_t throughout_gate_start_step = 0;
     float initial_position_scale = 2.5f;
@@ -180,7 +181,7 @@ void print_usage(){
         << "    [--reset-optimizer-on-curriculum-transition] [--no-load-optimizer]\n"
         << "    [--correlated-size-mass-sampling]\n"
         << "    [--trajectory-mode fixed|step|circle|figure8|mixed]\n"
-        << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F]\n"
+        << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F] [--training-episode-steps N]\n"
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
         << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
         << "    [--initial-attitude-scale S] [--initial-angular-velocity-scale S]\n"
@@ -483,6 +484,9 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--trajectory-frequency-hz" && i + 1 < argc){
             options.trajectory_frequency_hz = std::stof(argv[++i]);
         }
+        else if(arg == "--training-episode-steps" && i + 1 < argc){
+            options.training_episode_steps = std::stoull(argv[++i]);
+        }
         else if(arg == "--tracking-gate-mode" && i + 1 < argc){
             options.tracking_gate_mode = argv[++i];
             if(options.tracking_gate_mode != "local" && options.tracking_gate_mode != "recovery"){
@@ -752,6 +756,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.trajectory_mode = options.trajectory_mode;
     training_options.trajectory_amplitude = options.trajectory_amplitude;
     training_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
+    training_options.training_episode_steps = options.training_episode_steps;
     training_options.initial_position_scale = options.initial_position_scale;
     training_options.initial_velocity_scale = options.initial_velocity_scale;
     training_options.initial_attitude_scale = options.initial_attitude_scale;
@@ -954,6 +959,8 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_final_attitude_error_mean=" << summary.final_attitude_error_mean << "\n";
     std::cout << "gpu_full_training_final_angular_velocity_norm_mean=" << summary.final_angular_velocity_norm_mean << "\n";
     std::cout << "gpu_full_training_nan_inf_count=" << summary.nan_inf_count << "\n";
+    std::cout << "gpu_full_training_episode_steps=" << summary.training_episode_steps << "\n";
+    std::cout << "gpu_full_training_final_window_start_mean=" << summary.final_window_start_mean << "\n";
     std::cout << "gpu_checkpoint_saved=" << (summary.checkpoint_saved ? "true" : "false") << "\n";
     std::cout << "gpu_checkpoint_loaded=" << (summary.checkpoint_loaded ? "true" : "false") << "\n";
 }
@@ -1521,6 +1528,7 @@ int main(int argc, char** argv){
     std::cout << "trajectory_mode=" << trajectory_mode_name(options.trajectory_mode) << "\n";
     std::cout << "trajectory_amplitude=" << options.trajectory_amplitude << "\n";
     std::cout << "trajectory_frequency_hz=" << options.trajectory_frequency_hz << "\n";
+    std::cout << "training_episode_steps=" << options.training_episode_steps << "\n";
     std::cout << "tracking_gate_mode=" << options.tracking_gate_mode << "\n";
     std::cout << "throughout_gate_start_step=" << options.throughout_gate_start_step << "\n";
     std::cout << "initial_position_scale=" << options.initial_position_scale << "\n";
@@ -1592,7 +1600,8 @@ int main(int argc, char** argv){
         options.initial_velocity_scale,
         options.initial_angular_velocity_scale,
         options.initial_attitude_scale,
-        options.near_zero_guidance_probability
+        options.near_zero_guidance_probability,
+        options.training_episode_steps
     );
 
     try{

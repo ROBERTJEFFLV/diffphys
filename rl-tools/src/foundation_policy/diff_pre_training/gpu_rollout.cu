@@ -1263,6 +1263,7 @@ void EulerGpuBatch::resize(std::size_t new_batch_size, std::size_t new_horizon){
     dynamics_curve_shape_bin.assign(batch_size, 0u);
     dynamics_group_key.assign(batch_size, 0u);
     rejected_before_accept.assign(batch_size, 0u);
+    trajectory_start_step.assign(batch_size, 0u);
     group_weight.assign(batch_size, batch_size > 0 ? 1.0f / static_cast<float>(batch_size) : 0.0f);
     reset_mask.assign(horizon * batch_size, 0u);
     hidden_reset_mask.assign(horizon * batch_size, 0u);
@@ -1435,25 +1436,39 @@ void populate_reference_trajectory(
     float amplitude,
     float frequency_hz,
     std::mt19937& rng,
-    std::uniform_real_distribution<float>& unit
+    std::uniform_real_distribution<float>& unit,
+    std::size_t trajectory_episode_steps
 ){
     const float base_amplitude = std::max(0.0f, amplitude);
     const float base_frequency = std::max(0.0f, frequency_hz);
+    const std::size_t episode_steps = std::max(batch.horizon, trajectory_episode_steps);
+    const std::size_t max_start_step = episode_steps > batch.horizon ? episode_steps - batch.horizon : 0u;
+    const std::size_t step_switch_step = episode_steps / 2u;
     constexpr float two_pi = 6.28318530717958647692f;
     batch.trajectory_mode = static_cast<std::uint32_t>(mode);
     for(std::size_t b = 0; b < batch.batch_size; b++){
         const TrajectoryMode sample_mode = concrete_trajectory_mode(mode, b);
+        const std::size_t start_step = max_start_step > 0u
+            ? std::min<std::size_t>(
+                max_start_step,
+                static_cast<std::size_t>(unit(rng) * static_cast<float>(max_start_step + 1u))
+            )
+            : 0u;
+        batch.trajectory_start_step[b] = static_cast<std::uint32_t>(
+            std::min<std::size_t>(start_step, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
         const float sample_amplitude = base_amplitude * (0.5f + 0.5f * unit(rng));
         const float sample_frequency = base_frequency * (0.75f + 0.5f * unit(rng));
         const float omega_ref = two_pi * sample_frequency;
         const float step_value = sample_amplitude * (unit(rng) < 0.5f ? -1.0f : 1.0f);
         const int step_axis = static_cast<int>(b % 2u);
         for(std::size_t t = 0; t <= batch.horizon; t++){
-            const float time = static_cast<float>(t) * DT;
+            const std::size_t absolute_step = start_step + t;
+            const float time = static_cast<float>(absolute_step) * DT;
             float p_ref[3] = {0.0f, 0.0f, 0.0f};
             float v_ref[3] = {0.0f, 0.0f, 0.0f};
             if(sample_mode == TrajectoryMode::STEP){
-                if(t >= batch.horizon / 2u){
+                if(absolute_step >= step_switch_step){
                     p_ref[step_axis] = step_value;
                 }
             }
@@ -1496,7 +1511,8 @@ void generate_validation_batch(
     float initial_velocity_scale,
     float initial_angular_velocity_scale,
     float initial_attitude_scale,
-    float near_zero_guidance_probability
+    float near_zero_guidance_probability,
+    std::size_t trajectory_episode_steps
 ){
     batch.resize(batch_size, horizon);
     std::mt19937 rng(seed);
@@ -1688,7 +1704,15 @@ void generate_validation_batch(
             batch.initial_previous_action[pidx4(b, r)] = hover_action;
         }
     }
-    populate_reference_trajectory(batch, trajectory_mode, trajectory_amplitude, trajectory_frequency_hz, rng, unit);
+    populate_reference_trajectory(
+        batch,
+        trajectory_mode,
+        trajectory_amplitude,
+        trajectory_frequency_hz,
+        rng,
+        unit,
+        trajectory_episode_steps
+    );
     for(std::size_t b = 0; b < batch_size; b++){
         for(int dim = 0; dim < 3; dim++){
             batch.initial_p[pidx3(b, dim)] += batch.reference_p_traj[idx3(0, b, dim, batch_size)];
@@ -5630,6 +5654,17 @@ void append_loss_component_csv(std::ostream& log, const LossComponentMeans& comp
         << (finite ? "true" : "false") << "\n";
 }
 
+float mean_trajectory_start_step(const EulerGpuBatch& batch){
+    if(batch.trajectory_start_step.empty()){
+        return 0.0f;
+    }
+    double sum = 0.0;
+    for(std::uint32_t value: batch.trajectory_start_step){
+        sum += static_cast<double>(value);
+    }
+    return static_cast<float>(sum / static_cast<double>(batch.trajectory_start_step.size()));
+}
+
 FullGpuTrainingSummary run_full_gpu_training(
     const FullGpuTrainingOptions& training_options,
     const EulerGpuLossWeights& weights
@@ -5651,6 +5686,7 @@ FullGpuTrainingSummary run_full_gpu_training(
     std::uint32_t initial_optimizer_age = 1u;
     bool loaded_optimizer_state = false;
     FullGpuTrainingSummary summary;
+    summary.training_episode_steps = std::max(training_options.horizon, training_options.training_episode_steps);
     if(!training_options.load_path.empty()){
         if(training_options.load_optimizer_state){
             loaded_optimizer_state = load_actor_checkpoint_with_moments(
@@ -5673,7 +5709,8 @@ FullGpuTrainingSummary run_full_gpu_training(
         if(!log){
             throw std::runtime_error("Failed to open GPU training log path: " + training_options.log_path);
         }
-        log << "step,horizon,loss,diff_rollout_loss_scaled,critic_loss_raw,critic_loss_weight,critic_loss_scaled,"
+        log << "step,horizon,training_episode_steps,window_start_mean,loss,diff_rollout_loss_scaled,"
+            << "critic_loss_raw,critic_loss_weight,critic_loss_scaled,"
             << "critic_output_mean,critic_target_mean,critic_error_mean,critic_error_norm,grad_norm,"
             << "success_rate_batch,action_saturation_rate,final_position_norm_mean,final_velocity_norm_mean,"
             << "final_attitude_error_mean,final_angular_velocity_norm_mean,"
@@ -5712,7 +5749,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                 training_options.initial_velocity_scale,
                 training_options.initial_angular_velocity_scale,
                 training_options.initial_attitude_scale,
-                training_options.near_zero_guidance_probability
+                training_options.near_zero_guidance_probability,
+                summary.training_episode_steps
             );
         }
         allocate(d, training_options.batch_size, training_options.horizon);
@@ -5757,9 +5795,11 @@ FullGpuTrainingSummary run_full_gpu_training(
                     training_options.initial_velocity_scale,
                     training_options.initial_angular_velocity_scale,
                     training_options.initial_attitude_scale,
-                    training_options.near_zero_guidance_probability
+                    training_options.near_zero_guidance_probability,
+                    summary.training_episode_steps
                 );
             }
+            summary.final_window_start_mean = mean_trajectory_start_step(batch);
             copy_input_to_device(batch, d);
             zero_actor_gradients(d_actor_gradients, training_options.batch_size);
             CUDA_CHECK(cudaMemset(d.lambda_p, 0, sizeof(float) * state_count * 3));
@@ -5891,7 +5931,8 @@ FullGpuTrainingSummary run_full_gpu_training(
             if(!finite_step){
                 summary.finite = false;
                 if(log){
-                    log << step << "," << training_options.horizon << "," << summary.final_loss << "," << diff_loss_scaled << ","
+                    log << step << "," << training_options.horizon << "," << summary.training_episode_steps << ","
+                        << summary.final_window_start_mean << "," << summary.final_loss << "," << diff_loss_scaled << ","
                         << critic_metrics.raw_loss << "," << critic_metrics.weight << "," << critic_metrics.scaled_loss << ","
                         << critic_metrics.output_mean << "," << critic_metrics.target_mean << ","
                         << critic_metrics.error_mean << "," << critic_metrics.error_norm << ","
@@ -5918,7 +5959,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                 CUDA_CHECK(cudaDeviceSynchronize());
             }
             if(log){
-                log << step << "," << training_options.horizon << "," << summary.final_loss << "," << diff_loss_scaled << ","
+                log << step << "," << training_options.horizon << "," << summary.training_episode_steps << ","
+                    << summary.final_window_start_mean << "," << summary.final_loss << "," << diff_loss_scaled << ","
                     << critic_metrics.raw_loss << "," << critic_metrics.weight << "," << critic_metrics.scaled_loss << ","
                     << critic_metrics.output_mean << "," << critic_metrics.target_mean << ","
                     << critic_metrics.error_mean << "," << critic_metrics.error_norm << ","
