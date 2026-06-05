@@ -22,6 +22,7 @@ namespace{
 
 constexpr float DT = 0.01f;
 constexpr float G = 9.81f;
+constexpr std::uint64_t ACTIVE_TRAINING_HORIZON = 16;
 constexpr std::uint64_t CPU_MAX_HORIZON = 256;
 constexpr std::uint64_t GPU_EVAL_MAX_HORIZON = 4096;
 constexpr std::size_t DIAGNOSTICS_SIZE = 9;
@@ -5697,6 +5698,12 @@ FullGpuTrainingSummary run_full_gpu_training(
 ){
     if(training_options.steps == 0 || training_options.batch_size == 0 || training_options.horizon == 0){
         throw std::runtime_error("Full GPU training requires non-zero steps, batch size, and horizon");
+    }
+    if(training_options.horizon != ACTIVE_TRAINING_HORIZON){
+        throw std::runtime_error("Full GPU training is fixed-H16 origin recovery only");
+    }
+    if(training_options.trajectory_mode != TrajectoryMode::FIXED){
+        throw std::runtime_error("Full GPU training is origin recovery only; non-fixed setpoints are eval/deployment setpoint shifting");
     }
     if(training_options.horizon > CPU_MAX_HORIZON){
         throw std::runtime_error("Full GPU training horizon exceeds current validation horizon limit");

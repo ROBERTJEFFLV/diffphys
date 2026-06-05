@@ -15,6 +15,8 @@ namespace gpu = rl_tools::foundation_policy::diff_pre_training::gpu;
 
 namespace{
 
+constexpr std::size_t ACTIVE_TRAINING_HORIZON = 16;
+
 struct Options{
     std::size_t batch_size = 64;
     std::size_t horizon = 16;
@@ -87,7 +89,7 @@ struct Options{
     bool failure_analysis = false;
     std::string eval_model = "euler";
     std::size_t eval_episodes = 100;
-    std::size_t eval_horizon = 128;
+    std::size_t eval_horizon = 500;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
     float success_attitude_threshold = 3.14159265358979323846f;
@@ -160,10 +162,7 @@ void print_usage(){
         << "    [--stage9-6-checkpoint-parity] [--save-optimizer] [--load-optimizer]\n"
         << "    [--checkpoint-inspect [PATH]] [--checkpoint-convert-old [PATH]]\n"
         << "    [--stage9-6-steps N] [--stage9-6-replay-path PATH]\n"
-        << "    [--stage11] [--stage11-steps N] [--stage11-success-threshold VALUE]\n"
-        << "    [--stage11-velocity-threshold VALUE]\n"
-        << "    [--horizon-curriculum H1,H2,...] [--curriculum-success-threshold VALUE[,VALUE...]]\n"
-        << "    [--curriculum-min-steps N[,N...]] [--curriculum-gate-check-interval N]\n"
+        << "    active training is fixed-H16 origin recovery only; H64/H128 and curriculum flags are rejected\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
         << "    [--failure-analysis] [--force-dynamics-bins size_mass=3,thrust_to_weight=3,...]\n"
         << "    [--strict-stability-thresholds]\n"
@@ -174,13 +173,9 @@ void print_usage(){
         << "    [--w-action-magnitude W] [--w-u W] [--w-sat W]\n"
         << "    [--w-linear-acceleration W] [--w-angular-acceleration W]\n"
         << "    [--action-saturation-start VALUE] [--terminal-loss-scale VALUE]\n"
-        << "    [--curriculum-learning-rate-scale S1,S2,...]\n"
-        << "    [--curriculum-diff-loss-scale S1,S2,...]\n"
-        << "    [--curriculum-terminal-loss-scale S1,S2,...]\n"
-        << "    [--curriculum-actor-grad-clip-norm N1,N2,...]\n"
-        << "    [--reset-optimizer-on-curriculum-transition] [--no-load-optimizer]\n"
+        << "    [--no-load-optimizer]\n"
         << "    [--correlated-size-mass-sampling]\n"
-        << "    [--trajectory-mode fixed|step|circle|figure8|mixed]\n"
+        << "    [--trajectory-mode fixed|step|circle|figure8|mixed]  # eval/deployment setpoint shifting only\n"
         << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F] [--training-episode-steps N]\n"
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
         << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
@@ -190,9 +185,10 @@ void print_usage(){
         << "    [--initial-attitude-scale-local S] [--initial-angular-velocity-scale-local S]\n"
         << "    [--log-path PATH] [--save-path PATH] [--load-path PATH]\n"
         << "\n"
-        << "This CUDA target implements batched differentiable Euler rollout, physics VJP,\n"
-        << "RDAC actor/GRU/critic-head BPTT, and Adam update on GPU. Stage 9.6 CPU/CUDA\n"
-        << "checkpoint, sampler, and eval parity are still explicit validation gates.\n";
+        << "This CUDA target implements the active origin-recovery position-controller path:\n"
+        << "fixed H16 differentiable Euler rollout, physics VJP, RDAC actor/GRU/critic-head\n"
+        << "BPTT, and Adam update on GPU. Non-origin setpoints are deployment/eval-time\n"
+        << "setpoint shifting through relative p/v offsets, not a training curriculum.\n";
 }
 
 std::string trim(std::string value){
@@ -745,7 +741,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     gpu::FullGpuTrainingOptions training_options;
     training_options.device = options.gpu_device;
     training_options.batch_size = options.batch_size;
-    training_options.horizon = options.horizon;
+    training_options.horizon = ACTIVE_TRAINING_HORIZON;
     training_options.steps = options.steps;
     training_options.seed = options.seed;
     training_options.learning_rate = options.learning_rate;
@@ -765,9 +761,9 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.load_optimizer_state = options.load_optimizer_state;
     training_options.dynamics_randomization_level = parse_dynamics_randomization_level(options.sampled_dynamics_level);
     training_options.correlated_size_mass_sampling = options.correlated_size_mass_sampling;
-    training_options.trajectory_mode = options.trajectory_mode;
-    training_options.trajectory_amplitude = options.trajectory_amplitude;
-    training_options.trajectory_frequency_hz = options.trajectory_frequency_hz;
+    training_options.trajectory_mode = gpu::TrajectoryMode::FIXED;
+    training_options.trajectory_amplitude = 0.0f;
+    training_options.trajectory_frequency_hz = 0.0f;
     training_options.training_episode_steps = options.training_episode_steps;
     training_options.initial_position_scale = options.initial_position_scale;
     training_options.initial_velocity_scale = options.initial_velocity_scale;
@@ -1471,25 +1467,36 @@ int main(int argc, char** argv){
         options.initial_angular_velocity_scale = options.initial_angular_velocity_scale_local;
         options.throughout_gate_start_step = 0;
     }
-    if(options.horizon_curriculum_enabled){
-        if(options.horizon_curriculum.empty()){
-            options.horizon_curriculum = {16, 32, 64, options.horizon};
-        }
-        options.horizon = options.horizon_curriculum.back();
-    }
+    const bool active_training_requested = options.steps > 0 || options.stage11;
+    const bool removed_curriculum_requested =
+        options.horizon_curriculum_enabled ||
+        !options.horizon_curriculum.empty() ||
+        !options.curriculum_success_thresholds.empty() ||
+        !options.curriculum_min_steps.empty() ||
+        !options.curriculum_learning_rate_scales.empty() ||
+        !options.curriculum_diff_loss_scales.empty() ||
+        !options.curriculum_terminal_loss_scales.empty() ||
+        !options.curriculum_actor_grad_clip_norms.empty() ||
+        options.reset_optimizer_on_curriculum_transition;
     if(options.stage11){
-        options.batch_size = 128;
-        options.horizon = 128;
-        options.sample_dynamics = true;
-        options.balanced_dynamics_sampling = true;
-        options.sampled_dynamics_level = "broad";
-        options.loss_velocity_weight = 3.0f;
-        options.terminal_velocity_weight = 20.0f;
-        options.success_velocity_threshold = options.stage11_velocity_threshold;
-        if(options.stage11_steps == 0){
-            std::cerr << "Stage 11 requires --stage11-steps > 0.\n";
-            return 1;
-        }
+        std::cerr << "Stage 11/H64/H128 curriculum has been removed from the active CUDA training pipeline. "
+                  << "Use fixed-H16 origin recovery training only.\n";
+        return 1;
+    }
+    if(removed_curriculum_requested){
+        std::cerr << "Curriculum flags are not allowed in the active CUDA training pipeline. "
+                  << "The active task is fixed-H16 origin recovery.\n";
+        return 1;
+    }
+    if(active_training_requested && options.horizon != ACTIVE_TRAINING_HORIZON){
+        std::cerr << "Active CUDA training requires --horizon " << ACTIVE_TRAINING_HORIZON
+                  << " for fixed-H16 origin recovery.\n";
+        return 1;
+    }
+    if(active_training_requested && options.trajectory_mode != gpu::TrajectoryMode::FIXED){
+        std::cerr << "Active CUDA training is origin recovery only. "
+                  << "Use non-fixed --trajectory-mode only for eval/deployment setpoint shifting.\n";
+        return 1;
     }
     if(options.eval_only && options.load_path.empty()){
         std::cerr << "CUDA eval requires --load-path.\n";
@@ -1512,16 +1519,15 @@ int main(int argc, char** argv){
     std::cout << "critic_head_on_gpu=true\n";
     std::cout << "gru_backward_on_gpu=true\n";
     std::cout << "optimizer_on_gpu=true\n";
-    std::cout << "full_gpu_training_enabled=" << (options.steps > 0 || options.stage11 ? "true" : "false") << "\n";
-    std::cout << "stage11_enabled=" << (options.stage11 ? "true" : "false") << "\n";
-    std::cout << "stage11_total_steps=" << options.stage11_steps << "\n";
-    std::cout << "stage11_success_threshold=" << options.stage11_success_threshold << "\n";
-    std::cout << "stage11_velocity_threshold=" << options.stage11_velocity_threshold << "\n";
+    std::cout << "full_gpu_training_enabled=" << (options.steps > 0 ? "true" : "false") << "\n";
+    std::cout << "active_training_task=origin_recovery_position_controller\n";
+    std::cout << "active_training_horizon=" << ACTIVE_TRAINING_HORIZON << "\n";
+    std::cout << "setpoint_shifting_for_eval_and_deployment=true\n";
     std::cout << "eval_only=" << (options.eval_only ? "true" : "false") << "\n";
     std::cout << "eval_model=" << options.eval_model << "\n";
     std::cout << "failure_analysis=" << (options.failure_analysis ? "true" : "false") << "\n";
-    std::cout << "horizon_curriculum_enabled=" << (options.horizon_curriculum_enabled ? "true" : "false") << "\n";
-    std::cout << "curriculum_gate_check_interval=" << options.curriculum_gate_check_interval << "\n";
+    std::cout << "curriculum_enabled=false\n";
+    std::cout << "h64_h128_training_enabled=false\n";
     std::cout << "success_position_threshold=" << options.success_position_threshold << "\n";
     std::cout << "success_velocity_threshold=" << options.success_velocity_threshold << "\n";
     std::cout << "success_attitude_threshold=" << options.success_attitude_threshold << "\n";
@@ -1539,6 +1545,7 @@ int main(int argc, char** argv){
     std::cout << "sampled_dynamics_level=" << options.sampled_dynamics_level << "\n";
     std::cout << "correlated_size_mass_sampling=" << (options.correlated_size_mass_sampling ? "true" : "false") << "\n";
     std::cout << "trajectory_mode=" << trajectory_mode_name(options.trajectory_mode) << "\n";
+    std::cout << "training_reference_mode=origin\n";
     std::cout << "trajectory_amplitude=" << options.trajectory_amplitude << "\n";
     std::cout << "trajectory_frequency_hz=" << options.trajectory_frequency_hz << "\n";
     std::cout << "training_episode_steps=" << options.training_episode_steps << "\n";
@@ -1577,7 +1584,7 @@ int main(int argc, char** argv){
     std::cout << "disable_physics_gradient=" << (options.disable_physics_gradient ? "true" : "false") << "\n";
     std::cout << "reset_hidden_each_step=" << (options.reset_hidden_each_step ? "true" : "false") << "\n";
     std::cout << "load_optimizer_state=" << (options.load_optimizer_state ? "true" : "false") << "\n";
-    std::cout << "reset_optimizer_on_curriculum_transition=" << (options.reset_optimizer_on_curriculum_transition ? "true" : "false") << "\n";
+    std::cout << "reset_optimizer_on_curriculum_transition=false\n";
 
     gpu::EulerGpuBatch batch;
     gpu::EulerGpuLossWeights weights;

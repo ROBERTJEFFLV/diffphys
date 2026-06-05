@@ -326,9 +326,9 @@ struct FullGpuTrainingOptions{
     bool load_optimizer_state = true;
     DynamicsRandomizationLevel dynamics_randomization_level = DynamicsRandomizationLevel::BROAD;
     bool correlated_size_mass_sampling = false;
-    TrajectoryMode trajectory_mode = TrajectoryMode::FIXED;
-    float trajectory_amplitude = 0.03f;
-    float trajectory_frequency_hz = 0.5f;
+    TrajectoryMode trajectory_mode = TrajectoryMode::FIXED; // Training invariant: origin recovery only.
+    float trajectory_amplitude = 0.0f;
+    float trajectory_frequency_hz = 0.0f;
     std::size_t training_episode_steps = 500;
     float initial_position_scale = 2.5f;
     float initial_velocity_scale = 20.0f;
@@ -371,7 +371,7 @@ struct FullGpuTrainingSummary{
 struct GpuPolicyEvalOptions{
     int device = 0;
     std::size_t episodes = 100;
-    std::size_t horizon = 128;
+    std::size_t horizon = 500;
     unsigned seed = 0;
     bool sample_dynamics = true;
     bool reset_hidden_each_step = false;
