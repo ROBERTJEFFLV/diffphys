@@ -55,6 +55,7 @@ void write_production_objective_trace_header(std::ostream& out){
         << "total_loss_for_backprop,diff_rollout_loss_raw,diff_rollout_loss_weight,diff_rollout_loss_scaled,"
         << "position_loss,velocity_loss,attitude_loss,angular_velocity_loss,"
         << "terminal_loss,terminal_position_loss,terminal_velocity_loss,terminal_attitude_loss,terminal_angular_velocity_loss,"
+        << "clf_loss,window_clf_loss,outward_velocity_loss,attitude_control_loss,"
         << "action_magnitude_loss,action_smoothness_loss,saturation_loss,"
         << "critic_loss,actor_critic_loss,transition_consistency_loss,value_loss,entropy_loss,teacher_loss,other_loss_terms,"
         << "action_grad_norm_before_scale,action_grad_norm_after_diff_weight,action_grad_norm_after_action_clip,"
@@ -1112,6 +1113,9 @@ int main(int argc, char** argv){
         fp::LOSS_ACTION_SMOOTHNESS_WEIGHT,
         fp::LOSS_SATURATION_WEIGHT
     };
+    const T action_magnitude_center = options.hover_relative_action_magnitude
+        ? (T)2 * solve_hover_throttle_relative<PARAMETERS, T, TI>(env.parameters) - (T)1
+        : options.action_magnitude_center;
     const l2f_diff::EulerLossWeights<T> euler_weights{
         fp::LOSS_POSITION_WEIGHT,
         options.loss_velocity_weight,
@@ -1124,7 +1128,19 @@ int main(int argc, char** argv){
         fp::TERMINAL_POSITION_WEIGHT,
         options.terminal_velocity_weight,
         fp::TERMINAL_ATTITUDE_WEIGHT,
-        options.terminal_angular_velocity_weight
+        options.terminal_angular_velocity_weight,
+        options.loss_clf_weight,
+        options.loss_window_clf_weight,
+        options.loss_clf_alpha,
+        options.loss_clf_position_weight,
+        options.loss_clf_velocity_weight,
+        options.loss_clf_attitude_weight,
+        options.loss_clf_angular_velocity_weight,
+        options.loss_outward_velocity_weight,
+        options.loss_attitude_control_weight,
+        options.attitude_control_k_R,
+        options.attitude_control_k_omega,
+        action_magnitude_center
     };
     const auto tracking_reference = l2f_diff::zero_tracking_reference<T>();
 
@@ -1653,6 +1669,13 @@ int main(int argc, char** argv){
               << " terminal_ramp_min=" << options.terminal_ramp_min
               << " terminal_ramp_steps=" << options.terminal_ramp_steps
               << " terminal_ramp_terminal_only=" << (options.terminal_ramp_terminal_only ? "true" : "false")
+              << " loss_clf_weight=" << options.loss_clf_weight
+              << " loss_window_clf_weight=" << options.loss_window_clf_weight
+              << " loss_clf_alpha=" << options.loss_clf_alpha
+              << " loss_outward_velocity_weight=" << options.loss_outward_velocity_weight
+              << " loss_attitude_control_weight=" << options.loss_attitude_control_weight
+              << " action_magnitude_center=" << action_magnitude_center
+              << " hover_relative_action_magnitude=" << (options.hover_relative_action_magnitude ? "true" : "false")
               << " reset_optimizer_on_curriculum_transition=" << (options.reset_optimizer_on_curriculum_transition ? "true" : "false")
               << " physics_gradient_enabled=" << (!options.disable_physics_gradient ? "true" : "false")
               << " reset_hidden_each_step=" << (options.reset_hidden_each_step ? "true" : "false")
@@ -2174,6 +2197,10 @@ int main(int argc, char** argv){
                 mean_terms.terminal_velocity += diff_sample_weight * terms.terminal_velocity;
                 mean_terms.terminal_attitude += diff_sample_weight * terms.terminal_attitude;
                 mean_terms.terminal_angular_velocity += diff_sample_weight * terms.terminal_angular_velocity;
+                mean_terms.clf += diff_sample_weight * terms.clf;
+                mean_terms.window_clf += diff_sample_weight * terms.window_clf;
+                mean_terms.outward_velocity += diff_sample_weight * terms.outward_velocity;
+                mean_terms.attitude_control += diff_sample_weight * terms.attitude_control;
                 sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
                 mean_rollout_metrics.final_state_norm += l2f_diff::state_norm<T, TI>(euler_gradient_states[current_horizon]);
                 mean_rollout_metrics.final_position_norm += fp::euler_position_error_norm<T, TI>(euler_gradient_states[current_horizon], tracking_reference);
@@ -2277,7 +2304,8 @@ int main(int argc, char** argv){
                     }
                 }
                 for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
-                    cost += fp::LOSS_ACTION_MAGNITUDE_WEIGHT * actions[batch_i][horizon_i][action_i] * actions[batch_i][horizon_i][action_i];
+                    const T centered_action = actions[batch_i][horizon_i][action_i] - step_euler_weights.action_magnitude_center;
+                    cost += fp::LOSS_ACTION_MAGNITUDE_WEIGHT * centered_action * centered_action;
                 }
                 step_costs[batch_i][horizon_i] = cost;
                 if(horizon_i == 0){
@@ -2361,7 +2389,8 @@ int main(int argc, char** argv){
         const T rpm_max_value = rpm_count > 0 ? rpm_max : diagnostic_nan;
         const T thrust_mean = force_cache_count > 0 ? thrust_norm_sum / (T)force_cache_count : diagnostic_nan;
         const T torque_norm_mean = force_cache_count > 0 ? torque_norm_sum / (T)force_cache_count : diagnostic_nan;
-        const T loss_stabilization = mean_terms.position + mean_terms.velocity + mean_terms.attitude + mean_terms.angular_velocity + mean_terms.terminal;
+        const T loss_stabilization = mean_terms.position + mean_terms.velocity + mean_terms.attitude + mean_terms.angular_velocity +
+            mean_terms.terminal + mean_terms.clf + mean_terms.window_clf + mean_terms.outward_velocity + mean_terms.attitude_control;
         const T loss_action_regularization = mean_terms.action_magnitude + mean_terms.action_smoothness + mean_terms.saturation;
 
         // Action-gradient clipping: clips dL/du (rollout-output gradients) before BPTT.
@@ -2610,6 +2639,10 @@ int main(int argc, char** argv){
                                  << mean_terms.terminal_velocity << ","
                                  << mean_terms.terminal_attitude << ","
                                  << mean_terms.terminal_angular_velocity << ","
+                                 << mean_terms.clf << ","
+                                 << mean_terms.window_clf << ","
+                                 << mean_terms.outward_velocity << ","
+                                 << mean_terms.attitude_control << ","
                                  << mean_terms.action_magnitude << ","
                                  << mean_terms.action_smoothness << ","
                                  << mean_terms.saturation << ","
@@ -2651,6 +2684,10 @@ int main(int argc, char** argv){
                   << " mean_terminal_velocity_loss=" << mean_terms.terminal_velocity
                   << " mean_terminal_attitude_loss=" << mean_terms.terminal_attitude
                   << " mean_terminal_angular_velocity_loss=" << mean_terms.terminal_angular_velocity
+                  << " mean_clf_loss=" << mean_terms.clf
+                  << " mean_window_clf_loss=" << mean_terms.window_clf
+                  << " mean_outward_velocity_loss=" << mean_terms.outward_velocity
+                  << " mean_attitude_control_loss=" << mean_terms.attitude_control
                   << " transition_consistency_loss=" << transition_consistency_loss
                   << " actor_critic_actor_loss=" << rdac_ac_terms.actor_critic_actor
                   << " actor_critic_critic_loss=" << rdac_ac_terms.actor_critic_critic
@@ -2865,6 +2902,10 @@ int main(int argc, char** argv){
                      << mean_terms.terminal_velocity << ","
                      << mean_terms.terminal_attitude << ","
                      << mean_terms.terminal_angular_velocity << ","
+                     << mean_terms.clf << ","
+                     << mean_terms.window_clf << ","
+                     << mean_terms.outward_velocity << ","
+                     << mean_terms.attitude_control << ","
                      << transition_consistency_loss << ","
                      << rdac_ac_terms.actor_critic_actor << ","
                      << rdac_ac_terms.actor_critic_critic << ","
@@ -2918,6 +2959,10 @@ int main(int argc, char** argv){
                      << mean_terms.terminal_position << ","
                      << mean_terms.terminal_velocity << ","
                      << mean_terms.terminal_angular_velocity << ","
+                     << mean_terms.clf << ","
+                     << mean_terms.window_clf << ","
+                     << mean_terms.outward_velocity << ","
+                     << mean_terms.attitude_control << ","
                      << mean_terms.action_magnitude << ","
                      << mean_terms.action_smoothness << ","
                      << mean_terms.saturation << ","

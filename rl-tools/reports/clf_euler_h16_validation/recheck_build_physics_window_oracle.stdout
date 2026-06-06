@@ -1,0 +1,4 @@
+Scanning dependencies of target foundation_policy_diff_physics_check
+[ 50%] Building CXX object src/foundation_policy/CMakeFiles/foundation_policy_diff_physics_check.dir/diff_pre_training/physics_check.cpp.o
+[100%] Linking CXX executable foundation_policy_diff_physics_check
+[100%] Built target foundation_policy_diff_physics_check

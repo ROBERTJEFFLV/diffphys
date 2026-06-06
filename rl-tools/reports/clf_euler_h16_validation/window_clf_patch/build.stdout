@@ -1,0 +1,31 @@
+Scanning dependencies of target foundation_policy_diff_physics_check
+[ 50%] Building CXX object src/foundation_policy/CMakeFiles/foundation_policy_diff_physics_check.dir/diff_pre_training/physics_check.cpp.o
+[100%] Linking CXX executable foundation_policy_diff_physics_check
+[100%] Built target foundation_policy_diff_physics_check
+Scanning dependencies of target foundation_policy_diff_pre_training
+[ 50%] Building CXX object src/foundation_policy/CMakeFiles/foundation_policy_diff_pre_training.dir/diff_pre_training/main.cpp.o
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp: In function ‘int main(int, char**)’:
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2201:28: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2201 |                 mean_terms.window_clf += diff_sample_weight * terms.window_clf;
+      |                            ^~~~~~~~~~
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2393:63: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2393 |             mean_terms.terminal + mean_terms.clf + mean_terms.window_clf + mean_terms.outward_velocity + mean_terms.attitude_control;
+      |                                                               ^~~~~~~~~~
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2643:48: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2643 |                                  << mean_terms.window_clf << ","
+      |                                                ^~~~~~~~~~
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2688:61: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2688 |                   << " mean_window_clf_loss=" << mean_terms.window_clf
+      |                                                             ^~~~~~~~~~
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2906:36: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2906 |                      << mean_terms.window_clf << ","
+      |                                    ^~~~~~~~~~
+/home/lvmingyang/raptor_diff_20260531_215150/diffphys/rl-tools/src/foundation_policy/diff_pre_training/main.cpp:2963:36: error: ‘struct rl_tools::foundation_policy::diff_pre_training::ScalarTerms<float>’ has no member named ‘window_clf’
+ 2963 |                      << mean_terms.window_clf << ","
+      |                                    ^~~~~~~~~~
+At global scope:
+cc1plus: warning: unrecognized command line option ‘-Wno-unused-lambda-capture’
+make[3]: *** [src/foundation_policy/CMakeFiles/foundation_policy_diff_pre_training.dir/build.make:63：src/foundation_policy/CMakeFiles/foundation_policy_diff_pre_training.dir/diff_pre_training/main.cpp.o] 错误 1
+make[2]: *** [CMakeFiles/Makefile2:1648：src/foundation_policy/CMakeFiles/foundation_policy_diff_pre_training.dir/all] 错误 2
+make[1]: *** [CMakeFiles/Makefile2:1655：src/foundation_policy/CMakeFiles/foundation_policy_diff_pre_training.dir/rule] 错误 2
+make: *** [Makefile:573：foundation_policy_diff_pre_training] 错误 2

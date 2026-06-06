@@ -29,6 +29,7 @@ struct Options{
     bool validate_closed_loop = false;
     bool validate_action_gradient_injection = false;
     bool validate_actor_backward = false;
+    bool diagnose_objective_gradient_conflicts = false;
     bool validate_adam_update = false;
     bool validate_correlated_size_mass_sampler = false;
     bool validate_trajectory_sampler = false;
@@ -45,6 +46,8 @@ struct Options{
     std::size_t stage9_debug_steps = 10;
     float learning_rate = 1e-4f;
     float action_magnitude_weight = 0.005f;
+    float action_magnitude_center = 0.0f;
+    bool hover_relative_action_magnitude = false;
     float action_smoothness_weight = 0.03f;
     float action_saturation_weight = 0.05f;
     float action_saturation_start = 0.95f;
@@ -52,6 +55,16 @@ struct Options{
     float velocity_reference_gain = 0.0f;
     float progress_weight = 0.0f;
     float outward_velocity_weight = 0.0f;
+    float clf_weight = 0.0f;
+    float window_clf_weight = 0.0f;
+    float clf_alpha = 1.0f;
+    float clf_position_weight = 8.0f;
+    float clf_velocity_weight = 0.8f;
+    float clf_attitude_weight = 4.0f;
+    float clf_angular_velocity_weight = 0.8f;
+    float attitude_control_weight = 0.0f;
+    float attitude_control_k_R = 2.0f;
+    float attitude_control_k_omega = 1.0f;
     float loss_angular_velocity_weight = 0.8f;
     float loss_linear_acceleration_weight = 0.0f;
     float loss_angular_acceleration_weight = 0.0f;
@@ -133,6 +146,7 @@ void print_usage(){
         << "    [--gpu-validate-closed-loop]\n"
         << "    [--gpu-validate-action-gradient-injection]\n"
         << "    [--gpu-validate-actor-backward]\n"
+        << "    [--gpu-diagnose-objective-gradient-conflicts]\n"
         << "    [--gpu-validate-adam-update]\n"
         << "    [--gpu-validate-correlated-size-mass-sampler]\n"
         << "    [--gpu-validate-trajectory-sampler]\n"
@@ -152,7 +166,7 @@ void print_usage(){
         << "    [--stage9-6-checkpoint-parity] [--save-optimizer] [--load-optimizer]\n"
         << "    [--checkpoint-inspect [PATH]] [--checkpoint-convert-old [PATH]]\n"
         << "    [--stage9-6-steps N] [--stage9-6-replay-path PATH]\n"
-        << "    active training is fixed-H16 origin recovery only; H64/H128 and curriculum flags are rejected\n"
+        << "    active training defaults to H16 origin recovery; non-fixed trajectories and curriculum flags are rejected\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
         << "    [--failure-analysis] [--force-dynamics-bins size_mass=3,thrust_to_weight=3,...]\n"
         << "    [--strict-stability-thresholds]\n"
@@ -161,8 +175,12 @@ void print_usage(){
         << "    [--success-angular-velocity-threshold VALUE]\n"
         << "    [--success-action-saturation-threshold VALUE]\n"
         << "    [--w-action-magnitude W] [--w-u W] [--w-sat W]\n"
+        << "    [--action-magnitude-center VALUE] [--hover-relative-action-magnitude]\n"
         << "    [--w-linear-acceleration W] [--w-angular-acceleration W]\n"
         << "    [--w-progress W] [--w-outward-velocity W] [--velocity-reference-gain K]\n"
+        << "    [--w-clf W] [--w-window-clf W] [--clf-alpha A] [--w-clf-position W] [--w-clf-velocity W]\n"
+        << "    [--w-clf-attitude W] [--w-clf-angular-velocity W]\n"
+        << "    [--w-attitude-control W] [--attitude-control-k-r K] [--attitude-control-k-omega K]\n"
         << "    [--action-saturation-start VALUE] [--terminal-loss-scale VALUE]\n"
         << "    [--no-load-optimizer]\n"
         << "    [--correlated-size-mass-sampling]\n"
@@ -309,6 +327,10 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--gpu-validate-actor-backward"){
             options.validate_actor_backward = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--gpu-diagnose-objective-gradient-conflicts"){
+            options.diagnose_objective_gradient_conflicts = true;
             options.gpu_rollout = true;
         }
         else if(arg == "--gpu-validate-adam-update"){
@@ -519,6 +541,36 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--w-outward-velocity" && i + 1 < argc){
             options.outward_velocity_weight = std::stof(argv[++i]);
         }
+        else if(arg == "--w-clf" && i + 1 < argc){
+            options.clf_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-window-clf" && i + 1 < argc){
+            options.window_clf_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--clf-alpha" && i + 1 < argc){
+            options.clf_alpha = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-clf-position" && i + 1 < argc){
+            options.clf_position_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-clf-velocity" && i + 1 < argc){
+            options.clf_velocity_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-clf-attitude" && i + 1 < argc){
+            options.clf_attitude_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-clf-angular-velocity" && i + 1 < argc){
+            options.clf_angular_velocity_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-attitude-control" && i + 1 < argc){
+            options.attitude_control_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--attitude-control-k-r" && i + 1 < argc){
+            options.attitude_control_k_R = std::stof(argv[++i]);
+        }
+        else if(arg == "--attitude-control-k-omega" && i + 1 < argc){
+            options.attitude_control_k_omega = std::stof(argv[++i]);
+        }
         else if(arg == "--w-linear-acceleration" && i + 1 < argc){
             options.loss_linear_acceleration_weight = std::stof(argv[++i]);
         }
@@ -527,6 +579,13 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--w-action-magnitude" && i + 1 < argc){
             options.action_magnitude_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--action-magnitude-center" && i + 1 < argc){
+            options.action_magnitude_center = std::stof(argv[++i]);
+            options.hover_relative_action_magnitude = false;
+        }
+        else if(arg == "--hover-relative-action-magnitude"){
+            options.hover_relative_action_magnitude = true;
         }
         else if((arg == "--w-u" || arg == "--w-action-smoothness") && i + 1 < argc){
             options.action_smoothness_weight = std::stof(argv[++i]);
@@ -673,7 +732,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     gpu::FullGpuTrainingOptions training_options;
     training_options.device = options.gpu_device;
     training_options.batch_size = options.batch_size;
-    training_options.horizon = ACTIVE_TRAINING_HORIZON;
+    training_options.horizon = options.horizon;
     training_options.steps = options.steps;
     training_options.seed = options.seed;
     training_options.learning_rate = options.learning_rate;
@@ -685,6 +744,17 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.actor_grad_skip_norm = options.actor_grad_skip_norm;
     training_options.actor_grad_eps = options.actor_grad_eps;
     training_options.temporal_gradient_decay_alpha = options.temporal_gradient_decay_alpha;
+    training_options.clf_weight = options.clf_weight;
+    training_options.window_clf_weight = options.window_clf_weight;
+    training_options.clf_alpha = options.clf_alpha;
+    training_options.clf_position = options.clf_position_weight;
+    training_options.clf_velocity = options.clf_velocity_weight;
+    training_options.clf_attitude = options.clf_attitude_weight;
+    training_options.clf_angular_velocity = options.clf_angular_velocity_weight;
+    training_options.outward_velocity_weight = options.outward_velocity_weight;
+    training_options.attitude_control_weight = options.attitude_control_weight;
+    training_options.attitude_control_k_R = options.attitude_control_k_R;
+    training_options.attitude_control_k_omega = options.attitude_control_k_omega;
     training_options.velocity_observation_noise = options.velocity_observation_noise;
     training_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
     training_options.persistent_episode_training = options.persistent_episode_training;
@@ -867,6 +937,31 @@ void print_critic_backward_validation(const gpu::CriticBackwardValidationSummary
     std::cout << "critic_backward_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
 
+void print_objective_gradient_conflict_diagnostic(const gpu::ObjectiveGradientConflictSummary& summary){
+    std::cout << "objective_gradient_conflict_diagnostic_passed=" << (summary.passed ? "true" : "false") << "\n";
+    std::cout << "objective_gradient_conflict_finite=" << (summary.finite ? "true" : "false") << "\n";
+    std::cout << "objective_gradient_conflict_physics_nonzero=" << (summary.physics_nonzero ? "true" : "false") << "\n";
+    std::cout << "objective_gradient_conflict_critic_nonzero=" << (summary.critic_nonzero ? "true" : "false") << "\n";
+    std::cout << "objective_gradient_conflict_active_cuda_transition_consistency_present="
+              << (summary.active_cuda_transition_consistency_present ? "true" : "false") << "\n";
+    std::cout << "objective_gradient_conflict_batch_size=" << summary.batch_size << "\n";
+    std::cout << "objective_gradient_conflict_horizon=" << summary.horizon << "\n";
+    std::cout << "objective_gradient_conflict_diff_loss_scaled=" << summary.diff_loss_scaled << "\n";
+    std::cout << "objective_gradient_conflict_critic_loss_scaled=" << summary.critic_loss_scaled << "\n";
+    std::cout << "objective_gradient_conflict_physics_shared_norm=" << summary.physics_shared_norm << "\n";
+    std::cout << "objective_gradient_conflict_critic_shared_norm=" << summary.critic_shared_norm << "\n";
+    std::cout << "objective_gradient_conflict_combined_shared_norm=" << summary.combined_shared_norm << "\n";
+    std::cout << "objective_gradient_conflict_physics_actor_head_norm=" << summary.physics_actor_head_norm << "\n";
+    std::cout << "objective_gradient_conflict_critic_actor_head_norm=" << summary.critic_actor_head_norm << "\n";
+    std::cout << "objective_gradient_conflict_critic_head_norm=" << summary.critic_head_norm << "\n";
+    std::cout << "objective_gradient_conflict_shared_cosine=" << summary.shared_cosine << "\n";
+    std::cout << "objective_gradient_conflict_encoder_cosine=" << summary.encoder_cosine << "\n";
+    std::cout << "objective_gradient_conflict_gru_input_cosine=" << summary.gru_input_cosine << "\n";
+    std::cout << "objective_gradient_conflict_gru_hidden_cosine=" << summary.gru_hidden_cosine << "\n";
+    std::cout << "objective_gradient_conflict_h0_cosine=" << summary.h0_cosine << "\n";
+    std::cout << "objective_gradient_conflict_nan_inf_count=" << summary.nan_inf_count << "\n";
+}
+
 void print_adam_update_validation(const gpu::AdamUpdateValidationSummary& summary){
     std::cout << "gpu_adam_update_validation_passed=" << (summary.passed ? "true" : "false") << "\n";
     std::cout << "adam_weights_close=" << (summary.weights_close ? "true" : "false") << "\n";
@@ -932,6 +1027,24 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_action_cost=" << summary.action_cost << "\n";
     std::cout << "gpu_eval_weighted_cost=" << summary.weighted_cost << "\n";
     std::cout << "gpu_eval_reward=" << summary.reward_mean << "\n";
+    std::cout << "gpu_eval_mean_final_position_norm=" << summary.mean_final_position_norm << "\n";
+    std::cout << "gpu_eval_mean_final_velocity_norm=" << summary.mean_final_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_final_attitude_error=" << summary.mean_final_attitude_error << "\n";
+    std::cout << "gpu_eval_mean_final_angular_velocity_norm=" << summary.mean_final_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_max_position_norm=" << summary.mean_max_position_norm << "\n";
+    std::cout << "gpu_eval_mean_max_velocity_norm=" << summary.mean_max_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_max_attitude_error=" << summary.mean_max_attitude_error << "\n";
+    std::cout << "gpu_eval_mean_max_angular_velocity_norm=" << summary.mean_max_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_max_position_norm=" << summary.max_position_norm << "\n";
+    std::cout << "gpu_eval_max_velocity_norm=" << summary.max_velocity_norm << "\n";
+    std::cout << "gpu_eval_max_attitude_error=" << summary.max_attitude_error << "\n";
+    std::cout << "gpu_eval_max_angular_velocity_norm=" << summary.max_angular_velocity_norm << "\n";
+    std::cout << "gpu_eval_mean_action_magnitude=" << summary.mean_action_magnitude << "\n";
+    std::cout << "gpu_eval_max_action_magnitude=" << summary.max_action_magnitude << "\n";
+    std::cout << "gpu_eval_mean_action_smoothness=" << summary.mean_action_smoothness << "\n";
+    std::cout << "gpu_eval_max_action_smoothness=" << summary.max_action_smoothness << "\n";
+    std::cout << "gpu_eval_max_action_abs=" << summary.max_action_abs << "\n";
+    std::cout << "gpu_eval_action_saturation_rate=" << summary.action_saturation_rate << "\n";
     std::cout << "gpu_eval_sample_dynamics=" << (summary.sample_dynamics ? "true" : "false") << "\n";
     std::cout << "gpu_eval_correlated_size_mass_sampling=" << (summary.correlated_size_mass_sampling ? "true" : "false") << "\n";
     std::cout << "gpu_eval_mass_min=" << summary.mass_min << "\n";
@@ -1153,11 +1266,6 @@ int main(int argc, char** argv){
         options.throughout_gate_start_step = 0;
     }
     const bool active_training_requested = options.steps > 0;
-    if(active_training_requested && options.horizon != ACTIVE_TRAINING_HORIZON){
-        std::cerr << "Active CUDA training requires --horizon " << ACTIVE_TRAINING_HORIZON
-                  << " for fixed-H16 origin recovery.\n";
-        return 1;
-    }
     if(active_training_requested && options.trajectory_mode != gpu::TrajectoryMode::FIXED){
         std::cerr << "Active CUDA training is origin recovery only. "
                   << "Use non-fixed --trajectory-mode only for eval/deployment setpoint shifting.\n";
@@ -1186,7 +1294,8 @@ int main(int argc, char** argv){
     std::cout << "optimizer_on_gpu=true\n";
     std::cout << "full_gpu_training_enabled=" << (options.steps > 0 ? "true" : "false") << "\n";
     std::cout << "active_training_task=origin_recovery_position_controller\n";
-    std::cout << "active_training_horizon=" << ACTIVE_TRAINING_HORIZON << "\n";
+    std::cout << "active_training_default_horizon=" << ACTIVE_TRAINING_HORIZON << "\n";
+    std::cout << "active_training_requested_horizon=" << options.horizon << "\n";
     std::cout << "setpoint_shifting_for_eval_and_deployment=true\n";
     std::cout << "eval_only=" << (options.eval_only ? "true" : "false") << "\n";
     std::cout << "eval_model=" << options.eval_model << "\n";
@@ -1219,6 +1328,8 @@ int main(int argc, char** argv){
     std::cout << "sample_dynamics=" << (options.sample_dynamics ? "true" : "false") << "\n";
     std::cout << "learning_rate=" << options.learning_rate << "\n";
     std::cout << "action_magnitude_weight=" << options.action_magnitude_weight << "\n";
+    std::cout << "action_magnitude_center=" << options.action_magnitude_center << "\n";
+    std::cout << "hover_relative_action_magnitude=" << (options.hover_relative_action_magnitude ? "true" : "false") << "\n";
     std::cout << "action_smoothness_weight=" << options.action_smoothness_weight << "\n";
     std::cout << "action_saturation_weight=" << options.action_saturation_weight << "\n";
     std::cout << "action_saturation_start=" << options.action_saturation_start << "\n";
@@ -1226,6 +1337,16 @@ int main(int argc, char** argv){
     std::cout << "velocity_reference_gain=" << options.velocity_reference_gain << "\n";
     std::cout << "progress_weight=" << options.progress_weight << "\n";
     std::cout << "outward_velocity_weight=" << options.outward_velocity_weight << "\n";
+    std::cout << "clf_weight=" << options.clf_weight << "\n";
+    std::cout << "window_clf_weight=" << options.window_clf_weight << "\n";
+    std::cout << "clf_alpha=" << options.clf_alpha << "\n";
+    std::cout << "clf_position_weight=" << options.clf_position_weight << "\n";
+    std::cout << "clf_velocity_weight=" << options.clf_velocity_weight << "\n";
+    std::cout << "clf_attitude_weight=" << options.clf_attitude_weight << "\n";
+    std::cout << "clf_angular_velocity_weight=" << options.clf_angular_velocity_weight << "\n";
+    std::cout << "attitude_control_weight=" << options.attitude_control_weight << "\n";
+    std::cout << "attitude_control_k_R=" << options.attitude_control_k_R << "\n";
+    std::cout << "attitude_control_k_omega=" << options.attitude_control_k_omega << "\n";
     std::cout << "loss_angular_velocity_weight=" << options.loss_angular_velocity_weight << "\n";
     std::cout << "loss_linear_acceleration_weight=" << options.loss_linear_acceleration_weight << "\n";
     std::cout << "loss_angular_acceleration_weight=" << options.loss_angular_acceleration_weight << "\n";
@@ -1249,6 +1370,7 @@ int main(int argc, char** argv){
     gpu::EulerGpuBatch batch;
     gpu::EulerGpuLossWeights weights;
     weights.action_magnitude = options.action_magnitude_weight;
+    weights.action_magnitude_center = options.action_magnitude_center;
     weights.action_smoothness = options.action_smoothness_weight;
     weights.saturation = options.action_saturation_weight;
     weights.saturation_start = options.action_saturation_start;
@@ -1256,6 +1378,16 @@ int main(int argc, char** argv){
     weights.velocity_reference_gain = options.velocity_reference_gain;
     weights.progress = options.progress_weight;
     weights.outward_velocity = options.outward_velocity_weight;
+    weights.clf = options.clf_weight;
+    weights.window_clf = options.window_clf_weight;
+    weights.clf_alpha = options.clf_alpha;
+    weights.clf_position = options.clf_position_weight;
+    weights.clf_velocity = options.clf_velocity_weight;
+    weights.clf_attitude = options.clf_attitude_weight;
+    weights.clf_angular_velocity = options.clf_angular_velocity_weight;
+    weights.attitude_control = options.attitude_control_weight;
+    weights.attitude_control_k_R = options.attitude_control_k_R;
+    weights.attitude_control_k_omega = options.attitude_control_k_omega;
     weights.angular_velocity = options.loss_angular_velocity_weight;
     weights.linear_acceleration = options.loss_linear_acceleration_weight;
     weights.angular_acceleration = options.loss_angular_acceleration_weight;
@@ -1266,6 +1398,17 @@ int main(int argc, char** argv){
     run_options.device = options.gpu_device;
     run_options.compute_action_gradients = true;
     run_options.temporal_gradient_decay_alpha = options.temporal_gradient_decay_alpha;
+    run_options.clf_weight = options.clf_weight;
+    run_options.window_clf_weight = options.window_clf_weight;
+    run_options.clf_alpha = options.clf_alpha;
+    run_options.clf_position = options.clf_position_weight;
+    run_options.clf_velocity = options.clf_velocity_weight;
+    run_options.clf_attitude = options.clf_attitude_weight;
+    run_options.clf_angular_velocity = options.clf_angular_velocity_weight;
+    run_options.outward_velocity_weight = options.outward_velocity_weight;
+    run_options.attitude_control_weight = options.attitude_control_weight;
+    run_options.attitude_control_k_R = options.attitude_control_k_R;
+    run_options.attitude_control_k_omega = options.attitude_control_k_omega;
     run_options.velocity_observation_noise = options.velocity_observation_noise;
     run_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
     gpu::generate_validation_batch(
@@ -1287,6 +1430,10 @@ int main(int argc, char** argv){
         options.training_episode_steps,
         parse_dynamics_randomization_level(options.sampled_dynamics_level)
     );
+    if(options.hover_relative_action_magnitude && !batch.initial_previous_action.empty()){
+        weights.action_magnitude_center = batch.initial_previous_action[0];
+        std::cout << "hover_relative_action_magnitude_center_applied=" << weights.action_magnitude_center << "\n";
+    }
 
     try{
         bool formal_gate_run = false;
@@ -1456,6 +1603,20 @@ int main(int argc, char** argv){
                 return 1;
             }
         }
+        if(options.diagnose_objective_gradient_conflicts){
+            auto conflict_summary = gpu::diagnose_objective_gradient_conflicts(
+                options.batch_size,
+                options.horizon,
+                options.seed,
+                weights,
+                run_options,
+                options.diff_rollout_loss_weight
+            );
+            print_objective_gradient_conflict_diagnostic(conflict_summary);
+            if(!conflict_summary.passed){
+                return 1;
+            }
+        }
         if(options.validate_adam_update){
             auto adam_validation = gpu::validate_adam_update_against_cpu(options.seed, run_options);
             print_adam_update_validation(adam_validation);
@@ -1514,7 +1675,8 @@ int main(int argc, char** argv){
         }
         if(options.steps == 0 && !options.validate_observation && !options.validate_actor_forward && !options.validate_closed_loop &&
            !options.validate_action_gradient_injection && !options.validate_actor_backward &&
-           !options.validate_critic_backward && !options.validate_adam_update &&
+           !options.validate_critic_backward && !options.diagnose_objective_gradient_conflicts &&
+           !options.validate_adam_update &&
            !options.validate_correlated_size_mass_sampler && !options.validate_trajectory_sampler &&
            !options.validate_local_initial_conditions &&
            !options.validate_deployment_adapter &&

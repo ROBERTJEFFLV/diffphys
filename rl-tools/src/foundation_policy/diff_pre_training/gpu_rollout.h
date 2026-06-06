@@ -15,7 +15,7 @@ constexpr std::size_t RDAC_ACTOR_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_H
 constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
-constexpr std::size_t LOSS_COMPONENT_COUNT = 14;
+constexpr std::size_t LOSS_COMPONENT_COUNT = 18;
 
 enum class TrajectoryMode : std::uint32_t{
     FIXED = 0,
@@ -40,7 +40,18 @@ struct EulerGpuLossWeights{
     float angular_velocity = 0.8f;
     float linear_acceleration = 0.0f;
     float angular_acceleration = 0.0f;
+    float clf = 0.0f;
+    float window_clf = 0.0f;
+    float clf_alpha = 1.0f;
+    float clf_position = 8.0f;
+    float clf_velocity = 0.8f;
+    float clf_attitude = 4.0f;
+    float clf_angular_velocity = 0.8f;
+    float attitude_control = 0.0f;
+    float attitude_control_k_R = 2.0f;
+    float attitude_control_k_omega = 1.0f;
     float action_magnitude = 0.005f;
+    float action_magnitude_center = 0.0f;
     float action_smoothness = 0.03f;
     float saturation = 0.05f;
     float saturation_start = 0.95f;
@@ -68,6 +79,10 @@ struct LossComponentMeans{
     float angular_velocity = 0.0f;
     float linear_acceleration = 0.0f;
     float angular_acceleration = 0.0f;
+    float clf = 0.0f;
+    float window_clf = 0.0f;
+    float outward_velocity = 0.0f;
+    float attitude_control = 0.0f;
     float action_magnitude = 0.0f;
     float action_smoothness = 0.0f;
     float saturation = 0.0f;
@@ -158,6 +173,17 @@ struct EulerGpuRunOptions{
     int device = 0;
     bool compute_action_gradients = true;
     float temporal_gradient_decay_alpha = 0.0f;
+    float clf_weight = 0.0f;
+    float window_clf_weight = 0.0f;
+    float clf_alpha = 1.0f;
+    float clf_position = 8.0f;
+    float clf_velocity = 0.8f;
+    float clf_attitude = 4.0f;
+    float clf_angular_velocity = 0.8f;
+    float outward_velocity_weight = 0.0f;
+    float attitude_control_weight = 0.0f;
+    float attitude_control_k_R = 2.0f;
+    float attitude_control_k_omega = 1.0f;
     float velocity_observation_noise = 0.0f;
     std::size_t velocity_observation_delay_steps = 0;
 };
@@ -292,6 +318,30 @@ struct CriticBackwardValidationSummary{
     bool passed = false;
 };
 
+struct ObjectiveGradientConflictSummary{
+    std::size_t batch_size = 0;
+    std::size_t horizon = 0;
+    float diff_loss_scaled = 0.0f;
+    float critic_loss_scaled = 0.0f;
+    float physics_shared_norm = 0.0f;
+    float critic_shared_norm = 0.0f;
+    float combined_shared_norm = 0.0f;
+    float physics_actor_head_norm = 0.0f;
+    float critic_actor_head_norm = 0.0f;
+    float critic_head_norm = 0.0f;
+    float shared_cosine = 0.0f;
+    float encoder_cosine = 0.0f;
+    float gru_input_cosine = 0.0f;
+    float gru_hidden_cosine = 0.0f;
+    float h0_cosine = 0.0f;
+    std::size_t nan_inf_count = 0;
+    bool finite = false;
+    bool physics_nonzero = false;
+    bool critic_nonzero = false;
+    bool active_cuda_transition_consistency_present = false;
+    bool passed = false;
+};
+
 struct AdamUpdateValidationSummary{
     float max_weight_abs_error = 0.0f;
     float max_weight_rel_error = 0.0f;
@@ -321,6 +371,17 @@ struct FullGpuTrainingOptions{
     float actor_grad_skip_norm = 1e12f;
     float actor_grad_eps = 1e-6f;
     float temporal_gradient_decay_alpha = 0.0f;
+    float clf_weight = 0.0f;
+    float window_clf_weight = 0.0f;
+    float clf_alpha = 1.0f;
+    float clf_position = 8.0f;
+    float clf_velocity = 0.8f;
+    float clf_attitude = 4.0f;
+    float clf_angular_velocity = 0.8f;
+    float outward_velocity_weight = 0.0f;
+    float attitude_control_weight = 0.0f;
+    float attitude_control_k_R = 2.0f;
+    float attitude_control_k_omega = 1.0f;
     float velocity_observation_noise = 0.0f;
     std::size_t velocity_observation_delay_steps = 0;
     bool persistent_episode_training = true;
@@ -770,6 +831,15 @@ CriticBackwardValidationSummary validate_critic_backward_against_cpu(
     std::size_t horizon,
     unsigned seed,
     const EulerGpuRunOptions& options
+);
+
+ObjectiveGradientConflictSummary diagnose_objective_gradient_conflicts(
+    std::size_t batch_size,
+    std::size_t horizon,
+    unsigned seed,
+    const EulerGpuLossWeights& weights,
+    const EulerGpuRunOptions& options,
+    float diff_rollout_loss_weight
 );
 
 AdamUpdateValidationSummary validate_adam_update_against_cpu(

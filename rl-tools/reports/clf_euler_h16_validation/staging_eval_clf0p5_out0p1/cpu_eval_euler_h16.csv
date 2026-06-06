@@ -1,0 +1,2 @@
+eval_model,mode_fixed_or_sampled,eval_dynamics_mode,eval_sampled_dynamics_level,eval_episodes,eval_horizon,success_rate,near_success_rate_p,near_success_rate_pv,mean_total_loss,mean_final_position_norm,mean_final_velocity_norm,mean_final_angular_velocity_norm,median_final_position_norm,median_final_velocity_norm,median_final_angular_velocity_norm,p90_final_position_norm,p90_final_velocity_norm,mean_action_norm,invalid_or_nan_rate
+euler,fixed,fixed,fixed,64,16,0.46875,1,0.859375,18.7622,0.496141,1.4007,4.82843,0.519747,1.33137,4.84146,0.689038,2.06567,0.112845,0

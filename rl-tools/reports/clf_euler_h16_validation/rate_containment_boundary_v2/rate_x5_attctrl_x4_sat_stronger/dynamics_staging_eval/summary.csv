@@ -1,0 +1,5 @@
+mode,finite,weighted_cost,position_cost,linear_velocity_cost,angular_velocity_cost,mean_final_position_norm,mean_final_velocity_norm,mean_final_angular_velocity_norm,action_saturation_rate,nan_inf_count,sample_dynamics,sampled_dynamics_level,correlated_size_mass_sampling,mass_mean,thrust_to_weight_mean,motor_delay_mean
+fixed,true,120615,22910.1,177.891,97512.7,109.961,26.386,301.112,0.00131836,0,false,broad,false,0.05,3,0.065
+small,true,29117.9,28189,218.611,696.018,118.505,28.5683,38.077,0.00574121,0,true,small,false,0.0548492,3.15859,0.07269
+broad,false,2.25734e+07,nan,nan,nan,212.656,51.5057,5595.98,0.0369692,8,true,broad,false,0.135694,3.24105,0.115334
+broad_correlated,false,1.16533e+24,nan,nan,nan,194.057,46.3948,2.43204e+12,0.0327713,20,true,broad,true,0.10244,3.26758,0.114693

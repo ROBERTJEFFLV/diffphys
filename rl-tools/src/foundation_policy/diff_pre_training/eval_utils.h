@@ -38,6 +38,10 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         T terminal_velocity = 0;
         T terminal_attitude = 0;
         T terminal_angular_velocity = 0;
+        T clf = 0;
+        T window_clf = 0;
+        T outward_velocity = 0;
+        T attitude_control = 0;
     };
 
     template <typename T>
@@ -86,7 +90,8 @@ namespace rl_tools::foundation_policy::diff_pre_training{
                finite_value(terms.attitude) && finite_value(terms.angular_velocity) &&
                finite_value(terms.action_magnitude) && finite_value(terms.action_smoothness) && finite_value(terms.saturation) &&
                finite_value(terms.terminal) && finite_value(terms.terminal_position) && finite_value(terms.terminal_velocity) &&
-               finite_value(terms.terminal_attitude) && finite_value(terms.terminal_angular_velocity);
+               finite_value(terms.terminal_attitude) && finite_value(terms.terminal_angular_velocity) &&
+               finite_value(terms.clf) && finite_value(terms.outward_velocity) && finite_value(terms.attitude_control);
     }
 
     template <typename T>

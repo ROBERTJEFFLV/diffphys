@@ -28,7 +28,7 @@ namespace rl_tools::foundation_policy::diff_pre_training{
 
     struct RuntimeOptions{
         TI num_steps = DIFF_TRAINING_NUM_STEPS;
-        TI horizon = DIFF_TRAINING_HORIZON;
+        TI horizon = DIFF_TRAINING_DEFAULT_HORIZON;
         TI batch_size = DIFF_TRAINING_BATCH_SIZE;
         TI eval_episodes = 100;
         TI eval_horizon = 128;
@@ -84,6 +84,19 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         T loss_angular_velocity_weight = LOSS_ANGULAR_VELOCITY_WEIGHT;
         T terminal_velocity_weight = TERMINAL_VELOCITY_WEIGHT;
         T terminal_angular_velocity_weight = TERMINAL_ANGULAR_VELOCITY_WEIGHT;
+        T loss_clf_weight = (T)0;
+        T loss_window_clf_weight = (T)0;
+        T loss_clf_alpha = (T)1;
+        T loss_clf_position_weight = (T)8;
+        T loss_clf_velocity_weight = (T)0.8;
+        T loss_clf_attitude_weight = (T)4;
+        T loss_clf_angular_velocity_weight = (T)0.8;
+        T loss_outward_velocity_weight = (T)0;
+        T loss_attitude_control_weight = (T)0;
+        T attitude_control_k_R = (T)2;
+        T attitude_control_k_omega = (T)1;
+        T action_magnitude_center = (T)0;
+        bool hover_relative_action_magnitude = false;
         DiffModel diff_model = DiffModel::EULER;
         EvalModel eval_model = EvalModel::EULER;
         std::string save_path;
@@ -180,6 +193,11 @@ namespace rl_tools::foundation_policy::diff_pre_training{
                   << "    [--curriculum-min-stage-steps N] [--curriculum-max-stage-steps N]\n"
                   << "    [--curriculum-loss-spike-ratio VALUE]\n"
                   << "    [--eval-only] [--eval-model euler|l2f] [--eval-episodes N] [--eval-horizon H]\n"
+                  << "    [--w-clf VALUE] [--clf-alpha VALUE] [--w-clf-position VALUE] [--w-clf-velocity VALUE]\n"
+                  << "    [--w-clf-attitude VALUE] [--w-clf-angular-velocity VALUE]\n"
+                  << "    [--w-outward-velocity VALUE] [--w-attitude-control VALUE]\n"
+                  << "    [--attitude-control-k-r VALUE] [--attitude-control-k-omega VALUE]\n"
+                  << "    [--action-magnitude-center VALUE] [--hover-relative-action-magnitude]\n"
                   << "    [--failure-analysis] [--failure-analysis-path PATH] [--force-dynamics-bins S T Q D C]\n"
                   << "    [--gpu-rollout] [--gpu-device N] [--gpu-batch-size N]\n"
                   << "    [--gpu-validate-against-cpu] [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
@@ -324,6 +342,46 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             }
             else if(arg == "--w-terminal-w" && arg_i + 1 < argc){
                 options.terminal_angular_velocity_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-clf" && arg_i + 1 < argc){
+                options.loss_clf_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-window-clf" && arg_i + 1 < argc){
+                options.loss_window_clf_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--clf-alpha" && arg_i + 1 < argc){
+                options.loss_clf_alpha = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-clf-position" && arg_i + 1 < argc){
+                options.loss_clf_position_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-clf-velocity" && arg_i + 1 < argc){
+                options.loss_clf_velocity_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-clf-attitude" && arg_i + 1 < argc){
+                options.loss_clf_attitude_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-clf-angular-velocity" && arg_i + 1 < argc){
+                options.loss_clf_angular_velocity_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-outward-velocity" && arg_i + 1 < argc){
+                options.loss_outward_velocity_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-attitude-control" && arg_i + 1 < argc){
+                options.loss_attitude_control_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--attitude-control-k-r" && arg_i + 1 < argc){
+                options.attitude_control_k_R = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--attitude-control-k-omega" && arg_i + 1 < argc){
+                options.attitude_control_k_omega = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--action-magnitude-center" && arg_i + 1 < argc){
+                options.action_magnitude_center = std::stof(argv[++arg_i]);
+                options.hover_relative_action_magnitude = false;
+            }
+            else if(arg == "--hover-relative-action-magnitude"){
+                options.hover_relative_action_magnitude = true;
             }
             else if(arg == "--diff-model" && arg_i + 1 < argc){
                 std::string value = argv[++arg_i];

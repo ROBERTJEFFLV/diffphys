@@ -597,13 +597,17 @@ void coordinate_frame_audit(const PARAMETERS& parameters){
 int main(int argc, char** argv){
     std::cout << std::setprecision(8);
     std::string diff_model = "euler";
+    bool clf_validation = false;
     for(int arg_i = 1; arg_i < argc; arg_i++){
         std::string arg = argv[arg_i];
         if(arg == "--diff-model" && arg_i + 1 < argc){
             diff_model = argv[++arg_i];
         }
+        else if(arg == "--clf-validation"){
+            clf_validation = true;
+        }
         else if(arg == "--help"){
-            std::cout << "Usage: foundation_policy_diff_physics_check [--diff-model euler|l2f_approx]\n";
+            std::cout << "Usage: foundation_policy_diff_physics_check [--diff-model euler|l2f_approx] [--clf-validation]\n";
             return 0;
         }
         else{
@@ -628,7 +632,11 @@ int main(int argc, char** argv){
     std::cout << "foundation_policy_diff_physics_check\n";
     if(diff_model == "euler"){
         l2f_diff::EulerCheckSummary<T> euler_summary;
-        const bool euler_ok = l2f_diff::run_euler_physics_check<PARAMETERS, T, TI>(parameters, euler_summary);
+        bool euler_ok = l2f_diff::run_euler_physics_check<PARAMETERS, T, TI>(parameters, euler_summary);
+        if(clf_validation){
+            const bool clf_ok = l2f_diff::run_euler_clf_objective_validation<PARAMETERS, T, TI>(parameters);
+            euler_ok = euler_ok && clf_ok;
+        }
         rlt::free(device, rng);
         return euler_ok ? 0 : 1;
     }

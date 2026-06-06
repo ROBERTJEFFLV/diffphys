@@ -17,6 +17,18 @@ namespace rl_tools::rl::environments::l2f::diff{
         T terminal_velocity;
         T terminal_attitude;
         T terminal_angular_velocity;
+        T clf = 0;
+        T window_clf = 0;
+        T clf_alpha = 1;
+        T clf_position = 8;
+        T clf_velocity = 0.8;
+        T clf_attitude = 4;
+        T clf_angular_velocity = 0.8;
+        T outward_velocity = 0;
+        T attitude_control = 0;
+        T attitude_control_k_R = 2;
+        T attitude_control_k_omega = 1;
+        T action_magnitude_center = 0;
     };
 
     template <typename T>
@@ -33,9 +45,14 @@ namespace rl_tools::rl::environments::l2f::diff{
         T terminal_velocity = 0;
         T terminal_attitude = 0;
         T terminal_angular_velocity = 0;
+        T clf = 0;
+        T window_clf = 0;
+        T outward_velocity = 0;
+        T attitude_control = 0;
 
         T total() const{
-            return position + velocity + attitude + angular_velocity + action_magnitude + action_smoothness + saturation + terminal;
+            return position + velocity + attitude + angular_velocity + action_magnitude + action_smoothness + saturation + terminal +
+                clf + window_clf + outward_velocity + attitude_control;
         }
         void add(const EulerLossTerms& other){
             position += other.position;
@@ -50,6 +67,10 @@ namespace rl_tools::rl::environments::l2f::diff{
             terminal_velocity += other.terminal_velocity;
             terminal_attitude += other.terminal_attitude;
             terminal_angular_velocity += other.terminal_angular_velocity;
+            clf += other.clf;
+            window_clf += other.window_clf;
+            outward_velocity += other.outward_velocity;
+            attitude_control += other.attitude_control;
         }
         void scale(T factor){
             position *= factor;
@@ -64,8 +85,66 @@ namespace rl_tools::rl::environments::l2f::diff{
             terminal_velocity *= factor;
             terminal_attitude *= factor;
             terminal_angular_velocity *= factor;
+            clf *= factor;
+            window_clf *= factor;
+            outward_velocity *= factor;
+            attitude_control *= factor;
         }
     };
+
+    template <typename T, typename TI>
+    void attitude_identity_error_vee(const EulerState<T, TI>& state, T (&e_R)[3]){
+        e_R[0] = (T)0.5 * (state.R[2][1] - state.R[1][2]);
+        e_R[1] = (T)0.5 * (state.R[0][2] - state.R[2][0]);
+        e_R[2] = (T)0.5 * (state.R[1][0] - state.R[0][1]);
+    }
+
+    template <typename T, typename TI>
+    T lyapunov_energy_identity(
+        const EulerState<T, TI>& state,
+        const TrackingReference<T>& ref,
+        const EulerLossWeights<T>& weights
+    ){
+        T energy = 0;
+        for(TI i = 0; i < 3; i++){
+            const T e_p = state.p[i] - ref.p[i];
+            const T e_v = state.v[i] - ref.v[i];
+            energy += (T)0.5 * weights.clf_position * e_p * e_p;
+            energy += (T)0.5 * weights.clf_velocity * e_v * e_v;
+            energy += (T)0.5 * weights.clf_angular_velocity * state.omega[i] * state.omega[i];
+        }
+        for(TI i = 0; i < 3; i++){
+            for(TI j = 0; j < 3; j++){
+                const T target = i == j ? (T)1 : (T)0;
+                const T error = state.R[i][j] - target;
+                energy += (T)0.5 * weights.clf_attitude * error * error;
+            }
+        }
+        return energy;
+    }
+
+    template <typename T, typename TI>
+    void add_lyapunov_energy_adjoint_identity(
+        const EulerState<T, TI>& state,
+        const TrackingReference<T>& ref,
+        const EulerLossWeights<T>& weights,
+        T scale,
+        EulerStateAdjoint<T>& lambda
+    ){
+        for(TI i = 0; i < 3; i++){
+            const T e_p = state.p[i] - ref.p[i];
+            const T e_v = state.v[i] - ref.v[i];
+            lambda.p[i] += scale * weights.clf_position * e_p;
+            lambda.v[i] += scale * weights.clf_velocity * e_v;
+            lambda.omega[i] += scale * weights.clf_angular_velocity * state.omega[i];
+        }
+        for(TI i = 0; i < 3; i++){
+            for(TI j = 0; j < 3; j++){
+                const T target = i == j ? (T)1 : (T)0;
+                lambda.R[i][j] += scale * weights.clf_attitude * (state.R[i][j] - target);
+            }
+        }
+    }
 
     template <typename T, typename TI>
     void add_state_loss(
@@ -173,8 +252,9 @@ namespace rl_tools::rl::environments::l2f::diff{
         }
         for(TI step_i = 0; step_i < horizon; step_i++){
             for(TI action_i = 0; action_i < 4; action_i++){
-                terms.action_magnitude += normalizer * weights.action_magnitude * actions[step_i][action_i] * actions[step_i][action_i];
-                action_gradients[step_i][action_i] += normalizer * (T)2 * weights.action_magnitude * actions[step_i][action_i];
+                const T centered_action = actions[step_i][action_i] - weights.action_magnitude_center;
+                terms.action_magnitude += normalizer * weights.action_magnitude * centered_action * centered_action;
+                action_gradients[step_i][action_i] += normalizer * (T)2 * weights.action_magnitude * centered_action;
                 const T diff = actions[step_i][action_i] - previous_action[action_i];
                 terms.action_smoothness += normalizer * weights.action_smoothness * diff * diff;
                 action_gradients[step_i][action_i] += normalizer * (T)2 * weights.action_smoothness * diff;
@@ -194,6 +274,100 @@ namespace rl_tools::rl::environments::l2f::diff{
         }
     }
 
+    template <typename T, typename TI>
+    void add_clf_transition_loss(
+        const EulerState<T, TI>& previous,
+        const EulerState<T, TI>& next,
+        const TrackingReference<T>& ref,
+        const EulerLossWeights<T>& weights,
+        T dt,
+        T normalizer,
+        EulerLossTerms<T>& terms,
+        EulerStateAdjoint<T>& previous_lambda,
+        EulerStateAdjoint<T>& next_lambda
+    ){
+        if(weights.clf != (T)0){
+            const T V_prev = lyapunov_energy_identity<T, TI>(previous, ref, weights);
+            const T V_next = lyapunov_energy_identity<T, TI>(next, ref, weights);
+            const T target_next = ((T)1 - weights.clf_alpha * dt) * V_prev;
+            const T delta = V_next - target_next;
+            if(delta > (T)0){
+                terms.clf += normalizer * weights.clf * delta * delta;
+                const T grad_delta = normalizer * (T)2 * weights.clf * delta;
+                add_lyapunov_energy_adjoint_identity<T, TI>(next, ref, weights, grad_delta, next_lambda);
+                add_lyapunov_energy_adjoint_identity<T, TI>(
+                    previous,
+                    ref,
+                    weights,
+                    -grad_delta * ((T)1 - weights.clf_alpha * dt),
+                    previous_lambda
+                );
+            }
+        }
+        if(weights.outward_velocity != (T)0){
+            T radial = 0;
+            T e_p[3];
+            T e_v[3];
+            for(TI i = 0; i < 3; i++){
+                e_p[i] = next.p[i] - ref.p[i];
+                e_v[i] = next.v[i] - ref.v[i];
+                radial += e_p[i] * e_v[i];
+            }
+            if(radial > (T)0){
+                terms.outward_velocity += normalizer * weights.outward_velocity * radial * radial;
+                const T grad = normalizer * (T)2 * weights.outward_velocity * radial;
+                for(TI i = 0; i < 3; i++){
+                    next_lambda.p[i] += grad * e_v[i];
+                    next_lambda.v[i] += grad * e_p[i];
+                }
+            }
+        }
+        if(weights.attitude_control != (T)0){
+            T e_R[3];
+            attitude_identity_error_vee<T, TI>(previous, e_R);
+            for(TI i = 0; i < 3; i++){
+                const T omega_target_next = previous.omega[i] + dt * (
+                    -weights.attitude_control_k_R * e_R[i] -
+                    weights.attitude_control_k_omega * previous.omega[i]
+                );
+                const T error = next.omega[i] - omega_target_next;
+                terms.attitude_control += normalizer * weights.attitude_control * error * error;
+                next_lambda.omega[i] += normalizer * (T)2 * weights.attitude_control * error;
+            }
+        }
+    }
+
+    template <typename T, typename TI>
+    void add_window_clf_loss(
+        const EulerState<T, TI>& initial,
+        const EulerState<T, TI>& terminal,
+        const TrackingReference<T>& ref,
+        const EulerLossWeights<T>& weights,
+        T dt,
+        TI horizon,
+        EulerLossTerms<T>& terms,
+        EulerStateAdjoint<T>& initial_lambda,
+        EulerStateAdjoint<T>& terminal_lambda
+    ){
+        if(weights.window_clf == (T)0 || horizon <= 0){
+            return;
+        }
+        const T V_initial = lyapunov_energy_identity<T, TI>(initial, ref, weights);
+        const T V_terminal = lyapunov_energy_identity<T, TI>(terminal, ref, weights);
+        const T per_step_decay = (T)1 - weights.clf_alpha * dt;
+        T window_decay = (T)1;
+        for(TI step_i = 0; step_i < horizon; step_i++){
+            window_decay *= per_step_decay;
+        }
+        const T delta = V_terminal - window_decay * V_initial;
+        if(delta > (T)0){
+            terms.window_clf += weights.window_clf * delta * delta;
+            const T grad_delta = (T)2 * weights.window_clf * delta;
+            add_lyapunov_energy_adjoint_identity<T, TI>(terminal, ref, weights, grad_delta, terminal_lambda);
+            add_lyapunov_energy_adjoint_identity<T, TI>(initial, ref, weights, -grad_delta * window_decay, initial_lambda);
+        }
+    }
+
     template <typename PARAMETERS, typename T, typename TI, TI MAX_HORIZON>
     EulerLossTerms<T> rollout_loss(
         const PARAMETERS& parameters,
@@ -210,6 +384,7 @@ namespace rl_tools::rl::environments::l2f::diff{
             step<PARAMETERS, T, TI>(parameters, states[step_i], actions[step_i], states[step_i + 1], caches[step_i]);
         }
         EulerLossTerms<T> terms;
+        const T dt = parameters.integration.dt;
         const T normalizer = horizon > 0 ? (T)1 / (T)horizon : (T)1;
         EulerStateAdjoint<T> unused;
         zero(unused);
@@ -217,7 +392,31 @@ namespace rl_tools::rl::environments::l2f::diff{
             EulerStateAdjoint<T> state_loss;
             zero(state_loss);
             add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, state_loss);
+            EulerStateAdjoint<T> previous_loss;
+            zero(previous_loss);
+            add_clf_transition_loss<T, TI>(
+                states[step_i],
+                states[step_i + 1],
+                ref,
+                weights,
+                dt,
+                normalizer,
+                terms,
+                previous_loss,
+                state_loss
+            );
         }
+        add_window_clf_loss<T, TI>(
+            states[0],
+            states[horizon],
+            ref,
+            weights,
+            dt,
+            horizon,
+            terms,
+            unused,
+            unused
+        );
         T dummy_gradients[MAX_HORIZON][4] = {};
         add_action_loss<T, TI, MAX_HORIZON>(initial_state, actions, horizon, weights, normalizer, terms, dummy_gradients);
         EulerStateAdjoint<T> terminal_loss;
@@ -269,10 +468,33 @@ namespace rl_tools::rl::environments::l2f::diff{
         }
 
         EulerLossTerms<T> terms;
+        const T dt = parameters.integration.dt;
         const T normalizer = horizon > 0 ? (T)1 / (T)horizon : (T)1;
         for(TI step_i = 0; step_i < horizon; step_i++){
             add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, lambdas[step_i + 1]);
+            add_clf_transition_loss<T, TI>(
+                states[step_i],
+                states[step_i + 1],
+                ref,
+                weights,
+                dt,
+                normalizer,
+                terms,
+                lambdas[step_i],
+                lambdas[step_i + 1]
+            );
         }
+        add_window_clf_loss<T, TI>(
+            states[0],
+            states[horizon],
+            ref,
+            weights,
+            dt,
+            horizon,
+            terms,
+            lambdas[0],
+            lambdas[horizon]
+        );
         add_terminal_loss<T, TI>(states[horizon], ref, weights, terms, lambdas[horizon]);
         add_action_loss<T, TI, MAX_HORIZON>(initial_state, actions, horizon, weights, normalizer, terms, action_gradients);
 
