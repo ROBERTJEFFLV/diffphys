@@ -1,76 +1,45 @@
-# H16 Origin Recovery Position Controller
+# H16 Origin Recovery RAPTOR Metrics
 
 ## Scope
 
-This report tracks the active CUDA diffphys training objective after aligning it with the original RAPTOR/L2F position-controller formulation.
+This report tracks the active CUDA diffphys objective after aligning its public metrics with the original RAPTOR/L2F reporting style.
 
-The active training task is fixed-H16 origin recovery:
+The active task remains fixed-H16 origin recovery:
 
-- The GRU actor still outputs exactly four normalized motor commands.
-- The force/torque rigid-body differentiable rollout, CUDA VJP chain, motor delay, previous-action input, and action magnitude/smoothness/saturation penalties are preserved.
-- The training reference is the origin for every step: `p_ref = 0`, `v_ref = 0`, identity attitude, and zero angular velocity.
-- Initial position, velocity, attitude, and angular velocity are randomized with the recovery-scale defaults.
+- GRU actor output remains exactly four normalized motor commands.
+- The differentiable force/torque rigid-body rollout, CUDA VJP chain, motor delay, previous-action input, and optimizer path are unchanged.
+- Training recovers to the origin: zero position offset, zero linear velocity, identity attitude, and zero angular velocity.
+- Initial position, velocity, attitude, and angular velocity are randomized with recovery-scale defaults.
 - Terminal loss remains disabled by default.
-- Loss terms are per-step and horizon-normalized over the H16 BPTT window.
-- Non-origin waypoint or trajectory behavior is deployment/eval-time setpoint shifting: an external setpoint provider supplies `p_ref(t), v_ref(t)`, and the adapter converts the current state to relative position/velocity offsets before feeding the same GRU actor.
+- Non-origin setpoints are eval/deployment-time setpoint shifting only; they are not an active training curriculum.
+- H64/H128 and stage-style curriculum entry points remain rejected by the active CUDA interface.
 
-There is no active CUDA training curriculum in this pipeline. H64/H128 training paths and stage-style curriculum entry points are rejected by the active CUDA training interface.
+## Metric Interface
 
-## Active Interface
+Active training and eval now report RAPTOR-style aggregate metrics:
 
-Training command shape:
+- `returns_mean`
+- `returns_std`
+- `episode_length_mean`
+- `episode_length_std`
+- `num_terminated`
+- `share_terminated`
 
-```bash
-/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
-  --diff-model euler \
-  --gpu-rollout \
-  --steps N \
-  --horizon 16 \
-  --batch-size B \
-  --sample-dynamics \
-  --sampled-dynamics-level broad \
-  --balanced-dynamics-sampling \
-  --correlated-size-mass-sampling \
-  --terminal-loss-scale 0 \
-  --log-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/origin_recovery_train.csv \
-  --save-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/origin_recovery_checkpoint.ckpt
-```
+Reward component reporting uses the diffphys weighted-cost decomposition:
 
-The executable now rejects:
+- `position_cost`
+- `orientation_cost`
+- `linear_velocity_cost`
+- `angular_velocity_cost`
+- `action_cost`
+- `weighted_cost`
+- `reward`
 
-- `--stage11`
-- `--horizon-curriculum`
-- curriculum scale/reset flags
-- training with `--horizon` other than `16`
-- training with non-fixed `--trajectory-mode`
+For this differentiable origin-recovery path, `weighted_cost` is the horizon-normalized rollout cost and `reward = -weighted_cost`. Episode length is fixed by the rollout horizon unless the rollout is non-finite, in which case it is counted as terminated.
 
-Evaluation and deployment setpoint shifting may still use `--trajectory-mode fixed|step|circle|figure8|mixed`, because that path is not a training curriculum.
+The previous local tracking classification and window-diagnostic fields are no longer emitted by the active train/eval stdout or CSV files.
 
-## Metrics
-
-Training CSV logs include:
-
-- finite/NaN diagnostics
-- final position, velocity, attitude, and angular velocity diagnostics
-- action saturation rate
-- action magnitude, smoothness, and saturation loss components
-- linear and angular acceleration loss components
-- terminal loss components, which should remain zero unless explicitly enabled
-- critic loss diagnostics
-- gradient norm diagnostics
-
-500-step evaluation logs include:
-
-- `settling_fraction_position`
-- mean-error means for position, angle, linear velocity, angular velocity, angular acceleration, action, and action relative
-- max-error mean/std for the same quantities
-- RMSE diagnostics
-- action saturation rate
-- invalid/NaN rate
-
-Strict throughout success is retained as a diagnostic only. It is not the active training objective.
-
-## Validation Results
+## Validation Commands
 
 Build:
 
@@ -78,41 +47,7 @@ Build:
 cmake --build /tmp/raptor_stage96_cuda_build --target foundation_policy_diff_pre_training_cuda -j2
 ```
 
-Origin-recovery CPU/CUDA parity:
-
-```bash
-/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
-  --gpu-rollout \
-  --gpu-validate-against-cpu \
-  --batch-size 64 \
-  --horizon 16 \
-  --seed 9601 \
-  --trajectory-mode fixed \
-  --terminal-loss-scale 0 \
-  --w-linear-acceleration 0.001 \
-  --w-angular-acceleration 0.0001
-```
-
-Reject removed H64/H128 curriculum entry point:
-
-```bash
-/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
-  --gpu-rollout \
-  --steps 1 \
-  --horizon-curriculum 16,32,64,128
-```
-
-Reject non-origin training setpoint:
-
-```bash
-/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
-  --gpu-rollout \
-  --steps 1 \
-  --horizon 16 \
-  --trajectory-mode circle
-```
-
-Origin-recovery smoke training:
+H16 origin-recovery smoke train:
 
 ```bash
 /tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
@@ -127,94 +62,90 @@ Origin-recovery smoke training:
   --correlated-size-mass-sampling \
   --terminal-loss-scale 0 \
   --save-optimizer \
-  --log-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_smoke_train.csv \
-  --save-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_smoke.ckpt
+  --seed 9701 \
+  --log-path reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/train_smoke.csv \
+  --save-path reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/train_smoke.ckpt
 ```
 
-500-step origin-recovery evaluation:
+500-step fixed-dynamics eval:
 
 ```bash
 /tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
   --eval-only \
   --gpu-rollout \
-  --load-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_smoke.ckpt \
+  --load-path reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/train_smoke.ckpt \
   --eval-horizon 500 \
   --eval-episodes 128 \
-  --sample-dynamics \
+  --fixed-dynamics \
   --sampled-dynamics-level broad \
-  --balanced-dynamics-sampling \
-  --correlated-size-mass-sampling \
   --trajectory-mode fixed \
-  --log-path reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_smoke_eval_500.csv
+  --seed 9702 \
+  --log-path reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/eval_fixed_500.csv
 ```
 
-Deployment setpoint-shifting adapter validation:
-
-```bash
-/tmp/raptor_stage96_cuda_build/src/foundation_policy/foundation_policy_diff_pre_training_cuda \
-  --gpu-rollout \
-  --gpu-validate-deployment-adapter \
-  --batch-size 64 \
-  --horizon 16 \
-  --seed 9602 \
-  --trajectory-mode circle \
-  --trajectory-amplitude 0.02 \
-  --trajectory-frequency-hz 0.4 \
-  --validation-step 8
-```
+## Validation Results
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| CUDA build | PASS | `foundation_policy_diff_pre_training_cuda` rebuilt successfully. |
+| CUDA build | PASS | Target rebuilt and linked. |
 | actor output dimension | PASS | Startup reports `actor_output_dim=4`. |
-| origin-recovery CPU/CUDA parity | PASS | `gpu_validation_passed=true`; action-gradient L2 relative error `1.40141e-06`. |
-| removed curriculum flag rejection | PASS | `--steps 1 --horizon-curriculum 16,32,64,128` returned nonzero with the fixed-H16 origin-recovery error message. |
-| removed H32/H64/H128 training rejection | PASS | `--steps 1 --horizon 32` returned nonzero with the fixed-H16 origin-recovery error message. |
-| removed stage entry point rejection | PASS | `--stage11 --stage11-steps 1` returned nonzero with the removed-stage error message. |
-| non-origin training setpoint rejection | PASS | `--steps 1 --horizon 16 --trajectory-mode circle` returned nonzero and says non-fixed setpoints are eval/deployment setpoint shifting only. |
-| H16 broad correlated origin-recovery smoke training | PASS | 5-step smoke training passed finite, saved checkpoint, NaN/Inf count `0`, final action saturation `0`. |
-| 500-step origin-recovery eval diagnostics | PASS | Fixed-dynamics 500-step eval from the smoke checkpoint passed finite and wrote RAPTOR/L2F-style metrics. |
-| deployment setpoint-shifting adapter | PASS | Circle setpoint adapter validation passed; max observation error `2.14204e-06`. |
+| active H16 invariant | PASS | Active training still requires `--horizon 16`. |
+| origin training invariant | PASS | Non-fixed trajectory modes remain eval/deployment-only for active training. |
+| train stdout metric vocabulary | PASS | Smoke stdout contains no removed classification wording. |
+| eval stdout metric vocabulary | PASS | Fixed eval stdout contains no removed classification wording. |
+| train CSV schema | PASS | Header is RAPTOR-style aggregate/cost fields; no classification-rate fields. |
+| eval CSV schema | PASS | Header contains only returns, episode length, terminated share, and reward-cost fields. |
+| smoke train finite | PASS | 5-step H16 broad correlated smoke completed with `finite=true`. |
+| fixed eval finite | PASS | 500-step fixed eval completed with `num_terminated=0`. |
 
-The 5-step smoke checkpoint is not a useful controller. Its broad-correlated 500-step eval intentionally exposed the safety diagnostics: `invalid_or_nan_rate=0.398438` and action saturation `0.342487`. Fixed-dynamics 500-step eval from the same checkpoint remained finite with `invalid_or_nan_rate=0`.
-
-## Smoke Metrics
+## Smoke Train Metrics
 
 | Metric | Value |
 | --- | ---: |
-| train steps | 5 |
-| train batch | 256 |
-| train horizon | 16 |
-| train dynamics | broad + balanced + correlated size-mass |
-| final loss | 0.0550651 |
-| final grad norm | 0.0479047 |
-| final batch success diagnostic | 0.796875 |
-| final action saturation | 0 |
-| NaN/Inf count | 0 |
+| returns_mean | -9.66902 |
+| returns_std | 6.4727 |
+| episode_length_mean | 16 |
+| episode_length_std | 0 |
+| num_terminated | 0 |
+| share_terminated | 0 |
+| position_cost | 1.94749 |
+| orientation_cost | 5.41736 |
+| linear_velocity_cost | 1.08864 |
+| angular_velocity_cost | 1.21487 |
+| action_cost | 0.000660842 |
+| weighted_cost | 9.66902 |
+| reward | -9.66902 |
 
-500-step fixed-dynamics origin-recovery eval from the smoke checkpoint:
+## Fixed Eval Metrics
 
 | Metric | Value |
 | --- | ---: |
-| eval episodes | 128 |
-| eval horizon | 500 |
-| finite | true |
-| invalid/NaN rate | 0 |
-| settling fraction position | 0.115644 |
-| position mean error mean | 35.4815 |
-| position max error mean | 114.467 |
-| action saturation rate | 0.249824 |
+| returns_mean | -37490.4 |
+| returns_std | 28094 |
+| episode_length_mean | 500 |
+| episode_length_std | 0 |
+| num_terminated | 0 |
+| share_terminated | 0 |
+| position_cost | 17058.7 |
+| orientation_cost | 18.0308 |
+| linear_velocity_cost | 508.87 |
+| angular_velocity_cost | 19904.8 |
+| action_cost | 0.0062305 |
+| weighted_cost | 37490.4 |
+| reward | -37490.4 |
 
 ## Artifacts
 
+Tracked report:
+
 ```text
-reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/origin_recovery_smoke_train.csv
-reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/origin_recovery_smoke_eval_fixed_500.csv
+reports/h16_raptor_l2f_recovery_pipeline/report.md
+reports/h16_raptor_l2f_recovery_pipeline/completion_audit.md
 ```
 
-Runtime-only artifacts that should not be committed:
+Runtime artifacts, not intended for commit:
 
 ```text
-reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/*.ckpt
-reports/h16_raptor_l2f_recovery_pipeline/origin_recovery_active/*.stdout
+reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/*.ckpt
+reports/h16_raptor_l2f_recovery_pipeline/raptor_metric_alignment/*.stdout
 ```

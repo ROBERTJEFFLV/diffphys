@@ -49,6 +49,9 @@ struct Options{
     float action_saturation_weight = 0.05f;
     float action_saturation_start = 0.95f;
     float loss_velocity_weight = 0.8f;
+    float velocity_reference_gain = 0.0f;
+    float progress_weight = 0.0f;
+    float outward_velocity_weight = 0.0f;
     float loss_angular_velocity_weight = 0.8f;
     float loss_linear_acceleration_weight = 0.0f;
     float loss_angular_acceleration_weight = 0.0f;
@@ -65,6 +68,7 @@ struct Options{
     float temporal_gradient_decay_alpha = 0.0f;
     float velocity_observation_noise = 0.0f;
     std::size_t velocity_observation_delay_steps = 0;
+    bool persistent_episode_training = true;
     bool disable_physics_gradient = false;
     bool reset_hidden_each_step = false;
     bool load_optimizer_state = true;
@@ -158,6 +162,7 @@ void print_usage(){
         << "    [--success-action-saturation-threshold VALUE]\n"
         << "    [--w-action-magnitude W] [--w-u W] [--w-sat W]\n"
         << "    [--w-linear-acceleration W] [--w-angular-acceleration W]\n"
+        << "    [--w-progress W] [--w-outward-velocity W] [--velocity-reference-gain K]\n"
         << "    [--action-saturation-start VALUE] [--terminal-loss-scale VALUE]\n"
         << "    [--no-load-optimizer]\n"
         << "    [--correlated-size-mass-sampling]\n"
@@ -422,6 +427,12 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--velocity-observation-delay-steps" && i + 1 < argc){
             options.velocity_observation_delay_steps = std::stoull(argv[++i]);
         }
+        else if(arg == "--persistent-episode-training"){
+            options.persistent_episode_training = true;
+        }
+        else if(arg == "--disable-persistent-episode-training" || arg == "--fresh-h16-batches"){
+            options.persistent_episode_training = false;
+        }
         else if(arg == "--reset-hidden-each-step"){
             options.reset_hidden_each_step = true;
         }
@@ -498,6 +509,15 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--w-v" && i + 1 < argc){
             options.loss_velocity_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--velocity-reference-gain" && i + 1 < argc){
+            options.velocity_reference_gain = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-progress" && i + 1 < argc){
+            options.progress_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-outward-velocity" && i + 1 < argc){
+            options.outward_velocity_weight = std::stof(argv[++i]);
         }
         else if(arg == "--w-linear-acceleration" && i + 1 < argc){
             options.loss_linear_acceleration_weight = std::stof(argv[++i]);
@@ -667,6 +687,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.temporal_gradient_decay_alpha = options.temporal_gradient_decay_alpha;
     training_options.velocity_observation_noise = options.velocity_observation_noise;
     training_options.velocity_observation_delay_steps = options.velocity_observation_delay_steps;
+    training_options.persistent_episode_training = options.persistent_episode_training;
     training_options.disable_physics_gradient = options.disable_physics_gradient;
     training_options.reset_hidden_each_step = options.reset_hidden_each_step;
     training_options.sample_dynamics = options.sample_dynamics;
@@ -869,28 +890,26 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_final_critic_error_norm=" << summary.final_critic_error_norm << "\n";
     std::cout << "gpu_full_training_final_critic_output_mean=" << summary.final_critic_output_mean << "\n";
     std::cout << "gpu_full_training_final_critic_target_mean=" << summary.final_critic_target_mean << "\n";
-    std::cout << "gpu_full_training_final_success_rate=" << summary.final_success_rate << "\n";
-    std::cout << "gpu_full_training_final_action_saturation=" << summary.final_action_saturation << "\n";
-    std::cout << "gpu_full_training_final_position_norm_mean=" << summary.final_position_norm_mean << "\n";
-    std::cout << "gpu_full_training_final_velocity_norm_mean=" << summary.final_velocity_norm_mean << "\n";
-    std::cout << "gpu_full_training_final_attitude_error_mean=" << summary.final_attitude_error_mean << "\n";
-    std::cout << "gpu_full_training_final_angular_velocity_norm_mean=" << summary.final_angular_velocity_norm_mean << "\n";
-    std::cout << "gpu_full_training_window_position_norm_mean=" << summary.window_position_norm_mean << "\n";
-    std::cout << "gpu_full_training_window_velocity_norm_mean=" << summary.window_velocity_norm_mean << "\n";
-    std::cout << "gpu_full_training_window_attitude_error_mean=" << summary.window_attitude_error_mean << "\n";
-    std::cout << "gpu_full_training_window_angular_velocity_norm_mean=" << summary.window_angular_velocity_norm_mean << "\n";
-    std::cout << "gpu_full_training_window_position_norm_max_mean=" << summary.window_position_norm_max_mean << "\n";
-    std::cout << "gpu_full_training_window_velocity_norm_max_mean=" << summary.window_velocity_norm_max_mean << "\n";
-    std::cout << "gpu_full_training_window_attitude_error_max_mean=" << summary.window_attitude_error_max_mean << "\n";
-    std::cout << "gpu_full_training_window_angular_velocity_norm_max_mean=" << summary.window_angular_velocity_norm_max_mean << "\n";
-    std::cout << "gpu_full_training_window_position_norm_max=" << summary.window_position_norm_max << "\n";
-    std::cout << "gpu_full_training_window_velocity_norm_max=" << summary.window_velocity_norm_max << "\n";
-    std::cout << "gpu_full_training_window_attitude_error_max=" << summary.window_attitude_error_max << "\n";
-    std::cout << "gpu_full_training_window_angular_velocity_norm_max=" << summary.window_angular_velocity_norm_max << "\n";
-    std::cout << "gpu_full_training_settling_fraction_position=" << summary.settling_fraction_position << "\n";
-    std::cout << "gpu_full_training_invalid_or_nan_rate=" << summary.invalid_or_nan_rate << "\n";
+    std::cout << "gpu_full_training_returns_mean=" << summary.returns_mean << "\n";
+    std::cout << "gpu_full_training_returns_std=" << summary.returns_std << "\n";
+    std::cout << "gpu_full_training_episode_length_mean=" << summary.episode_length_mean << "\n";
+    std::cout << "gpu_full_training_episode_length_std=" << summary.episode_length_std << "\n";
+    std::cout << "gpu_full_training_num_terminated=" << summary.num_terminated << "\n";
+    std::cout << "gpu_full_training_share_terminated=" << summary.share_terminated << "\n";
+    std::cout << "gpu_full_training_position_cost=" << summary.position_cost << "\n";
+    std::cout << "gpu_full_training_orientation_cost=" << summary.orientation_cost << "\n";
+    std::cout << "gpu_full_training_linear_velocity_cost=" << summary.linear_velocity_cost << "\n";
+    std::cout << "gpu_full_training_angular_velocity_cost=" << summary.angular_velocity_cost << "\n";
+    std::cout << "gpu_full_training_action_cost=" << summary.action_cost << "\n";
+    std::cout << "gpu_full_training_weighted_cost=" << summary.weighted_cost << "\n";
+    std::cout << "gpu_full_training_reward=" << summary.reward_mean << "\n";
     std::cout << "gpu_full_training_nan_inf_count=" << summary.nan_inf_count << "\n";
     std::cout << "gpu_full_training_episode_steps=" << summary.training_episode_steps << "\n";
+    std::cout << "gpu_full_training_persistent_episode_training=" << (summary.persistent_episode_training ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_persistent_episode_step=" << summary.persistent_episode_step << "\n";
+    std::cout << "gpu_full_training_segment_start=" << summary.segment_start << "\n";
+    std::cout << "gpu_full_training_segment_end=" << summary.segment_end << "\n";
+    std::cout << "gpu_full_training_episode_reset_count=" << summary.episode_reset_count << "\n";
     std::cout << "gpu_full_training_final_window_start_mean=" << summary.final_window_start_mean << "\n";
     std::cout << "gpu_checkpoint_saved=" << (summary.checkpoint_saved ? "true" : "false") << "\n";
     std::cout << "gpu_checkpoint_loaded=" << (summary.checkpoint_loaded ? "true" : "false") << "\n";
@@ -900,70 +919,30 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_passed=" << (summary.passed ? "true" : "false") << "\n";
     std::cout << "gpu_eval_finite=" << (summary.finite ? "true" : "false") << "\n";
     std::cout << "gpu_eval_checkpoint_loaded=" << (summary.checkpoint_loaded ? "true" : "false") << "\n";
-    std::cout << "gpu_eval_success_rate=" << summary.success_rate << "\n";
-    std::cout << "gpu_eval_near_success_rate_p=" << summary.near_success_rate_p << "\n";
-    std::cout << "gpu_eval_near_success_rate_pv=" << summary.near_success_rate_pv << "\n";
-    std::cout << "gpu_eval_mean_total_loss=" << summary.mean_total_loss << "\n";
-    std::cout << "gpu_eval_mean_final_position_norm=" << summary.mean_final_position_norm << "\n";
-    std::cout << "gpu_eval_mean_final_velocity_norm=" << summary.mean_final_velocity_norm << "\n";
-    std::cout << "gpu_eval_mean_final_attitude_error=" << summary.mean_final_attitude_error << "\n";
-    std::cout << "gpu_eval_mean_final_angular_velocity_norm=" << summary.mean_final_angular_velocity_norm << "\n";
-    std::cout << "gpu_eval_position_rmse=" << summary.position_rmse << "\n";
-    std::cout << "gpu_eval_velocity_rmse=" << summary.velocity_rmse << "\n";
-    std::cout << "gpu_eval_attitude_rmse=" << summary.attitude_rmse << "\n";
-    std::cout << "gpu_eval_angular_velocity_rmse=" << summary.angular_velocity_rmse << "\n";
-    std::cout << "gpu_eval_linear_acceleration_error_rmse=" << summary.linear_acceleration_error_rmse << "\n";
-    std::cout << "gpu_eval_angular_acceleration_error_rmse=" << summary.angular_acceleration_error_rmse << "\n";
-    std::cout << "gpu_eval_settling_fraction_position=" << summary.settling_fraction_position << "\n";
-    std::cout << "gpu_eval_position_mean_error_mean=" << summary.position_mean_error_mean << "\n";
-    std::cout << "gpu_eval_angle_mean_error_mean=" << summary.angle_mean_error_mean << "\n";
-    std::cout << "gpu_eval_linear_velocity_mean_error_mean=" << summary.linear_velocity_mean_error_mean << "\n";
-    std::cout << "gpu_eval_angular_velocity_mean_error_mean=" << summary.angular_velocity_mean_error_mean << "\n";
-    std::cout << "gpu_eval_angular_acceleration_mean_error_mean=" << summary.angular_acceleration_mean_error_mean << "\n";
-    std::cout << "gpu_eval_action_mean_error_mean=" << summary.action_mean_error_mean << "\n";
-    std::cout << "gpu_eval_action_relative_mean_error_mean=" << summary.action_relative_mean_error_mean << "\n";
-    std::cout << "gpu_eval_position_max_error_mean=" << summary.position_max_error_mean << "\n";
-    std::cout << "gpu_eval_angle_max_error_mean=" << summary.angle_max_error_mean << "\n";
-    std::cout << "gpu_eval_linear_velocity_max_error_mean=" << summary.linear_velocity_max_error_mean << "\n";
-    std::cout << "gpu_eval_angular_velocity_max_error_mean=" << summary.angular_velocity_max_error_mean << "\n";
-    std::cout << "gpu_eval_angular_acceleration_max_error_mean=" << summary.angular_acceleration_max_error_mean << "\n";
-    std::cout << "gpu_eval_action_max_error_mean=" << summary.action_max_error_mean << "\n";
-    std::cout << "gpu_eval_action_relative_max_error_mean=" << summary.action_relative_max_error_mean << "\n";
-    std::cout << "gpu_eval_position_max_error_std=" << summary.position_max_error_std << "\n";
-    std::cout << "gpu_eval_angle_max_error_std=" << summary.angle_max_error_std << "\n";
-    std::cout << "gpu_eval_linear_velocity_max_error_std=" << summary.linear_velocity_max_error_std << "\n";
-    std::cout << "gpu_eval_angular_velocity_max_error_std=" << summary.angular_velocity_max_error_std << "\n";
-    std::cout << "gpu_eval_angular_acceleration_max_error_std=" << summary.angular_acceleration_max_error_std << "\n";
-    std::cout << "gpu_eval_action_max_error_std=" << summary.action_max_error_std << "\n";
-    std::cout << "gpu_eval_action_relative_max_error_std=" << summary.action_relative_max_error_std << "\n";
-    std::cout << "gpu_eval_p90_final_position_norm=" << summary.p90_final_position_norm << "\n";
-    std::cout << "gpu_eval_p90_final_velocity_norm=" << summary.p90_final_velocity_norm << "\n";
-    std::cout << "gpu_eval_p90_final_attitude_error=" << summary.p90_final_attitude_error << "\n";
-    std::cout << "gpu_eval_p90_final_angular_velocity_norm=" << summary.p90_final_angular_velocity_norm << "\n";
-    std::cout << "gpu_eval_throughout_success_rate=" << summary.throughout_success_rate << "\n";
-    std::cout << "gpu_eval_post_burnin_throughout_success_rate=" << summary.post_burnin_throughout_success_rate << "\n";
-    std::cout << "gpu_eval_mean_time_inside_fraction=" << summary.mean_time_inside_fraction << "\n";
-    std::cout << "gpu_eval_mean_first_failure_time_s=" << summary.mean_first_failure_time_s << "\n";
-    std::cout << "gpu_eval_mean_max_position_norm=" << summary.mean_max_position_norm << "\n";
-    std::cout << "gpu_eval_mean_max_velocity_norm=" << summary.mean_max_velocity_norm << "\n";
-    std::cout << "gpu_eval_mean_max_attitude_error=" << summary.mean_max_attitude_error << "\n";
-    std::cout << "gpu_eval_mean_max_angular_velocity_norm=" << summary.mean_max_angular_velocity_norm << "\n";
-    std::cout << "gpu_eval_p90_max_position_norm=" << summary.p90_max_position_norm << "\n";
-    std::cout << "gpu_eval_p90_max_velocity_norm=" << summary.p90_max_velocity_norm << "\n";
-    std::cout << "gpu_eval_p90_max_attitude_error=" << summary.p90_max_attitude_error << "\n";
-    std::cout << "gpu_eval_p90_max_angular_velocity_norm=" << summary.p90_max_angular_velocity_norm << "\n";
-    std::cout << "gpu_eval_max_position_norm=" << summary.max_position_norm << "\n";
-    std::cout << "gpu_eval_max_velocity_norm=" << summary.max_velocity_norm << "\n";
-    std::cout << "gpu_eval_max_attitude_error=" << summary.max_attitude_error << "\n";
-    std::cout << "gpu_eval_max_angular_velocity_norm=" << summary.max_angular_velocity_norm << "\n";
-    std::cout << "gpu_eval_mean_action_magnitude=" << summary.mean_action_magnitude << "\n";
-    std::cout << "gpu_eval_max_action_magnitude=" << summary.max_action_magnitude << "\n";
-    std::cout << "gpu_eval_mean_action_smoothness=" << summary.mean_action_smoothness << "\n";
-    std::cout << "gpu_eval_max_action_smoothness=" << summary.max_action_smoothness << "\n";
-    std::cout << "gpu_eval_max_action_abs=" << summary.max_action_abs << "\n";
-    std::cout << "gpu_eval_action_saturation_rate=" << summary.action_saturation_rate << "\n";
-    std::cout << "gpu_eval_stability_gate_passed=" << (summary.stability_gate_passed ? "true" : "false") << "\n";
-    std::cout << "gpu_eval_invalid_or_nan_rate=" << summary.invalid_or_nan_rate << "\n";
+    std::cout << "gpu_eval_returns_mean=" << summary.returns_mean << "\n";
+    std::cout << "gpu_eval_returns_std=" << summary.returns_std << "\n";
+    std::cout << "gpu_eval_episode_length_mean=" << summary.episode_length_mean << "\n";
+    std::cout << "gpu_eval_episode_length_std=" << summary.episode_length_std << "\n";
+    std::cout << "gpu_eval_num_terminated=" << summary.num_terminated << "\n";
+    std::cout << "gpu_eval_share_terminated=" << summary.share_terminated << "\n";
+    std::cout << "gpu_eval_position_cost=" << summary.position_cost << "\n";
+    std::cout << "gpu_eval_orientation_cost=" << summary.orientation_cost << "\n";
+    std::cout << "gpu_eval_linear_velocity_cost=" << summary.linear_velocity_cost << "\n";
+    std::cout << "gpu_eval_angular_velocity_cost=" << summary.angular_velocity_cost << "\n";
+    std::cout << "gpu_eval_action_cost=" << summary.action_cost << "\n";
+    std::cout << "gpu_eval_weighted_cost=" << summary.weighted_cost << "\n";
+    std::cout << "gpu_eval_reward=" << summary.reward_mean << "\n";
+    std::cout << "gpu_eval_sample_dynamics=" << (summary.sample_dynamics ? "true" : "false") << "\n";
+    std::cout << "gpu_eval_correlated_size_mass_sampling=" << (summary.correlated_size_mass_sampling ? "true" : "false") << "\n";
+    std::cout << "gpu_eval_mass_min=" << summary.mass_min << "\n";
+    std::cout << "gpu_eval_mass_mean=" << summary.mass_mean << "\n";
+    std::cout << "gpu_eval_mass_max=" << summary.mass_max << "\n";
+    std::cout << "gpu_eval_thrust_to_weight_min=" << summary.thrust_to_weight_min << "\n";
+    std::cout << "gpu_eval_thrust_to_weight_mean=" << summary.thrust_to_weight_mean << "\n";
+    std::cout << "gpu_eval_thrust_to_weight_max=" << summary.thrust_to_weight_max << "\n";
+    std::cout << "gpu_eval_motor_delay_min=" << summary.motor_delay_min << "\n";
+    std::cout << "gpu_eval_motor_delay_mean=" << summary.motor_delay_mean << "\n";
+    std::cout << "gpu_eval_motor_delay_max=" << summary.motor_delay_max << "\n";
     std::cout << "gpu_eval_nan_inf_count=" << summary.nan_inf_count << "\n";
 }
 
@@ -1212,11 +1191,6 @@ int main(int argc, char** argv){
     std::cout << "eval_only=" << (options.eval_only ? "true" : "false") << "\n";
     std::cout << "eval_model=" << options.eval_model << "\n";
     std::cout << "failure_analysis=" << (options.failure_analysis ? "true" : "false") << "\n";
-    std::cout << "success_position_threshold=" << options.success_position_threshold << "\n";
-    std::cout << "success_velocity_threshold=" << options.success_velocity_threshold << "\n";
-    std::cout << "success_attitude_threshold=" << options.success_attitude_threshold << "\n";
-    std::cout << "success_angular_velocity_threshold=" << options.success_angular_velocity_threshold << "\n";
-    std::cout << "success_action_saturation_threshold=" << options.success_action_saturation_threshold << "\n";
     std::cout << "forced_dynamics_bins_enabled=" << (options.forced_bins.enabled ? "true" : "false") << "\n";
     if(options.forced_bins.enabled){
         std::cout << "forced_dynamics_bins=size_mass=" << options.forced_bins.size_mass
@@ -1234,7 +1208,6 @@ int main(int argc, char** argv){
     std::cout << "trajectory_frequency_hz=" << options.trajectory_frequency_hz << "\n";
     std::cout << "training_episode_steps=" << options.training_episode_steps << "\n";
     std::cout << "tracking_gate_mode=" << options.tracking_gate_mode << "\n";
-    std::cout << "throughout_gate_start_step=" << options.throughout_gate_start_step << "\n";
     std::cout << "initial_position_scale=" << options.initial_position_scale << "\n";
     std::cout << "initial_velocity_scale=" << options.initial_velocity_scale << "\n";
     std::cout << "initial_attitude_scale=" << options.initial_attitude_scale << "\n";
@@ -1250,6 +1223,9 @@ int main(int argc, char** argv){
     std::cout << "action_saturation_weight=" << options.action_saturation_weight << "\n";
     std::cout << "action_saturation_start=" << options.action_saturation_start << "\n";
     std::cout << "loss_velocity_weight=" << options.loss_velocity_weight << "\n";
+    std::cout << "velocity_reference_gain=" << options.velocity_reference_gain << "\n";
+    std::cout << "progress_weight=" << options.progress_weight << "\n";
+    std::cout << "outward_velocity_weight=" << options.outward_velocity_weight << "\n";
     std::cout << "loss_angular_velocity_weight=" << options.loss_angular_velocity_weight << "\n";
     std::cout << "loss_linear_acceleration_weight=" << options.loss_linear_acceleration_weight << "\n";
     std::cout << "loss_angular_acceleration_weight=" << options.loss_angular_acceleration_weight << "\n";
@@ -1260,6 +1236,7 @@ int main(int argc, char** argv){
     std::cout << "temporal_gradient_decay_alpha=" << options.temporal_gradient_decay_alpha << "\n";
     std::cout << "velocity_observation_noise=" << options.velocity_observation_noise << "\n";
     std::cout << "velocity_observation_delay_steps=" << options.velocity_observation_delay_steps << "\n";
+    std::cout << "persistent_episode_training=" << (options.persistent_episode_training ? "true" : "false") << "\n";
     std::cout << "action_grad_clip_enabled=" << (options.action_grad_clip_enabled ? "true" : "false") << "\n";
     std::cout << "action_grad_clip_norm=" << options.action_grad_clip_norm << "\n";
     std::cout << "actor_grad_clip_enabled=" << (options.actor_grad_clip_enabled ? "true" : "false") << "\n";
@@ -1276,6 +1253,9 @@ int main(int argc, char** argv){
     weights.saturation = options.action_saturation_weight;
     weights.saturation_start = options.action_saturation_start;
     weights.velocity = options.loss_velocity_weight;
+    weights.velocity_reference_gain = options.velocity_reference_gain;
+    weights.progress = options.progress_weight;
+    weights.outward_velocity = options.outward_velocity_weight;
     weights.angular_velocity = options.loss_angular_velocity_weight;
     weights.linear_acceleration = options.loss_linear_acceleration_weight;
     weights.angular_acceleration = options.loss_angular_acceleration_weight;
