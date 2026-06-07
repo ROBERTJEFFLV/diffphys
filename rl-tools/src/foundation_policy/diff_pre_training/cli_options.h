@@ -86,16 +86,27 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         T terminal_angular_velocity_weight = TERMINAL_ANGULAR_VELOCITY_WEIGHT;
         T loss_clf_weight = (T)0;
         T loss_window_clf_weight = (T)0;
-        T loss_clf_alpha = (T)1;
+        T loss_clf_alpha = (T)0.2;
         T loss_clf_position_weight = (T)8;
         T loss_clf_velocity_weight = (T)0.8;
         T loss_clf_attitude_weight = (T)4;
         T loss_clf_angular_velocity_weight = (T)0.8;
+        T loss_clf_position_velocity_cross_beta = (T)0;
+        T loss_clf_attitude_angular_velocity_cross_beta = (T)0;
+        T loss_window_clf_epsilon = (T)1e-3;
+        T loss_window_clf_huber_delta = (T)1;
+        T loss_velocity_barrier_weight = (T)0;
+        T velocity_barrier_safe = (T)10;
+        T loss_angular_velocity_barrier_weight = (T)0;
+        T angular_velocity_barrier_safe = (T)15;
+        T loss_attitude_barrier_weight = (T)0;
+        T attitude_barrier_safe = (T)4;
         T loss_outward_velocity_weight = (T)0;
         T loss_attitude_control_weight = (T)0;
         T attitude_control_k_R = (T)2;
         T attitude_control_k_omega = (T)1;
         T action_magnitude_center = (T)0;
+        T action_saturation_start = (T)0.95;
         bool hover_relative_action_magnitude = false;
         DiffModel diff_model = DiffModel::EULER;
         EvalModel eval_model = EvalModel::EULER;
@@ -364,6 +375,36 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             else if(arg == "--w-clf-angular-velocity" && arg_i + 1 < argc){
                 options.loss_clf_angular_velocity_weight = std::stof(argv[++arg_i]);
             }
+            else if(arg == "--clf-pv-beta" && arg_i + 1 < argc){
+                options.loss_clf_position_velocity_cross_beta = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--clf-rw-beta" && arg_i + 1 < argc){
+                options.loss_clf_attitude_angular_velocity_cross_beta = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--window-clf-eps" && arg_i + 1 < argc){
+                options.loss_window_clf_epsilon = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--window-clf-huber-delta" && arg_i + 1 < argc){
+                options.loss_window_clf_huber_delta = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-velocity-barrier" && arg_i + 1 < argc){
+                options.loss_velocity_barrier_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--velocity-barrier-safe" && arg_i + 1 < argc){
+                options.velocity_barrier_safe = std::stof(argv[++arg_i]);
+            }
+            else if((arg == "--w-angular-velocity-barrier" || arg == "--w-omega-barrier") && arg_i + 1 < argc){
+                options.loss_angular_velocity_barrier_weight = std::stof(argv[++arg_i]);
+            }
+            else if((arg == "--angular-velocity-barrier-safe" || arg == "--omega-barrier-safe") && arg_i + 1 < argc){
+                options.angular_velocity_barrier_safe = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--w-attitude-barrier" && arg_i + 1 < argc){
+                options.loss_attitude_barrier_weight = std::stof(argv[++arg_i]);
+            }
+            else if(arg == "--attitude-barrier-safe" && arg_i + 1 < argc){
+                options.attitude_barrier_safe = std::stof(argv[++arg_i]);
+            }
             else if(arg == "--w-outward-velocity" && arg_i + 1 < argc){
                 options.loss_outward_velocity_weight = std::stof(argv[++arg_i]);
             }
@@ -379,6 +420,9 @@ namespace rl_tools::foundation_policy::diff_pre_training{
             else if(arg == "--action-magnitude-center" && arg_i + 1 < argc){
                 options.action_magnitude_center = std::stof(argv[++arg_i]);
                 options.hover_relative_action_magnitude = false;
+            }
+            else if(arg == "--action-saturation-start" && arg_i + 1 < argc){
+                options.action_saturation_start = std::stof(argv[++arg_i]);
             }
             else if(arg == "--hover-relative-action-magnitude"){
                 options.hover_relative_action_magnitude = true;

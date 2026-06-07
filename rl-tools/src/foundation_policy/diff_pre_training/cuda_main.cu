@@ -57,11 +57,21 @@ struct Options{
     float outward_velocity_weight = 0.0f;
     float clf_weight = 0.0f;
     float window_clf_weight = 0.0f;
-    float clf_alpha = 1.0f;
+    float clf_alpha = 0.2f;
     float clf_position_weight = 8.0f;
     float clf_velocity_weight = 0.8f;
     float clf_attitude_weight = 4.0f;
     float clf_angular_velocity_weight = 0.8f;
+    float clf_position_velocity_cross_beta = 0.0f;
+    float clf_attitude_angular_velocity_cross_beta = 0.0f;
+    float window_clf_epsilon = 1e-3f;
+    float window_clf_huber_delta = 1.0f;
+    float velocity_barrier_weight = 0.0f;
+    float velocity_barrier_safe = 10.0f;
+    float angular_velocity_barrier_weight = 0.0f;
+    float angular_velocity_barrier_safe = 15.0f;
+    float attitude_barrier_weight = 0.0f;
+    float attitude_barrier_safe = 4.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
     float attitude_control_k_omega = 1.0f;
@@ -103,6 +113,31 @@ struct Options{
     std::string eval_model = "euler";
     std::size_t eval_episodes = 100;
     std::size_t eval_horizon = 500;
+    bool h1000_gate_enabled = false;
+    std::size_t h1000_gate_interval = 0;
+    std::size_t h1000_gate_horizon = 1000;
+    std::size_t h1000_gate_episodes = 256;
+    bool h1000_gate_sample_dynamics = false;
+    std::string h1000_gate_dynamics_level = "small";
+    bool h1000_gate_correlated_size_mass_sampling = false;
+    float h1000_gate_max_action_saturation_rate = 0.05f;
+    float h1000_gate_max_action_abs = 0.98f;
+    float h1000_gate_mean_max_angular_velocity_norm = 15.0f;
+    float h1000_gate_max_angular_velocity_norm = 40.0f;
+    float h1000_gate_mean_max_position_norm = 10.0f;
+    float h1000_gate_mean_max_velocity_norm = 15.0f;
+    std::string h1000_gate_best_path;
+    std::string h1000_gate_candidate_path;
+    std::string h1000_gate_log_path;
+    bool failure_replay_enabled = false;
+    float failure_replay_ratio = 0.30f;
+    std::size_t failure_replay_capacity = 512;
+    std::size_t failure_replay_backtrack_min = 32;
+    std::size_t failure_replay_backtrack_max = 128;
+    float failure_replay_position_norm = 20.0f;
+    float failure_replay_velocity_norm = 20.0f;
+    float failure_replay_angular_velocity_norm = 30.0f;
+    float failure_replay_attitude_error = 2.6179938779914943654f;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
     float success_attitude_threshold = 3.14159265358979323846f;
@@ -168,6 +203,9 @@ void print_usage(){
         << "    [--stage9-6-steps N] [--stage9-6-replay-path PATH]\n"
         << "    active training defaults to H16 origin recovery; non-fixed trajectories and curriculum flags are rejected\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
+        << "    [--h1000-gate] [--h1000-gate-interval N] [--h1000-gate-horizon N] [--h1000-gate-episodes N]\n"
+        << "    [--h1000-gate-small-dynamics|--h1000-gate-fixed-dynamics] [--h1000-gate-correlated-size-mass-sampling]\n"
+        << "    [--h1000-gate-best-path PATH] [--h1000-gate-log-path PATH]\n"
         << "    [--failure-analysis] [--force-dynamics-bins size_mass=3,thrust_to_weight=3,...]\n"
         << "    [--strict-stability-thresholds]\n"
         << "    [--success-position-threshold VALUE] [--success-velocity-threshold VALUE]\n"
@@ -178,6 +216,11 @@ void print_usage(){
         << "    [--action-magnitude-center VALUE] [--hover-relative-action-magnitude]\n"
         << "    [--w-linear-acceleration W] [--w-angular-acceleration W]\n"
         << "    [--w-progress W] [--w-outward-velocity W] [--velocity-reference-gain K]\n"
+        << "    [--w-window-clf W] [--w-clf W] [--clf-alpha A] [--clf-pv-beta B] [--clf-rw-beta B]\n"
+        << "    [--window-clf-eps EPS] [--window-clf-huber-delta D]\n"
+        << "    [--w-velocity-barrier W] [--velocity-barrier-safe V]\n"
+        << "    [--w-omega-barrier W] [--omega-barrier-safe WSAFE]\n"
+        << "    [--w-attitude-barrier W] [--attitude-barrier-safe PSI]\n"
         << "    [--w-clf W] [--w-window-clf W] [--clf-alpha A] [--w-clf-position W] [--w-clf-velocity W]\n"
         << "    [--w-clf-attitude W] [--w-clf-angular-velocity W]\n"
         << "    [--w-attitude-control W] [--attitude-control-k-r K] [--attitude-control-k-omega K]\n"
@@ -186,6 +229,7 @@ void print_usage(){
         << "    [--correlated-size-mass-sampling]\n"
         << "    [--trajectory-mode fixed|step|circle|figure8|mixed]  # eval/deployment setpoint shifting only\n"
         << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F] [--training-episode-steps N]\n"
+        << "    [--h1000-gate] [--failure-replay] [--failure-replay-ratio P]\n"
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
         << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
         << "    [--initial-attitude-scale S] [--initial-angular-velocity-scale S]\n"
@@ -562,6 +606,36 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--w-clf-angular-velocity" && i + 1 < argc){
             options.clf_angular_velocity_weight = std::stof(argv[++i]);
         }
+        else if(arg == "--clf-pv-beta" && i + 1 < argc){
+            options.clf_position_velocity_cross_beta = std::stof(argv[++i]);
+        }
+        else if(arg == "--clf-rw-beta" && i + 1 < argc){
+            options.clf_attitude_angular_velocity_cross_beta = std::stof(argv[++i]);
+        }
+        else if(arg == "--window-clf-eps" && i + 1 < argc){
+            options.window_clf_epsilon = std::stof(argv[++i]);
+        }
+        else if(arg == "--window-clf-huber-delta" && i + 1 < argc){
+            options.window_clf_huber_delta = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-velocity-barrier" && i + 1 < argc){
+            options.velocity_barrier_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--velocity-barrier-safe" && i + 1 < argc){
+            options.velocity_barrier_safe = std::stof(argv[++i]);
+        }
+        else if((arg == "--w-angular-velocity-barrier" || arg == "--w-omega-barrier") && i + 1 < argc){
+            options.angular_velocity_barrier_weight = std::stof(argv[++i]);
+        }
+        else if((arg == "--angular-velocity-barrier-safe" || arg == "--omega-barrier-safe") && i + 1 < argc){
+            options.angular_velocity_barrier_safe = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-attitude-barrier" && i + 1 < argc){
+            options.attitude_barrier_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--attitude-barrier-safe" && i + 1 < argc){
+            options.attitude_barrier_safe = std::stof(argv[++i]);
+        }
         else if(arg == "--w-attitude-control" && i + 1 < argc){
             options.attitude_control_weight = std::stof(argv[++i]);
         }
@@ -664,6 +738,120 @@ bool parse_options(int argc, char** argv, Options& options){
             options.eval_horizon = std::stoull(argv[++i]);
             options.gpu_rollout = true;
         }
+        else if(arg == "--h1000-gate"){
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-interval" && i + 1 < argc){
+            options.h1000_gate_interval = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-horizon" && i + 1 < argc){
+            options.h1000_gate_horizon = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-episodes" && i + 1 < argc){
+            options.h1000_gate_episodes = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-fixed-dynamics"){
+            options.h1000_gate_sample_dynamics = false;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-small-dynamics"){
+            options.h1000_gate_sample_dynamics = true;
+            options.h1000_gate_dynamics_level = "small";
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-broad-dynamics"){
+            options.h1000_gate_sample_dynamics = true;
+            options.h1000_gate_dynamics_level = "broad";
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-correlated-size-mass-sampling"){
+            options.h1000_gate_correlated_size_mass_sampling = true;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--h1000-gate-max-action-saturation-rate" && i + 1 < argc){
+            options.h1000_gate_max_action_saturation_rate = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-max-action-abs" && i + 1 < argc){
+            options.h1000_gate_max_action_abs = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-mean-max-omega" && i + 1 < argc){
+            options.h1000_gate_mean_max_angular_velocity_norm = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-max-omega" && i + 1 < argc){
+            options.h1000_gate_max_angular_velocity_norm = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-mean-max-position" && i + 1 < argc){
+            options.h1000_gate_mean_max_position_norm = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-mean-max-velocity" && i + 1 < argc){
+            options.h1000_gate_mean_max_velocity_norm = std::stof(argv[++i]);
+        }
+        else if(arg == "--h1000-gate-best-path" && i + 1 < argc){
+            options.h1000_gate_best_path = argv[++i];
+            options.h1000_gate_enabled = true;
+        }
+        else if(arg == "--h1000-gate-candidate-path" && i + 1 < argc){
+            options.h1000_gate_candidate_path = argv[++i];
+            options.h1000_gate_enabled = true;
+        }
+        else if(arg == "--h1000-gate-log-path" && i + 1 < argc){
+            options.h1000_gate_log_path = argv[++i];
+            options.h1000_gate_enabled = true;
+        }
+        else if(arg == "--failure-replay"){
+            options.failure_replay_enabled = true;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--failure-replay-ratio" && i + 1 < argc){
+            options.failure_replay_ratio = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--failure-replay-capacity" && i + 1 < argc){
+            options.failure_replay_capacity = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-backtrack-min" && i + 1 < argc){
+            options.failure_replay_backtrack_min = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-backtrack-max" && i + 1 < argc){
+            options.failure_replay_backtrack_max = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-position-norm" && i + 1 < argc){
+            options.failure_replay_position_norm = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-velocity-norm" && i + 1 < argc){
+            options.failure_replay_velocity_norm = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if((arg == "--failure-replay-angular-velocity-norm" || arg == "--failure-replay-omega-norm") && i + 1 < argc){
+            options.failure_replay_angular_velocity_norm = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-attitude-error" && i + 1 < argc){
+            options.failure_replay_attitude_error = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-attitude-error-deg" && i + 1 < argc){
+            options.failure_replay_attitude_error = std::stof(argv[++i]) * 3.14159265358979323846f / 180.0f;
+            options.failure_replay_enabled = true;
+        }
         else if(arg == "--strict-stability-thresholds"){
             options.success_position_threshold = 0.05f;
             options.success_velocity_threshold = 0.1f;
@@ -751,6 +939,16 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.clf_velocity = options.clf_velocity_weight;
     training_options.clf_attitude = options.clf_attitude_weight;
     training_options.clf_angular_velocity = options.clf_angular_velocity_weight;
+    training_options.clf_position_velocity_cross_beta = options.clf_position_velocity_cross_beta;
+    training_options.clf_attitude_angular_velocity_cross_beta = options.clf_attitude_angular_velocity_cross_beta;
+    training_options.window_clf_epsilon = options.window_clf_epsilon;
+    training_options.window_clf_huber_delta = options.window_clf_huber_delta;
+    training_options.velocity_barrier_weight = options.velocity_barrier_weight;
+    training_options.velocity_barrier_safe = options.velocity_barrier_safe;
+    training_options.angular_velocity_barrier_weight = options.angular_velocity_barrier_weight;
+    training_options.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
+    training_options.attitude_barrier_weight = options.attitude_barrier_weight;
+    training_options.attitude_barrier_safe = options.attitude_barrier_safe;
     training_options.outward_velocity_weight = options.outward_velocity_weight;
     training_options.attitude_control_weight = options.attitude_control_weight;
     training_options.attitude_control_k_R = options.attitude_control_k_R;
@@ -781,6 +979,31 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.log_path = options.log_path;
     training_options.save_path = options.save_path;
     training_options.load_path = options.load_path;
+    training_options.h1000_gate_enabled = options.h1000_gate_enabled;
+    training_options.h1000_gate_interval = options.h1000_gate_interval;
+    training_options.h1000_gate_horizon = options.h1000_gate_horizon;
+    training_options.h1000_gate_episodes = options.h1000_gate_episodes;
+    training_options.h1000_gate_sample_dynamics = options.h1000_gate_sample_dynamics;
+    training_options.h1000_gate_dynamics_randomization_level = parse_dynamics_randomization_level(options.h1000_gate_dynamics_level);
+    training_options.h1000_gate_correlated_size_mass_sampling = options.h1000_gate_correlated_size_mass_sampling;
+    training_options.h1000_gate_max_action_saturation_rate = options.h1000_gate_max_action_saturation_rate;
+    training_options.h1000_gate_max_action_abs = options.h1000_gate_max_action_abs;
+    training_options.h1000_gate_mean_max_angular_velocity_norm = options.h1000_gate_mean_max_angular_velocity_norm;
+    training_options.h1000_gate_max_angular_velocity_norm = options.h1000_gate_max_angular_velocity_norm;
+    training_options.h1000_gate_mean_max_position_norm = options.h1000_gate_mean_max_position_norm;
+    training_options.h1000_gate_mean_max_velocity_norm = options.h1000_gate_mean_max_velocity_norm;
+    training_options.h1000_gate_best_path = options.h1000_gate_best_path;
+    training_options.h1000_gate_candidate_path = options.h1000_gate_candidate_path;
+    training_options.h1000_gate_log_path = options.h1000_gate_log_path;
+    training_options.failure_replay_enabled = options.failure_replay_enabled;
+    training_options.failure_replay_ratio = options.failure_replay_ratio;
+    training_options.failure_replay_capacity = options.failure_replay_capacity;
+    training_options.failure_replay_backtrack_min = options.failure_replay_backtrack_min;
+    training_options.failure_replay_backtrack_max = options.failure_replay_backtrack_max;
+    training_options.failure_replay_position_norm = options.failure_replay_position_norm;
+    training_options.failure_replay_velocity_norm = options.failure_replay_velocity_norm;
+    training_options.failure_replay_angular_velocity_norm = options.failure_replay_angular_velocity_norm;
+    training_options.failure_replay_attitude_error = options.failure_replay_attitude_error;
     return training_options;
 }
 
@@ -1006,6 +1229,20 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_segment_end=" << summary.segment_end << "\n";
     std::cout << "gpu_full_training_episode_reset_count=" << summary.episode_reset_count << "\n";
     std::cout << "gpu_full_training_final_window_start_mean=" << summary.final_window_start_mean << "\n";
+    std::cout << "gpu_full_training_h1000_gate_enabled=" << (summary.h1000_gate_enabled ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_h1000_gate_eval_count=" << summary.h1000_gate_eval_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_pass_count=" << summary.h1000_gate_pass_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_fail_count=" << summary.h1000_gate_fail_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_rollback_count=" << summary.h1000_gate_rollback_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_passed=" << (summary.h1000_gate_last_passed ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_weighted_cost=" << summary.h1000_gate_last_weighted_cost << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_mean_max_omega=" << summary.h1000_gate_last_mean_max_angular_velocity_norm << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_max_omega=" << summary.h1000_gate_last_max_angular_velocity_norm << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_action_saturation=" << summary.h1000_gate_last_action_saturation_rate << "\n";
+    std::cout << "gpu_full_training_failure_replay_enabled=" << (summary.failure_replay_enabled ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_failure_replay_buffer_size=" << summary.failure_replay_buffer_size << "\n";
+    std::cout << "gpu_full_training_failure_replay_added_count=" << summary.failure_replay_added_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_used_count=" << summary.failure_replay_used_count << "\n";
     std::cout << "gpu_checkpoint_saved=" << (summary.checkpoint_saved ? "true" : "false") << "\n";
     std::cout << "gpu_checkpoint_loaded=" << (summary.checkpoint_loaded ? "true" : "false") << "\n";
 }
@@ -1344,6 +1581,16 @@ int main(int argc, char** argv){
     std::cout << "clf_velocity_weight=" << options.clf_velocity_weight << "\n";
     std::cout << "clf_attitude_weight=" << options.clf_attitude_weight << "\n";
     std::cout << "clf_angular_velocity_weight=" << options.clf_angular_velocity_weight << "\n";
+    std::cout << "clf_position_velocity_cross_beta=" << options.clf_position_velocity_cross_beta << "\n";
+    std::cout << "clf_attitude_angular_velocity_cross_beta=" << options.clf_attitude_angular_velocity_cross_beta << "\n";
+    std::cout << "window_clf_epsilon=" << options.window_clf_epsilon << "\n";
+    std::cout << "window_clf_huber_delta=" << options.window_clf_huber_delta << "\n";
+    std::cout << "velocity_barrier_weight=" << options.velocity_barrier_weight << "\n";
+    std::cout << "velocity_barrier_safe=" << options.velocity_barrier_safe << "\n";
+    std::cout << "angular_velocity_barrier_weight=" << options.angular_velocity_barrier_weight << "\n";
+    std::cout << "angular_velocity_barrier_safe=" << options.angular_velocity_barrier_safe << "\n";
+    std::cout << "attitude_barrier_weight=" << options.attitude_barrier_weight << "\n";
+    std::cout << "attitude_barrier_safe=" << options.attitude_barrier_safe << "\n";
     std::cout << "attitude_control_weight=" << options.attitude_control_weight << "\n";
     std::cout << "attitude_control_k_R=" << options.attitude_control_k_R << "\n";
     std::cout << "attitude_control_k_omega=" << options.attitude_control_k_omega << "\n";
@@ -1385,6 +1632,17 @@ int main(int argc, char** argv){
     weights.clf_velocity = options.clf_velocity_weight;
     weights.clf_attitude = options.clf_attitude_weight;
     weights.clf_angular_velocity = options.clf_angular_velocity_weight;
+    weights.clf_position_velocity_cross_beta = options.clf_position_velocity_cross_beta;
+    weights.clf_attitude_angular_velocity_cross_beta = options.clf_attitude_angular_velocity_cross_beta;
+    weights.window_clf_epsilon = options.window_clf_epsilon;
+    weights.window_clf_huber_delta = options.window_clf_huber_delta;
+    weights.velocity_barrier = options.velocity_barrier_weight;
+    weights.velocity_barrier_safe = options.velocity_barrier_safe;
+    weights.angular_velocity_barrier = options.angular_velocity_barrier_weight;
+    weights.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
+    weights.attitude_barrier = options.attitude_barrier_weight;
+    weights.attitude_barrier_safe = options.attitude_barrier_safe;
+    weights.hover_relative_action_magnitude = options.hover_relative_action_magnitude;
     weights.attitude_control = options.attitude_control_weight;
     weights.attitude_control_k_R = options.attitude_control_k_R;
     weights.attitude_control_k_omega = options.attitude_control_k_omega;
@@ -1405,6 +1663,16 @@ int main(int argc, char** argv){
     run_options.clf_velocity = options.clf_velocity_weight;
     run_options.clf_attitude = options.clf_attitude_weight;
     run_options.clf_angular_velocity = options.clf_angular_velocity_weight;
+    run_options.clf_position_velocity_cross_beta = options.clf_position_velocity_cross_beta;
+    run_options.clf_attitude_angular_velocity_cross_beta = options.clf_attitude_angular_velocity_cross_beta;
+    run_options.window_clf_epsilon = options.window_clf_epsilon;
+    run_options.window_clf_huber_delta = options.window_clf_huber_delta;
+    run_options.velocity_barrier_weight = options.velocity_barrier_weight;
+    run_options.velocity_barrier_safe = options.velocity_barrier_safe;
+    run_options.angular_velocity_barrier_weight = options.angular_velocity_barrier_weight;
+    run_options.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
+    run_options.attitude_barrier_weight = options.attitude_barrier_weight;
+    run_options.attitude_barrier_safe = options.attitude_barrier_safe;
     run_options.outward_velocity_weight = options.outward_velocity_weight;
     run_options.attitude_control_weight = options.attitude_control_weight;
     run_options.attitude_control_k_R = options.attitude_control_k_R;
@@ -1430,9 +1698,8 @@ int main(int argc, char** argv){
         options.training_episode_steps,
         parse_dynamics_randomization_level(options.sampled_dynamics_level)
     );
-    if(options.hover_relative_action_magnitude && !batch.initial_previous_action.empty()){
-        weights.action_magnitude_center = batch.initial_previous_action[0];
-        std::cout << "hover_relative_action_magnitude_center_applied=" << weights.action_magnitude_center << "\n";
+    if(options.hover_relative_action_magnitude){
+        std::cout << "hover_relative_action_magnitude_center=per_sample_initial_previous_action\n";
     }
 
     try{

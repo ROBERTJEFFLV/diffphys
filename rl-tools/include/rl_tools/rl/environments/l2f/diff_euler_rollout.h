@@ -2,6 +2,9 @@
 
 #include "diff_euler_model.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace rl_tools::rl::environments::l2f::diff{
     template <typename T>
     struct EulerLossWeights{
@@ -19,7 +22,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         T terminal_angular_velocity;
         T clf = 0;
         T window_clf = 0;
-        T clf_alpha = 1;
+        T clf_alpha = (T)0.2;
         T clf_position = 8;
         T clf_velocity = 0.8;
         T clf_attitude = 4;
@@ -29,6 +32,18 @@ namespace rl_tools::rl::environments::l2f::diff{
         T attitude_control_k_R = 2;
         T attitude_control_k_omega = 1;
         T action_magnitude_center = 0;
+        T saturation_start = (T)0.95;
+        T clf_position_velocity_cross_beta = 0;
+        T clf_attitude_angular_velocity_cross_beta = 0;
+        T window_clf_epsilon = (T)1e-3;
+        T window_clf_huber_delta = (T)1;
+        T velocity_barrier = 0;
+        T velocity_barrier_safe = (T)10;
+        T angular_velocity_barrier = 0;
+        T angular_velocity_barrier_safe = (T)15;
+        T attitude_barrier = 0;
+        T attitude_barrier_safe = (T)4;
+        bool hover_relative_action_magnitude = false;
     };
 
     template <typename T>
@@ -49,10 +64,13 @@ namespace rl_tools::rl::environments::l2f::diff{
         T window_clf = 0;
         T outward_velocity = 0;
         T attitude_control = 0;
+        T velocity_barrier = 0;
+        T angular_velocity_barrier = 0;
+        T attitude_barrier = 0;
 
         T total() const{
             return position + velocity + attitude + angular_velocity + action_magnitude + action_smoothness + saturation + terminal +
-                clf + window_clf + outward_velocity + attitude_control;
+                clf + window_clf + outward_velocity + attitude_control + velocity_barrier + angular_velocity_barrier + attitude_barrier;
         }
         void add(const EulerLossTerms& other){
             position += other.position;
@@ -71,6 +89,9 @@ namespace rl_tools::rl::environments::l2f::diff{
             window_clf += other.window_clf;
             outward_velocity += other.outward_velocity;
             attitude_control += other.attitude_control;
+            velocity_barrier += other.velocity_barrier;
+            angular_velocity_barrier += other.angular_velocity_barrier;
+            attitude_barrier += other.attitude_barrier;
         }
         void scale(T factor){
             position *= factor;
@@ -89,6 +110,9 @@ namespace rl_tools::rl::environments::l2f::diff{
             window_clf *= factor;
             outward_velocity *= factor;
             attitude_control *= factor;
+            velocity_barrier *= factor;
+            angular_velocity_barrier *= factor;
+            attitude_barrier *= factor;
         }
     };
 
@@ -100,25 +124,63 @@ namespace rl_tools::rl::environments::l2f::diff{
     }
 
     template <typename T, typename TI>
+    void add_attitude_identity_error_vee_adjoint(T scale, const T (&grad_e_R)[3], EulerStateAdjoint<T>& lambda){
+        lambda.R[2][1] += scale * (T)0.5 * grad_e_R[0];
+        lambda.R[1][2] -= scale * (T)0.5 * grad_e_R[0];
+        lambda.R[0][2] += scale * (T)0.5 * grad_e_R[1];
+        lambda.R[2][0] -= scale * (T)0.5 * grad_e_R[1];
+        lambda.R[1][0] += scale * (T)0.5 * grad_e_R[2];
+        lambda.R[0][1] -= scale * (T)0.5 * grad_e_R[2];
+    }
+
+    template <typename T>
+    T safe_cross_weight(T beta, T a, T b){
+        const T beta_clamped = std::max((T)-0.999, std::min((T)0.999, beta));
+        return beta_clamped * std::sqrt(std::max((T)0, a * b));
+    }
+
+    template <typename T>
+    T positive_huber(T x, T delta){
+        const T d = delta > (T)0 ? delta : (T)1;
+        return x <= d ? (T)0.5 * x * x : d * (x - (T)0.5 * d);
+    }
+
+    template <typename T>
+    T positive_huber_grad(T x, T delta){
+        const T d = delta > (T)0 ? delta : (T)1;
+        return x <= d ? x : d;
+    }
+
+    template <typename T, typename TI>
     T lyapunov_energy_identity(
         const EulerState<T, TI>& state,
         const TrackingReference<T>& ref,
         const EulerLossWeights<T>& weights
     ){
         T energy = 0;
+        const T c_pv = safe_cross_weight<T>(
+            weights.clf_position_velocity_cross_beta,
+            weights.clf_position,
+            weights.clf_velocity
+        );
         for(TI i = 0; i < 3; i++){
             const T e_p = state.p[i] - ref.p[i];
             const T e_v = state.v[i] - ref.v[i];
             energy += (T)0.5 * weights.clf_position * e_p * e_p;
+            energy += c_pv * e_p * e_v;
             energy += (T)0.5 * weights.clf_velocity * e_v * e_v;
-            energy += (T)0.5 * weights.clf_angular_velocity * state.omega[i] * state.omega[i];
         }
+        T e_R[3];
+        attitude_identity_error_vee<T, TI>(state, e_R);
+        const T c_Rw = safe_cross_weight<T>(
+            weights.clf_attitude_angular_velocity_cross_beta,
+            weights.clf_attitude,
+            weights.clf_angular_velocity
+        );
         for(TI i = 0; i < 3; i++){
-            for(TI j = 0; j < 3; j++){
-                const T target = i == j ? (T)1 : (T)0;
-                const T error = state.R[i][j] - target;
-                energy += (T)0.5 * weights.clf_attitude * error * error;
-            }
+            energy += (T)0.5 * weights.clf_attitude * e_R[i] * e_R[i];
+            energy += c_Rw * e_R[i] * state.omega[i];
+            energy += (T)0.5 * weights.clf_angular_velocity * state.omega[i] * state.omega[i];
         }
         return energy;
     }
@@ -131,19 +193,30 @@ namespace rl_tools::rl::environments::l2f::diff{
         T scale,
         EulerStateAdjoint<T>& lambda
     ){
+        const T c_pv = safe_cross_weight<T>(
+            weights.clf_position_velocity_cross_beta,
+            weights.clf_position,
+            weights.clf_velocity
+        );
         for(TI i = 0; i < 3; i++){
             const T e_p = state.p[i] - ref.p[i];
             const T e_v = state.v[i] - ref.v[i];
-            lambda.p[i] += scale * weights.clf_position * e_p;
-            lambda.v[i] += scale * weights.clf_velocity * e_v;
-            lambda.omega[i] += scale * weights.clf_angular_velocity * state.omega[i];
+            lambda.p[i] += scale * (weights.clf_position * e_p + c_pv * e_v);
+            lambda.v[i] += scale * (weights.clf_velocity * e_v + c_pv * e_p);
         }
+        T e_R[3];
+        attitude_identity_error_vee<T, TI>(state, e_R);
+        const T c_Rw = safe_cross_weight<T>(
+            weights.clf_attitude_angular_velocity_cross_beta,
+            weights.clf_attitude,
+            weights.clf_angular_velocity
+        );
+        T grad_e_R[3];
         for(TI i = 0; i < 3; i++){
-            for(TI j = 0; j < 3; j++){
-                const T target = i == j ? (T)1 : (T)0;
-                lambda.R[i][j] += scale * weights.clf_attitude * (state.R[i][j] - target);
-            }
+            grad_e_R[i] = weights.clf_attitude * e_R[i] + c_Rw * state.omega[i];
+            lambda.omega[i] += scale * (weights.clf_angular_velocity * state.omega[i] + c_Rw * e_R[i]);
         }
+        add_attitude_identity_error_vee_adjoint<T, TI>(scale, grad_e_R, lambda);
     }
 
     template <typename T, typename TI>
@@ -252,7 +325,10 @@ namespace rl_tools::rl::environments::l2f::diff{
         }
         for(TI step_i = 0; step_i < horizon; step_i++){
             for(TI action_i = 0; action_i < 4; action_i++){
-                const T centered_action = actions[step_i][action_i] - weights.action_magnitude_center;
+                const T action_center = weights.hover_relative_action_magnitude
+                    ? initial_state.previous_action[action_i]
+                    : weights.action_magnitude_center;
+                const T centered_action = actions[step_i][action_i] - action_center;
                 terms.action_magnitude += normalizer * weights.action_magnitude * centered_action * centered_action;
                 action_gradients[step_i][action_i] += normalizer * (T)2 * weights.action_magnitude * centered_action;
                 const T diff = actions[step_i][action_i] - previous_action[action_i];
@@ -262,14 +338,74 @@ namespace rl_tools::rl::environments::l2f::diff{
                     action_gradients[step_i - 1][action_i] -= normalizer * (T)2 * weights.action_smoothness * diff;
                 }
                 const T abs_action = std::abs(actions[step_i][action_i]);
-                constexpr T SATURATION_START = (T)0.95;
-                if(abs_action > SATURATION_START){
+                if(abs_action > weights.saturation_start){
                     const T sign = actions[step_i][action_i] >= (T)0 ? (T)1 : (T)-1;
-                    const T excess = abs_action - SATURATION_START;
+                    const T excess = abs_action - weights.saturation_start;
                     terms.saturation += normalizer * weights.saturation * excess * excess;
                     action_gradients[step_i][action_i] += normalizer * (T)2 * weights.saturation * excess * sign;
                 }
                 previous_action[action_i] = actions[step_i][action_i];
+            }
+        }
+    }
+
+    template <typename T, typename TI>
+    void add_barrier_loss(
+        const EulerState<T, TI>& state,
+        const EulerLossWeights<T>& weights,
+        T normalizer,
+        EulerLossTerms<T>& terms,
+        EulerStateAdjoint<T>& lambda
+    ){
+        if(weights.velocity_barrier != (T)0){
+            T norm_sq = 0;
+            for(TI i = 0; i < 3; i++){
+                norm_sq += state.v[i] * state.v[i];
+            }
+            const T safe_sq = weights.velocity_barrier_safe * weights.velocity_barrier_safe;
+            const T delta = norm_sq - safe_sq;
+            if(delta > (T)0){
+                terms.velocity_barrier += normalizer * weights.velocity_barrier * delta * delta;
+                const T grad = normalizer * (T)4 * weights.velocity_barrier * delta;
+                for(TI i = 0; i < 3; i++){
+                    lambda.v[i] += grad * state.v[i];
+                }
+            }
+        }
+        if(weights.angular_velocity_barrier != (T)0){
+            T norm_sq = 0;
+            for(TI i = 0; i < 3; i++){
+                norm_sq += state.omega[i] * state.omega[i];
+            }
+            const T safe_sq = weights.angular_velocity_barrier_safe * weights.angular_velocity_barrier_safe;
+            const T delta = norm_sq - safe_sq;
+            if(delta > (T)0){
+                terms.angular_velocity_barrier += normalizer * weights.angular_velocity_barrier * delta * delta;
+                const T grad = normalizer * (T)4 * weights.angular_velocity_barrier * delta;
+                for(TI i = 0; i < 3; i++){
+                    lambda.omega[i] += grad * state.omega[i];
+                }
+            }
+        }
+        if(weights.attitude_barrier != (T)0){
+            T psi = 0;
+            for(TI i = 0; i < 3; i++){
+                for(TI j = 0; j < 3; j++){
+                    const T target = i == j ? (T)1 : (T)0;
+                    const T error = state.R[i][j] - target;
+                    psi += error * error;
+                }
+            }
+            const T delta = psi - weights.attitude_barrier_safe;
+            if(delta > (T)0){
+                terms.attitude_barrier += normalizer * weights.attitude_barrier * delta * delta;
+                const T grad = normalizer * (T)4 * weights.attitude_barrier * delta;
+                for(TI i = 0; i < 3; i++){
+                    for(TI j = 0; j < 3; j++){
+                        const T target = i == j ? (T)1 : (T)0;
+                        lambda.R[i][j] += grad * (state.R[i][j] - target);
+                    }
+                }
             }
         }
     }
@@ -289,7 +425,8 @@ namespace rl_tools::rl::environments::l2f::diff{
         if(weights.clf != (T)0){
             const T V_prev = lyapunov_energy_identity<T, TI>(previous, ref, weights);
             const T V_next = lyapunov_energy_identity<T, TI>(next, ref, weights);
-            const T target_next = ((T)1 - weights.clf_alpha * dt) * V_prev;
+            const T decay = std::max((T)0, (T)1 - weights.clf_alpha * dt);
+            const T target_next = decay * V_prev;
             const T delta = V_next - target_next;
             if(delta > (T)0){
                 terms.clf += normalizer * weights.clf * delta * delta;
@@ -299,7 +436,7 @@ namespace rl_tools::rl::environments::l2f::diff{
                     previous,
                     ref,
                     weights,
-                    -grad_delta * ((T)1 - weights.clf_alpha * dt),
+                    -grad_delta * decay,
                     previous_lambda
                 );
             }
@@ -354,17 +491,22 @@ namespace rl_tools::rl::environments::l2f::diff{
         }
         const T V_initial = lyapunov_energy_identity<T, TI>(initial, ref, weights);
         const T V_terminal = lyapunov_energy_identity<T, TI>(terminal, ref, weights);
-        const T per_step_decay = (T)1 - weights.clf_alpha * dt;
+        const T per_step_decay = std::max((T)0, (T)1 - weights.clf_alpha * dt);
         T window_decay = (T)1;
         for(TI step_i = 0; step_i < horizon; step_i++){
             window_decay *= per_step_decay;
         }
-        const T delta = V_terminal - window_decay * V_initial;
-        if(delta > (T)0){
-            terms.window_clf += weights.window_clf * delta * delta;
-            const T grad_delta = (T)2 * weights.window_clf * delta;
-            add_lyapunov_energy_adjoint_identity<T, TI>(terminal, ref, weights, grad_delta, terminal_lambda);
-            add_lyapunov_energy_adjoint_identity<T, TI>(initial, ref, weights, -grad_delta * window_decay, initial_lambda);
+        const T delta_raw = V_terminal - window_decay * V_initial;
+        const T denom = std::max(weights.window_clf_epsilon + V_initial, (T)1e-12);
+        const T delta_norm = delta_raw / denom;
+        if(delta_norm > (T)0){
+            const T huber = positive_huber<T>(delta_norm, weights.window_clf_huber_delta);
+            const T huber_grad = weights.window_clf * positive_huber_grad<T>(delta_norm, weights.window_clf_huber_delta);
+            terms.window_clf += weights.window_clf * huber;
+            const T grad_terminal = huber_grad / denom;
+            const T grad_initial = -huber_grad * (window_decay * denom + delta_raw) / (denom * denom);
+            add_lyapunov_energy_adjoint_identity<T, TI>(terminal, ref, weights, grad_terminal, terminal_lambda);
+            add_lyapunov_energy_adjoint_identity<T, TI>(initial, ref, weights, grad_initial, initial_lambda);
         }
     }
 
@@ -392,6 +534,7 @@ namespace rl_tools::rl::environments::l2f::diff{
             EulerStateAdjoint<T> state_loss;
             zero(state_loss);
             add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, state_loss);
+            add_barrier_loss<T, TI>(states[step_i + 1], weights, normalizer, terms, state_loss);
             EulerStateAdjoint<T> previous_loss;
             zero(previous_loss);
             add_clf_transition_loss<T, TI>(
@@ -472,6 +615,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         const T normalizer = horizon > 0 ? (T)1 / (T)horizon : (T)1;
         for(TI step_i = 0; step_i < horizon; step_i++){
             add_state_loss<T, TI>(states[step_i + 1], ref, weights, normalizer, terms, lambdas[step_i + 1]);
+            add_barrier_loss<T, TI>(states[step_i + 1], weights, normalizer, terms, lambdas[step_i + 1]);
             add_clf_transition_loss<T, TI>(
                 states[step_i],
                 states[step_i + 1],

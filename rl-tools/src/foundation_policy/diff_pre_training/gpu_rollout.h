@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -15,7 +16,7 @@ constexpr std::size_t RDAC_ACTOR_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_H
 constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
-constexpr std::size_t LOSS_COMPONENT_COUNT = 18;
+constexpr std::size_t LOSS_COMPONENT_COUNT = 21;
 
 enum class TrajectoryMode : std::uint32_t{
     FIXED = 0,
@@ -42,16 +43,27 @@ struct EulerGpuLossWeights{
     float angular_acceleration = 0.0f;
     float clf = 0.0f;
     float window_clf = 0.0f;
-    float clf_alpha = 1.0f;
+    float clf_alpha = 0.2f;
     float clf_position = 8.0f;
     float clf_velocity = 0.8f;
     float clf_attitude = 4.0f;
     float clf_angular_velocity = 0.8f;
+    float clf_position_velocity_cross_beta = 0.0f;
+    float clf_attitude_angular_velocity_cross_beta = 0.0f;
+    float window_clf_epsilon = 1e-3f;
+    float window_clf_huber_delta = 1.0f;
+    float velocity_barrier = 0.0f;
+    float velocity_barrier_safe = 10.0f;
+    float angular_velocity_barrier = 0.0f;
+    float angular_velocity_barrier_safe = 15.0f;
+    float attitude_barrier = 0.0f;
+    float attitude_barrier_safe = 4.0f;
     float attitude_control = 0.0f;
     float attitude_control_k_R = 2.0f;
     float attitude_control_k_omega = 1.0f;
     float action_magnitude = 0.005f;
     float action_magnitude_center = 0.0f;
+    bool hover_relative_action_magnitude = false;
     float action_smoothness = 0.03f;
     float saturation = 0.05f;
     float saturation_start = 0.95f;
@@ -83,6 +95,9 @@ struct LossComponentMeans{
     float window_clf = 0.0f;
     float outward_velocity = 0.0f;
     float attitude_control = 0.0f;
+    float velocity_barrier = 0.0f;
+    float angular_velocity_barrier = 0.0f;
+    float attitude_barrier = 0.0f;
     float action_magnitude = 0.0f;
     float action_smoothness = 0.0f;
     float saturation = 0.0f;
@@ -154,6 +169,40 @@ struct EulerGpuResult{
     void resize(std::size_t batch_size, std::size_t horizon);
 };
 
+struct FailureReplaySample{
+    std::array<float, 3> p = {};
+    std::array<float, 3> v = {};
+    std::array<float, 9> R = {};
+    std::array<float, 3> omega = {};
+    std::array<float, 4> rpm = {};
+    std::array<float, 4> previous_action = {};
+    std::array<float, RDAC_HIDDEN_DIM> hidden = {};
+    std::array<float, 3> reference_p = {};
+    std::array<float, 3> reference_v = {};
+    std::array<float, 3> gravity = {};
+    std::array<float, 9> J = {};
+    std::array<float, 9> J_inv = {};
+    std::array<float, 4 * 3> rotor_positions = {};
+    std::array<float, 4 * 3> rotor_thrust_directions = {};
+    std::array<float, 4 * 3> rotor_torque_directions = {};
+    std::array<float, 4> rotor_torque_constants = {};
+    std::array<float, 4> rotor_time_rising = {};
+    std::array<float, 4> rotor_time_falling = {};
+    std::array<float, 4 * 3> rotor_thrust_coeffs = {};
+    float mass = 0.0f;
+    float action_min = 0.0f;
+    float action_max = 0.0f;
+    std::uint32_t dynamics_size_mass_bin = 0;
+    std::uint32_t dynamics_thrust_to_weight_bin = 0;
+    std::uint32_t dynamics_torque_to_inertia_bin = 0;
+    std::uint32_t dynamics_motor_delay_bin = 0;
+    std::uint32_t dynamics_curve_shape_bin = 0;
+    std::uint32_t dynamics_group_key = 0;
+    std::uint32_t source_episode = 0;
+    std::uint32_t source_failure_step = 0;
+    std::uint32_t source_replay_step = 0;
+};
+
 struct DeploymentAdapterInput{
     float p[3] = {};
     float v[3] = {};
@@ -175,11 +224,21 @@ struct EulerGpuRunOptions{
     float temporal_gradient_decay_alpha = 0.0f;
     float clf_weight = 0.0f;
     float window_clf_weight = 0.0f;
-    float clf_alpha = 1.0f;
+    float clf_alpha = 0.2f;
     float clf_position = 8.0f;
     float clf_velocity = 0.8f;
     float clf_attitude = 4.0f;
     float clf_angular_velocity = 0.8f;
+    float clf_position_velocity_cross_beta = 0.0f;
+    float clf_attitude_angular_velocity_cross_beta = 0.0f;
+    float window_clf_epsilon = 1e-3f;
+    float window_clf_huber_delta = 1.0f;
+    float velocity_barrier_weight = 0.0f;
+    float velocity_barrier_safe = 10.0f;
+    float angular_velocity_barrier_weight = 0.0f;
+    float angular_velocity_barrier_safe = 15.0f;
+    float attitude_barrier_weight = 0.0f;
+    float attitude_barrier_safe = 4.0f;
     float outward_velocity_weight = 0.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
@@ -373,11 +432,21 @@ struct FullGpuTrainingOptions{
     float temporal_gradient_decay_alpha = 0.0f;
     float clf_weight = 0.0f;
     float window_clf_weight = 0.0f;
-    float clf_alpha = 1.0f;
+    float clf_alpha = 0.2f;
     float clf_position = 8.0f;
     float clf_velocity = 0.8f;
     float clf_attitude = 4.0f;
     float clf_angular_velocity = 0.8f;
+    float clf_position_velocity_cross_beta = 0.0f;
+    float clf_attitude_angular_velocity_cross_beta = 0.0f;
+    float window_clf_epsilon = 1e-3f;
+    float window_clf_huber_delta = 1.0f;
+    float velocity_barrier_weight = 0.0f;
+    float velocity_barrier_safe = 10.0f;
+    float angular_velocity_barrier_weight = 0.0f;
+    float angular_velocity_barrier_safe = 15.0f;
+    float attitude_barrier_weight = 0.0f;
+    float attitude_barrier_safe = 4.0f;
     float outward_velocity_weight = 0.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
@@ -408,6 +477,31 @@ struct FullGpuTrainingOptions{
     std::string log_path;
     std::string save_path;
     std::string load_path;
+    bool h1000_gate_enabled = false;
+    std::size_t h1000_gate_interval = 0;
+    std::size_t h1000_gate_horizon = 1000;
+    std::size_t h1000_gate_episodes = 256;
+    bool h1000_gate_sample_dynamics = false;
+    DynamicsRandomizationLevel h1000_gate_dynamics_randomization_level = DynamicsRandomizationLevel::SMALL;
+    bool h1000_gate_correlated_size_mass_sampling = false;
+    float h1000_gate_max_action_saturation_rate = 0.05f;
+    float h1000_gate_max_action_abs = 0.98f;
+    float h1000_gate_mean_max_angular_velocity_norm = 15.0f;
+    float h1000_gate_max_angular_velocity_norm = 40.0f;
+    float h1000_gate_mean_max_position_norm = 10.0f;
+    float h1000_gate_mean_max_velocity_norm = 15.0f;
+    std::string h1000_gate_best_path;
+    std::string h1000_gate_candidate_path;
+    std::string h1000_gate_log_path;
+    bool failure_replay_enabled = false;
+    float failure_replay_ratio = 0.30f;
+    std::size_t failure_replay_capacity = 512;
+    std::size_t failure_replay_backtrack_min = 32;
+    std::size_t failure_replay_backtrack_max = 128;
+    float failure_replay_position_norm = 20.0f;
+    float failure_replay_velocity_norm = 20.0f;
+    float failure_replay_angular_velocity_norm = 30.0f;
+    float failure_replay_attitude_error = 2.6179938779914943654f; // 150 deg
 };
 
 struct FullGpuTrainingSummary{
@@ -455,6 +549,29 @@ struct FullGpuTrainingSummary{
     bool finite = false;
     bool checkpoint_saved = false;
     bool checkpoint_loaded = false;
+    bool h1000_gate_enabled = false;
+    bool h1000_gate_last_passed = false;
+    bool h1000_gate_best_available = false;
+    std::size_t h1000_gate_eval_count = 0;
+    std::size_t h1000_gate_pass_count = 0;
+    std::size_t h1000_gate_fail_count = 0;
+    std::size_t h1000_gate_rollback_count = 0;
+    std::size_t h1000_gate_last_step = 0;
+    float h1000_gate_last_weighted_cost = 0.0f;
+    float h1000_gate_last_action_saturation_rate = 0.0f;
+    float h1000_gate_last_max_action_abs = 0.0f;
+    float h1000_gate_last_mean_max_angular_velocity_norm = 0.0f;
+    float h1000_gate_last_max_angular_velocity_norm = 0.0f;
+    float h1000_gate_last_mean_max_position_norm = 0.0f;
+    float h1000_gate_last_mean_max_velocity_norm = 0.0f;
+    std::size_t h1000_gate_last_nan_inf_count = 0;
+    float h1000_gate_best_weighted_cost = 0.0f;
+    bool failure_replay_enabled = false;
+    std::size_t failure_replay_buffer_size = 0;
+    std::size_t failure_replay_added_count = 0;
+    std::size_t failure_replay_used_count = 0;
+    std::size_t failure_replay_last_added = 0;
+    bool failure_replay_last_episode = false;
     bool passed = false;
 };
 
@@ -484,6 +601,14 @@ struct GpuPolicyEvalOptions{
     float velocity_observation_noise = 0.0f;
     std::size_t velocity_observation_delay_steps = 0;
     ForcedDynamicsBins forced_bins;
+    bool collect_failure_replay = false;
+    std::size_t failure_replay_capacity = 0;
+    std::size_t failure_replay_backtrack_min = 32;
+    std::size_t failure_replay_backtrack_max = 128;
+    float failure_replay_position_norm = 20.0f;
+    float failure_replay_velocity_norm = 20.0f;
+    float failure_replay_angular_velocity_norm = 30.0f;
+    float failure_replay_attitude_error = 2.6179938779914943654f; // 150 deg
     std::string load_path;
     std::string log_path;
 };
@@ -577,6 +702,8 @@ struct GpuPolicyEvalSummary{
     float action_saturation_rate = 0.0f;
     float invalid_or_nan_rate = 0.0f;
     std::size_t nan_inf_count = 0;
+    std::vector<FailureReplaySample> failure_replay_samples;
+    std::size_t failure_replay_sample_count = 0;
     bool checkpoint_loaded = false;
     bool finite = false;
     bool passed = false;

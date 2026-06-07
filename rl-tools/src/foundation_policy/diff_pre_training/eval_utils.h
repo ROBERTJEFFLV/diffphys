@@ -42,6 +42,9 @@ namespace rl_tools::foundation_policy::diff_pre_training{
         T window_clf = 0;
         T outward_velocity = 0;
         T attitude_control = 0;
+        T velocity_barrier = 0;
+        T angular_velocity_barrier = 0;
+        T attitude_barrier = 0;
     };
 
     template <typename T>

@@ -56,6 +56,7 @@ void write_production_objective_trace_header(std::ostream& out){
         << "position_loss,velocity_loss,attitude_loss,angular_velocity_loss,"
         << "terminal_loss,terminal_position_loss,terminal_velocity_loss,terminal_attitude_loss,terminal_angular_velocity_loss,"
         << "clf_loss,window_clf_loss,outward_velocity_loss,attitude_control_loss,"
+        << "velocity_barrier_loss,angular_velocity_barrier_loss,attitude_barrier_loss,"
         << "action_magnitude_loss,action_smoothness_loss,saturation_loss,"
         << "critic_loss,actor_critic_loss,transition_consistency_loss,value_loss,entropy_loss,teacher_loss,other_loss_terms,"
         << "action_grad_norm_before_scale,action_grad_norm_after_diff_weight,action_grad_norm_after_action_clip,"
@@ -1140,7 +1141,19 @@ int main(int argc, char** argv){
         options.loss_attitude_control_weight,
         options.attitude_control_k_R,
         options.attitude_control_k_omega,
-        action_magnitude_center
+        action_magnitude_center,
+        options.action_saturation_start,
+        options.loss_clf_position_velocity_cross_beta,
+        options.loss_clf_attitude_angular_velocity_cross_beta,
+        options.loss_window_clf_epsilon,
+        options.loss_window_clf_huber_delta,
+        options.loss_velocity_barrier_weight,
+        options.velocity_barrier_safe,
+        options.loss_angular_velocity_barrier_weight,
+        options.angular_velocity_barrier_safe,
+        options.loss_attitude_barrier_weight,
+        options.attitude_barrier_safe,
+        options.hover_relative_action_magnitude
     };
     const auto tracking_reference = l2f_diff::zero_tracking_reference<T>();
 
@@ -2201,6 +2214,9 @@ int main(int argc, char** argv){
                 mean_terms.window_clf += diff_sample_weight * terms.window_clf;
                 mean_terms.outward_velocity += diff_sample_weight * terms.outward_velocity;
                 mean_terms.attitude_control += diff_sample_weight * terms.attitude_control;
+                mean_terms.velocity_barrier += diff_sample_weight * terms.velocity_barrier;
+                mean_terms.angular_velocity_barrier += diff_sample_weight * terms.angular_velocity_barrier;
+                mean_terms.attitude_barrier += diff_sample_weight * terms.attitude_barrier;
                 sample_weighted_loss_for_bin = diff_rollout_weight * terms.total();
                 mean_rollout_metrics.final_state_norm += l2f_diff::state_norm<T, TI>(euler_gradient_states[current_horizon]);
                 mean_rollout_metrics.final_position_norm += fp::euler_position_error_norm<T, TI>(euler_gradient_states[current_horizon], tracking_reference);
@@ -2390,7 +2406,9 @@ int main(int argc, char** argv){
         const T thrust_mean = force_cache_count > 0 ? thrust_norm_sum / (T)force_cache_count : diagnostic_nan;
         const T torque_norm_mean = force_cache_count > 0 ? torque_norm_sum / (T)force_cache_count : diagnostic_nan;
         const T loss_stabilization = mean_terms.position + mean_terms.velocity + mean_terms.attitude + mean_terms.angular_velocity +
-            mean_terms.terminal + mean_terms.clf + mean_terms.window_clf + mean_terms.outward_velocity + mean_terms.attitude_control;
+            mean_terms.terminal + mean_terms.clf + mean_terms.window_clf + mean_terms.outward_velocity +
+            mean_terms.attitude_control + mean_terms.velocity_barrier + mean_terms.angular_velocity_barrier +
+            mean_terms.attitude_barrier;
         const T loss_action_regularization = mean_terms.action_magnitude + mean_terms.action_smoothness + mean_terms.saturation;
 
         // Action-gradient clipping: clips dL/du (rollout-output gradients) before BPTT.
@@ -2643,6 +2661,9 @@ int main(int argc, char** argv){
                                  << mean_terms.window_clf << ","
                                  << mean_terms.outward_velocity << ","
                                  << mean_terms.attitude_control << ","
+                                 << mean_terms.velocity_barrier << ","
+                                 << mean_terms.angular_velocity_barrier << ","
+                                 << mean_terms.attitude_barrier << ","
                                  << mean_terms.action_magnitude << ","
                                  << mean_terms.action_smoothness << ","
                                  << mean_terms.saturation << ","
@@ -2688,6 +2709,9 @@ int main(int argc, char** argv){
                   << " mean_window_clf_loss=" << mean_terms.window_clf
                   << " mean_outward_velocity_loss=" << mean_terms.outward_velocity
                   << " mean_attitude_control_loss=" << mean_terms.attitude_control
+                  << " mean_velocity_barrier_loss=" << mean_terms.velocity_barrier
+                  << " mean_angular_velocity_barrier_loss=" << mean_terms.angular_velocity_barrier
+                  << " mean_attitude_barrier_loss=" << mean_terms.attitude_barrier
                   << " transition_consistency_loss=" << transition_consistency_loss
                   << " actor_critic_actor_loss=" << rdac_ac_terms.actor_critic_actor
                   << " actor_critic_critic_loss=" << rdac_ac_terms.actor_critic_critic
@@ -2906,6 +2930,9 @@ int main(int argc, char** argv){
                      << mean_terms.window_clf << ","
                      << mean_terms.outward_velocity << ","
                      << mean_terms.attitude_control << ","
+                     << mean_terms.velocity_barrier << ","
+                     << mean_terms.angular_velocity_barrier << ","
+                     << mean_terms.attitude_barrier << ","
                      << transition_consistency_loss << ","
                      << rdac_ac_terms.actor_critic_actor << ","
                      << rdac_ac_terms.actor_critic_critic << ","
