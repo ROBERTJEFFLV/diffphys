@@ -1238,6 +1238,7 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_h1000_gate_last_weighted_cost=" << summary.h1000_gate_last_weighted_cost << "\n";
     std::cout << "gpu_full_training_h1000_gate_last_mean_max_omega=" << summary.h1000_gate_last_mean_max_angular_velocity_norm << "\n";
     std::cout << "gpu_full_training_h1000_gate_last_max_omega=" << summary.h1000_gate_last_max_angular_velocity_norm << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_mean_first_failure_time_s=" << summary.h1000_gate_last_mean_first_failure_time_s << "\n";
     std::cout << "gpu_full_training_h1000_gate_last_action_saturation=" << summary.h1000_gate_last_action_saturation_rate << "\n";
     std::cout << "gpu_full_training_failure_replay_enabled=" << (summary.failure_replay_enabled ? "true" : "false") << "\n";
     std::cout << "gpu_full_training_failure_replay_buffer_size=" << summary.failure_replay_buffer_size << "\n";

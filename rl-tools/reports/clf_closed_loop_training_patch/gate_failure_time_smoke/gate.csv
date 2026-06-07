@@ -1,0 +1,3 @@
+step,passed,rolled_back,weighted_cost,mean_max_position_norm,mean_max_velocity_norm,mean_max_angular_velocity_norm,max_angular_velocity_norm,mean_first_failure_time_s,max_action_abs,action_saturation_rate,nan_inf_count,best_available,best_weighted_cost,failure_replay_added,failure_replay_buffer_size
+1,true,false,2.08138,0.0304962,0.160936,0.213723,0.244831,0.16,0.0311981,0,0,true,2.08138,0,0
+2,true,false,2.24692,0.0309295,0.160255,0.216613,0.233392,0.16,0.0315523,0,0,true,2.08138,0,0

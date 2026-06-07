@@ -7029,7 +7029,8 @@ FullGpuTrainingSummary run_full_gpu_training(
                 throw std::runtime_error("Failed to open H1000 gate log path: " + training_options.h1000_gate_log_path);
             }
             h1000_gate_log << "step,passed,rolled_back,weighted_cost,mean_max_position_norm,mean_max_velocity_norm,"
-                << "mean_max_angular_velocity_norm,max_angular_velocity_norm,max_action_abs,action_saturation_rate,nan_inf_count,"
+                << "mean_max_angular_velocity_norm,max_angular_velocity_norm,mean_first_failure_time_s,"
+                << "max_action_abs,action_saturation_rate,nan_inf_count,"
                 << "best_available,best_weighted_cost,failure_replay_added,failure_replay_buffer_size\n";
         }
         auto run_h1000_gate = [&](std::size_t step)->bool{
@@ -7086,6 +7087,7 @@ FullGpuTrainingSummary run_full_gpu_training(
             summary.h1000_gate_last_max_angular_velocity_norm = gate_eval.max_angular_velocity_norm;
             summary.h1000_gate_last_mean_max_position_norm = gate_eval.mean_max_position_norm;
             summary.h1000_gate_last_mean_max_velocity_norm = gate_eval.mean_max_velocity_norm;
+            summary.h1000_gate_last_mean_first_failure_time_s = gate_eval.mean_first_failure_time_s;
             summary.h1000_gate_last_nan_inf_count = gate_eval.nan_inf_count;
             const bool gate_passed = gate_eval.finite &&
                 gate_eval.nan_inf_count == 0 &&
@@ -7154,6 +7156,7 @@ FullGpuTrainingSummary run_full_gpu_training(
                 h1000_gate_log << step << "," << (gate_passed ? "true" : "false") << "," << (rolled_back ? "true" : "false") << ","
                     << gate_eval.weighted_cost << "," << gate_eval.mean_max_position_norm << "," << gate_eval.mean_max_velocity_norm << ","
                     << gate_eval.mean_max_angular_velocity_norm << "," << gate_eval.max_angular_velocity_norm << ","
+                    << gate_eval.mean_first_failure_time_s << ","
                     << gate_eval.max_action_abs << "," << gate_eval.action_saturation_rate << "," << gate_eval.nan_inf_count << ","
                     << (summary.h1000_gate_best_available ? "true" : "false") << "," << summary.h1000_gate_best_weighted_cost << ","
                     << summary.failure_replay_last_added << "," << summary.failure_replay_buffer_size << "\n";
@@ -7166,6 +7169,7 @@ FullGpuTrainingSummary run_full_gpu_training(
         std::size_t episode_reset_count = 0;
         bool needs_episode_reset = persistent_mode;
         bool current_episode_from_replay = false;
+        bool force_failure_replay_reset = false;
         const int hidden_block = 256;
         const int hidden_grid = static_cast<int>((training_options.batch_size * RDAC_HIDDEN_DIM + hidden_block - 1) / hidden_block);
         auto reset_training_episode = [&](unsigned reset_seed){
@@ -7196,6 +7200,7 @@ FullGpuTrainingSummary run_full_gpu_training(
             persistent_episode_step = 0;
             needs_episode_reset = false;
             current_episode_from_replay = false;
+            force_failure_replay_reset = false;
             summary.failure_replay_last_episode = false;
         };
         auto reset_failure_replay_segment = [&](){
@@ -7216,6 +7221,7 @@ FullGpuTrainingSummary run_full_gpu_training(
             persistent_episode_step = 0;
             needs_episode_reset = false;
             current_episode_from_replay = true;
+            force_failure_replay_reset = false;
             summary.failure_replay_last_episode = true;
             summary.failure_replay_used_count++;
             summary.failure_replay_buffer_size = failure_replay_buffer.size();
@@ -7224,9 +7230,13 @@ FullGpuTrainingSummary run_full_gpu_training(
             if(persistent_mode){
                 if(needs_episode_reset){
                     const bool use_failure_replay =
-                        training_options.failure_replay_enabled &&
-                        !failure_replay_buffer.empty() &&
-                        failure_replay_choice(failure_replay_rng) < training_options.failure_replay_ratio;
+                        force_failure_replay_reset ||
+                        (
+                            training_options.failure_replay_enabled &&
+                            !failure_replay_buffer.empty() &&
+                            failure_replay_choice(failure_replay_rng) < training_options.failure_replay_ratio
+                        );
+                    force_failure_replay_reset = false;
                     if(use_failure_replay){
                         reset_failure_replay_segment();
                     }
@@ -7555,6 +7565,7 @@ FullGpuTrainingSummary run_full_gpu_training(
                 if(!gate_passed && (summary.h1000_gate_best_available || (training_options.failure_replay_enabled && !failure_replay_buffer.empty()))){
                     needs_episode_reset = persistent_mode;
                     persistent_episode_step = 0;
+                    force_failure_replay_reset = training_options.failure_replay_enabled && !failure_replay_buffer.empty();
                 }
             }
             if(log){
@@ -7596,6 +7607,14 @@ FullGpuTrainingSummary run_full_gpu_training(
                     summary.episode_reset_count = episode_reset_count;
                     needs_episode_reset = true;
                     current_episode_from_replay = false;
+                }
+                else if(training_options.failure_replay_enabled &&
+                    !failure_replay_buffer.empty() &&
+                    failure_replay_choice(failure_replay_rng) < training_options.failure_replay_ratio){
+                    episode_reset_count++;
+                    summary.episode_reset_count = episode_reset_count;
+                    needs_episode_reset = true;
+                    force_failure_replay_reset = true;
                 }
                 else if(persistent_episode_step + training_options.horizon > summary.training_episode_steps){
                     episode_reset_count++;

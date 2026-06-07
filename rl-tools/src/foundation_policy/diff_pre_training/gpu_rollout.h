@@ -564,6 +564,7 @@ struct FullGpuTrainingSummary{
     float h1000_gate_last_max_angular_velocity_norm = 0.0f;
     float h1000_gate_last_mean_max_position_norm = 0.0f;
     float h1000_gate_last_mean_max_velocity_norm = 0.0f;
+    float h1000_gate_last_mean_first_failure_time_s = 0.0f;
     std::size_t h1000_gate_last_nan_inf_count = 0;
     float h1000_gate_best_weighted_cost = 0.0f;
     bool failure_replay_enabled = false;

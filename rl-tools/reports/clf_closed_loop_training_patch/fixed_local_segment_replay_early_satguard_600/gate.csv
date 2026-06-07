@@ -1,0 +1,7 @@
+step,passed,rolled_back,weighted_cost,mean_max_position_norm,mean_max_velocity_norm,mean_max_angular_velocity_norm,max_angular_velocity_norm,mean_first_failure_time_s,max_action_abs,action_saturation_rate,nan_inf_count,best_available,best_weighted_cost,failure_replay_added,failure_replay_buffer_size
+100,false,false,1.51033e+08,403.732,87.4599,173.9,229.191,0.791094,1,0.350635,0,false,0,128,128
+200,false,false,1.83451e+08,399.822,86.5746,196.84,304.732,0.813516,1,0.329562,0,false,0,128,256
+300,false,false,1.32779e+08,340.071,78.3923,174.284,270.729,0.898047,1,0.296787,0,false,0,128,384
+400,false,false,1.71868e+08,287.652,71.0414,184.217,772.41,1.01258,1,0.268049,0,false,0,128,512
+500,false,false,1.58672e+12,423.435,90.3564,3082.47,5347.99,1.00539,1,0.386014,0,false,0,128,512
+600,false,false,1.20774e+13,453.159,94.3418,5855.78,7690.66,0.953984,1,0.407635,0,false,0,128,512
