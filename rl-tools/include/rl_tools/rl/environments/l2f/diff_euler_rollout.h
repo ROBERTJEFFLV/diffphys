@@ -43,6 +43,8 @@ namespace rl_tools::rl::environments::l2f::diff{
         T angular_velocity_barrier_safe = (T)15;
         T attitude_barrier = 0;
         T attitude_barrier_safe = (T)4;
+        T barrier_huber_delta = (T)1;
+        T barrier_gradient_cap = 0;
         bool hover_relative_action_magnitude = false;
     };
 
@@ -149,6 +151,14 @@ namespace rl_tools::rl::environments::l2f::diff{
     T positive_huber_grad(T x, T delta){
         const T d = delta > (T)0 ? delta : (T)1;
         return x <= d ? x : d;
+    }
+
+    template <typename T>
+    T cap_barrier_gradient(T value, const EulerLossWeights<T>& weights){
+        if(weights.barrier_gradient_cap <= (T)0){
+            return value;
+        }
+        return std::max(-weights.barrier_gradient_cap, std::min(weights.barrier_gradient_cap, value));
     }
 
     template <typename T, typename TI>
@@ -326,7 +336,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         for(TI step_i = 0; step_i < horizon; step_i++){
             for(TI action_i = 0; action_i < 4; action_i++){
                 const T action_center = weights.hover_relative_action_magnitude
-                    ? initial_state.previous_action[action_i]
+                    ? initial_state.action_hover_center[action_i]
                     : weights.action_magnitude_center;
                 const T centered_action = actions[step_i][action_i] - action_center;
                 terms.action_magnitude += normalizer * weights.action_magnitude * centered_action * centered_action;
@@ -362,13 +372,15 @@ namespace rl_tools::rl::environments::l2f::diff{
             for(TI i = 0; i < 3; i++){
                 norm_sq += state.v[i] * state.v[i];
             }
-            const T safe_sq = weights.velocity_barrier_safe * weights.velocity_barrier_safe;
-            const T delta = norm_sq - safe_sq;
-            if(delta > (T)0){
-                terms.velocity_barrier += normalizer * weights.velocity_barrier * delta * delta;
-                const T grad = normalizer * (T)4 * weights.velocity_barrier * delta;
+            const T safe_sq = std::max((T)1.0e-6, weights.velocity_barrier_safe * weights.velocity_barrier_safe);
+            const T excess = norm_sq / safe_sq - (T)1;
+            if(excess > (T)0){
+                terms.velocity_barrier += normalizer * weights.velocity_barrier *
+                    positive_huber<T>(excess, weights.barrier_huber_delta);
+                const T grad = normalizer * weights.velocity_barrier *
+                    positive_huber_grad<T>(excess, weights.barrier_huber_delta) * (T)2 / safe_sq;
                 for(TI i = 0; i < 3; i++){
-                    lambda.v[i] += grad * state.v[i];
+                    lambda.v[i] += cap_barrier_gradient<T>(grad * state.v[i], weights);
                 }
             }
         }
@@ -377,13 +389,15 @@ namespace rl_tools::rl::environments::l2f::diff{
             for(TI i = 0; i < 3; i++){
                 norm_sq += state.omega[i] * state.omega[i];
             }
-            const T safe_sq = weights.angular_velocity_barrier_safe * weights.angular_velocity_barrier_safe;
-            const T delta = norm_sq - safe_sq;
-            if(delta > (T)0){
-                terms.angular_velocity_barrier += normalizer * weights.angular_velocity_barrier * delta * delta;
-                const T grad = normalizer * (T)4 * weights.angular_velocity_barrier * delta;
+            const T safe_sq = std::max((T)1.0e-6, weights.angular_velocity_barrier_safe * weights.angular_velocity_barrier_safe);
+            const T excess = norm_sq / safe_sq - (T)1;
+            if(excess > (T)0){
+                terms.angular_velocity_barrier += normalizer * weights.angular_velocity_barrier *
+                    positive_huber<T>(excess, weights.barrier_huber_delta);
+                const T grad = normalizer * weights.angular_velocity_barrier *
+                    positive_huber_grad<T>(excess, weights.barrier_huber_delta) * (T)2 / safe_sq;
                 for(TI i = 0; i < 3; i++){
-                    lambda.omega[i] += grad * state.omega[i];
+                    lambda.omega[i] += cap_barrier_gradient<T>(grad * state.omega[i], weights);
                 }
             }
         }
@@ -396,14 +410,17 @@ namespace rl_tools::rl::environments::l2f::diff{
                     psi += error * error;
                 }
             }
-            const T delta = psi - weights.attitude_barrier_safe;
-            if(delta > (T)0){
-                terms.attitude_barrier += normalizer * weights.attitude_barrier * delta * delta;
-                const T grad = normalizer * (T)4 * weights.attitude_barrier * delta;
+            const T safe = std::max((T)1.0e-6, weights.attitude_barrier_safe);
+            const T excess = psi / safe - (T)1;
+            if(excess > (T)0){
+                terms.attitude_barrier += normalizer * weights.attitude_barrier *
+                    positive_huber<T>(excess, weights.barrier_huber_delta);
+                const T grad = normalizer * weights.attitude_barrier *
+                    positive_huber_grad<T>(excess, weights.barrier_huber_delta) * (T)2 / safe;
                 for(TI i = 0; i < 3; i++){
                     for(TI j = 0; j < 3; j++){
                         const T target = i == j ? (T)1 : (T)0;
-                        lambda.R[i][j] += grad * (state.R[i][j] - target);
+                        lambda.R[i][j] += cap_barrier_gradient<T>(grad * (state.R[i][j] - target), weights);
                     }
                 }
             }

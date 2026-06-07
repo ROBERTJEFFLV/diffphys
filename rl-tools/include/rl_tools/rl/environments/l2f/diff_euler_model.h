@@ -12,6 +12,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         T omega[3];
         T rpm[4];
         T previous_action[4];
+        T action_hover_center[4];
     };
 
     template <typename T>
@@ -460,9 +461,11 @@ namespace rl_tools::rl::environments::l2f::diff{
             next.p[dim_i] = state.p[dim_i] + dt * next.v[dim_i];
             next.rpm[dim_i] = cache.rpm_next[dim_i];
             next.previous_action[dim_i] = action[dim_i];
+            next.action_hover_center[dim_i] = state.action_hover_center[dim_i];
         }
         next.rpm[3] = cache.rpm_next[3];
         next.previous_action[3] = action[3];
+        next.action_hover_center[3] = state.action_hover_center[3];
 
         skew3(next.omega, cache.skew_omega_next);
         for(TI dim_i = 0; dim_i < 3; dim_i++){

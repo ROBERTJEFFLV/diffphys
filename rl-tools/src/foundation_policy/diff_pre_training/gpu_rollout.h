@@ -16,7 +16,7 @@ constexpr std::size_t RDAC_ACTOR_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_H
 constexpr std::size_t RDAC_CRITIC_DIM = 1;
 constexpr std::size_t RDAC_CRITIC_HEAD_INPUT_DIM = EULER_OBSERVATION_DIM + RDAC_HIDDEN_DIM;
 constexpr float RDAC_CRITIC_LOSS_WEIGHT = 0.10f;
-constexpr std::size_t LOSS_COMPONENT_COUNT = 21;
+constexpr std::size_t LOSS_COMPONENT_COUNT = 24;
 
 enum class TrajectoryMode : std::uint32_t{
     FIXED = 0,
@@ -29,6 +29,12 @@ enum class TrajectoryMode : std::uint32_t{
 enum class DynamicsRandomizationLevel : std::uint32_t{
     BROAD = 0,
     SMALL = 1
+};
+
+enum class FailureReplayTriggerMode : std::uint32_t{
+    ANY = 0,
+    STATE = 1,
+    ACTION = 2
 };
 
 struct EulerGpuLossWeights{
@@ -58,6 +64,8 @@ struct EulerGpuLossWeights{
     float angular_velocity_barrier_safe = 15.0f;
     float attitude_barrier = 0.0f;
     float attitude_barrier_safe = 4.0f;
+    float barrier_huber_delta = 1.0f;
+    float barrier_gradient_cap = 0.0f;
     float attitude_control = 0.0f;
     float attitude_control_k_R = 2.0f;
     float attitude_control_k_omega = 1.0f;
@@ -67,6 +75,17 @@ struct EulerGpuLossWeights{
     float action_smoothness = 0.03f;
     float saturation = 0.05f;
     float saturation_start = 0.95f;
+    float replay_recovery_action_magnitude = 0.0f;
+    float replay_recovery_saturation = 0.0f;
+    float replay_recovery_linear_velocity = 0.0f;
+    float replay_recovery_velocity_barrier = 0.0f;
+    float replay_recovery_velocity_barrier_safe = 2.0f;
+    float replay_recovery_angular_velocity = 0.0f;
+    float replay_recovery_position_progress = 0.0f;
+    float replay_recovery_progress_margin = 0.0f;
+    float replay_recovery_progress_epsilon = 1e-3f;
+    float replay_recovery_progress_huber_delta = 1.0f;
+    std::uint32_t replay_recovery_start_segment = 1u; // zero-based replay segment index
     float terminal_loss_weight = 4.0f;
     float terminal_loss_scale = 0.0f;
     float terminal_position = 12.0f;
@@ -101,6 +120,9 @@ struct LossComponentMeans{
     float action_magnitude = 0.0f;
     float action_smoothness = 0.0f;
     float saturation = 0.0f;
+    float replay_recovery = 0.0f;
+    float replay_recovery_progress = 0.0f;
+    float replay_recovery_velocity_barrier = 0.0f;
     float terminal = 0.0f;
     float terminal_position = 0.0f;
     float terminal_velocity = 0.0f;
@@ -118,6 +140,7 @@ struct EulerGpuBatch{
     std::vector<float> initial_omega;           // [B, 3]
     std::vector<float> initial_rpm;             // [B, 4]
     std::vector<float> initial_previous_action; // [B, 4]
+    std::vector<float> action_hover_center;      // [B, 4], per-sample hover action center for action magnitude loss
     std::vector<float> reference_p;             // [B, 3], fixed-reference compatibility metadata
     std::vector<float> reference_v;             // [B, 3], fixed-reference compatibility metadata
     std::vector<float> reference_p_traj;        // [H + 1, B, 3]
@@ -148,7 +171,8 @@ struct EulerGpuBatch{
     std::vector<float> group_weight;                            // [B]
     std::vector<std::uint32_t> reset_mask;                      // [H, B]
     std::vector<std::uint32_t> hidden_reset_mask;               // [H, B]
-    std::uint32_t replay_schema_version = 2;
+    std::vector<std::uint32_t> failure_replay_segment_index;    // [B], 0 inactive, otherwise 1 + zero-based replay segment index
+    std::uint32_t replay_schema_version = 4;
     std::uint32_t sampler_seed = 0;
     std::uint32_t sampler_balance_bins = 4;
     std::uint32_t hidden_reset_enabled = 0;
@@ -176,6 +200,7 @@ struct FailureReplaySample{
     std::array<float, 3> omega = {};
     std::array<float, 4> rpm = {};
     std::array<float, 4> previous_action = {};
+    std::array<float, 4> action_hover_center = {};
     std::array<float, RDAC_HIDDEN_DIM> hidden = {};
     std::array<float, 3> reference_p = {};
     std::array<float, 3> reference_v = {};
@@ -239,6 +264,8 @@ struct EulerGpuRunOptions{
     float angular_velocity_barrier_safe = 15.0f;
     float attitude_barrier_weight = 0.0f;
     float attitude_barrier_safe = 4.0f;
+    float barrier_huber_delta = 1.0f;
+    float barrier_gradient_cap = 0.0f;
     float outward_velocity_weight = 0.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
@@ -447,6 +474,8 @@ struct FullGpuTrainingOptions{
     float angular_velocity_barrier_safe = 15.0f;
     float attitude_barrier_weight = 0.0f;
     float attitude_barrier_safe = 4.0f;
+    float barrier_huber_delta = 1.0f;
+    float barrier_gradient_cap = 0.0f;
     float outward_velocity_weight = 0.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
@@ -478,6 +507,7 @@ struct FullGpuTrainingOptions{
     std::string save_path;
     std::string load_path;
     bool h1000_gate_enabled = false;
+    bool h1000_gate_rollback_enabled = true;
     std::size_t h1000_gate_interval = 0;
     std::size_t h1000_gate_horizon = 1000;
     std::size_t h1000_gate_episodes = 256;
@@ -495,13 +525,31 @@ struct FullGpuTrainingOptions{
     std::string h1000_gate_log_path;
     bool failure_replay_enabled = false;
     float failure_replay_ratio = 0.30f;
+    std::size_t failure_replay_segments = 1;
+    FailureReplayTriggerMode failure_replay_trigger_mode = FailureReplayTriggerMode::ANY;
     std::size_t failure_replay_capacity = 512;
     std::size_t failure_replay_backtrack_min = 32;
     std::size_t failure_replay_backtrack_max = 128;
+    bool failure_replay_response_sampling = false;
+    float failure_replay_response_probability = 0.0f;
+    std::size_t failure_replay_response_min = 0;
+    std::size_t failure_replay_response_max = 0;
     float failure_replay_position_norm = 20.0f;
     float failure_replay_velocity_norm = 20.0f;
     float failure_replay_angular_velocity_norm = 30.0f;
     float failure_replay_attitude_error = 2.6179938779914943654f; // 150 deg
+    float failure_replay_action_abs = 1.01f;
+    float replay_recovery_action_magnitude_weight = 0.0f;
+    float replay_recovery_saturation_weight = 0.0f;
+    float replay_recovery_linear_velocity_weight = 0.0f;
+    float replay_recovery_velocity_barrier_weight = 0.0f;
+    float replay_recovery_velocity_barrier_safe = 2.0f;
+    float replay_recovery_angular_velocity_weight = 0.0f;
+    float replay_recovery_position_progress_weight = 0.0f;
+    float replay_recovery_progress_margin = 0.0f;
+    float replay_recovery_progress_epsilon = 1e-3f;
+    float replay_recovery_progress_huber_delta = 1.0f;
+    std::uint32_t replay_recovery_start_segment = 1u;
 };
 
 struct FullGpuTrainingSummary{
@@ -566,12 +614,42 @@ struct FullGpuTrainingSummary{
     float h1000_gate_last_mean_max_velocity_norm = 0.0f;
     float h1000_gate_last_mean_first_failure_time_s = 0.0f;
     std::size_t h1000_gate_last_nan_inf_count = 0;
+    std::size_t h1000_gate_last_first_failure_position_count = 0;
+    std::size_t h1000_gate_last_first_failure_velocity_count = 0;
+    std::size_t h1000_gate_last_first_failure_attitude_count = 0;
+    std::size_t h1000_gate_last_first_failure_angular_velocity_count = 0;
+    std::size_t h1000_gate_last_first_failure_nonfinite_count = 0;
+    float h1000_gate_last_shadow_score = 0.0f;
     float h1000_gate_best_weighted_cost = 0.0f;
+    float h1000_gate_best_shadow_score = 0.0f;
     bool failure_replay_enabled = false;
     std::size_t failure_replay_buffer_size = 0;
     std::size_t failure_replay_added_count = 0;
     std::size_t failure_replay_used_count = 0;
     std::size_t failure_replay_last_added = 0;
+    std::size_t failure_replay_active_slots = 0;
+    std::size_t failure_replay_new_slots = 0;
+    std::size_t failure_replay_chain_length = 1;
+    std::size_t failure_replay_episode_count = 0;
+    std::size_t failure_replay_segment_count = 0;
+    std::size_t failure_replay_completed_chain_count = 0;
+    std::size_t failure_replay_last_state_trigger_count = 0;
+    std::size_t failure_replay_last_action_trigger_count = 0;
+    std::size_t failure_replay_last_nonfinite_trigger_count = 0;
+    float failure_replay_mean_segment_index = 0.0f;
+    std::size_t failure_replay_max_segment_index = 0;
+    std::size_t failure_replay_observed_max_segment_index = 0;
+    bool failure_replay_state_carry_enabled = false;
+    bool failure_replay_hidden_carry_enabled = false;
+    float failure_replay_action_saturation_rate = 0.0f;
+    std::size_t failure_replay_carry_check_slots = 0;
+    float failure_replay_carry_position_error = 0.0f;
+    float failure_replay_carry_velocity_error = 0.0f;
+    float failure_replay_carry_rotation_error = 0.0f;
+    float failure_replay_carry_angular_velocity_error = 0.0f;
+    float failure_replay_carry_rpm_error = 0.0f;
+    float failure_replay_carry_previous_action_error = 0.0f;
+    float failure_replay_carry_hidden_error = 0.0f;
     bool failure_replay_last_episode = false;
     bool passed = false;
 };
@@ -603,13 +681,19 @@ struct GpuPolicyEvalOptions{
     std::size_t velocity_observation_delay_steps = 0;
     ForcedDynamicsBins forced_bins;
     bool collect_failure_replay = false;
+    FailureReplayTriggerMode failure_replay_trigger_mode = FailureReplayTriggerMode::ANY;
     std::size_t failure_replay_capacity = 0;
     std::size_t failure_replay_backtrack_min = 32;
     std::size_t failure_replay_backtrack_max = 128;
+    bool failure_replay_response_sampling = false;
+    float failure_replay_response_probability = 0.0f;
+    std::size_t failure_replay_response_min = 0;
+    std::size_t failure_replay_response_max = 0;
     float failure_replay_position_norm = 20.0f;
     float failure_replay_velocity_norm = 20.0f;
     float failure_replay_angular_velocity_norm = 30.0f;
     float failure_replay_attitude_error = 2.6179938779914943654f; // 150 deg
+    float failure_replay_action_abs = 1.01f;
     std::string load_path;
     std::string log_path;
 };
@@ -703,8 +787,16 @@ struct GpuPolicyEvalSummary{
     float action_saturation_rate = 0.0f;
     float invalid_or_nan_rate = 0.0f;
     std::size_t nan_inf_count = 0;
+    std::size_t first_failure_position_count = 0;
+    std::size_t first_failure_velocity_count = 0;
+    std::size_t first_failure_attitude_count = 0;
+    std::size_t first_failure_angular_velocity_count = 0;
+    std::size_t first_failure_nonfinite_count = 0;
     std::vector<FailureReplaySample> failure_replay_samples;
     std::size_t failure_replay_sample_count = 0;
+    std::size_t failure_replay_state_trigger_count = 0;
+    std::size_t failure_replay_action_trigger_count = 0;
+    std::size_t failure_replay_nonfinite_trigger_count = 0;
     bool checkpoint_loaded = false;
     bool finite = false;
     bool passed = false;

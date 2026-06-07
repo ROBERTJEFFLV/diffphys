@@ -1153,7 +1153,14 @@ int main(int argc, char** argv){
         options.angular_velocity_barrier_safe,
         options.loss_attitude_barrier_weight,
         options.attitude_barrier_safe,
+        (T)1,
+        (T)0,
         options.hover_relative_action_magnitude
+    };
+    auto set_euler_action_hover_center = [&](l2f_diff::EulerState<T, TI>& state){
+        for(TI action_i = 0; action_i < ENVIRONMENT::ACTION_DIM; action_i++){
+            state.action_hover_center[action_i] = action_magnitude_center;
+        }
     };
     const auto tracking_reference = l2f_diff::zero_tracking_reference<T>();
 
@@ -1185,6 +1192,7 @@ int main(int argc, char** argv){
             rlt::sample_initial_state(device, env, parameters, state, rng);
             l2f_diff::EulerState<T, TI> euler_state;
             l2f_diff::from_l2f_state<STATE, T, TI>(state, euler_state);
+            set_euler_action_hover_center(euler_state);
             rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
             T previous_action[ENVIRONMENT::ACTION_DIM] = {};
             T previous_response_error[fp::RESPONSE_ERROR_DIM] = {};
@@ -1433,6 +1441,7 @@ int main(int argc, char** argv){
             rlt::sample_initial_state(device, env, parameters, state, rng);
             l2f_diff::EulerState<T, TI> euler_state;
             l2f_diff::from_l2f_state<STATE, T, TI>(state, euler_state);
+            set_euler_action_hover_center(euler_state);
             rlt::reset(device, rollout_actor.trunk, rollout_actor_state, rng);
             T previous_action[ENVIRONMENT::ACTION_DIM] = {};
             T previous_response_error[fp::RESPONSE_ERROR_DIM] = {};
@@ -1938,6 +1947,7 @@ int main(int argc, char** argv){
                 apply_state_curriculum<STATE, T>(states[batch_i][0], state_difficulty);
             }
             l2f_diff::from_l2f_state<STATE, T, TI>(states[batch_i][0], euler_states[batch_i][0]);
+            set_euler_action_hover_center(euler_states[batch_i][0]);
             mean_rollout_metrics.initial_position_norm += fp::l2f_position_error_norm<STATE, T, TI>(states[batch_i][0], tracking_reference);
             mean_rollout_metrics.initial_velocity_norm += fp::l2f_velocity_error_norm<STATE, T, TI>(states[batch_i][0], tracking_reference);
             mean_rollout_metrics.initial_angular_velocity_norm += fp::norm3(states[batch_i][0].angular_velocity);

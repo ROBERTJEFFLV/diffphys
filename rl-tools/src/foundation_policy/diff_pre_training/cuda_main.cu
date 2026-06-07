@@ -72,6 +72,8 @@ struct Options{
     float angular_velocity_barrier_safe = 15.0f;
     float attitude_barrier_weight = 0.0f;
     float attitude_barrier_safe = 4.0f;
+    float barrier_huber_delta = 1.0f;
+    float barrier_gradient_cap = 0.0f;
     float attitude_control_weight = 0.0f;
     float attitude_control_k_R = 2.0f;
     float attitude_control_k_omega = 1.0f;
@@ -114,6 +116,7 @@ struct Options{
     std::size_t eval_episodes = 100;
     std::size_t eval_horizon = 500;
     bool h1000_gate_enabled = false;
+    bool h1000_gate_rollback_enabled = true;
     std::size_t h1000_gate_interval = 0;
     std::size_t h1000_gate_horizon = 1000;
     std::size_t h1000_gate_episodes = 256;
@@ -131,13 +134,31 @@ struct Options{
     std::string h1000_gate_log_path;
     bool failure_replay_enabled = false;
     float failure_replay_ratio = 0.30f;
+    std::size_t failure_replay_segments = 1;
+    gpu::FailureReplayTriggerMode failure_replay_trigger_mode = gpu::FailureReplayTriggerMode::ANY;
     std::size_t failure_replay_capacity = 512;
     std::size_t failure_replay_backtrack_min = 32;
     std::size_t failure_replay_backtrack_max = 128;
+    bool failure_replay_response_sampling = false;
+    float failure_replay_response_probability = 0.0f;
+    std::size_t failure_replay_response_min = 0;
+    std::size_t failure_replay_response_max = 0;
     float failure_replay_position_norm = 20.0f;
     float failure_replay_velocity_norm = 20.0f;
     float failure_replay_angular_velocity_norm = 30.0f;
     float failure_replay_attitude_error = 2.6179938779914943654f;
+    float failure_replay_action_abs = 1.01f;
+    float replay_recovery_action_magnitude_weight = 0.0f;
+    float replay_recovery_saturation_weight = 0.0f;
+    float replay_recovery_linear_velocity_weight = 0.0f;
+    float replay_recovery_velocity_barrier_weight = 0.0f;
+    float replay_recovery_velocity_barrier_safe = 2.0f;
+    float replay_recovery_angular_velocity_weight = 0.0f;
+    float replay_recovery_position_progress_weight = 0.0f;
+    float replay_recovery_progress_margin = 0.0f;
+    float replay_recovery_progress_epsilon = 1e-3f;
+    float replay_recovery_progress_huber_delta = 1.0f;
+    std::uint32_t replay_recovery_start_segment = 1u;
     float success_position_threshold = 1.0f;
     float success_velocity_threshold = 2.0f;
     float success_attitude_threshold = 3.14159265358979323846f;
@@ -204,6 +225,7 @@ void print_usage(){
         << "    active training defaults to H16 origin recovery; non-fixed trajectories and curriculum flags are rejected\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
         << "    [--h1000-gate] [--h1000-gate-interval N] [--h1000-gate-horizon N] [--h1000-gate-episodes N]\n"
+        << "    [--disable-h1000-gate-rollback]\n"
         << "    [--h1000-gate-small-dynamics|--h1000-gate-fixed-dynamics] [--h1000-gate-correlated-size-mass-sampling]\n"
         << "    [--h1000-gate-best-path PATH] [--h1000-gate-log-path PATH]\n"
         << "    [--failure-analysis] [--force-dynamics-bins size_mass=3,thrust_to_weight=3,...]\n"
@@ -220,7 +242,7 @@ void print_usage(){
         << "    [--window-clf-eps EPS] [--window-clf-huber-delta D]\n"
         << "    [--w-velocity-barrier W] [--velocity-barrier-safe V]\n"
         << "    [--w-omega-barrier W] [--omega-barrier-safe WSAFE]\n"
-        << "    [--w-attitude-barrier W] [--attitude-barrier-safe PSI]\n"
+        << "    [--w-attitude-barrier W] [--attitude-barrier-safe PSI] [--barrier-huber-delta D] [--barrier-gradient-cap C]\n"
         << "    [--w-clf W] [--w-window-clf W] [--clf-alpha A] [--w-clf-position W] [--w-clf-velocity W]\n"
         << "    [--w-clf-attitude W] [--w-clf-angular-velocity W]\n"
         << "    [--w-attitude-control W] [--attitude-control-k-r K] [--attitude-control-k-omega K]\n"
@@ -229,7 +251,17 @@ void print_usage(){
         << "    [--correlated-size-mass-sampling]\n"
         << "    [--trajectory-mode fixed|step|circle|figure8|mixed]  # eval/deployment setpoint shifting only\n"
         << "    [--trajectory-amplitude M] [--trajectory-frequency-hz F] [--training-episode-steps N]\n"
-        << "    [--h1000-gate] [--failure-replay] [--failure-replay-ratio P]\n"
+        << "    [--h1000-gate] [--failure-replay] [--failure-replay-ratio P] [--failure-replay-segments N]\n"
+        << "    [--failure-replay-trigger any|state|action]\n"
+        << "    [--failure-replay-action-abs A] [--failure-replay-omega-norm W]\n"
+        << "    [--failure-replay-response-sampling] [--failure-replay-response-probability P]\n"
+        << "    [--failure-replay-response-min N] [--failure-replay-response-max N]\n"
+        << "    [--w-replay-recovery-action W] [--w-replay-recovery-saturation W]\n"
+        << "    [--w-replay-recovery-velocity W] [--w-replay-recovery-velocity-barrier W]\n"
+        << "    [--replay-recovery-velocity-safe V] [--w-replay-recovery-angular-velocity W]\n"
+        << "    [--w-replay-recovery-progress W]\n"
+        << "    [--replay-recovery-progress-margin M] [--replay-recovery-progress-eps EPS]\n"
+        << "    [--replay-recovery-progress-huber-delta D] [--replay-recovery-start-segment N]\n"
         << "    [--tracking-gate-mode local|recovery] [--throughout-gate-start-step N]\n"
         << "    [--initial-position-scale S] [--initial-velocity-scale S]\n"
         << "    [--initial-attitude-scale S] [--initial-angular-velocity-scale S]\n"
@@ -280,6 +312,13 @@ gpu::DynamicsRandomizationLevel parse_dynamics_randomization_level(const std::st
     throw std::runtime_error("Unknown --sampled-dynamics-level value: " + value);
 }
 
+gpu::FailureReplayTriggerMode parse_failure_replay_trigger_mode(const std::string& value){
+    if(value == "any") return gpu::FailureReplayTriggerMode::ANY;
+    if(value == "state") return gpu::FailureReplayTriggerMode::STATE;
+    if(value == "action" || value == "action-only") return gpu::FailureReplayTriggerMode::ACTION;
+    throw std::runtime_error("Unknown --failure-replay-trigger value: " + value);
+}
+
 const char* trajectory_mode_name(gpu::TrajectoryMode mode){
     switch(mode){
         case gpu::TrajectoryMode::FIXED: return "fixed";
@@ -287,6 +326,15 @@ const char* trajectory_mode_name(gpu::TrajectoryMode mode){
         case gpu::TrajectoryMode::CIRCLE: return "circle";
         case gpu::TrajectoryMode::FIGURE8: return "figure8";
         case gpu::TrajectoryMode::MIXED: return "mixed";
+    }
+    return "unknown";
+}
+
+const char* failure_replay_trigger_mode_name(gpu::FailureReplayTriggerMode mode){
+    switch(mode){
+        case gpu::FailureReplayTriggerMode::ANY: return "any";
+        case gpu::FailureReplayTriggerMode::STATE: return "state";
+        case gpu::FailureReplayTriggerMode::ACTION: return "action";
     }
     return "unknown";
 }
@@ -636,6 +684,12 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--attitude-barrier-safe" && i + 1 < argc){
             options.attitude_barrier_safe = std::stof(argv[++i]);
         }
+        else if(arg == "--barrier-huber-delta" && i + 1 < argc){
+            options.barrier_huber_delta = std::stof(argv[++i]);
+        }
+        else if(arg == "--barrier-gradient-cap" && i + 1 < argc){
+            options.barrier_gradient_cap = std::stof(argv[++i]);
+        }
         else if(arg == "--w-attitude-control" && i + 1 < argc){
             options.attitude_control_weight = std::stof(argv[++i]);
         }
@@ -742,6 +796,11 @@ bool parse_options(int argc, char** argv, Options& options){
             options.h1000_gate_enabled = true;
             options.gpu_rollout = true;
         }
+        else if(arg == "--disable-h1000-gate-rollback"){
+            options.h1000_gate_rollback_enabled = false;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
         else if(arg == "--h1000-gate-interval" && i + 1 < argc){
             options.h1000_gate_interval = static_cast<std::size_t>(std::stoul(argv[++i]));
             options.h1000_gate_enabled = true;
@@ -820,6 +879,18 @@ bool parse_options(int argc, char** argv, Options& options){
             options.h1000_gate_enabled = true;
             options.gpu_rollout = true;
         }
+        else if(arg == "--failure-replay-segments" && i + 1 < argc){
+            options.failure_replay_segments = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
+        else if(arg == "--failure-replay-trigger" && i + 1 < argc){
+            options.failure_replay_trigger_mode = parse_failure_replay_trigger_mode(argv[++i]);
+            options.failure_replay_enabled = true;
+            options.h1000_gate_enabled = true;
+            options.gpu_rollout = true;
+        }
         else if(arg == "--failure-replay-capacity" && i + 1 < argc){
             options.failure_replay_capacity = static_cast<std::size_t>(std::stoul(argv[++i]));
             options.failure_replay_enabled = true;
@@ -830,6 +901,23 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--failure-replay-backtrack-max" && i + 1 < argc){
             options.failure_replay_backtrack_max = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-response-sampling"){
+            options.failure_replay_response_sampling = true;
+            options.failure_replay_response_probability = 1.0f;
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-response-probability" && i + 1 < argc){
+            options.failure_replay_response_probability = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-response-min" && i + 1 < argc){
+            options.failure_replay_response_min = static_cast<std::size_t>(std::stoul(argv[++i]));
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-response-max" && i + 1 < argc){
+            options.failure_replay_response_max = static_cast<std::size_t>(std::stoul(argv[++i]));
             options.failure_replay_enabled = true;
         }
         else if(arg == "--failure-replay-position-norm" && i + 1 < argc){
@@ -851,6 +939,43 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--failure-replay-attitude-error-deg" && i + 1 < argc){
             options.failure_replay_attitude_error = std::stof(argv[++i]) * 3.14159265358979323846f / 180.0f;
             options.failure_replay_enabled = true;
+        }
+        else if(arg == "--failure-replay-action-abs" && i + 1 < argc){
+            options.failure_replay_action_abs = std::stof(argv[++i]);
+            options.failure_replay_enabled = true;
+        }
+        else if(arg == "--w-replay-recovery-action" && i + 1 < argc){
+            options.replay_recovery_action_magnitude_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--w-replay-recovery-saturation" && i + 1 < argc){
+            options.replay_recovery_saturation_weight = std::stof(argv[++i]);
+        }
+        else if((arg == "--w-replay-recovery-velocity" || arg == "--w-replay-recovery-linear-velocity") && i + 1 < argc){
+            options.replay_recovery_linear_velocity_weight = std::stof(argv[++i]);
+        }
+        else if((arg == "--w-replay-recovery-velocity-barrier" || arg == "--w-replay-velocity-barrier") && i + 1 < argc){
+            options.replay_recovery_velocity_barrier_weight = std::stof(argv[++i]);
+        }
+        else if((arg == "--replay-recovery-velocity-safe" || arg == "--replay-velocity-safe") && i + 1 < argc){
+            options.replay_recovery_velocity_barrier_safe = std::stof(argv[++i]);
+        }
+        else if((arg == "--w-replay-recovery-angular-velocity" || arg == "--w-replay-recovery-omega") && i + 1 < argc){
+            options.replay_recovery_angular_velocity_weight = std::stof(argv[++i]);
+        }
+        else if((arg == "--w-replay-recovery-progress" || arg == "--w-replay-recovery-position-progress") && i + 1 < argc){
+            options.replay_recovery_position_progress_weight = std::stof(argv[++i]);
+        }
+        else if(arg == "--replay-recovery-progress-margin" && i + 1 < argc){
+            options.replay_recovery_progress_margin = std::stof(argv[++i]);
+        }
+        else if((arg == "--replay-recovery-progress-eps" || arg == "--replay-recovery-progress-epsilon") && i + 1 < argc){
+            options.replay_recovery_progress_epsilon = std::stof(argv[++i]);
+        }
+        else if(arg == "--replay-recovery-progress-huber-delta" && i + 1 < argc){
+            options.replay_recovery_progress_huber_delta = std::stof(argv[++i]);
+        }
+        else if(arg == "--replay-recovery-start-segment" && i + 1 < argc){
+            options.replay_recovery_start_segment = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         }
         else if(arg == "--strict-stability-thresholds"){
             options.success_position_threshold = 0.05f;
@@ -949,6 +1074,8 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
     training_options.attitude_barrier_weight = options.attitude_barrier_weight;
     training_options.attitude_barrier_safe = options.attitude_barrier_safe;
+    training_options.barrier_huber_delta = options.barrier_huber_delta;
+    training_options.barrier_gradient_cap = options.barrier_gradient_cap;
     training_options.outward_velocity_weight = options.outward_velocity_weight;
     training_options.attitude_control_weight = options.attitude_control_weight;
     training_options.attitude_control_k_R = options.attitude_control_k_R;
@@ -980,6 +1107,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.save_path = options.save_path;
     training_options.load_path = options.load_path;
     training_options.h1000_gate_enabled = options.h1000_gate_enabled;
+    training_options.h1000_gate_rollback_enabled = options.h1000_gate_rollback_enabled;
     training_options.h1000_gate_interval = options.h1000_gate_interval;
     training_options.h1000_gate_horizon = options.h1000_gate_horizon;
     training_options.h1000_gate_episodes = options.h1000_gate_episodes;
@@ -997,13 +1125,31 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.h1000_gate_log_path = options.h1000_gate_log_path;
     training_options.failure_replay_enabled = options.failure_replay_enabled;
     training_options.failure_replay_ratio = options.failure_replay_ratio;
+    training_options.failure_replay_segments = options.failure_replay_segments;
+    training_options.failure_replay_trigger_mode = options.failure_replay_trigger_mode;
     training_options.failure_replay_capacity = options.failure_replay_capacity;
     training_options.failure_replay_backtrack_min = options.failure_replay_backtrack_min;
     training_options.failure_replay_backtrack_max = options.failure_replay_backtrack_max;
+    training_options.failure_replay_response_sampling = options.failure_replay_response_sampling;
+    training_options.failure_replay_response_probability = options.failure_replay_response_probability;
+    training_options.failure_replay_response_min = options.failure_replay_response_min;
+    training_options.failure_replay_response_max = options.failure_replay_response_max;
     training_options.failure_replay_position_norm = options.failure_replay_position_norm;
     training_options.failure_replay_velocity_norm = options.failure_replay_velocity_norm;
     training_options.failure_replay_angular_velocity_norm = options.failure_replay_angular_velocity_norm;
     training_options.failure_replay_attitude_error = options.failure_replay_attitude_error;
+    training_options.failure_replay_action_abs = options.failure_replay_action_abs;
+    training_options.replay_recovery_action_magnitude_weight = options.replay_recovery_action_magnitude_weight;
+    training_options.replay_recovery_saturation_weight = options.replay_recovery_saturation_weight;
+    training_options.replay_recovery_linear_velocity_weight = options.replay_recovery_linear_velocity_weight;
+    training_options.replay_recovery_velocity_barrier_weight = options.replay_recovery_velocity_barrier_weight;
+    training_options.replay_recovery_velocity_barrier_safe = options.replay_recovery_velocity_barrier_safe;
+    training_options.replay_recovery_angular_velocity_weight = options.replay_recovery_angular_velocity_weight;
+    training_options.replay_recovery_position_progress_weight = options.replay_recovery_position_progress_weight;
+    training_options.replay_recovery_progress_margin = options.replay_recovery_progress_margin;
+    training_options.replay_recovery_progress_epsilon = options.replay_recovery_progress_epsilon;
+    training_options.replay_recovery_progress_huber_delta = options.replay_recovery_progress_huber_delta;
+    training_options.replay_recovery_start_segment = options.replay_recovery_start_segment;
     return training_options;
 }
 
@@ -1240,10 +1386,41 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_h1000_gate_last_max_omega=" << summary.h1000_gate_last_max_angular_velocity_norm << "\n";
     std::cout << "gpu_full_training_h1000_gate_last_mean_first_failure_time_s=" << summary.h1000_gate_last_mean_first_failure_time_s << "\n";
     std::cout << "gpu_full_training_h1000_gate_last_action_saturation=" << summary.h1000_gate_last_action_saturation_rate << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_nan_inf_count=" << summary.h1000_gate_last_nan_inf_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_first_failure_position_count=" << summary.h1000_gate_last_first_failure_position_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_first_failure_velocity_count=" << summary.h1000_gate_last_first_failure_velocity_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_first_failure_attitude_count=" << summary.h1000_gate_last_first_failure_attitude_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_first_failure_angular_velocity_count=" << summary.h1000_gate_last_first_failure_angular_velocity_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_first_failure_nonfinite_count=" << summary.h1000_gate_last_first_failure_nonfinite_count << "\n";
+    std::cout << "gpu_full_training_h1000_gate_last_shadow_score=" << summary.h1000_gate_last_shadow_score << "\n";
+    std::cout << "gpu_full_training_h1000_gate_best_shadow_score=" << summary.h1000_gate_best_shadow_score << "\n";
     std::cout << "gpu_full_training_failure_replay_enabled=" << (summary.failure_replay_enabled ? "true" : "false") << "\n";
     std::cout << "gpu_full_training_failure_replay_buffer_size=" << summary.failure_replay_buffer_size << "\n";
     std::cout << "gpu_full_training_failure_replay_added_count=" << summary.failure_replay_added_count << "\n";
     std::cout << "gpu_full_training_failure_replay_used_count=" << summary.failure_replay_used_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_active_slots=" << summary.failure_replay_active_slots << "\n";
+    std::cout << "gpu_full_training_failure_replay_new_slots=" << summary.failure_replay_new_slots << "\n";
+    std::cout << "gpu_full_training_failure_replay_chain_length=" << summary.failure_replay_chain_length << "\n";
+    std::cout << "gpu_full_training_failure_replay_episode_count=" << summary.failure_replay_episode_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_segment_count=" << summary.failure_replay_segment_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_completed_chain_count=" << summary.failure_replay_completed_chain_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_last_state_trigger_count=" << summary.failure_replay_last_state_trigger_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_last_action_trigger_count=" << summary.failure_replay_last_action_trigger_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_last_nonfinite_trigger_count=" << summary.failure_replay_last_nonfinite_trigger_count << "\n";
+    std::cout << "gpu_full_training_failure_replay_mean_segment_index=" << summary.failure_replay_mean_segment_index << "\n";
+    std::cout << "gpu_full_training_failure_replay_max_segment_index=" << summary.failure_replay_max_segment_index << "\n";
+    std::cout << "gpu_full_training_failure_replay_observed_max_segment_index=" << summary.failure_replay_observed_max_segment_index << "\n";
+    std::cout << "gpu_full_training_failure_replay_state_carry_enabled=" << (summary.failure_replay_state_carry_enabled ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_failure_replay_hidden_carry_enabled=" << (summary.failure_replay_hidden_carry_enabled ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_failure_replay_action_saturation_rate=" << summary.failure_replay_action_saturation_rate << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_check_slots=" << summary.failure_replay_carry_check_slots << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_position_error=" << summary.failure_replay_carry_position_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_velocity_error=" << summary.failure_replay_carry_velocity_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_rotation_error=" << summary.failure_replay_carry_rotation_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_angular_velocity_error=" << summary.failure_replay_carry_angular_velocity_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_rpm_error=" << summary.failure_replay_carry_rpm_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_previous_action_error=" << summary.failure_replay_carry_previous_action_error << "\n";
+    std::cout << "gpu_full_training_failure_replay_carry_hidden_error=" << summary.failure_replay_carry_hidden_error << "\n";
     std::cout << "gpu_checkpoint_saved=" << (summary.checkpoint_saved ? "true" : "false") << "\n";
     std::cout << "gpu_checkpoint_loaded=" << (summary.checkpoint_loaded ? "true" : "false") << "\n";
 }
@@ -1283,6 +1460,11 @@ void print_gpu_eval_summary(const gpu::GpuPolicyEvalSummary& summary){
     std::cout << "gpu_eval_max_action_smoothness=" << summary.max_action_smoothness << "\n";
     std::cout << "gpu_eval_max_action_abs=" << summary.max_action_abs << "\n";
     std::cout << "gpu_eval_action_saturation_rate=" << summary.action_saturation_rate << "\n";
+    std::cout << "gpu_eval_first_failure_position_count=" << summary.first_failure_position_count << "\n";
+    std::cout << "gpu_eval_first_failure_velocity_count=" << summary.first_failure_velocity_count << "\n";
+    std::cout << "gpu_eval_first_failure_attitude_count=" << summary.first_failure_attitude_count << "\n";
+    std::cout << "gpu_eval_first_failure_angular_velocity_count=" << summary.first_failure_angular_velocity_count << "\n";
+    std::cout << "gpu_eval_first_failure_nonfinite_count=" << summary.first_failure_nonfinite_count << "\n";
     std::cout << "gpu_eval_sample_dynamics=" << (summary.sample_dynamics ? "true" : "false") << "\n";
     std::cout << "gpu_eval_correlated_size_mass_sampling=" << (summary.correlated_size_mass_sampling ? "true" : "false") << "\n";
     std::cout << "gpu_eval_mass_min=" << summary.mass_min << "\n";
@@ -1554,6 +1736,23 @@ int main(int argc, char** argv){
     std::cout << "trajectory_amplitude=" << options.trajectory_amplitude << "\n";
     std::cout << "trajectory_frequency_hz=" << options.trajectory_frequency_hz << "\n";
     std::cout << "training_episode_steps=" << options.training_episode_steps << "\n";
+    std::cout << "h1000_gate_rollback_enabled=" << (options.h1000_gate_rollback_enabled ? "true" : "false") << "\n";
+    std::cout << "failure_replay_trigger_mode=" << failure_replay_trigger_mode_name(options.failure_replay_trigger_mode) << "\n";
+    std::cout << "failure_replay_response_sampling=" << (options.failure_replay_response_sampling ? "true" : "false") << "\n";
+    std::cout << "failure_replay_response_probability=" << options.failure_replay_response_probability << "\n";
+    std::cout << "failure_replay_response_min=" << options.failure_replay_response_min << "\n";
+    std::cout << "failure_replay_response_max=" << options.failure_replay_response_max << "\n";
+    std::cout << "replay_recovery_action_magnitude_weight=" << options.replay_recovery_action_magnitude_weight << "\n";
+    std::cout << "replay_recovery_saturation_weight=" << options.replay_recovery_saturation_weight << "\n";
+    std::cout << "replay_recovery_linear_velocity_weight=" << options.replay_recovery_linear_velocity_weight << "\n";
+    std::cout << "replay_recovery_velocity_barrier_weight=" << options.replay_recovery_velocity_barrier_weight << "\n";
+    std::cout << "replay_recovery_velocity_barrier_safe=" << options.replay_recovery_velocity_barrier_safe << "\n";
+    std::cout << "replay_recovery_angular_velocity_weight=" << options.replay_recovery_angular_velocity_weight << "\n";
+    std::cout << "replay_recovery_position_progress_weight=" << options.replay_recovery_position_progress_weight << "\n";
+    std::cout << "replay_recovery_progress_margin=" << options.replay_recovery_progress_margin << "\n";
+    std::cout << "replay_recovery_progress_epsilon=" << options.replay_recovery_progress_epsilon << "\n";
+    std::cout << "replay_recovery_progress_huber_delta=" << options.replay_recovery_progress_huber_delta << "\n";
+    std::cout << "replay_recovery_start_segment=" << options.replay_recovery_start_segment << "\n";
     std::cout << "tracking_gate_mode=" << options.tracking_gate_mode << "\n";
     std::cout << "initial_position_scale=" << options.initial_position_scale << "\n";
     std::cout << "initial_velocity_scale=" << options.initial_velocity_scale << "\n";
@@ -1592,6 +1791,8 @@ int main(int argc, char** argv){
     std::cout << "angular_velocity_barrier_safe=" << options.angular_velocity_barrier_safe << "\n";
     std::cout << "attitude_barrier_weight=" << options.attitude_barrier_weight << "\n";
     std::cout << "attitude_barrier_safe=" << options.attitude_barrier_safe << "\n";
+    std::cout << "barrier_huber_delta=" << options.barrier_huber_delta << "\n";
+    std::cout << "barrier_gradient_cap=" << options.barrier_gradient_cap << "\n";
     std::cout << "attitude_control_weight=" << options.attitude_control_weight << "\n";
     std::cout << "attitude_control_k_R=" << options.attitude_control_k_R << "\n";
     std::cout << "attitude_control_k_omega=" << options.attitude_control_k_omega << "\n";
@@ -1643,7 +1844,20 @@ int main(int argc, char** argv){
     weights.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
     weights.attitude_barrier = options.attitude_barrier_weight;
     weights.attitude_barrier_safe = options.attitude_barrier_safe;
+    weights.barrier_huber_delta = options.barrier_huber_delta;
+    weights.barrier_gradient_cap = options.barrier_gradient_cap;
     weights.hover_relative_action_magnitude = options.hover_relative_action_magnitude;
+    weights.replay_recovery_action_magnitude = options.replay_recovery_action_magnitude_weight;
+    weights.replay_recovery_saturation = options.replay_recovery_saturation_weight;
+    weights.replay_recovery_linear_velocity = options.replay_recovery_linear_velocity_weight;
+    weights.replay_recovery_velocity_barrier = options.replay_recovery_velocity_barrier_weight;
+    weights.replay_recovery_velocity_barrier_safe = options.replay_recovery_velocity_barrier_safe;
+    weights.replay_recovery_angular_velocity = options.replay_recovery_angular_velocity_weight;
+    weights.replay_recovery_position_progress = options.replay_recovery_position_progress_weight;
+    weights.replay_recovery_progress_margin = options.replay_recovery_progress_margin;
+    weights.replay_recovery_progress_epsilon = options.replay_recovery_progress_epsilon;
+    weights.replay_recovery_progress_huber_delta = options.replay_recovery_progress_huber_delta;
+    weights.replay_recovery_start_segment = options.replay_recovery_start_segment;
     weights.attitude_control = options.attitude_control_weight;
     weights.attitude_control_k_R = options.attitude_control_k_R;
     weights.attitude_control_k_omega = options.attitude_control_k_omega;
@@ -1674,6 +1888,8 @@ int main(int argc, char** argv){
     run_options.angular_velocity_barrier_safe = options.angular_velocity_barrier_safe;
     run_options.attitude_barrier_weight = options.attitude_barrier_weight;
     run_options.attitude_barrier_safe = options.attitude_barrier_safe;
+    run_options.barrier_huber_delta = options.barrier_huber_delta;
+    run_options.barrier_gradient_cap = options.barrier_gradient_cap;
     run_options.outward_velocity_weight = options.outward_velocity_weight;
     run_options.attitude_control_weight = options.attitude_control_weight;
     run_options.attitude_control_k_R = options.attitude_control_k_R;
@@ -1700,7 +1916,7 @@ int main(int argc, char** argv){
         parse_dynamics_randomization_level(options.sampled_dynamics_level)
     );
     if(options.hover_relative_action_magnitude){
-        std::cout << "hover_relative_action_magnitude_center=per_sample_initial_previous_action\n";
+        std::cout << "hover_relative_action_magnitude_center=per_sample_action_hover_center\n";
     }
 
     try{
