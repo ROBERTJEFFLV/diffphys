@@ -448,6 +448,8 @@ struct FullGpuTrainingOptions{
     std::size_t horizon = 16;
     std::size_t steps = 0;
     unsigned seed = 0;
+    bool direct_h500_training = false;
+    bool critic_training_enabled = true;
     float learning_rate = 1e-4f;
     float diff_rollout_loss_weight = 5e-4f;
     bool action_grad_clip_enabled = false;
@@ -594,6 +596,8 @@ struct FullGpuTrainingSummary{
     std::size_t segment_end = 0;
     std::size_t episode_reset_count = 0;
     bool persistent_episode_training = false;
+    bool direct_h500_training = false;
+    bool critic_training_enabled = true;
     bool finite = false;
     bool checkpoint_saved = false;
     bool checkpoint_loaded = false;

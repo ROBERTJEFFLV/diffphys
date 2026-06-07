@@ -7212,8 +7212,77 @@ FullGpuTrainingSummary run_full_gpu_training(
     if(training_options.trajectory_mode != TrajectoryMode::FIXED){
         throw std::runtime_error("Full GPU training is origin recovery only; non-fixed setpoints are eval/deployment setpoint shifting");
     }
-    if(training_options.horizon > CPU_MAX_HORIZON){
-        throw std::runtime_error("Full GPU training horizon exceeds current validation horizon limit");
+    if(training_options.horizon > GPU_EVAL_MAX_HORIZON){
+        throw std::runtime_error("Full GPU training horizon exceeds GPU_EVAL_MAX_HORIZON");
+    }
+    if(training_options.direct_h500_training){
+        if(training_options.horizon != 500){
+            throw std::runtime_error("Direct-H500 training requires --horizon 500");
+        }
+        if(training_options.persistent_episode_training){
+            throw std::runtime_error("Direct-H500 training must not use persistent H16 episode training");
+        }
+        if(training_options.sample_dynamics){
+            throw std::runtime_error("Direct-H500 training starts with fixed dynamics only");
+        }
+        if(training_options.disable_physics_gradient){
+            throw std::runtime_error("Direct-H500 training must backpropagate through the differentiable physics chain");
+        }
+        if(training_options.reset_hidden_each_step){
+            throw std::runtime_error("Direct-H500 training keeps the GRU recurrent state through the full horizon");
+        }
+        if(training_options.temporal_gradient_decay_alpha != 0.0f){
+            throw std::runtime_error("Direct-H500 training uses the un-decayed original physics loss gradient");
+        }
+        if(training_options.h1000_gate_enabled || training_options.h1000_gate_interval != 0){
+            throw std::runtime_error("Direct-H500 training does not allow H1000 gate feedback or rollback");
+        }
+        if(training_options.failure_replay_enabled){
+            throw std::runtime_error("Direct-H500 training does not allow failure replay");
+        }
+        if(!training_options.action_grad_clip_enabled || !training_options.actor_grad_clip_enabled){
+            throw std::runtime_error("Direct-H500 training requires action-gradient and actor-gradient clipping");
+        }
+        if(training_options.critic_training_enabled){
+            throw std::runtime_error("Direct-H500 training disables critic loss and trains from physics state/action loss only");
+        }
+        const bool has_auxiliary_objective =
+            training_options.clf_weight != 0.0f ||
+            training_options.window_clf_weight != 0.0f ||
+            training_options.outward_velocity_weight != 0.0f ||
+            training_options.attitude_control_weight != 0.0f ||
+            training_options.velocity_barrier_weight != 0.0f ||
+            training_options.angular_velocity_barrier_weight != 0.0f ||
+            training_options.attitude_barrier_weight != 0.0f ||
+            training_options.replay_recovery_action_magnitude_weight != 0.0f ||
+            training_options.replay_recovery_saturation_weight != 0.0f ||
+            training_options.replay_recovery_linear_velocity_weight != 0.0f ||
+            training_options.replay_recovery_velocity_barrier_weight != 0.0f ||
+            training_options.replay_recovery_angular_velocity_weight != 0.0f ||
+            training_options.replay_recovery_position_progress_weight != 0.0f ||
+            weights.clf != 0.0f ||
+            weights.window_clf != 0.0f ||
+            weights.outward_velocity != 0.0f ||
+            weights.attitude_control != 0.0f ||
+            weights.velocity_barrier != 0.0f ||
+            weights.angular_velocity_barrier != 0.0f ||
+            weights.attitude_barrier != 0.0f ||
+            weights.replay_recovery_action_magnitude != 0.0f ||
+            weights.replay_recovery_saturation != 0.0f ||
+            weights.replay_recovery_linear_velocity != 0.0f ||
+            weights.replay_recovery_velocity_barrier != 0.0f ||
+            weights.replay_recovery_angular_velocity != 0.0f ||
+            weights.replay_recovery_position_progress != 0.0f ||
+            weights.linear_acceleration != 0.0f ||
+            weights.angular_acceleration != 0.0f ||
+            weights.terminal_loss_scale != 0.0f ||
+            weights.progress != 0.0f ||
+            weights.velocity_reference_gain != 0.0f ||
+            weights.hover_relative_action_magnitude ||
+            weights.action_magnitude_center != 0.0f;
+        if(has_auxiliary_objective){
+            throw std::runtime_error("Direct-H500 training allows only state/action tracking losses");
+        }
     }
 
     std::mt19937 actor_rng(training_options.seed + 991u);
@@ -7226,6 +7295,8 @@ FullGpuTrainingSummary run_full_gpu_training(
     std::uint32_t initial_optimizer_age = 1u;
     bool loaded_optimizer_state = false;
     FullGpuTrainingSummary summary;
+    summary.direct_h500_training = training_options.direct_h500_training;
+    summary.critic_training_enabled = training_options.critic_training_enabled;
     summary.training_episode_steps = std::max(training_options.horizon, training_options.training_episode_steps);
     if(!training_options.load_path.empty()){
         if(training_options.load_optimizer_state){
@@ -7249,7 +7320,7 @@ FullGpuTrainingSummary run_full_gpu_training(
         if(!log){
             throw std::runtime_error("Failed to open GPU training log path: " + training_options.log_path);
         }
-        log << "step,horizon,training_episode_steps,window_start_mean,returns_mean,returns_std,"
+        log << "step,horizon,direct_h500_training,critic_training_enabled,training_episode_steps,window_start_mean,returns_mean,returns_std,"
             << "persistent_episode_training,persistent_episode_step,segment_start,segment_end,episode_reset_count,"
             << "episode_length_mean,episode_length_std,num_terminated,share_terminated,"
             << "critic_loss_raw,critic_loss_weight,critic_loss_scaled,"
@@ -7819,7 +7890,13 @@ FullGpuTrainingSummary run_full_gpu_training(
                 raw_action_gradient_sq_post_clip += static_cast<double>(value) * static_cast<double>(value);
             }
             summary.raw_action_gradient_norm_post_clip = static_cast<float>(std::sqrt(raw_action_gradient_sq_post_clip));
-            const CriticLossMetrics critic_metrics = compute_critic_targets_and_gradients(batch, d, d_actor_buffers, weights);
+            CriticLossMetrics critic_metrics;
+            if(training_options.critic_training_enabled){
+                critic_metrics = compute_critic_targets_and_gradients(batch, d, d_actor_buffers, weights);
+            }
+            else{
+                critic_metrics.weight = 0.0f;
+            }
             for(std::size_t reverse_i = 0; reverse_i < training_options.horizon; reverse_i++){
                 const std::size_t step_i = training_options.horizon - 1 - reverse_i;
                 rdac_actor_backward_step_kernel<<<grid, block>>>(
@@ -7994,7 +8071,10 @@ FullGpuTrainingSummary run_full_gpu_training(
             if(!finite_step){
                 summary.finite = false;
                 if(log){
-                    log << step << "," << training_options.horizon << "," << summary.training_episode_steps << ","
+                    log << step << "," << training_options.horizon << ","
+                        << (training_options.direct_h500_training ? 1 : 0) << ","
+                        << (training_options.critic_training_enabled ? 1 : 0) << ","
+                        << summary.training_episode_steps << ","
                         << summary.final_window_start_mean << ","
                         << summary.returns_mean << "," << summary.returns_std << ","
                         << (persistent_mode ? 1 : 0) << ","
@@ -8050,7 +8130,10 @@ FullGpuTrainingSummary run_full_gpu_training(
                 }
             }
             if(log){
-                log << step << "," << training_options.horizon << "," << summary.training_episode_steps << ","
+                log << step << "," << training_options.horizon << ","
+                    << (training_options.direct_h500_training ? 1 : 0) << ","
+                    << (training_options.critic_training_enabled ? 1 : 0) << ","
+                    << summary.training_episode_steps << ","
                     << summary.final_window_start_mean << ","
                     << summary.returns_mean << "," << summary.returns_std << ","
                     << (persistent_mode ? 1 : 0) << ","

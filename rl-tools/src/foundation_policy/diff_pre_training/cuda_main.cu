@@ -15,11 +15,15 @@ namespace gpu = rl_tools::foundation_policy::diff_pre_training::gpu;
 
 namespace{
 
-constexpr std::size_t ACTIVE_TRAINING_HORIZON = 16;
+constexpr std::size_t ACTIVE_TRAINING_HORIZON = 500;
 
 struct Options{
     std::size_t batch_size = 64;
     std::size_t horizon = 16;
+    bool horizon_overridden = false;
+    bool direct_h500_training = true;
+    bool action_grad_clip_configured = false;
+    bool actor_grad_clip_configured = false;
     int gpu_device = 0;
     std::size_t gpu_batch_size = 0;
     bool gpu_rollout = false;
@@ -210,7 +214,7 @@ void print_usage(){
         << "    [--gpu-validate-deployment-adapter] [--validation-step N]\n"
         << "    [--gpu-stage9-debug] [--stage9-debug-steps N] [--stage9-debug-replay-path PATH]\n"
         << "    [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
-        << "    [--steps N] [--learning-rate LR]\n"
+        << "    [--steps N] [--learning-rate LR] [--direct-h500-training]\n"
         << "    [--diff-rollout-loss-weight W] [--disable-physics-gradient]\n"
         << "    [--temporal-gradient-decay-alpha A]\n"
         << "    [--velocity-observation-noise STD] [--velocity-observation-delay-steps N]\n"
@@ -222,7 +226,8 @@ void print_usage(){
         << "    [--stage9-6-checkpoint-parity] [--save-optimizer] [--load-optimizer]\n"
         << "    [--checkpoint-inspect [PATH]] [--checkpoint-convert-old [PATH]]\n"
         << "    [--stage9-6-steps N] [--stage9-6-replay-path PATH]\n"
-        << "    active training defaults to H16 origin recovery; non-fixed trajectories and curriculum flags are rejected\n"
+        << "    active training defaults to direct H500 fixed-dynamics origin recovery with original state/action loss only\n"
+        << "    CLF/window-CLF/outward/barrier/attitude-control/replay/H1000-gate feedback are disabled for active training\n"
         << "    [--eval-only] [--eval-episodes N] [--eval-horizon N]\n"
         << "    [--h1000-gate] [--h1000-gate-interval N] [--h1000-gate-horizon N] [--h1000-gate-episodes N]\n"
         << "    [--disable-h1000-gate-rollback]\n"
@@ -475,6 +480,7 @@ bool parse_options(int argc, char** argv, Options& options){
         }
         else if(arg == "--horizon" && i + 1 < argc){
             options.horizon = std::stoull(argv[++i]);
+            options.horizon_overridden = true;
         }
         else if(arg == "--seed" && i + 1 < argc){
             options.seed = static_cast<unsigned>(std::stoul(argv[++i]));
@@ -500,31 +506,40 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--disable-physics-gradient"){
             options.disable_physics_gradient = true;
         }
+        else if(arg == "--direct-h500-training"){
+            options.direct_h500_training = true;
+        }
         else if(arg == "--action-grad-clip"){
             options.action_grad_clip_enabled = true;
+            options.action_grad_clip_configured = true;
             if(has_next_value(argc, argv, i)){
                 options.action_grad_clip_norm = std::stof(argv[++i]);
             }
         }
         else if(arg == "--action-grad-clip-norm" && i + 1 < argc){
             options.action_grad_clip_enabled = true;
+            options.action_grad_clip_configured = true;
             options.action_grad_clip_norm = std::stof(argv[++i]);
         }
         else if(arg == "--disable-action-grad-clip"){
             options.action_grad_clip_enabled = false;
+            options.action_grad_clip_configured = true;
         }
         else if(arg == "--actor-grad-clip"){
             options.actor_grad_clip_enabled = true;
+            options.actor_grad_clip_configured = true;
             if(has_next_value(argc, argv, i)){
                 options.actor_grad_clip_norm = std::stof(argv[++i]);
             }
         }
         else if(arg == "--actor-grad-clip-norm" && i + 1 < argc){
             options.actor_grad_clip_enabled = true;
+            options.actor_grad_clip_configured = true;
             options.actor_grad_clip_norm = std::stof(argv[++i]);
         }
         else if(arg == "--disable-actor-grad-clip"){
             options.actor_grad_clip_enabled = false;
+            options.actor_grad_clip_configured = true;
         }
         else if(arg == "--actor-grad-skip-norm" && i + 1 < argc){
             options.actor_grad_skip_norm = std::stof(argv[++i]);
@@ -1041,6 +1056,69 @@ bool parse_options(int argc, char** argv, Options& options){
     return true;
 }
 
+void apply_direct_h500_training_defaults(Options& options){
+    if(!options.horizon_overridden){
+        options.horizon = ACTIVE_TRAINING_HORIZON;
+    }
+    options.sample_dynamics = false;
+    options.balanced_dynamics_sampling = false;
+    options.correlated_size_mass_sampling = false;
+    options.sampled_dynamics_level = "small";
+    options.trajectory_mode = gpu::TrajectoryMode::FIXED;
+    options.trajectory_amplitude = 0.0f;
+    options.trajectory_frequency_hz = 0.0f;
+    options.persistent_episode_training = false;
+    options.training_episode_steps = std::max(options.training_episode_steps, options.horizon);
+    options.disable_physics_gradient = false;
+    options.reset_hidden_each_step = false;
+    options.load_optimizer_state = false;
+    options.temporal_gradient_decay_alpha = 0.0f;
+    options.velocity_observation_noise = 0.0f;
+    options.velocity_observation_delay_steps = 0;
+    options.h1000_gate_enabled = false;
+    options.h1000_gate_rollback_enabled = false;
+    options.h1000_gate_interval = 0;
+    options.h1000_gate_best_path.clear();
+    options.h1000_gate_candidate_path.clear();
+    options.h1000_gate_log_path.clear();
+    options.failure_replay_enabled = false;
+    options.failure_replay_ratio = 0.0f;
+    options.failure_replay_segments = 1;
+    options.failure_replay_response_sampling = false;
+    options.failure_replay_response_probability = 0.0f;
+    options.velocity_reference_gain = 0.0f;
+    options.progress_weight = 0.0f;
+    options.outward_velocity_weight = 0.0f;
+    options.clf_weight = 0.0f;
+    options.window_clf_weight = 0.0f;
+    options.clf_position_velocity_cross_beta = 0.0f;
+    options.clf_attitude_angular_velocity_cross_beta = 0.0f;
+    options.velocity_barrier_weight = 0.0f;
+    options.angular_velocity_barrier_weight = 0.0f;
+    options.attitude_barrier_weight = 0.0f;
+    options.barrier_gradient_cap = 0.0f;
+    options.attitude_control_weight = 0.0f;
+    options.loss_linear_acceleration_weight = 0.0f;
+    options.loss_angular_acceleration_weight = 0.0f;
+    options.terminal_loss_scale = 0.0f;
+    options.action_magnitude_center = 0.0f;
+    options.hover_relative_action_magnitude = false;
+    options.replay_recovery_action_magnitude_weight = 0.0f;
+    options.replay_recovery_saturation_weight = 0.0f;
+    options.replay_recovery_linear_velocity_weight = 0.0f;
+    options.replay_recovery_velocity_barrier_weight = 0.0f;
+    options.replay_recovery_angular_velocity_weight = 0.0f;
+    options.replay_recovery_position_progress_weight = 0.0f;
+    if(!options.action_grad_clip_configured){
+        options.action_grad_clip_enabled = true;
+        options.action_grad_clip_norm = 1.0f;
+    }
+    if(!options.actor_grad_clip_configured){
+        options.actor_grad_clip_enabled = true;
+        options.actor_grad_clip_norm = 10.0f;
+    }
+}
+
 gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     gpu::FullGpuTrainingOptions training_options;
     training_options.device = options.gpu_device;
@@ -1048,6 +1126,8 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.horizon = options.horizon;
     training_options.steps = options.steps;
     training_options.seed = options.seed;
+    training_options.direct_h500_training = options.direct_h500_training;
+    training_options.critic_training_enabled = !options.direct_h500_training;
     training_options.learning_rate = options.learning_rate;
     training_options.diff_rollout_loss_weight = options.diff_rollout_loss_weight;
     training_options.action_grad_clip_enabled = options.action_grad_clip_enabled;
@@ -1369,6 +1449,8 @@ void print_full_gpu_training_summary(const gpu::FullGpuTrainingSummary& summary)
     std::cout << "gpu_full_training_reward=" << summary.reward_mean << "\n";
     std::cout << "gpu_full_training_nan_inf_count=" << summary.nan_inf_count << "\n";
     std::cout << "gpu_full_training_episode_steps=" << summary.training_episode_steps << "\n";
+    std::cout << "gpu_full_training_direct_h500_training=" << (summary.direct_h500_training ? "true" : "false") << "\n";
+    std::cout << "gpu_full_training_critic_training_enabled=" << (summary.critic_training_enabled ? "true" : "false") << "\n";
     std::cout << "gpu_full_training_persistent_episode_training=" << (summary.persistent_episode_training ? "true" : "false") << "\n";
     std::cout << "gpu_full_training_persistent_episode_step=" << summary.persistent_episode_step << "\n";
     std::cout << "gpu_full_training_segment_start=" << summary.segment_start << "\n";
@@ -1686,6 +1768,9 @@ int main(int argc, char** argv){
         options.throughout_gate_start_step = 0;
     }
     const bool active_training_requested = options.steps > 0;
+    if(active_training_requested && options.direct_h500_training){
+        apply_direct_h500_training_defaults(options);
+    }
     if(active_training_requested && options.trajectory_mode != gpu::TrajectoryMode::FIXED){
         std::cerr << "Active CUDA training is origin recovery only. "
                   << "Use non-fixed --trajectory-mode only for eval/deployment setpoint shifting.\n";
@@ -1714,6 +1799,10 @@ int main(int argc, char** argv){
     std::cout << "optimizer_on_gpu=true\n";
     std::cout << "full_gpu_training_enabled=" << (options.steps > 0 ? "true" : "false") << "\n";
     std::cout << "active_training_task=origin_recovery_position_controller\n";
+    std::cout << "direct_h500_training=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
+    std::cout << "direct_h500_clean_loss=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
+    std::cout << "direct_h500_fixed_dynamics_only=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
+    std::cout << "direct_h500_critic_training_enabled=" << (options.direct_h500_training && options.steps > 0 ? "false" : "true") << "\n";
     std::cout << "active_training_default_horizon=" << ACTIVE_TRAINING_HORIZON << "\n";
     std::cout << "active_training_requested_horizon=" << options.horizon << "\n";
     std::cout << "setpoint_shifting_for_eval_and_deployment=true\n";
