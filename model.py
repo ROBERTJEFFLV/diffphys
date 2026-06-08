@@ -5,7 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 
 
-STATE_DIM = 22
+STATE_DIM = 18
 ERROR_DIM = 18
 PREVIOUS_ACTION_DIM = 4
 ACTION_DIM = 4

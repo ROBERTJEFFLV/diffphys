@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr int STATE_DIM = 44;
+constexpr int STATE_DIM = 40;
 constexpr int ENC_DIM = 192;
 constexpr int HID_DIM = 192;
 constexpr int GATE_DIM = 3 * HID_DIM;
@@ -44,6 +44,10 @@ struct DynamicsParams {
     float inertia_y;
     float inertia_z;
     float state_grad_decay;
+    int noise_seed;
+    float external_force_max;
+    float external_torque_max;
+    float action_noise_max;
 };
 
 struct LossParams {
@@ -65,6 +69,8 @@ struct LossParams {
     float lambda_ddu;
     float lambda_sat;
     float negative_slope;
+    int noise_seed;
+    float observation_noise_max;
 };
 
 __device__ inline float clampf(float value, float lo, float hi) {
@@ -81,6 +87,31 @@ __device__ inline float leaky(float x, float slope) {
 
 __device__ inline float leaky_grad(float y, float slope) {
     return y >= 0.0f ? 1.0f : slope;
+}
+
+__device__ inline unsigned int mix_u32(unsigned int x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+__device__ inline float signed_noise(int seed, int t, int b, int channel, int stream) {
+    unsigned int x = static_cast<unsigned int>(seed);
+    x ^= static_cast<unsigned int>(t + 1) * 0x9e3779b9u;
+    x ^= static_cast<unsigned int>(b + 1) * 0x85ebca6bu;
+    x ^= static_cast<unsigned int>(channel + 1) * 0xc2b2ae35u;
+    x ^= static_cast<unsigned int>(stream + 1) * 0x27d4eb2fu;
+    const unsigned int h = mix_u32(x);
+    const float unit = static_cast<float>(h & 0x00ffffffu) * (1.0f / 16777215.0f);
+    return 2.0f * unit - 1.0f;
+}
+
+__device__ inline float add_observation_noise(float value, const LossParams lp, int t, int b, int k) {
+    if (lp.observation_noise_max <= 0.0f) return value;
+    return value + lp.observation_noise_max * signed_noise(lp.noise_seed, t, b, k, 0);
 }
 
 __device__ inline void cross3(const float a[3], const float b[3], float out[3]) {
@@ -288,22 +319,21 @@ __global__ void actor_forward_kernel(
     const int state_base9 = (t * batch + b) * 9;
     const int state_base4 = (t * batch + b) * 4;
     if (tid < 3) {
-        input[tid] = p[state_base3 + tid];
-        input[3 + tid] = v[state_base3 + tid];
-        input[15 + tid] = w[state_base3 + tid];
-        input[22 + tid] = p[state_base3 + tid];
-        input[25 + tid] = v[state_base3 + tid];
-        input[37 + tid] = w[state_base3 + tid];
+        input[tid] = add_observation_noise(p[state_base3 + tid], lp, t, b, tid);
+        input[3 + tid] = add_observation_noise(v[state_base3 + tid], lp, t, b, 3 + tid);
+        input[15 + tid] = add_observation_noise(w[state_base3 + tid], lp, t, b, 15 + tid);
+        input[18 + tid] = add_observation_noise(p[state_base3 + tid], lp, t, b, 18 + tid);
+        input[21 + tid] = add_observation_noise(v[state_base3 + tid], lp, t, b, 21 + tid);
+        input[33 + tid] = add_observation_noise(w[state_base3 + tid], lp, t, b, 33 + tid);
     }
     if (tid < 9) {
         const float r = R[state_base9 + tid];
         const float target = (tid == 0 || tid == 4 || tid == 8) ? 1.0f : 0.0f;
-        input[6 + tid] = r;
-        input[28 + tid] = r - target;
+        input[6 + tid] = add_observation_noise(r, lp, t, b, 6 + tid);
+        input[24 + tid] = add_observation_noise(r - target, lp, t, b, 24 + tid);
     }
     if (tid < 4) {
-        input[18 + tid] = m[state_base4 + tid];
-        input[40 + tid] = pa[state_base4 + tid];
+        input[36 + tid] = add_observation_noise(pa[state_base4 + tid], lp, t, b, 36 + tid);
     }
     if (tid < HID_DIM) {
         hprev[tid] = hidden[(t * batch + b) * HID_DIM + tid];
@@ -383,7 +413,8 @@ __global__ void physics_forward_kernel(
     const float hover = dp.mass * dp.gravity * 0.25f;
     float command[4], nm[4], thrust[4];
     for (int i = 0; i < 4; i++) {
-        command[i] = clampf(actions[act4 + i], -1.0f, 1.0f);
+        const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
+        command[i] = clampf(actions[act4 + i] + action_noise, -1.0f, 1.0f);
         nm[i] = m[base4 + i] + alpha * (command[i] - m[base4 + i]);
         thrust[i] = fmaxf(hover * (1.0f + dp.motor_authority * nm[i]), 0.0f);
         m[next4 + i] = nm[i];
@@ -393,9 +424,9 @@ __global__ void physics_forward_kernel(
     for (int i = 0; i < 9; i++) rmat[i] = R[base9 + i];
     const float total = thrust[0] + thrust[1] + thrust[2] + thrust[3];
     const float acc[3] = {
-        rmat[2] * total / dp.mass,
-        rmat[5] * total / dp.mass,
-        rmat[8] * total / dp.mass - dp.gravity,
+        rmat[2] * total / dp.mass + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 0, 2) / dp.mass : 0.0f),
+        rmat[5] * total / dp.mass + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 1, 2) / dp.mass : 0.0f),
+        rmat[8] * total / dp.mass - dp.gravity + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 2, 2) / dp.mass : 0.0f),
     };
     for (int i = 0; i < 3; i++) {
         const float nv = v[base3 + i] + dp.dt * acc[i];
@@ -403,9 +434,9 @@ __global__ void physics_forward_kernel(
         p[next3 + i] = p[base3 + i] + dp.dt * nv;
     }
     const float torque[3] = {
-        dp.arm_length * (thrust[1] - thrust[3]),
-        dp.arm_length * (thrust[2] - thrust[0]),
-        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]),
+        dp.arm_length * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
+        dp.arm_length * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
+        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
     };
     const float inertia[3] = {dp.inertia_x, dp.inertia_y, dp.inertia_z};
     float omega[3], iw[3], oc[3], nw[3];
@@ -568,14 +599,15 @@ __global__ void physics_backward_kernel(
     for (int i = 0; i < 9; i++) rmat[i] = R[base9 + i];
     float command[4], nm[4], thrust[4];
     for (int i = 0; i < 4; i++) {
-        command[i] = clampf(actions[act4 + i], -1.0f, 1.0f);
+        const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
+        command[i] = clampf(actions[act4 + i] + action_noise, -1.0f, 1.0f);
         nm[i] = m[base4 + i] + alpha * (command[i] - m[base4 + i]);
         thrust[i] = fmaxf(hover * (1.0f + dp.motor_authority * nm[i]), 0.0f);
     }
     const float torque[3] = {
-        dp.arm_length * (thrust[1] - thrust[3]),
-        dp.arm_length * (thrust[2] - thrust[0]),
-        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]),
+        dp.arm_length * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
+        dp.arm_length * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
+        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
     };
     float omega[3], iw[3], oc[3], nw[3];
     for (int i = 0; i < 3; i++) {
@@ -667,7 +699,9 @@ __global__ void physics_backward_kernel(
         if (thrust_pre > 0.0f) gm_next[i] += gthrust[i] * hover * dp.motor_authority;
         gm_in[i] += (1.0f - alpha) * gm_next[i];
         gc[i] += alpha * gm_next[i];
-        if (actions[act4 + i] >= -1.0f && actions[act4 + i] <= 1.0f) ga_in[i] += gc[i];
+        const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
+        const float noisy_action = actions[act4 + i] + action_noise;
+        if (noisy_action >= -1.0f && noisy_action <= 1.0f) ga_in[i] += gc[i];
     }
     for (int i = 0; i < 3; i++) {
         atomicAdd(&lp_adj[base3 + i], gp_in[i]);
@@ -733,16 +767,21 @@ __global__ void actor_backward_kernel(
         gate_h[g] = gate_h_store[(t * batch + b) * GATE_DIM + g];
     }
     if (tid < 3) {
-        input[tid] = p[s3 + tid]; input[3 + tid] = v[s3 + tid]; input[15 + tid] = w[s3 + tid];
-        input[22 + tid] = p[s3 + tid]; input[25 + tid] = v[s3 + tid]; input[37 + tid] = w[s3 + tid];
+        input[tid] = add_observation_noise(p[s3 + tid], lp, t, b, tid);
+        input[3 + tid] = add_observation_noise(v[s3 + tid], lp, t, b, 3 + tid);
+        input[15 + tid] = add_observation_noise(w[s3 + tid], lp, t, b, 15 + tid);
+        input[18 + tid] = add_observation_noise(p[s3 + tid], lp, t, b, 18 + tid);
+        input[21 + tid] = add_observation_noise(v[s3 + tid], lp, t, b, 21 + tid);
+        input[33 + tid] = add_observation_noise(w[s3 + tid], lp, t, b, 33 + tid);
     }
     if (tid < 9) {
         const float rv = R[s9 + tid];
         const float target = (tid == 0 || tid == 4 || tid == 8) ? 1.0f : 0.0f;
-        input[6 + tid] = rv; input[28 + tid] = rv - target;
+        input[6 + tid] = add_observation_noise(rv, lp, t, b, 6 + tid);
+        input[24 + tid] = add_observation_noise(rv - target, lp, t, b, 24 + tid);
     }
     if (tid < 4) {
-        input[18 + tid] = m[s4 + tid]; input[40 + tid] = pa[s4 + tid];
+        input[36 + tid] = add_observation_noise(pa[s4 + tid], lp, t, b, 36 + tid);
     }
     __syncthreads();
 
@@ -847,16 +886,15 @@ __global__ void actor_backward_kernel(
     __syncthreads();
 
     if (tid < 3) {
-        atomicAdd(&lp_adj[s3 + tid], d_input[tid] + d_input[22 + tid]);
-        atomicAdd(&lv_adj[s3 + tid], d_input[3 + tid] + d_input[25 + tid]);
-        atomicAdd(&lw_adj[s3 + tid], d_input[15 + tid] + d_input[37 + tid]);
+        atomicAdd(&lp_adj[s3 + tid], d_input[tid] + d_input[18 + tid]);
+        atomicAdd(&lv_adj[s3 + tid], d_input[3 + tid] + d_input[21 + tid]);
+        atomicAdd(&lw_adj[s3 + tid], d_input[15 + tid] + d_input[33 + tid]);
     }
     if (tid < 9) {
-        atomicAdd(&lR_adj[s9 + tid], d_input[6 + tid] + d_input[28 + tid]);
+        atomicAdd(&lR_adj[s9 + tid], d_input[6 + tid] + d_input[24 + tid]);
     }
     if (tid < 4) {
-        atomicAdd(&lm_adj[s4 + tid], d_input[18 + tid]);
-        atomicAdd(&lpa_adj[s4 + tid], d_input[40 + tid]);
+        atomicAdd(&lpa_adj[s4 + tid], d_input[36 + tid]);
     }
 }
 
@@ -914,7 +952,12 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     double lambda_du,
     double lambda_ddu,
     double lambda_sat,
-    double negative_slope) {
+    double negative_slope,
+    int noise_seed,
+    double external_force_max,
+    double external_torque_max,
+    double action_noise_max,
+    double observation_noise_max) {
     const c10::cuda::CUDAGuard device_guard(position0.device());
     const int batch = static_cast<int>(position0.size(0));
     const int states = horizon + 1;
@@ -966,6 +1009,10 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
         static_cast<float>(inertia_y),
         static_cast<float>(inertia_z),
         static_cast<float>(state_grad_decay),
+        noise_seed,
+        static_cast<float>(external_force_max),
+        static_cast<float>(external_torque_max),
+        static_cast<float>(action_noise_max),
     };
     LossParams lp{
         static_cast<float>(hidden_grad_decay),
@@ -986,6 +1033,8 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
         static_cast<float>(lambda_ddu),
         static_cast<float>(lambda_sat),
         static_cast<float>(negative_slope),
+        noise_seed,
+        static_cast<float>(observation_noise_max),
     };
 
     const int init_total = std::max({batch * 9, batch * 4, batch * HID_DIM});

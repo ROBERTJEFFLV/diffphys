@@ -175,7 +175,6 @@ class L2FSimulator:
                 state.velocity,
                 state.rotation.reshape(state.position.shape[0], 9),
                 state.omega,
-                state.motor,
             ),
             dim=-1,
         )
@@ -201,6 +200,8 @@ class L2FSimulator:
         action: torch.Tensor,
         *,
         grad_decay: float = 1.0,
+        external_force: torch.Tensor | None = None,
+        external_torque: torch.Tensor | None = None,
     ) -> L2FState:
         p = self.params
         dt = p.dt
@@ -220,6 +221,8 @@ class L2FSimulator:
             dtype=state.position.dtype,
         )
         acceleration = body_z * (total_thrust / p.mass) + gravity
+        if external_force is not None:
+            acceleration = acceleration + external_force / p.mass
         velocity = state.velocity + dt * acceleration
         position = state.position + dt * velocity
 
@@ -231,6 +234,8 @@ class L2FSimulator:
             ),
             dim=-1,
         )
+        if external_torque is not None:
+            torque = torque + external_torque
         inertia = torch.tensor(
             (p.inertia_x, p.inertia_y, p.inertia_z),
             device=state.position.device,

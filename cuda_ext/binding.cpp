@@ -92,7 +92,12 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     double lambda_du,
     double lambda_ddu,
     double lambda_sat,
-    double negative_slope);
+    double negative_slope,
+    int noise_seed,
+    double external_force_max,
+    double external_torque_max,
+    double action_noise_max,
+    double observation_noise_max);
 
 namespace {
 
@@ -255,9 +260,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               double lambda_du,
                               double lambda_ddu,
                               double lambda_sat,
-                              double negative_slope) {
+                              double negative_slope,
+                              int noise_seed,
+                              double external_force_max,
+                              double external_torque_max,
+                              double action_noise_max,
+                              double observation_noise_max) {
         check_state_inputs(position0, velocity0, rotation0, omega0, motor0, previous_action0);
-        check_2d(encoder0_w, "encoder0_w", 192, 44);
+        check_2d(encoder0_w, "encoder0_w", 192, 40);
         check_1d(encoder0_b, "encoder0_b", 192);
         check_2d(encoder1_w, "encoder1_w", 192, 192);
         check_1d(encoder1_b, "encoder1_b", 192);
@@ -280,6 +290,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             p_scale, v_scale, omega_scale, huber_beta,
             w_p, w_v, w_r, w_omega, clf_kappa, u_soft,
             lambda_clf, lambda_out, lambda_tail, lambda_du, lambda_ddu, lambda_sat,
-            negative_slope);
+            negative_slope, noise_seed, external_force_max, external_torque_max,
+            action_noise_max, observation_noise_max);
     }, "Full H-step L2F rollout, loss, physics VJP, and actor backward (CUDA)");
 }

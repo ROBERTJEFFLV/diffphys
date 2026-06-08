@@ -48,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--dt", type=float, default=0.01)
+    parser.add_argument("--max-initial-position", type=float, default=1.0)
+    parser.add_argument("--max-initial-velocity", type=float, default=0.6)
+    parser.add_argument("--max-initial-angle", type=float, default=0.45)
+    parser.add_argument("--max-initial-omega", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--encoder-dim", type=int, default=192)
@@ -74,10 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-du", type=float, default=3.0e-3)
     parser.add_argument("--lambda-ddu", type=float, default=3.0e-4)
     parser.add_argument("--lambda-sat", type=float, default=0.03)
+    parser.add_argument("--external-force-max", type=float, default=0.0)
+    parser.add_argument("--external-torque-max", type=float, default=0.0)
+    parser.add_argument("--action-noise-max", type=float, default=0.0)
+    parser.add_argument("--observation-noise-max", type=float, default=0.0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--log-path", default="runs/direct_h500/train.csv")
     parser.add_argument("--checkpoint-path", default="checkpoints/direct_h500_motor_gru.pt")
+    parser.add_argument("--init-checkpoint-path", default="")
     parser.add_argument("--settling-position-mm", type=float, default=10.0)
     parser.add_argument("--tail-start-step", type=int, default=450)
     parser.add_argument("--eval-only", action="store_true")
@@ -270,6 +279,12 @@ def _write_trajectory_csv(path: Path, rows: list[dict[str, float | int]]) -> Non
         writer.writerows(rows)
 
 
+def _uniform_noise_like(tensor: torch.Tensor, max_abs: float) -> torch.Tensor:
+    if max_abs <= 0.0:
+        return torch.zeros_like(tensor)
+    return torch.empty_like(tensor).uniform_(-max_abs, max_abs)
+
+
 @torch.no_grad()
 def rollout_diagnostics(
     policy: MotorGRUPolicy,
@@ -293,7 +308,13 @@ def rollout_diagnostics(
         state_features = sim.state_features(state)
         error_features = sim.error_features(state)
         previous_action = state.previous_action
-        action, hidden = policy(state_features, error_features, previous_action, hidden)
+        if args.observation_noise_max > 0.0:
+            state_features = state_features + _uniform_noise_like(state_features, args.observation_noise_max)
+            error_features = error_features + _uniform_noise_like(error_features, args.observation_noise_max)
+            previous_action_input = previous_action + _uniform_noise_like(previous_action, args.observation_noise_max)
+        else:
+            previous_action_input = previous_action
+        action, hidden = policy(state_features, error_features, previous_action_input, hidden)
 
         position_norm = state.position.norm(dim=-1)
         angle_error = _quat_angle_from_rotation_matrix(state.rotation)
@@ -301,10 +322,31 @@ def rollout_diagnostics(
         omega_norm = state.omega.norm(dim=-1)
         action_metric, action_relative_metric = _action_metrics(action)
 
-        if step_backend == "cuda":
-            next_state = cuda_step(state, action, sim.params, grad_decay=1.0)
+        if args.action_noise_max > 0.0:
+            physics_action = (action + _uniform_noise_like(action, args.action_noise_max)).clamp(-1.0, 1.0)
         else:
-            next_state = sim.step(state, action, grad_decay=1.0)
+            physics_action = action
+        external_force = (
+            _uniform_noise_like(state.position, args.external_force_max)
+            if args.external_force_max > 0.0
+            else None
+        )
+        external_torque = (
+            _uniform_noise_like(state.omega, args.external_torque_max)
+            if args.external_torque_max > 0.0
+            else None
+        )
+
+        if step_backend == "cuda" and external_force is None and external_torque is None:
+            next_state = cuda_step(state, physics_action, sim.params, grad_decay=1.0)
+        else:
+            next_state = sim.step(
+                state,
+                physics_action,
+                grad_decay=1.0,
+                external_force=external_force,
+                external_torque=external_torque,
+            )
 
         angular_acceleration = (next_state.omega - omega_before).norm(dim=-1) / args.dt
 
@@ -398,7 +440,15 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    sim = L2FSimulator(L2FParams(dt=args.dt))
+    sim = L2FSimulator(
+        L2FParams(
+            dt=args.dt,
+            max_initial_position=args.max_initial_position,
+            max_initial_velocity=args.max_initial_velocity,
+            max_initial_angle=args.max_initial_angle,
+            max_initial_omega=args.max_initial_omega,
+        )
+    )
     loss_config = L2FLossConfig(
         p_scale=args.p_scale,
         v_scale=args.v_scale,
@@ -424,6 +474,12 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+
+    if args.init_checkpoint_path:
+        init_checkpoint = torch.load(args.init_checkpoint_path, map_location=device)
+        init_state_dict = init_checkpoint.get("model", init_checkpoint)
+        policy.load_state_dict(init_state_dict)
+        print(f"loaded initial model checkpoint: {args.init_checkpoint_path}")
 
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,6 +593,11 @@ def main() -> None:
                     lambda_du=args.lambda_du,
                     lambda_ddu=args.lambda_ddu,
                     lambda_sat=args.lambda_sat,
+                    noise_seed=args.seed * 1000003 + step_idx,
+                    external_force_max=args.external_force_max,
+                    external_torque_max=args.external_torque_max,
+                    action_noise_max=args.action_noise_max,
+                    observation_noise_max=args.observation_noise_max,
                 )
                 loss = metrics_tensor[0]
 

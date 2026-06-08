@@ -26,8 +26,8 @@ METRIC_NAMES = (
 def _policy_tensors(policy: MotorGRUPolicy) -> tuple[torch.Tensor, ...]:
     if len(policy.encoder) != 4:
         raise ValueError("cuda-full backend currently requires encoder_depth=2")
-    if policy.encoder[0].weight.shape != (192, 44):
-        raise ValueError("cuda-full backend currently requires encoder[0] weight shape [192,44]")
+    if policy.encoder[0].weight.shape != (192, 40):
+        raise ValueError("cuda-full backend currently requires encoder[0] weight shape [192,40]")
     if policy.encoder[2].weight.shape != (192, 192):
         raise ValueError("cuda-full backend currently requires encoder[1] weight shape [192,192]")
     if policy.gru.weight_ih.shape != (576, 192) or policy.gru.weight_hh.shape != (576, 192):
@@ -99,6 +99,11 @@ class _FullCudaRollout(torch.autograd.Function):
         lambda_ddu: float,
         lambda_sat: float,
         negative_slope: float,
+        noise_seed: int,
+        external_force_max: float,
+        external_torque_max: float,
+        action_noise_max: float,
+        observation_noise_max: float,
     ) -> torch.Tensor:
         ext = load_extension()
         outputs = ext.full_rollout(
@@ -149,6 +154,11 @@ class _FullCudaRollout(torch.autograd.Function):
             float(lambda_ddu),
             float(lambda_sat),
             float(negative_slope),
+            int(noise_seed),
+            float(external_force_max),
+            float(external_torque_max),
+            float(action_noise_max),
+            float(observation_noise_max),
         )
         metrics = outputs[0]
         ctx.save_for_backward(*outputs[1:])
@@ -167,7 +177,7 @@ class _FullCudaRollout(torch.autograd.Function):
             None,
             None,
             *scaled_grads,
-            *([None] * 31),
+            *([None] * 36),
         )
 
 
@@ -189,6 +199,11 @@ def full_cuda_rollout_metrics(
     lambda_du: float,
     lambda_ddu: float,
     lambda_sat: float,
+    noise_seed: int = 0,
+    external_force_max: float = 0.0,
+    external_torque_max: float = 0.0,
+    action_noise_max: float = 0.0,
+    observation_noise_max: float = 0.0,
 ) -> torch.Tensor:
     if not initial_state.position.is_cuda:
         raise RuntimeError("cuda-full backend requires CUDA initial state tensors")
@@ -232,4 +247,9 @@ def full_cuda_rollout_metrics(
         lambda_ddu,
         lambda_sat,
         policy.negative_slope,
+        int(noise_seed),
+        external_force_max,
+        external_torque_max,
+        action_noise_max,
+        observation_noise_max,
     )
