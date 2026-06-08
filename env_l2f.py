@@ -22,6 +22,7 @@ class L2FParams:
     max_initial_velocity: float = 0.6
     max_initial_angle: float = 0.45
     max_initial_omega: float = 1.0
+    disturbance_force_max: float = 0.0
     external_force_ratio: float = 0.0
 
 
@@ -158,10 +159,17 @@ class L2FSimulator:
         )
         motor = torch.zeros(batch_size, 4, device=device, dtype=dtype)
         previous_action = torch.zeros(batch_size, 4, device=device, dtype=dtype)
-        force_std = p.external_force_ratio * p.mass * p.gravity
-        if force_std > 0.0:
+        disturbance_force_max = p.disturbance_force_max
+        if disturbance_force_max <= 0.0:
+            disturbance_force_max = p.external_force_ratio
+        thrust_to_weight = max(1.0 + p.motor_authority, 0.0)
+        max_force_std = max(thrust_to_weight - 1.0, 0.0) * disturbance_force_max
+        max_force_std = max_force_std * thrust_to_weight * p.mass / 3.0
+        if max_force_std > 0.0:
+            force_std = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(
+                0.0, max_force_std
+            )
             external_force = torch.randn(batch_size, 3, device=device, dtype=dtype) * force_std
-            external_force = external_force.clamp(-3.0 * force_std, 3.0 * force_std)
         else:
             external_force = torch.zeros(batch_size, 3, device=device, dtype=dtype)
 

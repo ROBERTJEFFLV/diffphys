@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-initial-velocity", type=float, default=0.6)
     parser.add_argument("--max-initial-angle", type=float, default=0.45)
     parser.add_argument("--max-initial-omega", type=float, default=1.0)
+    parser.add_argument("--disturbance-force-max", type=float, default=0.0)
     parser.add_argument("--external-force-ratio", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
@@ -424,7 +425,7 @@ def rollout_diagnostics(
 def main() -> None:
     args = parse_args()
     if args.external_force_max != 0.0:
-        raise ValueError("--external-force-max is deprecated; use --external-force-ratio for episode-level hidden force")
+        raise ValueError("--external-force-max is deprecated; use --disturbance-force-max for episode-level hidden force")
     if args.external_torque_max != 0.0:
         raise ValueError("--external-torque-max is not part of the RAPTOR-style external-force path")
     device = resolve_device(args.device)
@@ -440,6 +441,7 @@ def main() -> None:
             max_initial_velocity=args.max_initial_velocity,
             max_initial_angle=args.max_initial_angle,
             max_initial_omega=args.max_initial_omega,
+            disturbance_force_max=args.disturbance_force_max,
             external_force_ratio=args.external_force_ratio,
         )
     )
