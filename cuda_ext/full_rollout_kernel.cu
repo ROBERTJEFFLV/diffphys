@@ -45,7 +45,6 @@ struct DynamicsParams {
     float inertia_z;
     float state_grad_decay;
     int noise_seed;
-    float external_force_max;
     float external_torque_max;
     float action_noise_max;
 };
@@ -398,6 +397,7 @@ __global__ void physics_forward_kernel(
     int t,
     int batch,
     const float* actions,
+    const float* external_force0,
     float* p, float* v, float* R, float* w, float* m, float* pa,
     DynamicsParams dp) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -424,9 +424,9 @@ __global__ void physics_forward_kernel(
     for (int i = 0; i < 9; i++) rmat[i] = R[base9 + i];
     const float total = thrust[0] + thrust[1] + thrust[2] + thrust[3];
     const float acc[3] = {
-        rmat[2] * total / dp.mass + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 0, 2) / dp.mass : 0.0f),
-        rmat[5] * total / dp.mass + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 1, 2) / dp.mass : 0.0f),
-        rmat[8] * total / dp.mass - dp.gravity + (dp.external_force_max > 0.0f ? dp.external_force_max * signed_noise(dp.noise_seed, t, b, 2, 2) / dp.mass : 0.0f),
+        rmat[2] * total / dp.mass + external_force0[b * 3 + 0] / dp.mass,
+        rmat[5] * total / dp.mass + external_force0[b * 3 + 1] / dp.mass,
+        rmat[8] * total / dp.mass - dp.gravity + external_force0[b * 3 + 2] / dp.mass,
     };
     for (int i = 0; i < 3; i++) {
         const float nv = v[base3 + i] + dp.dt * acc[i];
@@ -912,6 +912,7 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     torch::Tensor omega0,
     torch::Tensor motor0,
     torch::Tensor previous_action0,
+    torch::Tensor external_force0,
     torch::Tensor encoder0_w,
     torch::Tensor encoder0_b,
     torch::Tensor encoder1_w,
@@ -954,7 +955,6 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     double lambda_sat,
     double negative_slope,
     int noise_seed,
-    double external_force_max,
     double external_torque_max,
     double action_noise_max,
     double observation_noise_max) {
@@ -1010,7 +1010,6 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
         static_cast<float>(inertia_z),
         static_cast<float>(state_grad_decay),
         noise_seed,
-        static_cast<float>(external_force_max),
         static_cast<float>(external_torque_max),
         static_cast<float>(action_noise_max),
     };
@@ -1059,7 +1058,7 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
             hidden.data_ptr<float>(), enc0.data_ptr<float>(), enc1.data_ptr<float>(),
             gate_i.data_ptr<float>(), gate_h.data_ptr<float>(), actions.data_ptr<float>(), lp);
         physics_forward_kernel<<<(batch + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-            t, batch, actions.data_ptr<float>(),
+            t, batch, actions.data_ptr<float>(), external_force0.data_ptr<float>(),
             p.data_ptr<float>(), v.data_ptr<float>(), R.data_ptr<float>(), w.data_ptr<float>(),
             m.data_ptr<float>(), pa.data_ptr<float>(), dp);
     }

@@ -22,6 +22,7 @@ class L2FParams:
     max_initial_velocity: float = 0.6
     max_initial_angle: float = 0.45
     max_initial_omega: float = 1.0
+    external_force_ratio: float = 0.0
 
 
 @dataclass
@@ -32,6 +33,7 @@ class L2FState:
     omega: torch.Tensor
     motor: torch.Tensor
     previous_action: torch.Tensor
+    external_force: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ def decay_state_gradient(state: L2FState, decay: float) -> L2FState:
         omega=apply_gradient_decay(state.omega, decay),
         motor=apply_gradient_decay(state.motor, decay),
         previous_action=apply_gradient_decay(state.previous_action, decay),
+        external_force=state.external_force,
     )
 
 
@@ -155,6 +158,12 @@ class L2FSimulator:
         )
         motor = torch.zeros(batch_size, 4, device=device, dtype=dtype)
         previous_action = torch.zeros(batch_size, 4, device=device, dtype=dtype)
+        force_std = p.external_force_ratio * p.mass * p.gravity
+        if force_std > 0.0:
+            external_force = torch.randn(batch_size, 3, device=device, dtype=dtype) * force_std
+            external_force = external_force.clamp(-3.0 * force_std, 3.0 * force_std)
+        else:
+            external_force = torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
         axis = torch.randn(batch_size, 3, device=device, dtype=dtype)
         axis = F.normalize(axis, dim=-1, eps=1.0e-6)
@@ -166,7 +175,7 @@ class L2FSimulator:
         rotation = identity + torch.sin(angle).view(-1, 1, 1) * k
         rotation = rotation + (1.0 - torch.cos(angle)).view(-1, 1, 1) * (k @ k)
 
-        return L2FState(position, velocity, rotation, omega, motor, previous_action)
+        return L2FState(position, velocity, rotation, omega, motor, previous_action, external_force)
 
     def state_features(self, state: L2FState) -> torch.Tensor:
         return torch.cat(
@@ -200,8 +209,6 @@ class L2FSimulator:
         action: torch.Tensor,
         *,
         grad_decay: float = 1.0,
-        external_force: torch.Tensor | None = None,
-        external_torque: torch.Tensor | None = None,
     ) -> L2FState:
         p = self.params
         dt = p.dt
@@ -220,9 +227,7 @@ class L2FSimulator:
             device=state.position.device,
             dtype=state.position.dtype,
         )
-        acceleration = body_z * (total_thrust / p.mass) + gravity
-        if external_force is not None:
-            acceleration = acceleration + external_force / p.mass
+        acceleration = body_z * (total_thrust / p.mass) + gravity + state.external_force / p.mass
         velocity = state.velocity + dt * acceleration
         position = state.position + dt * velocity
 
@@ -234,8 +239,6 @@ class L2FSimulator:
             ),
             dim=-1,
         )
-        if external_torque is not None:
-            torque = torque + external_torque
         inertia = torch.tensor(
             (p.inertia_x, p.inertia_y, p.inertia_z),
             device=state.position.device,
@@ -246,7 +249,7 @@ class L2FSimulator:
 
         rotation = state.rotation @ _so3_exp(dt * omega)
 
-        next_state = L2FState(position, velocity, rotation, omega, motor, command)
+        next_state = L2FState(position, velocity, rotation, omega, motor, command, state.external_force)
         return decay_state_gradient(next_state, grad_decay)
 
     def tracking_components(

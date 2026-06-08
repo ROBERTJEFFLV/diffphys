@@ -21,6 +21,7 @@ def clone_state_for_grad(state: L2FState) -> L2FState:
         omega=state.omega.detach().clone().requires_grad_(True),
         motor=state.motor.detach().clone().requires_grad_(True),
         previous_action=state.previous_action.detach().clone().requires_grad_(True),
+        external_force=state.external_force.detach().clone(),
     )
 
 

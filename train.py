@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-initial-velocity", type=float, default=0.6)
     parser.add_argument("--max-initial-angle", type=float, default=0.45)
     parser.add_argument("--max-initial-omega", type=float, default=1.0)
+    parser.add_argument("--external-force-ratio", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--encoder-dim", type=int, default=192)
@@ -218,6 +219,7 @@ def _clone_state(state):
         omega=state.omega.detach().clone(),
         motor=state.motor.detach().clone(),
         previous_action=state.previous_action.detach().clone(),
+        external_force=state.external_force.detach().clone(),
     )
 
 
@@ -326,26 +328,13 @@ def rollout_diagnostics(
             physics_action = (action + _uniform_noise_like(action, args.action_noise_max)).clamp(-1.0, 1.0)
         else:
             physics_action = action
-        external_force = (
-            _uniform_noise_like(state.position, args.external_force_max)
-            if args.external_force_max > 0.0
-            else None
-        )
-        external_torque = (
-            _uniform_noise_like(state.omega, args.external_torque_max)
-            if args.external_torque_max > 0.0
-            else None
-        )
-
-        if step_backend == "cuda" and external_force is None and external_torque is None:
+        if step_backend == "cuda":
             next_state = cuda_step(state, physics_action, sim.params, grad_decay=1.0)
         else:
             next_state = sim.step(
                 state,
                 physics_action,
                 grad_decay=1.0,
-                external_force=external_force,
-                external_torque=external_torque,
             )
 
         angular_acceleration = (next_state.omega - omega_before).norm(dim=-1) / args.dt
@@ -434,6 +423,10 @@ def rollout_diagnostics(
 
 def main() -> None:
     args = parse_args()
+    if args.external_force_max != 0.0:
+        raise ValueError("--external-force-max is deprecated; use --external-force-ratio for episode-level hidden force")
+    if args.external_torque_max != 0.0:
+        raise ValueError("--external-torque-max is not part of the RAPTOR-style external-force path")
     device = resolve_device(args.device)
     sim_backend = resolve_sim_backend(args.sim_backend, device)
     torch.manual_seed(args.seed)
@@ -447,6 +440,7 @@ def main() -> None:
             max_initial_velocity=args.max_initial_velocity,
             max_initial_angle=args.max_initial_angle,
             max_initial_omega=args.max_initial_omega,
+            external_force_ratio=args.external_force_ratio,
         )
     )
     loss_config = L2FLossConfig(
@@ -594,7 +588,6 @@ def main() -> None:
                     lambda_ddu=args.lambda_ddu,
                     lambda_sat=args.lambda_sat,
                     noise_seed=args.seed * 1000003 + step_idx,
-                    external_force_max=args.external_force_max,
                     external_torque_max=args.external_torque_max,
                     action_noise_max=args.action_noise_max,
                     observation_noise_max=args.observation_noise_max,

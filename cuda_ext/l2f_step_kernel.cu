@@ -136,6 +136,7 @@ __global__ void l2f_step_forward_kernel(
     const float* __restrict__ omega,
     const float* __restrict__ motor,
     const float* __restrict__ action,
+    const float* __restrict__ external_force,
     float* __restrict__ out_position,
     float* __restrict__ out_velocity,
     float* __restrict__ out_rotation,
@@ -180,9 +181,9 @@ __global__ void l2f_step_forward_kernel(
 
     const float total_thrust = thrust[0] + thrust[1] + thrust[2] + thrust[3];
     float acceleration[3];
-    acceleration[0] = r[2] * (total_thrust / mass);
-    acceleration[1] = r[5] * (total_thrust / mass);
-    acceleration[2] = r[8] * (total_thrust / mass) - gravity;
+    acceleration[0] = r[2] * (total_thrust / mass) + external_force[bidx * 3 + 0] / mass;
+    acceleration[1] = r[5] * (total_thrust / mass) + external_force[bidx * 3 + 1] / mass;
+    acceleration[2] = r[8] * (total_thrust / mass) - gravity + external_force[bidx * 3 + 2] / mass;
     for (int i = 0; i < 3; i++) {
         const int idx3 = bidx * 3 + i;
         const float next_velocity = velocity[idx3] + dt * acceleration[i];
@@ -423,6 +424,7 @@ std::vector<torch::Tensor> l2f_step_forward_cuda(
     torch::Tensor omega,
     torch::Tensor motor,
     torch::Tensor action,
+    torch::Tensor external_force,
     double dt,
     double mass,
     double gravity,
@@ -451,6 +453,7 @@ std::vector<torch::Tensor> l2f_step_forward_cuda(
         omega.data_ptr<float>(),
         motor.data_ptr<float>(),
         action.data_ptr<float>(),
+        external_force.data_ptr<float>(),
         out_position.data_ptr<float>(),
         out_velocity.data_ptr<float>(),
         out_rotation.data_ptr<float>(),

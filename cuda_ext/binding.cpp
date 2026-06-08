@@ -9,6 +9,7 @@ std::vector<torch::Tensor> l2f_step_forward_cuda(
     torch::Tensor omega,
     torch::Tensor motor,
     torch::Tensor action,
+    torch::Tensor external_force,
     double dt,
     double mass,
     double gravity,
@@ -52,6 +53,7 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     torch::Tensor omega0,
     torch::Tensor motor0,
     torch::Tensor previous_action0,
+    torch::Tensor external_force0,
     torch::Tensor encoder0_w,
     torch::Tensor encoder0_b,
     torch::Tensor encoder1_w,
@@ -94,7 +96,6 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     double lambda_sat,
     double negative_slope,
     int noise_seed,
-    double external_force_max,
     double external_torque_max,
     double action_noise_max,
     double observation_noise_max);
@@ -161,6 +162,7 @@ std::vector<torch::Tensor> step_forward(
     torch::Tensor omega,
     torch::Tensor motor,
     torch::Tensor action,
+    torch::Tensor external_force,
     double dt,
     double mass,
     double gravity,
@@ -172,8 +174,9 @@ std::vector<torch::Tensor> step_forward(
     double inertia_y,
     double inertia_z) {
     check_state_inputs(position, velocity, rotation, omega, motor, action);
+    check_2d(external_force, "external_force", position.size(0), 3);
     return l2f_step_forward_cuda(
-        position, velocity, rotation, omega, motor, action,
+        position, velocity, rotation, omega, motor, action, external_force,
         dt, mass, gravity, arm_length, yaw_drag, motor_tau, motor_authority,
         inertia_x, inertia_y, inertia_z);
 }
@@ -220,6 +223,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               torch::Tensor omega0,
                               torch::Tensor motor0,
                               torch::Tensor previous_action0,
+                              torch::Tensor external_force0,
                               torch::Tensor encoder0_w,
                               torch::Tensor encoder0_b,
                               torch::Tensor encoder1_w,
@@ -262,11 +266,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               double lambda_sat,
                               double negative_slope,
                               int noise_seed,
-                              double external_force_max,
                               double external_torque_max,
                               double action_noise_max,
                               double observation_noise_max) {
         check_state_inputs(position0, velocity0, rotation0, omega0, motor0, previous_action0);
+        check_2d(external_force0, "external_force0", position0.size(0), 3);
         check_2d(encoder0_w, "encoder0_w", 192, 40);
         check_1d(encoder0_b, "encoder0_b", 192);
         check_2d(encoder1_w, "encoder1_w", 192, 192);
@@ -279,7 +283,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         check_1d(motor_head_b, "motor_head_b", 4);
         TORCH_CHECK(horizon > 0, "horizon must be positive");
         return l2f_full_rollout_cuda(
-            position0, velocity0, rotation0, omega0, motor0, previous_action0,
+            position0, velocity0, rotation0, omega0, motor0, previous_action0, external_force0,
             encoder0_w, encoder0_b, encoder1_w, encoder1_b,
             gru_w_ih, gru_w_hh, gru_b_ih, gru_b_hh,
             motor_head_w, motor_head_b,
@@ -290,7 +294,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             p_scale, v_scale, omega_scale, huber_beta,
             w_p, w_v, w_r, w_omega, clf_kappa, u_soft,
             lambda_clf, lambda_out, lambda_tail, lambda_du, lambda_ddu, lambda_sat,
-            negative_slope, noise_seed, external_force_max, external_torque_max,
+            negative_slope, noise_seed, external_torque_max,
             action_noise_max, observation_noise_max);
     }, "Full H-step L2F rollout, loss, physics VJP, and actor backward (CUDA)");
 }

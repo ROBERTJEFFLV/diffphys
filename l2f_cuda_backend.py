@@ -98,6 +98,7 @@ class _CudaL2FStep(torch.autograd.Function):
         omega: torch.Tensor,
         motor: torch.Tensor,
         action: torch.Tensor,
+        external_force: torch.Tensor,
         dt: float,
         mass: float,
         gravity: float,
@@ -118,8 +119,9 @@ class _CudaL2FStep(torch.autograd.Function):
             omega.contiguous(),
             motor.contiguous(),
             action.contiguous(),
+            external_force.contiguous(),
         )
-        ctx.save_for_backward(*tensors)
+        ctx.save_for_backward(*tensors[:6])
         ctx.params = (
             float(dt),
             float(mass),
@@ -156,7 +158,7 @@ class _CudaL2FStep(torch.autograd.Function):
             grad_previous_action.contiguous(),
         )
         outputs = ext.step_backward(*saved, *grads, *ctx.params)
-        return (*outputs, *([None] * 11))
+        return (*outputs, None, *([None] * 11))
 
 
 def cuda_step(
@@ -175,6 +177,7 @@ def cuda_step(
         state.omega,
         state.motor,
         action,
+        state.external_force,
         params.dt,
         params.mass,
         params.gravity,
@@ -194,4 +197,5 @@ def cuda_step(
         omega=outputs[3],
         motor=outputs[4],
         previous_action=outputs[5],
+        external_force=state.external_force,
     )
