@@ -249,6 +249,7 @@ struct DeviceArrays{
     float* actions = nullptr;
     float* initial_previous_action = nullptr;
     float* action_hover_center = nullptr;
+    float* external_force = nullptr;
     std::uint32_t* failure_replay_segment_index = nullptr;
     float* reference_p = nullptr;
     float* reference_v = nullptr;
@@ -689,7 +690,7 @@ void add_barrier_loss_state(
 
 void cuda_free(DeviceArrays& d){
     float* ptrs[] = {
-        d.p, d.v, d.R, d.omega, d.rpm, d.actions, d.initial_previous_action, d.action_hover_center,
+        d.p, d.v, d.R, d.omega, d.rpm, d.actions, d.initial_previous_action, d.action_hover_center, d.external_force,
         d.reference_p, d.reference_v, d.reference_p_traj, d.reference_v_traj,
         d.mass, d.gravity, d.J, d.J_inv, d.rotor_positions, d.rotor_thrust_directions, d.rotor_torque_directions,
         d.rotor_torque_constants, d.rotor_time_rising, d.rotor_time_falling, d.rotor_thrust_coeffs, d.action_min,
@@ -727,6 +728,7 @@ void allocate(DeviceArrays& d, std::size_t batch_size, std::size_t horizon){
     cuda_alloc(d.actions, step_count * 4);
     cuda_alloc(d.initial_previous_action, batch_size * 4);
     cuda_alloc(d.action_hover_center, batch_size * 4);
+    cuda_alloc(d.external_force, batch_size * 3);
     cuda_alloc(d.failure_replay_segment_index, batch_size);
     cuda_alloc(d.reference_p, batch_size * 3);
     cuda_alloc(d.reference_v, batch_size * 3);
@@ -928,7 +930,10 @@ __global__ void forward_step_kernel(DeviceArrays d, std::size_t batch_size, std:
     mat_vec3(R, thrust_body, rotated_thrust);
     float acceleration_world[3];
     for(int dim = 0; dim < 3; dim++){
-        acceleration_world[dim] = rotated_thrust[dim] / d.mass[b] + d.gravity[pidx3(b, dim)];
+        acceleration_world[dim] =
+            rotated_thrust[dim] / d.mass[b] +
+            d.gravity[pidx3(b, dim)] +
+            d.external_force[pidx3(b, dim)] / d.mass[b];
     }
 
     float J[9], J_inv[9], omega[3];
@@ -1567,6 +1572,7 @@ void copy_input_to_device(const EulerGpuBatch& batch, DeviceArrays& d){
     CUDA_CHECK(cudaMemcpy(d.actions, batch.actions.data(), sizeof(float) * H * B * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.initial_previous_action, batch.initial_previous_action.data(), sizeof(float) * B * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.action_hover_center, batch.action_hover_center.data(), sizeof(float) * B * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d.external_force, batch.external_force.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.failure_replay_segment_index, batch.failure_replay_segment_index.data(), sizeof(std::uint32_t) * B, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.reference_p, batch.reference_p.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d.reference_v, batch.reference_v.data(), sizeof(float) * B * 3, cudaMemcpyHostToDevice));
@@ -1682,6 +1688,7 @@ void run_cpu_reference(
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -2039,6 +2046,7 @@ void EulerGpuBatch::resize(std::size_t new_batch_size, std::size_t new_horizon){
     initial_rpm.assign(batch_size * 4, 0.0f);
     initial_previous_action.assign(batch_size * 4, 0.0f);
     action_hover_center.assign(batch_size * 4, 0.0f);
+    external_force.assign(batch_size * 3, 0.0f);
     reference_p.assign(batch_size * 3, 0.0f);
     reference_v.assign(batch_size * 3, 0.0f);
     reference_p_traj.assign((horizon + 1) * batch_size * 3, 0.0f);
@@ -2063,6 +2071,15 @@ void EulerGpuBatch::resize(std::size_t new_batch_size, std::size_t new_horizon){
     dynamics_motor_delay_bin.assign(batch_size, 0u);
     dynamics_curve_shape_bin.assign(batch_size, 0u);
     dynamics_group_key.assign(batch_size, 0u);
+    dynamics_cbrt_mass.assign(batch_size, 0.0f);
+    dynamics_thrust_to_weight.assign(batch_size, 0.0f);
+    dynamics_torque_to_inertia.assign(batch_size, 0.0f);
+    dynamics_rotor_distance_factor.assign(batch_size, 0.0f);
+    dynamics_inertia_factor.assign(batch_size, 0.0f);
+    dynamics_tau_rise.assign(batch_size, 0.0f);
+    dynamics_tau_fall.assign(batch_size, 0.0f);
+    dynamics_rotor_torque_constant.assign(batch_size, 0.0f);
+    dynamics_force_std.assign(batch_size, 0.0f);
     rejected_before_accept.assign(batch_size, 0u);
     trajectory_start_step.assign(batch_size, 0u);
     group_weight.assign(batch_size, batch_size > 0 ? 1.0f / static_cast<float>(batch_size) : 0.0f);
@@ -2336,7 +2353,7 @@ void generate_validation_batch(
     const float guidance_probability = std::max(0.0f, std::min(1.0f, near_zero_guidance_probability));
     constexpr float max_rpm = 22000.0f;
     constexpr std::uint32_t balance_bins = 4u;
-    batch.replay_schema_version = 4u;
+    batch.replay_schema_version = 5u;
     batch.sampler_seed = seed;
     batch.sampler_balance_bins = balance_bins;
 
@@ -2370,66 +2387,144 @@ void generate_validation_batch(
         constexpr float nominal_jx = 0.55f * nominal_mass * nominal_arm * nominal_arm;
         constexpr float nominal_jy = nominal_jx;
         constexpr float nominal_jz = 1.10f * nominal_mass * nominal_arm * nominal_arm;
+        constexpr float nominal_linear_curve_share = 0.15f;
+        const float nominal_per_rotor_max_thrust = nominal_thrust_to_weight * nominal_mass * G / 4.0f;
+        const float nominal_c1 = nominal_linear_curve_share * nominal_per_rotor_max_thrust / max_rpm;
+        const float nominal_c2 = (1.0f - nominal_linear_curve_share) * nominal_per_rotor_max_thrust / (max_rpm * max_rpm);
+        const float max_thrust_nominal = 4.0f * (nominal_c1 * max_rpm + nominal_c2 * max_rpm * max_rpm);
+        const float thrust_to_weight_nominal = max_thrust_nominal / (nominal_mass * G);
         const bool correlated_size_mass = correlated_size_mass_sampling && !nominal_dynamics;
         const bool small_randomization = dynamics_randomization_level == DynamicsRandomizationLevel::SMALL;
+        const bool raptor_broad_randomization = !small_randomization && !nominal_dynamics;
         const float mass_min = small_randomization ? 0.035f : 0.02f;
-        const float mass_max = small_randomization ? 0.075f : 0.25f;
+        const float mass_max = small_randomization ? 0.075f : 5.00f;
         const float arm_min = small_randomization ? 0.075f : 0.035f;
         const float arm_max = small_randomization ? 0.110f : 0.215f;
         const float thrust_to_weight_min = small_randomization ? 2.5f : 1.5f;
         const float thrust_to_weight_max = small_randomization ? 3.8f : 5.0f;
-        const float torque_to_inertia_min = small_randomization ? 200.0f : 125.0f;
-        const float torque_to_inertia_max = small_randomization ? 320.0f : 500.0f;
+        const float torque_to_inertia_min = small_randomization ? 200.0f : 40.0f;
+        const float torque_to_inertia_max = small_randomization ? 320.0f : 1200.0f;
         const float torque_constant_min = small_randomization ? 0.015f : 0.005f;
         const float torque_constant_max = small_randomization ? 0.030f : 0.05f;
         const float tau_rise_min = small_randomization ? 0.040f : 0.03f;
         const float tau_rise_max = small_randomization ? 0.070f : 0.10f;
         const float tau_fall_min = small_randomization ? 0.060f : 0.03f;
         const float tau_fall_max = small_randomization ? 0.120f : 0.30f;
+        const float disturbance_force_max = small_randomization ? 0.0f : 0.1f;
 
-        float mass = nominal_dynamics ? nominal_mass : sample_binned_value(rng, unit, mass_min, mass_max, size_bin, balance_bins);
-        float arm = nominal_dynamics ? nominal_arm : sample_binned_value(rng, unit, arm_min, arm_max, balance_bins - 1u - torque_bin, balance_bins);
-        const float thrust_to_weight = nominal_dynamics ? nominal_thrust_to_weight : sample_binned_value(rng, unit, thrust_to_weight_min, thrust_to_weight_max, thrust_bin, balance_bins);
-        float per_rotor_max_thrust = thrust_to_weight * mass * G / 4.0f;
-        const float sampled_torque_to_inertia = nominal_dynamics ? nominal_torque_to_inertia : sample_binned_value(rng, unit, torque_to_inertia_min, torque_to_inertia_max, torque_bin, balance_bins);
-        const float torque_constant = nominal_dynamics ? nominal_torque_constant : sample_binned_value(rng, unit, torque_constant_min, torque_constant_max, torque_bin, balance_bins);
-        const float tau_rise = nominal_dynamics ? 0.05f : sample_binned_value(rng, unit, tau_rise_min, tau_rise_max, delay_bin, balance_bins);
-        const float tau_fall = nominal_dynamics ? 0.08f : sample_binned_value(rng, unit, tau_fall_min, tau_fall_max, delay_bin, balance_bins);
-        const float linear_curve_share = nominal_dynamics ? 0.15f : (
-            small_randomization
-                ? sample_binned_value(rng, unit, 0.08f, 0.22f, curve_bin, balance_bins)
-                : static_cast<float>(curve_bin) * 0.15f
-        );
+        float mass = nominal_mass;
+        float arm = nominal_arm;
+        float thrust_to_weight = nominal_thrust_to_weight;
+        float per_rotor_max_thrust = nominal_per_rotor_max_thrust;
+        float sampled_torque_to_inertia = nominal_torque_to_inertia;
+        float torque_constant = nominal_torque_constant;
+        float tau_rise = 0.05f;
+        float tau_fall = 0.08f;
+        float linear_curve_share = nominal_linear_curve_share;
+        float rotor_distance_factor = 1.0f;
+        float inertia_factor = 1.0f;
+        float force_std = 0.0f;
+        float jx = nominal_jx;
+        float jy = nominal_jy;
+        float jz = nominal_jz;
 
-        float jx = std::max(1e-6f, 0.55f * mass * arm * arm);
-        float jy = std::max(1e-6f, 0.55f * mass * arm * arm);
-        float jz = std::max(1e-6f, 1.10f * mass * arm * arm);
-        if(correlated_size_mass){
-            const float mass_size_deviation = small_randomization ? 0.08f : 0.20f;
+        if(raptor_broad_randomization){
+            constexpr float mass_size_deviation = 0.1f;
             const float relative_size_min = std::cbrt(mass_min);
             const float relative_size_max = std::cbrt(mass_max);
-            const float size_new = relative_size_min + unit(rng) * (relative_size_max - relative_size_min);
+            const float size_new = sample_binned_value(rng, unit, relative_size_min, relative_size_max, size_bin, balance_bins);
             mass = std::max(mass_min, std::min(mass_max, size_new * size_new * size_new));
             const float scale_relative = std::cbrt(mass / nominal_mass);
             const float factor_mass = mass / nominal_mass;
-            const float size_factor = sample_reciprocal_randomization_factor(rng, unit, mass_size_deviation);
-            const float rotor_distance_factor = scale_relative * size_factor;
-            arm = nominal_arm * rotor_distance_factor;
-            const float factor_thrust_to_weight = thrust_to_weight / nominal_thrust_to_weight;
+            thrust_to_weight = sample_binned_value(rng, unit, thrust_to_weight_min, thrust_to_weight_max, thrust_bin, balance_bins);
+            const float factor_thrust_to_weight = thrust_to_weight / std::max(1e-6f, thrust_to_weight_nominal);
             const float factor_thrust_coefficients = factor_thrust_to_weight * factor_mass;
-            const float nominal_per_rotor_max_thrust = nominal_thrust_to_weight * nominal_mass * G / 4.0f;
             per_rotor_max_thrust = nominal_per_rotor_max_thrust * factor_thrust_coefficients;
-            const float torque_to_inertia_factor = sampled_torque_to_inertia / nominal_torque_to_inertia;
-            const float inertia_factor = torque_to_inertia_factor / std::max(1e-6f, rotor_distance_factor);
+            sampled_torque_to_inertia = sample_binned_value(rng, unit, torque_to_inertia_min, torque_to_inertia_max, torque_bin, balance_bins);
+            const float size_factor = sample_reciprocal_randomization_factor(rng, unit, mass_size_deviation);
+            rotor_distance_factor = scale_relative * size_factor;
+            arm = nominal_arm * rotor_distance_factor;
+            const float max_thrust_per_rotor = thrust_to_weight * mass * G / 4.0f;
+            const float max_torque = std::sqrt(2.0f) * std::abs(nominal_arm) * max_thrust_per_rotor;
+            const float torque_to_inertia_nominal = max_torque / std::max(1e-12f, nominal_jx);
+            const float torque_to_inertia_factor = sampled_torque_to_inertia / std::max(1e-6f, torque_to_inertia_nominal);
+            inertia_factor = torque_to_inertia_factor / std::max(1e-6f, rotor_distance_factor);
             jx = std::max(1e-6f, nominal_jx / std::max(1e-6f, inertia_factor));
             jy = std::max(1e-6f, nominal_jy / std::max(1e-6f, inertia_factor));
             jz = std::max(1e-6f, nominal_jz / std::max(1e-6f, inertia_factor));
+            torque_constant = torque_constant_min + unit(rng) * (torque_constant_max - torque_constant_min);
+            tau_rise = sample_binned_value(rng, unit, tau_rise_min, tau_rise_max, delay_bin, balance_bins);
+            tau_fall = sample_binned_value(rng, unit, tau_fall_min, tau_fall_max, delay_bin, balance_bins);
+            linear_curve_share = static_cast<float>(curve_bin) * 0.15f;
+            const float surplus = std::max(0.0f, thrust_to_weight - 1.0f);
+            const float multiple = unit(rng) * surplus * disturbance_force_max;
+            force_std = multiple * thrust_to_weight * mass / 3.0f;
+        }
+        else if(!nominal_dynamics){
+            mass = sample_binned_value(rng, unit, mass_min, mass_max, size_bin, balance_bins);
+            arm = sample_binned_value(rng, unit, arm_min, arm_max, balance_bins - 1u - torque_bin, balance_bins);
+            thrust_to_weight = sample_binned_value(rng, unit, thrust_to_weight_min, thrust_to_weight_max, thrust_bin, balance_bins);
+            per_rotor_max_thrust = thrust_to_weight * mass * G / 4.0f;
+            sampled_torque_to_inertia = sample_binned_value(rng, unit, torque_to_inertia_min, torque_to_inertia_max, torque_bin, balance_bins);
+            torque_constant = sample_binned_value(rng, unit, torque_constant_min, torque_constant_max, torque_bin, balance_bins);
+            tau_rise = sample_binned_value(rng, unit, tau_rise_min, tau_rise_max, delay_bin, balance_bins);
+            tau_fall = sample_binned_value(rng, unit, tau_fall_min, tau_fall_max, delay_bin, balance_bins);
+            linear_curve_share = small_randomization
+                ? sample_binned_value(rng, unit, 0.08f, 0.22f, curve_bin, balance_bins)
+                : static_cast<float>(curve_bin) * 0.15f;
+            jx = std::max(1e-6f, 0.55f * mass * arm * arm);
+            jy = std::max(1e-6f, 0.55f * mass * arm * arm);
+            jz = std::max(1e-6f, 1.10f * mass * arm * arm);
+            if(correlated_size_mass){
+                const float mass_size_deviation = small_randomization ? 0.08f : 0.10f;
+                const float relative_size_min = std::cbrt(mass_min);
+                const float relative_size_max = std::cbrt(mass_max);
+                const float size_new = sample_binned_value(rng, unit, relative_size_min, relative_size_max, size_bin, balance_bins);
+                mass = std::max(mass_min, std::min(mass_max, size_new * size_new * size_new));
+                const float scale_relative = std::cbrt(mass / nominal_mass);
+                const float factor_mass = mass / nominal_mass;
+                const float size_factor = sample_reciprocal_randomization_factor(rng, unit, mass_size_deviation);
+                rotor_distance_factor = scale_relative * size_factor;
+                arm = nominal_arm * rotor_distance_factor;
+                const float factor_thrust_to_weight = thrust_to_weight / std::max(1e-6f, thrust_to_weight_nominal);
+                const float factor_thrust_coefficients = factor_thrust_to_weight * factor_mass;
+                per_rotor_max_thrust = nominal_per_rotor_max_thrust * factor_thrust_coefficients;
+                const float torque_to_inertia_factor = sampled_torque_to_inertia / std::max(1e-6f, nominal_torque_to_inertia);
+                inertia_factor = torque_to_inertia_factor / std::max(1e-6f, rotor_distance_factor);
+                jx = std::max(1e-6f, nominal_jx / std::max(1e-6f, inertia_factor));
+                jy = std::max(1e-6f, nominal_jy / std::max(1e-6f, inertia_factor));
+                jz = std::max(1e-6f, nominal_jz / std::max(1e-6f, inertia_factor));
+            }
+            else{
+                rotor_distance_factor = arm / nominal_arm;
+                inertia_factor = nominal_jx / std::max(1e-6f, jx);
+            }
+        }
+
+        float sampled_external_force[3] = {0.0f, 0.0f, 0.0f};
+        if(force_std > 0.0f){
+            std::normal_distribution<float> force_dist(0.0f, force_std);
+            for(int dim = 0; dim < 3; dim++){
+                sampled_external_force[dim] = force_dist(rng);
+            }
         }
 
         batch.mass[b] = mass;
+        batch.dynamics_cbrt_mass[b] = std::cbrt(std::max(0.0f, mass));
+        batch.dynamics_thrust_to_weight[b] = thrust_to_weight;
+        batch.dynamics_torque_to_inertia[b] = sampled_torque_to_inertia;
+        batch.dynamics_rotor_distance_factor[b] = rotor_distance_factor;
+        batch.dynamics_inertia_factor[b] = inertia_factor;
+        batch.dynamics_tau_rise[b] = tau_rise;
+        batch.dynamics_tau_fall[b] = tau_fall;
+        batch.dynamics_rotor_torque_constant[b] = torque_constant;
+        batch.dynamics_force_std[b] = force_std;
         batch.gravity[pidx3(b, 0)] = 0.0f;
         batch.gravity[pidx3(b, 1)] = 0.0f;
         batch.gravity[pidx3(b, 2)] = -G;
+        for(int dim = 0; dim < 3; dim++){
+            batch.external_force[pidx3(b, dim)] = sampled_external_force[dim];
+        }
         batch.action_min[b] = 0.0f;
         batch.action_max[b] = max_rpm;
 
@@ -2628,9 +2723,9 @@ CorrelatedSizeMassSamplerValidationSummary validate_correlated_size_mass_sampler
     constexpr float nominal_jz = 1.10f * nominal_mass * nominal_arm * nominal_arm;
     constexpr float nominal_per_rotor_max_thrust = nominal_thrust_to_weight * nominal_mass * G / 4.0f;
     constexpr float mass_min = 0.02f;
-    constexpr float mass_max = 0.25f;
-    constexpr float size_factor_low = 1.0f / 1.20f;
-    constexpr float size_factor_high = 1.20f;
+    constexpr float mass_max = 5.00f;
+    constexpr float size_factor_low = 1.0f / 1.10f;
+    constexpr float size_factor_high = 1.10f;
     constexpr float max_rpm = 22000.0f;
 
     summary.fixed_nominal_unchanged = true;
@@ -2673,8 +2768,7 @@ CorrelatedSizeMassSamplerValidationSummary validate_correlated_size_mass_sampler
         const float jx = correlated_batch.J[pidx9(b, 0)];
         const float jy = correlated_batch.J[pidx9(b, 4)];
         const float jz = correlated_batch.J[pidx9(b, 8)];
-        const float inferred_torque_to_inertia =
-            (nominal_jx / std::max(1e-12f, jx)) * rotor_distance_factor * nominal_torque_to_inertia;
+        const float inferred_torque_to_inertia = correlated_batch.dynamics_torque_to_inertia[b];
 
         summary.mass_min = std::min(summary.mass_min, mass);
         summary.mass_max = std::max(summary.mass_max, mass);
@@ -2708,11 +2802,11 @@ CorrelatedSizeMassSamplerValidationSummary validate_correlated_size_mass_sampler
         if(thrust_to_weight > 5.0f){
             summary.max_thrust_to_weight_bounds_error = std::max(summary.max_thrust_to_weight_bounds_error, thrust_to_weight - 5.0f);
         }
-        if(inferred_torque_to_inertia < 125.0f){
-            summary.max_inertia_bounds_error = std::max(summary.max_inertia_bounds_error, 125.0f - inferred_torque_to_inertia);
+        if(inferred_torque_to_inertia < 40.0f){
+            summary.max_inertia_bounds_error = std::max(summary.max_inertia_bounds_error, 40.0f - inferred_torque_to_inertia);
         }
-        if(inferred_torque_to_inertia > 500.0f){
-            summary.max_inertia_bounds_error = std::max(summary.max_inertia_bounds_error, inferred_torque_to_inertia - 500.0f);
+        if(inferred_torque_to_inertia > 1200.0f){
+            summary.max_inertia_bounds_error = std::max(summary.max_inertia_bounds_error, inferred_torque_to_inertia - 1200.0f);
         }
         update_max_abs(summary.max_j_inverse_abs_error, correlated_batch.J_inv[pidx9(b, 0)] * jx, 1.0f);
         update_max_abs(summary.max_j_inverse_abs_error, correlated_batch.J_inv[pidx9(b, 4)] * jy, 1.0f);
@@ -2918,6 +3012,7 @@ ObservationValidationSummary validate_observations_against_cpu(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -3036,6 +3131,7 @@ DeploymentAdapterValidationSummary validate_deployment_adapter(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -3740,6 +3836,7 @@ void copy_persistent_segment_start_to_host(
     CUDA_CHECK(cudaMemcpy(batch.initial_omega.data(), d.omega, sizeof(float) * B * 3, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(batch.initial_rpm.data(), d.rpm, sizeof(float) * B * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(batch.initial_previous_action.data(), d.initial_previous_action, sizeof(float) * B * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(batch.external_force.data(), d.external_force, sizeof(float) * B * 3, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(initial_hidden.data(), buffers.initial_hidden, sizeof(float) * initial_hidden.size(), cudaMemcpyDeviceToHost));
 }
 
@@ -3768,6 +3865,7 @@ std::size_t overlay_failure_replay_slots(
             batch.reference_p[pidx3(b, dim)] = sample.reference_p[dim];
             batch.reference_v[pidx3(b, dim)] = sample.reference_v[dim];
             batch.gravity[pidx3(b, dim)] = sample.gravity[dim];
+            batch.external_force[pidx3(b, dim)] = sample.external_force[dim];
         }
         for(int flat = 0; flat < 9; flat++){
             batch.initial_R[pidx9(b, flat)] = sample.R[flat];
@@ -3801,6 +3899,15 @@ std::size_t overlay_failure_replay_slots(
         batch.dynamics_motor_delay_bin[b] = sample.dynamics_motor_delay_bin;
         batch.dynamics_curve_shape_bin[b] = sample.dynamics_curve_shape_bin;
         batch.dynamics_group_key[b] = sample.dynamics_group_key;
+        batch.dynamics_cbrt_mass[b] = sample.dynamics_cbrt_mass;
+        batch.dynamics_thrust_to_weight[b] = sample.dynamics_thrust_to_weight;
+        batch.dynamics_torque_to_inertia[b] = sample.dynamics_torque_to_inertia;
+        batch.dynamics_rotor_distance_factor[b] = sample.dynamics_rotor_distance_factor;
+        batch.dynamics_inertia_factor[b] = sample.dynamics_inertia_factor;
+        batch.dynamics_tau_rise[b] = sample.dynamics_tau_rise;
+        batch.dynamics_tau_fall[b] = sample.dynamics_tau_fall;
+        batch.dynamics_rotor_torque_constant[b] = sample.dynamics_rotor_torque_constant;
+        batch.dynamics_force_std[b] = sample.dynamics_force_std;
         batch.rejected_before_accept[b] = 0;
         batch.trajectory_start_step[b] = sample.source_replay_step;
         batch.group_weight[b] = 1.0f;
@@ -4754,6 +4861,53 @@ void populate_action_hover_center_from_dynamics(EulerGpuBatch& batch){
     }
 }
 
+void populate_sampler_diagnostics_from_dynamics(EulerGpuBatch& batch){
+    constexpr float nominal_mass = 0.05f;
+    constexpr float nominal_arm = 0.09f;
+    constexpr float nominal_jx = 0.55f * nominal_mass * nominal_arm * nominal_arm;
+    batch.dynamics_cbrt_mass.assign(batch.batch_size, 0.0f);
+    batch.dynamics_thrust_to_weight.assign(batch.batch_size, 0.0f);
+    batch.dynamics_torque_to_inertia.assign(batch.batch_size, 0.0f);
+    batch.dynamics_rotor_distance_factor.assign(batch.batch_size, 0.0f);
+    batch.dynamics_inertia_factor.assign(batch.batch_size, 0.0f);
+    batch.dynamics_tau_rise.assign(batch.batch_size, 0.0f);
+    batch.dynamics_tau_fall.assign(batch.batch_size, 0.0f);
+    batch.dynamics_rotor_torque_constant.assign(batch.batch_size, 0.0f);
+    batch.dynamics_force_std.assign(batch.batch_size, 0.0f);
+    for(std::size_t b = 0; b < batch.batch_size; b++){
+        const float mass = batch.mass[b];
+        float total_thrust = 0.0f;
+        for(int rotor = 0; rotor < 4; rotor++){
+            const float rpm = batch.action_max[b];
+            const float c0 = batch.rotor_thrust_coeffs[rotor3(b, rotor, 0)];
+            const float c1 = batch.rotor_thrust_coeffs[rotor3(b, rotor, 1)];
+            const float c2 = batch.rotor_thrust_coeffs[rotor3(b, rotor, 2)];
+            total_thrust += c0 + c1 * rpm + c2 * rpm * rpm;
+        }
+        const float g_norm = std::sqrt(
+            batch.gravity[pidx3(b, 0)] * batch.gravity[pidx3(b, 0)] +
+            batch.gravity[pidx3(b, 1)] * batch.gravity[pidx3(b, 1)] +
+            batch.gravity[pidx3(b, 2)] * batch.gravity[pidx3(b, 2)]
+        );
+        const float arm_x = std::fabs(batch.rotor_positions[rotor3(b, 0, 0)]);
+        const float arm_y = std::fabs(batch.rotor_positions[rotor3(b, 0, 1)]);
+        const float rotor_distance_factor = 0.5f * (arm_x + arm_y) / std::max(1e-6f, nominal_arm);
+        const float jx = batch.J[pidx9(b, 0)];
+        const float inertia_factor = nominal_jx / std::max(1e-6f, jx);
+        const float per_rotor_max_thrust = 0.25f * total_thrust;
+        const float torque_to_inertia = std::sqrt(2.0f) * nominal_arm * per_rotor_max_thrust / std::max(1e-6f, jx);
+        batch.dynamics_cbrt_mass[b] = std::cbrt(std::max(0.0f, mass));
+        batch.dynamics_thrust_to_weight[b] = total_thrust / std::max(1e-6f, mass * g_norm);
+        batch.dynamics_torque_to_inertia[b] = torque_to_inertia;
+        batch.dynamics_rotor_distance_factor[b] = rotor_distance_factor;
+        batch.dynamics_inertia_factor[b] = inertia_factor;
+        batch.dynamics_tau_rise[b] = batch.rotor_time_rising[pidx4(b, 0)];
+        batch.dynamics_tau_fall[b] = batch.rotor_time_falling[pidx4(b, 0)];
+        batch.dynamics_rotor_torque_constant[b] = batch.rotor_torque_constants[pidx4(b, 0)];
+        batch.dynamics_force_std[b] = 0.0f;
+    }
+}
+
 void write_replay_batch(std::ostream& out, const EulerGpuBatch& batch){
     write_float_vector(out, batch.initial_p);
     write_float_vector(out, batch.initial_v);
@@ -4796,6 +4950,18 @@ void write_replay_batch(std::ostream& out, const EulerGpuBatch& batch){
     out.write(reinterpret_cast<const char*>(&batch.trajectory_mode), sizeof(batch.trajectory_mode));
     if(batch.replay_schema_version >= 4u){
         write_float_vector(out, batch.action_hover_center);
+    }
+    if(batch.replay_schema_version >= 5u){
+        write_float_vector(out, batch.external_force);
+        write_float_vector(out, batch.dynamics_cbrt_mass);
+        write_float_vector(out, batch.dynamics_thrust_to_weight);
+        write_float_vector(out, batch.dynamics_torque_to_inertia);
+        write_float_vector(out, batch.dynamics_rotor_distance_factor);
+        write_float_vector(out, batch.dynamics_inertia_factor);
+        write_float_vector(out, batch.dynamics_tau_rise);
+        write_float_vector(out, batch.dynamics_tau_fall);
+        write_float_vector(out, batch.dynamics_rotor_torque_constant);
+        write_float_vector(out, batch.dynamics_force_std);
     }
 }
 
@@ -4844,6 +5010,22 @@ void read_replay_batch(std::istream& in, EulerGpuBatch& batch){
     }
     else{
         populate_action_hover_center_from_dynamics(batch);
+    }
+    if(batch.replay_schema_version >= 5u){
+        read_float_vector(in, batch.external_force);
+        read_float_vector(in, batch.dynamics_cbrt_mass);
+        read_float_vector(in, batch.dynamics_thrust_to_weight);
+        read_float_vector(in, batch.dynamics_torque_to_inertia);
+        read_float_vector(in, batch.dynamics_rotor_distance_factor);
+        read_float_vector(in, batch.dynamics_inertia_factor);
+        read_float_vector(in, batch.dynamics_tau_rise);
+        read_float_vector(in, batch.dynamics_tau_fall);
+        read_float_vector(in, batch.dynamics_rotor_torque_constant);
+        read_float_vector(in, batch.dynamics_force_std);
+    }
+    else{
+        batch.external_force.assign(batch.batch_size * 3, 0.0f);
+        populate_sampler_diagnostics_from_dynamics(batch);
     }
 }
 
@@ -5068,6 +5250,7 @@ Stage9StepMetrics cpu_stage9_replay_step(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -5154,6 +5337,7 @@ Stage9StepMetrics cpu_stage9_replay_step(
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -5405,6 +5589,7 @@ ObjectiveGradientConflictSummary diagnose_objective_gradient_conflicts_impl(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -5482,6 +5667,7 @@ ObjectiveGradientConflictSummary diagnose_objective_gradient_conflicts_impl(
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6067,6 +6253,7 @@ ClosedLoopValidationSummary validate_closed_loop_against_cpu(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6140,6 +6327,7 @@ ClosedLoopValidationSummary validate_closed_loop_against_cpu(
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6305,6 +6493,7 @@ ActionGradientInjectionValidationSummary validate_action_gradient_injection_agai
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6363,6 +6552,7 @@ ActionGradientInjectionValidationSummary validate_action_gradient_injection_agai
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6558,6 +6748,7 @@ ActorBackwardValidationSummary validate_actor_backward_against_cpu(
             state.p[i] = batch.initial_p[pidx3(b, i)];
             state.v[i] = batch.initial_v[pidx3(b, i)];
             state.omega[i] = batch.initial_omega[pidx3(b, i)];
+            state.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 state.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -6621,6 +6812,7 @@ ActorBackwardValidationSummary validate_actor_backward_against_cpu(
             initial.p[i] = batch.initial_p[pidx3(b, i)];
             initial.v[i] = batch.initial_v[pidx3(b, i)];
             initial.omega[i] = batch.initial_omega[pidx3(b, i)];
+            initial.external_force[i] = batch.external_force[pidx3(b, i)];
             for(int j = 0; j < 3; j++){
                 initial.R[i][j] = batch.initial_R[pidx9(b, i * 3 + j)];
             }
@@ -7122,6 +7314,82 @@ void fill_dynamics_metadata_summary(const EulerGpuBatch& batch, GpuPolicyEvalSum
     summary.motor_delay_max = delay_stats.max;
 }
 
+void fill_training_sampler_summary(const EulerGpuBatch& batch, FullGpuTrainingSummary& summary){
+    const double inv_batch = batch.batch_size > 0 ? 1.0 / static_cast<double>(batch.batch_size) : 0.0;
+    double mass_sum = 0.0;
+    double cbrt_mass_sum = 0.0;
+    double thrust_to_weight_sum = 0.0;
+    double torque_to_inertia_sum = 0.0;
+    double rotor_distance_factor_sum = 0.0;
+    double inertia_factor_sum = 0.0;
+    double tau_rise_sum = 0.0;
+    double tau_fall_sum = 0.0;
+    double rotor_torque_constant_sum = 0.0;
+    double force_std_sum = 0.0;
+    double force_norm_sum = 0.0;
+    for(std::size_t b = 0; b < batch.batch_size; b++){
+        mass_sum += batch.mass[b];
+        cbrt_mass_sum += batch.dynamics_cbrt_mass[b];
+        thrust_to_weight_sum += batch.dynamics_thrust_to_weight[b];
+        torque_to_inertia_sum += batch.dynamics_torque_to_inertia[b];
+        rotor_distance_factor_sum += batch.dynamics_rotor_distance_factor[b];
+        inertia_factor_sum += batch.dynamics_inertia_factor[b];
+        tau_rise_sum += batch.dynamics_tau_rise[b];
+        tau_fall_sum += batch.dynamics_tau_fall[b];
+        rotor_torque_constant_sum += batch.dynamics_rotor_torque_constant[b];
+        force_std_sum += batch.dynamics_force_std[b];
+        const float fx = batch.external_force[pidx3(b, 0)];
+        const float fy = batch.external_force[pidx3(b, 1)];
+        const float fz = batch.external_force[pidx3(b, 2)];
+        force_norm_sum += std::sqrt(fx * fx + fy * fy + fz * fz);
+    }
+    summary.sampler_mass_mean = static_cast<float>(mass_sum * inv_batch);
+    summary.sampler_cbrt_mass_mean = static_cast<float>(cbrt_mass_sum * inv_batch);
+    summary.sampler_thrust_to_weight_mean = static_cast<float>(thrust_to_weight_sum * inv_batch);
+    summary.sampler_torque_to_inertia_mean = static_cast<float>(torque_to_inertia_sum * inv_batch);
+    summary.sampler_rotor_distance_factor_mean = static_cast<float>(rotor_distance_factor_sum * inv_batch);
+    summary.sampler_inertia_factor_mean = static_cast<float>(inertia_factor_sum * inv_batch);
+    summary.sampler_tau_rise_mean = static_cast<float>(tau_rise_sum * inv_batch);
+    summary.sampler_tau_fall_mean = static_cast<float>(tau_fall_sum * inv_batch);
+    summary.sampler_rotor_torque_constant_mean = static_cast<float>(rotor_torque_constant_sum * inv_batch);
+    summary.sampler_force_std_mean = static_cast<float>(force_std_sum * inv_batch);
+    summary.sampler_external_force_norm_mean = static_cast<float>(force_norm_sum * inv_batch);
+}
+
+void write_sampler_audit_header(std::ostream& out){
+    out << "step,batch_slot,episode_id,segment_id,reset_mask,mass,cbrt_mass,thrust_to_weight,"
+        << "torque_to_inertia,rotor_distance_factor,inertia_factor,tau_rise,tau_fall,"
+        << "rotor_torque_constant,force_std,f_ext_x,f_ext_y,f_ext_z,f_ext_norm\n";
+}
+
+void append_sampler_audit_rows(
+    std::ostream& out,
+    const EulerGpuBatch& batch,
+    std::size_t step,
+    std::size_t episode_id,
+    std::size_t segment_id
+){
+    for(std::size_t b = 0; b < batch.batch_size; b++){
+        const float fx = batch.external_force[pidx3(b, 0)];
+        const float fy = batch.external_force[pidx3(b, 1)];
+        const float fz = batch.external_force[pidx3(b, 2)];
+        const float force_norm = std::sqrt(fx * fx + fy * fy + fz * fz);
+        const std::uint32_t reset = batch.horizon > 0 ? batch.reset_mask[b] : 0u;
+        out << step << "," << b << "," << episode_id << "," << segment_id << "," << reset << ","
+            << batch.mass[b] << ","
+            << batch.dynamics_cbrt_mass[b] << ","
+            << batch.dynamics_thrust_to_weight[b] << ","
+            << batch.dynamics_torque_to_inertia[b] << ","
+            << batch.dynamics_rotor_distance_factor[b] << ","
+            << batch.dynamics_inertia_factor[b] << ","
+            << batch.dynamics_tau_rise[b] << ","
+            << batch.dynamics_tau_fall[b] << ","
+            << batch.dynamics_rotor_torque_constant[b] << ","
+            << batch.dynamics_force_std[b] << ","
+            << fx << "," << fy << "," << fz << "," << force_norm << "\n";
+    }
+}
+
 float action_cost_from_components(const LossComponentMeans& components){
     return components.action_magnitude + components.action_smoothness + components.saturation;
 }
@@ -7150,6 +7418,17 @@ void append_reward_component_csv(std::ostream& log, const LossComponentMeans& co
 
 void append_training_diagnostics_csv(std::ostream& log, const FullGpuTrainingSummary& summary){
     log << ","
+        << summary.sampler_mass_mean << ","
+        << summary.sampler_cbrt_mass_mean << ","
+        << summary.sampler_thrust_to_weight_mean << ","
+        << summary.sampler_torque_to_inertia_mean << ","
+        << summary.sampler_rotor_distance_factor_mean << ","
+        << summary.sampler_inertia_factor_mean << ","
+        << summary.sampler_tau_rise_mean << ","
+        << summary.sampler_tau_fall_mean << ","
+        << summary.sampler_rotor_torque_constant_mean << ","
+        << summary.sampler_force_std_mean << ","
+        << summary.sampler_external_force_norm_mean << ","
         << summary.action_saturation_rate << ","
         << summary.action_abs_mean << ","
         << summary.action_abs_max << ","
@@ -7221,9 +7500,6 @@ FullGpuTrainingSummary run_full_gpu_training(
         }
         if(training_options.persistent_episode_training){
             throw std::runtime_error("Direct-H500 training must not use persistent H16 episode training");
-        }
-        if(training_options.sample_dynamics){
-            throw std::runtime_error("Direct-H500 training starts with fixed dynamics only");
         }
         if(training_options.disable_physics_gradient){
             throw std::runtime_error("Direct-H500 training must backpropagate through the differentiable physics chain");
@@ -7327,6 +7603,10 @@ FullGpuTrainingSummary run_full_gpu_training(
             << "critic_output_mean,critic_target_mean,critic_error_mean,critic_error_norm,grad_norm,"
             << "position_cost,orientation_cost,linear_velocity_cost,angular_velocity_cost,"
             << "action_cost,weighted_cost,reward,clf_loss,window_clf_loss,outward_velocity_loss,attitude_control_loss,velocity_barrier_loss,angular_velocity_barrier_loss,attitude_barrier_loss,replay_recovery_loss,replay_recovery_progress_loss,replay_recovery_velocity_barrier_loss,finite,"
+            << "sampler_mass_mean,sampler_cbrt_mass_mean,sampler_thrust_to_weight_mean,"
+            << "sampler_torque_to_inertia_mean,sampler_rotor_distance_factor_mean,sampler_inertia_factor_mean,"
+            << "sampler_tau_rise_mean,sampler_tau_fall_mean,sampler_rotor_torque_constant_mean,"
+            << "sampler_force_std_mean,sampler_external_force_norm_mean,"
             << "action_saturation_rate,action_abs_mean,action_abs_max,"
             << "action_delta_mean,action_delta_max,hover_relative_action_mean,hover_relative_action_max,"
             << "action_gradient_norm,raw_action_gradient_norm_pre_clip,raw_action_gradient_norm_post_clip,"
@@ -7343,6 +7623,14 @@ FullGpuTrainingSummary run_full_gpu_training(
             << "failure_replay_carry_angular_velocity_error,failure_replay_carry_rpm_error,"
             << "failure_replay_carry_previous_action_error,failure_replay_carry_hidden_error,"
             << "failure_replay_last_episode\n";
+    }
+    std::ofstream sampler_audit_log;
+    if(!training_options.sampler_audit_path.empty()){
+        sampler_audit_log.open(training_options.sampler_audit_path);
+        if(!sampler_audit_log){
+            throw std::runtime_error("Failed to open sampler audit path: " + training_options.sampler_audit_path);
+        }
+        write_sampler_audit_header(sampler_audit_log);
     }
 
     EulerGpuBatch batch;
@@ -7812,6 +8100,14 @@ FullGpuTrainingSummary run_full_gpu_training(
             summary.segment_start = persistent_mode ? persistent_episode_step : 0;
             summary.segment_end = persistent_mode ? persistent_episode_step + training_options.horizon : training_options.horizon;
             summary.episode_reset_count = episode_reset_count;
+            fill_training_sampler_summary(batch, summary);
+            if(sampler_audit_log){
+                const std::size_t audit_episode_id = persistent_mode ? episode_reset_count : step;
+                const std::size_t audit_segment_id = persistent_mode && training_options.horizon > 0
+                    ? persistent_episode_step / training_options.horizon
+                    : 0;
+                append_sampler_audit_rows(sampler_audit_log, batch, step, audit_episode_id, audit_segment_id);
+            }
             zero_actor_gradients(d_actor_gradients, training_options.batch_size);
             CUDA_CHECK(cudaMemset(d.lambda_p, 0, sizeof(float) * state_count * 3));
             CUDA_CHECK(cudaMemset(d.lambda_v, 0, sizeof(float) * state_count * 3));
@@ -8811,6 +9107,7 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                     sample.reference_p[dim] = batch.reference_p_traj[idx3(replay_step, b, dim, eval_options.episodes)];
                     sample.reference_v[dim] = batch.reference_v_traj[idx3(replay_step, b, dim, eval_options.episodes)];
                     sample.gravity[dim] = batch.gravity[pidx3(b, dim)];
+                    sample.external_force[dim] = batch.external_force[pidx3(b, dim)];
                 }
                 for(int flat = 0; flat < 9; flat++){
                     sample.R[flat] = host_R[idx9(replay_step, b, flat, eval_options.episodes)];
@@ -8848,6 +9145,15 @@ GpuPolicyEvalSummary run_gpu_policy_eval(
                 sample.dynamics_motor_delay_bin = batch.dynamics_motor_delay_bin[b];
                 sample.dynamics_curve_shape_bin = batch.dynamics_curve_shape_bin[b];
                 sample.dynamics_group_key = batch.dynamics_group_key[b];
+                sample.dynamics_cbrt_mass = batch.dynamics_cbrt_mass[b];
+                sample.dynamics_thrust_to_weight = batch.dynamics_thrust_to_weight[b];
+                sample.dynamics_torque_to_inertia = batch.dynamics_torque_to_inertia[b];
+                sample.dynamics_rotor_distance_factor = batch.dynamics_rotor_distance_factor[b];
+                sample.dynamics_inertia_factor = batch.dynamics_inertia_factor[b];
+                sample.dynamics_tau_rise = batch.dynamics_tau_rise[b];
+                sample.dynamics_tau_fall = batch.dynamics_tau_fall[b];
+                sample.dynamics_rotor_torque_constant = batch.dynamics_rotor_torque_constant[b];
+                sample.dynamics_force_std = batch.dynamics_force_std[b];
                 summary.failure_replay_samples.push_back(sample);
             }
         }
@@ -9260,7 +9566,8 @@ Stage9SamplerParitySummary run_stage9_sampler_parity(
         }
         const bool supported_schema =
             batch.replay_schema_version == 3u ||
-            batch.replay_schema_version == 4u;
+            batch.replay_schema_version == 4u ||
+            batch.replay_schema_version == 5u;
         summary.metadata_present = summary.metadata_present ||
             (supported_schema && batch.sampler_balance_bins == bins);
         if(!supported_schema || batch.sampler_balance_bins != bins){

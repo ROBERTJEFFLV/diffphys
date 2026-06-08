@@ -141,6 +141,7 @@ struct EulerGpuBatch{
     std::vector<float> initial_rpm;             // [B, 4]
     std::vector<float> initial_previous_action; // [B, 4]
     std::vector<float> action_hover_center;      // [B, 4], per-sample hover action center for action magnitude loss
+    std::vector<float> external_force;           // [B, 3], episode-level hidden physical state
     std::vector<float> reference_p;             // [B, 3], fixed-reference compatibility metadata
     std::vector<float> reference_v;             // [B, 3], fixed-reference compatibility metadata
     std::vector<float> reference_p_traj;        // [H + 1, B, 3]
@@ -166,13 +167,22 @@ struct EulerGpuBatch{
     std::vector<std::uint32_t> dynamics_motor_delay_bin;        // [B]
     std::vector<std::uint32_t> dynamics_curve_shape_bin;        // [B]
     std::vector<std::uint32_t> dynamics_group_key;              // [B]
+    std::vector<float> dynamics_cbrt_mass;                      // [B]
+    std::vector<float> dynamics_thrust_to_weight;               // [B]
+    std::vector<float> dynamics_torque_to_inertia;              // [B]
+    std::vector<float> dynamics_rotor_distance_factor;          // [B]
+    std::vector<float> dynamics_inertia_factor;                 // [B]
+    std::vector<float> dynamics_tau_rise;                       // [B]
+    std::vector<float> dynamics_tau_fall;                       // [B]
+    std::vector<float> dynamics_rotor_torque_constant;          // [B]
+    std::vector<float> dynamics_force_std;                      // [B]
     std::vector<std::uint32_t> rejected_before_accept;          // [B]
     std::vector<std::uint32_t> trajectory_start_step;           // [B]
     std::vector<float> group_weight;                            // [B]
     std::vector<std::uint32_t> reset_mask;                      // [H, B]
     std::vector<std::uint32_t> hidden_reset_mask;               // [H, B]
     std::vector<std::uint32_t> failure_replay_segment_index;    // [B], 0 inactive, otherwise 1 + zero-based replay segment index
-    std::uint32_t replay_schema_version = 4;
+    std::uint32_t replay_schema_version = 5;
     std::uint32_t sampler_seed = 0;
     std::uint32_t sampler_balance_bins = 4;
     std::uint32_t hidden_reset_enabled = 0;
@@ -201,6 +211,7 @@ struct FailureReplaySample{
     std::array<float, 4> rpm = {};
     std::array<float, 4> previous_action = {};
     std::array<float, 4> action_hover_center = {};
+    std::array<float, 3> external_force = {};
     std::array<float, RDAC_HIDDEN_DIM> hidden = {};
     std::array<float, 3> reference_p = {};
     std::array<float, 3> reference_v = {};
@@ -223,6 +234,15 @@ struct FailureReplaySample{
     std::uint32_t dynamics_motor_delay_bin = 0;
     std::uint32_t dynamics_curve_shape_bin = 0;
     std::uint32_t dynamics_group_key = 0;
+    float dynamics_cbrt_mass = 0.0f;
+    float dynamics_thrust_to_weight = 0.0f;
+    float dynamics_torque_to_inertia = 0.0f;
+    float dynamics_rotor_distance_factor = 0.0f;
+    float dynamics_inertia_factor = 0.0f;
+    float dynamics_tau_rise = 0.0f;
+    float dynamics_tau_fall = 0.0f;
+    float dynamics_rotor_torque_constant = 0.0f;
+    float dynamics_force_std = 0.0f;
     std::uint32_t source_episode = 0;
     std::uint32_t source_failure_step = 0;
     std::uint32_t source_replay_step = 0;
@@ -525,6 +545,7 @@ struct FullGpuTrainingOptions{
     std::string h1000_gate_best_path;
     std::string h1000_gate_candidate_path;
     std::string h1000_gate_log_path;
+    std::string sampler_audit_path;
     bool failure_replay_enabled = false;
     float failure_replay_ratio = 0.30f;
     std::size_t failure_replay_segments = 1;
@@ -590,6 +611,17 @@ struct FullGpuTrainingSummary{
     LossComponentMeans final_loss_components;
     std::size_t nan_inf_count = 0;
     float final_window_start_mean = 0.0f;
+    float sampler_mass_mean = 0.0f;
+    float sampler_cbrt_mass_mean = 0.0f;
+    float sampler_thrust_to_weight_mean = 0.0f;
+    float sampler_torque_to_inertia_mean = 0.0f;
+    float sampler_rotor_distance_factor_mean = 0.0f;
+    float sampler_inertia_factor_mean = 0.0f;
+    float sampler_tau_rise_mean = 0.0f;
+    float sampler_tau_fall_mean = 0.0f;
+    float sampler_rotor_torque_constant_mean = 0.0f;
+    float sampler_force_std_mean = 0.0f;
+    float sampler_external_force_norm_mean = 0.0f;
     std::size_t training_episode_steps = 0;
     std::size_t persistent_episode_step = 0;
     std::size_t segment_start = 0;

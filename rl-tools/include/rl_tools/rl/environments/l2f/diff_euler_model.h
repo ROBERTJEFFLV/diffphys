@@ -13,6 +13,7 @@ namespace rl_tools::rl::environments::l2f::diff{
         T rpm[4];
         T previous_action[4];
         T action_hover_center[4];
+        T external_force[3];
     };
 
     template <typename T>
@@ -344,6 +345,7 @@ namespace rl_tools::rl::environments::l2f::diff{
             out.p[i] = state.position[i];
             out.v[i] = state.linear_velocity[i];
             out.omega[i] = state.angular_velocity[i];
+            out.external_force[i] = (T)0;
         }
         quaternion_to_rotation_matrix<T>(state, out.R);
         for(TI i = 0; i < 4; i++){
@@ -437,7 +439,10 @@ namespace rl_tools::rl::environments::l2f::diff{
         T rotated_thrust[3];
         mat_vec3(state.R, cache.thrust_body, rotated_thrust);
         for(TI dim_i = 0; dim_i < 3; dim_i++){
-            cache.acceleration_world[dim_i] = rotated_thrust[dim_i] / parameters.dynamics.mass + parameters.dynamics.gravity[dim_i];
+            cache.acceleration_world[dim_i] =
+                rotated_thrust[dim_i] / parameters.dynamics.mass +
+                parameters.dynamics.gravity[dim_i] +
+                state.external_force[dim_i] / parameters.dynamics.mass;
         }
 
         mat_vec3(parameters.dynamics.J, state.omega, cache.J_omega);
@@ -462,6 +467,7 @@ namespace rl_tools::rl::environments::l2f::diff{
             next.rpm[dim_i] = cache.rpm_next[dim_i];
             next.previous_action[dim_i] = action[dim_i];
             next.action_hover_center[dim_i] = state.action_hover_center[dim_i];
+            next.external_force[dim_i] = state.external_force[dim_i];
         }
         next.rpm[3] = cache.rpm_next[3];
         next.previous_action[3] = action[3];

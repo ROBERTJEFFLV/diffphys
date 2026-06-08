@@ -43,6 +43,7 @@ struct Options{
     bool benchmark = false;
     bool stage9_debug = false;
     bool sample_dynamics = true;
+    bool sample_dynamics_overridden = false;
     int benchmark_iterations = 20;
     unsigned seed = 0;
     std::size_t steps = 0;
@@ -170,8 +171,11 @@ struct Options{
     float success_action_saturation_threshold = 1.0f;
     gpu::ForcedDynamicsBins forced_bins;
     bool balanced_dynamics_sampling = false;
+    bool balanced_dynamics_sampling_overridden = false;
     std::string sampled_dynamics_level = "broad";
+    bool sampled_dynamics_level_overridden = false;
     bool correlated_size_mass_sampling = false;
+    bool correlated_size_mass_sampling_overridden = false;
     gpu::TrajectoryMode trajectory_mode = gpu::TrajectoryMode::FIXED;
     float trajectory_amplitude = 0.03f;
     float trajectory_frequency_hz = 0.5f;
@@ -193,6 +197,7 @@ struct Options{
     std::string checkpoint_inspect_path;
     bool checkpoint_convert_old = false;
     std::string checkpoint_convert_old_path;
+    std::string sampler_audit_path;
 };
 
 void print_usage(){
@@ -214,7 +219,8 @@ void print_usage(){
         << "    [--gpu-validate-deployment-adapter] [--validation-step N]\n"
         << "    [--gpu-stage9-debug] [--stage9-debug-steps N] [--stage9-debug-replay-path PATH]\n"
         << "    [--gpu-benchmark] [--gpu-benchmark-iterations N]\n"
-        << "    [--steps N] [--learning-rate LR] [--direct-h500-training]\n"
+        << "    [--steps N] [--learning-rate LR] [--direct-h500-training] [--disable-direct-h500-training]\n"
+        << "    [--sampler-audit-path PATH]\n"
         << "    [--diff-rollout-loss-weight W] [--disable-physics-gradient]\n"
         << "    [--temporal-gradient-decay-alpha A]\n"
         << "    [--velocity-observation-noise STD] [--velocity-observation-delay-steps N]\n"
@@ -509,6 +515,9 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--direct-h500-training"){
             options.direct_h500_training = true;
         }
+        else if(arg == "--disable-direct-h500-training" || arg == "--h16-training"){
+            options.direct_h500_training = false;
+        }
         else if(arg == "--action-grad-clip"){
             options.action_grad_clip_enabled = true;
             options.action_grad_clip_configured = true;
@@ -571,22 +580,31 @@ bool parse_options(int argc, char** argv, Options& options){
         else if(arg == "--log-path" && i + 1 < argc){
             options.log_path = argv[++i];
         }
+        else if(arg == "--sampler-audit-path" && i + 1 < argc){
+            options.sampler_audit_path = argv[++i];
+        }
         else if(arg == "--fixed-dynamics"){
             options.sample_dynamics = false;
+            options.sample_dynamics_overridden = true;
         }
         else if(arg == "--sample-dynamics"){
             options.sample_dynamics = true;
+            options.sample_dynamics_overridden = true;
         }
         else if(arg == "--balanced-dynamics-sampling"){
             options.balanced_dynamics_sampling = true;
+            options.balanced_dynamics_sampling_overridden = true;
         }
         else if(arg == "--correlated-size-mass-sampling"){
             options.correlated_size_mass_sampling = true;
             options.sample_dynamics = true;
+            options.correlated_size_mass_sampling_overridden = true;
+            options.sample_dynamics_overridden = true;
         }
         else if(arg == "--sampled-dynamics-level" && i + 1 < argc){
             options.sampled_dynamics_level = argv[++i];
             (void)parse_dynamics_randomization_level(options.sampled_dynamics_level);
+            options.sampled_dynamics_level_overridden = true;
         }
         else if(arg == "--trajectory-mode" && i + 1 < argc){
             options.trajectory_mode = parse_trajectory_mode(argv[++i]);
@@ -1060,10 +1078,18 @@ void apply_direct_h500_training_defaults(Options& options){
     if(!options.horizon_overridden){
         options.horizon = ACTIVE_TRAINING_HORIZON;
     }
-    options.sample_dynamics = false;
-    options.balanced_dynamics_sampling = false;
-    options.correlated_size_mass_sampling = false;
-    options.sampled_dynamics_level = "small";
+    if(!options.sample_dynamics_overridden){
+        options.sample_dynamics = false;
+    }
+    if(!options.balanced_dynamics_sampling_overridden){
+        options.balanced_dynamics_sampling = false;
+    }
+    if(!options.correlated_size_mass_sampling_overridden){
+        options.correlated_size_mass_sampling = false;
+    }
+    if(!options.sampled_dynamics_level_overridden){
+        options.sampled_dynamics_level = "small";
+    }
     options.trajectory_mode = gpu::TrajectoryMode::FIXED;
     options.trajectory_amplitude = 0.0f;
     options.trajectory_frequency_hz = 0.0f;
@@ -1203,6 +1229,7 @@ gpu::FullGpuTrainingOptions make_full_training_options(const Options& options){
     training_options.h1000_gate_best_path = options.h1000_gate_best_path;
     training_options.h1000_gate_candidate_path = options.h1000_gate_candidate_path;
     training_options.h1000_gate_log_path = options.h1000_gate_log_path;
+    training_options.sampler_audit_path = options.sampler_audit_path;
     training_options.failure_replay_enabled = options.failure_replay_enabled;
     training_options.failure_replay_ratio = options.failure_replay_ratio;
     training_options.failure_replay_segments = options.failure_replay_segments;
@@ -1801,7 +1828,8 @@ int main(int argc, char** argv){
     std::cout << "active_training_task=origin_recovery_position_controller\n";
     std::cout << "direct_h500_training=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
     std::cout << "direct_h500_clean_loss=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
-    std::cout << "direct_h500_fixed_dynamics_only=" << (options.direct_h500_training && options.steps > 0 ? "true" : "false") << "\n";
+    std::cout << "direct_h500_fixed_dynamics_only="
+              << (options.direct_h500_training && options.steps > 0 && !options.sample_dynamics ? "true" : "false") << "\n";
     std::cout << "direct_h500_critic_training_enabled=" << (options.direct_h500_training && options.steps > 0 ? "false" : "true") << "\n";
     std::cout << "active_training_default_horizon=" << ACTIVE_TRAINING_HORIZON << "\n";
     std::cout << "active_training_requested_horizon=" << options.horizon << "\n";
