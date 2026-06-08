@@ -1,0 +1,12 @@
+--device auto
+--sim-backend auto
+--horizon 16
+--batch-size 8
+--steps 2
+--state-grad-decay 0.5
+--hidden-grad-decay 0.7
+--tail-steps 8
+--log-every 1
+--save-every 0
+--log-path runs/smoke/train.csv
+--checkpoint-path checkpoints/smoke_motor_gru.pt

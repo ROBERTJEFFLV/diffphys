@@ -1,3 +1,0 @@
-add_executable(test_math math.cpp)
-target_link_libraries(test_math PRIVATE rl_tools rl_tools_test)
-gtest_discover_tests(test_math)

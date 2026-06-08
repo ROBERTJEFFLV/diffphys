@@ -1,0 +1,782 @@
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+from time import perf_counter
+
+import torch
+from torch.nn import functional as F
+
+from env_l2f import L2FLossConfig, L2FParams, L2FSimulator, apply_gradient_decay
+from l2f_full_cuda_backend import METRIC_NAMES, full_cuda_rollout_metrics
+from l2f_cuda_backend import cuda_backend_available, cuda_step, load_extension
+from model import MotorGRUPolicy
+
+RAPTOR_QUANTITIES = (
+    "position",
+    "angle",
+    "linear_velocity",
+    "angular_velocity",
+    "angular_acceleration",
+    "action",
+    "action_relative",
+)
+
+
+def _metric_summary(values: list[torch.Tensor]) -> tuple[float, float, float]:
+    if len(values) == 0:
+        nan = float("nan")
+        return nan, nan, nan
+    stacked = torch.stack(values, dim=0)
+    mean = stacked.mean().item()
+    max_per_episode = stacked.max(dim=0).values
+    max_mean = max_per_episode.mean().item()
+    if max_per_episode.numel() <= 1:
+        max_std = 0.0
+    else:
+        max_std = max_per_episode.std(unbiased=False).item()
+    return mean, max_mean, max_std
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train state/error/action GRU motor policy.")
+    parser.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
+    parser.add_argument("--sim-backend", default="auto", choices=("auto", "torch", "cuda", "cuda-full"))
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--horizon", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--dt", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=3.0e-4)
+    parser.add_argument("--weight-decay", type=float, default=1.0e-5)
+    parser.add_argument("--encoder-dim", type=int, default=192)
+    parser.add_argument("--hidden-dim", type=int, default=192)
+    parser.add_argument("--encoder-depth", type=int, default=2)
+    parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument("--state-grad-decay", type=float, default=0.5)
+    parser.add_argument("--hidden-grad-decay", type=float, default=0.7)
+    parser.add_argument("--p-scale", type=float, default=2.0)
+    parser.add_argument("--v-scale", type=float, default=3.0)
+    parser.add_argument("--omega-scale", type=float, default=10.0)
+    parser.add_argument("--huber-beta", type=float, default=1.0)
+    parser.add_argument("--w-p", type=float, default=1.0)
+    parser.add_argument("--w-v", type=float, default=0.3)
+    parser.add_argument("--w-r", type=float, default=0.1)
+    parser.add_argument("--w-omega", type=float, default=0.05)
+    parser.add_argument("--attitude-mode", choices=("full", "tilt"), default="full")
+    parser.add_argument("--clf-kappa", type=float, default=1.0)
+    parser.add_argument("--tail-steps", type=int, default=50)
+    parser.add_argument("--u-soft", type=float, default=0.9)
+    parser.add_argument("--lambda-clf", type=float, default=0.5)
+    parser.add_argument("--lambda-out", type=float, default=0.1)
+    parser.add_argument("--lambda-tail", type=float, default=1.0)
+    parser.add_argument("--lambda-du", type=float, default=3.0e-3)
+    parser.add_argument("--lambda-ddu", type=float, default=3.0e-4)
+    parser.add_argument("--lambda-sat", type=float, default=0.03)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--log-path", default="runs/direct_h500/train.csv")
+    parser.add_argument("--checkpoint-path", default="checkpoints/direct_h500_motor_gru.pt")
+    parser.add_argument("--settling-position-mm", type=float, default=10.0)
+    parser.add_argument("--tail-start-step", type=int, default=450)
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--eval-seeds", default="")
+    parser.add_argument("--eval-seed-count", type=int, default=1)
+    parser.add_argument("--trajectory-path", default="")
+    parser.add_argument("--trajectory-count", type=int, default=5)
+    parser.add_argument("--success-position-m", type=float, default=0.05)
+    parser.add_argument("--success-angle-rad", type=float, default=0.10)
+    parser.add_argument("--success-velocity", type=float, default=0.10)
+    parser.add_argument("--success-omega", type=float, default=0.20)
+    return parser.parse_args()
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def resolve_sim_backend(name: str, device: torch.device) -> str:
+    if name == "torch":
+        return "torch"
+    if name == "cuda":
+        if device.type != "cuda":
+            raise ValueError("--sim-backend cuda requires --device cuda or auto with CUDA available")
+        load_extension()
+        return "cuda"
+    if name == "cuda-full":
+        if device.type != "cuda":
+            raise ValueError("--sim-backend cuda-full requires --device cuda or auto with CUDA available")
+        load_extension()
+        return "cuda-full"
+    if device.type == "cuda" and cuda_backend_available():
+        return "cuda-full"
+    return "torch"
+
+
+def _base_fieldnames() -> tuple[str, ...]:
+    return (
+        "step",
+        "loss",
+        "tracking",
+        "position",
+        "velocity",
+        "attitude",
+        "omega",
+        "clf",
+        "outward",
+        "tail",
+        "du",
+        "ddu",
+        "sat",
+        "grad_norm",
+        "seconds",
+    )
+
+
+def _status_fieldnames() -> tuple[str, ...]:
+    return (
+        "success_rate",
+        "tail_success_rate",
+        "invalid_fraction",
+    )
+
+
+def _raptor_fieldnames(settling_position_mm: float) -> tuple[str, ...]:
+    names: list[str] = []
+    for prefix in ("full", "tail"):
+        for quantity in RAPTOR_QUANTITIES:
+            names.append(f"{prefix}_{quantity}_mean")
+            names.append(f"{prefix}_{quantity}_max_mean")
+            names.append(f"{prefix}_{quantity}_max_std")
+    names.append(f"full_position_settling_fraction_{int(settling_position_mm)}mm")
+    names.append(f"tail_position_settling_fraction_{int(settling_position_mm)}mm")
+    return tuple(names)
+
+
+def open_log(path: Path, settling_position_mm: float) -> tuple[object, csv.DictWriter]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w", newline="")
+    writer = csv.DictWriter(
+        handle,
+        fieldnames=_base_fieldnames() + _status_fieldnames() + _raptor_fieldnames(settling_position_mm),
+    )
+    writer.writeheader()
+    return handle, writer
+
+
+def open_eval_log(path: Path, settling_position_mm: float) -> tuple[object, csv.DictWriter]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w", newline="")
+    writer = csv.DictWriter(
+        handle,
+        fieldnames=(
+            "eval_seed",
+            "eval_batch_size",
+            "eval_horizon",
+            "seconds",
+        )
+        + _status_fieldnames()
+        + _raptor_fieldnames(settling_position_mm),
+    )
+    writer.writeheader()
+    return handle, writer
+
+
+def _quat_angle_from_rotation_matrix(rotation: torch.Tensor) -> torch.Tensor:
+    trace = rotation[:, 0, 0] + rotation[:, 1, 1] + rotation[:, 2, 2]
+    qw = torch.sqrt(torch.clamp(1.0 + trace, min=0.0)) * 0.5
+    angle = 2.0 * torch.acos(torch.clamp(qw, -1.0, 1.0))
+    return angle.abs()
+
+
+def _action_metrics(action: torch.Tensor, action_min: float = -1.0, action_max: float = 1.0, hover_relative: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+    half_range = (action_max - action_min) * 0.5
+    action_value = action * half_range + action_min + half_range
+    hovering_value = hover_relative * (action_max - action_min) + action_min
+    action_metric = (action_value - hovering_value).abs().mean(dim=-1)
+    action_relative_metric = ((action + 1.0) * 0.5 - hover_relative).abs().mean(dim=-1)
+    return action_metric, action_relative_metric
+
+
+def _clone_state(state):
+    return type(state)(
+        position=state.position.detach().clone(),
+        velocity=state.velocity.detach().clone(),
+        rotation=state.rotation.detach().clone(),
+        omega=state.omega.detach().clone(),
+        motor=state.motor.detach().clone(),
+        previous_action=state.previous_action.detach().clone(),
+    )
+
+
+def _empty_raptor_metrics(settling_position_mm: float) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for name in _status_fieldnames() + _raptor_fieldnames(settling_position_mm):
+        metrics[name] = float("nan")
+    return metrics
+
+
+def _parse_eval_seeds(seed_arg: str, seed: int, count: int) -> list[int]:
+    if seed_arg.strip():
+        return [int(part.strip()) for part in seed_arg.split(",") if part.strip()]
+    return [seed + offset for offset in range(max(count, 1))]
+
+
+def _window_stats(
+    samples: dict[str, list[torch.Tensor]],
+    *,
+    prefix: str,
+    start_step: int,
+    horizon: int,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    start = min(max(start_step, 0), max(horizon - 1, 0))
+    for quantity in RAPTOR_QUANTITIES:
+        mean, max_mean, max_std = _metric_summary(samples[quantity][start:])
+        metrics[f"{prefix}_{quantity}_mean"] = mean
+        metrics[f"{prefix}_{quantity}_max_mean"] = max_mean
+        metrics[f"{prefix}_{quantity}_max_std"] = max_std
+    return metrics
+
+
+def _write_trajectory_csv(path: Path, rows: list[dict[str, float | int]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = (
+        "eval_seed",
+        "sample",
+        "step",
+        "time_s",
+        "p_norm",
+        "v_norm",
+        "angle_error",
+        "omega_norm",
+        "action_0",
+        "action_1",
+        "action_2",
+        "action_3",
+        "motor_0",
+        "motor_1",
+        "motor_2",
+        "motor_3",
+    )
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@torch.no_grad()
+def rollout_diagnostics(
+    policy: MotorGRUPolicy,
+    sim: L2FSimulator,
+    initial_state,
+    args: argparse.Namespace,
+    *,
+    step_backend: str,
+    eval_seed: int | None = None,
+    trajectory_count: int = 0,
+) -> tuple[dict[str, float], list[dict[str, float | int]]]:
+    state = _clone_state(initial_state)
+    hidden = None
+    samples = {quantity: [] for quantity in RAPTOR_QUANTITIES}
+    trajectory_rows: list[dict[str, float | int]] = []
+    finite_mask = torch.ones(state.position.shape[0], device=state.position.device, dtype=torch.bool)
+    capture_count = min(max(trajectory_count, 0), state.position.shape[0])
+
+    for step_i in range(args.horizon):
+        omega_before = state.omega
+        state_features = sim.state_features(state)
+        error_features = sim.error_features(state)
+        previous_action = state.previous_action
+        action, hidden = policy(state_features, error_features, previous_action, hidden)
+
+        position_norm = state.position.norm(dim=-1)
+        angle_error = _quat_angle_from_rotation_matrix(state.rotation)
+        velocity_norm = state.velocity.norm(dim=-1)
+        omega_norm = state.omega.norm(dim=-1)
+        action_metric, action_relative_metric = _action_metrics(action)
+
+        if step_backend == "cuda":
+            next_state = cuda_step(state, action, sim.params, grad_decay=1.0)
+        else:
+            next_state = sim.step(state, action, grad_decay=1.0)
+
+        angular_acceleration = (next_state.omega - omega_before).norm(dim=-1) / args.dt
+
+        samples["position"].append(position_norm.detach())
+        samples["angle"].append(angle_error.detach())
+        samples["linear_velocity"].append(velocity_norm.detach())
+        samples["angular_velocity"].append(omega_norm.detach())
+        samples["angular_acceleration"].append(angular_acceleration.detach())
+        samples["action"].append(action_metric.detach())
+        samples["action_relative"].append(action_relative_metric.detach())
+
+        finite_mask &= torch.isfinite(position_norm)
+        finite_mask &= torch.isfinite(angle_error)
+        finite_mask &= torch.isfinite(velocity_norm)
+        finite_mask &= torch.isfinite(omega_norm)
+        finite_mask &= torch.isfinite(angular_acceleration)
+        finite_mask &= torch.isfinite(action).all(dim=-1)
+        finite_mask &= torch.isfinite(next_state.motor).all(dim=-1)
+
+        if capture_count > 0:
+            p_cpu = position_norm[:capture_count].detach().cpu()
+            v_cpu = velocity_norm[:capture_count].detach().cpu()
+            angle_cpu = angle_error[:capture_count].detach().cpu()
+            omega_cpu = omega_norm[:capture_count].detach().cpu()
+            action_cpu = action[:capture_count].detach().cpu()
+            motor_cpu = next_state.motor[:capture_count].detach().cpu()
+            for sample_i in range(capture_count):
+                trajectory_rows.append(
+                    {
+                        "eval_seed": -1 if eval_seed is None else eval_seed,
+                        "sample": sample_i,
+                        "step": step_i,
+                        "time_s": step_i * args.dt,
+                        "p_norm": float(p_cpu[sample_i]),
+                        "v_norm": float(v_cpu[sample_i]),
+                        "angle_error": float(angle_cpu[sample_i]),
+                        "omega_norm": float(omega_cpu[sample_i]),
+                        "action_0": float(action_cpu[sample_i, 0]),
+                        "action_1": float(action_cpu[sample_i, 1]),
+                        "action_2": float(action_cpu[sample_i, 2]),
+                        "action_3": float(action_cpu[sample_i, 3]),
+                        "motor_0": float(motor_cpu[sample_i, 0]),
+                        "motor_1": float(motor_cpu[sample_i, 1]),
+                        "motor_2": float(motor_cpu[sample_i, 2]),
+                        "motor_3": float(motor_cpu[sample_i, 3]),
+                    }
+                )
+
+        state = next_state
+
+    metrics = {}
+    metrics.update(_window_stats(samples, prefix="full", start_step=0, horizon=args.horizon))
+    metrics.update(_window_stats(samples, prefix="tail", start_step=args.tail_start_step, horizon=args.horizon))
+
+    settle_thr = args.settling_position_mm / 1000.0
+    final_position = samples["position"][-1]
+    tail_start = min(max(args.tail_start_step, 0), max(args.horizon - 1, 0))
+    tail_position_stack = torch.stack(samples["position"][tail_start:], dim=0)
+    metrics[f"full_position_settling_fraction_{int(args.settling_position_mm)}mm"] = (
+        (final_position < settle_thr) & finite_mask
+    ).float().mean().item()
+    metrics[f"tail_position_settling_fraction_{int(args.settling_position_mm)}mm"] = (
+        (tail_position_stack.max(dim=0).values < settle_thr) & finite_mask
+    ).float().mean().item()
+
+    final_success = (
+        (samples["position"][-1] < args.success_position_m)
+        & (samples["angle"][-1] < args.success_angle_rad)
+        & (samples["linear_velocity"][-1] < args.success_velocity)
+        & (samples["angular_velocity"][-1] < args.success_omega)
+        & finite_mask
+    )
+    tail_success = (
+        (torch.stack(samples["position"][tail_start:], dim=0).mean(dim=0) < args.success_position_m)
+        & (torch.stack(samples["angle"][tail_start:], dim=0).mean(dim=0) < args.success_angle_rad)
+        & (torch.stack(samples["linear_velocity"][tail_start:], dim=0).mean(dim=0) < args.success_velocity)
+        & (torch.stack(samples["angular_velocity"][tail_start:], dim=0).mean(dim=0) < args.success_omega)
+        & finite_mask
+    )
+    metrics["success_rate"] = final_success.float().mean().item()
+    metrics["tail_success_rate"] = tail_success.float().mean().item()
+    metrics["invalid_fraction"] = (~finite_mask).float().mean().item()
+    return metrics, trajectory_rows
+
+
+def main() -> None:
+    args = parse_args()
+    device = resolve_device(args.device)
+    sim_backend = resolve_sim_backend(args.sim_backend, device)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+
+    sim = L2FSimulator(L2FParams(dt=args.dt))
+    loss_config = L2FLossConfig(
+        p_scale=args.p_scale,
+        v_scale=args.v_scale,
+        omega_scale=args.omega_scale,
+        huber_beta=args.huber_beta,
+        w_p=args.w_p,
+        w_v=args.w_v,
+        w_r=args.w_r,
+        w_omega=args.w_omega,
+        attitude_mode=args.attitude_mode,
+    )
+    if sim_backend == "cuda-full" and args.attitude_mode != "full":
+        raise ValueError("cuda-full backend currently requires --attitude-mode full")
+    state_step_decay = args.state_grad_decay ** args.dt
+    hidden_step_decay = args.hidden_grad_decay ** args.dt
+    policy = MotorGRUPolicy(
+        encoder_dim=args.encoder_dim,
+        hidden_dim=args.hidden_dim,
+        encoder_depth=args.encoder_depth,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    checkpoint_path = Path(args.checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic_backend = "cuda" if device.type == "cuda" and sim_backend in ("cuda", "cuda-full") else "torch"
+
+    if args.eval_only:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint.get("model", checkpoint)
+        policy.load_state_dict(state_dict)
+        policy.eval()
+        eval_seeds = _parse_eval_seeds(args.eval_seeds, args.seed, args.eval_seed_count)
+        eval_handle, eval_writer = open_eval_log(Path(args.log_path), args.settling_position_mm)
+        trajectory_rows_all: list[dict[str, float | int]] = []
+        eval_rows: list[dict[str, float | int]] = []
+        start = perf_counter()
+        print(
+            f"device={device} sim_backend={sim_backend} eval_only=true "
+            f"step_backend={diagnostic_backend} eval_seeds={','.join(str(seed) for seed in eval_seeds)}"
+        )
+        try:
+            for seed_i, eval_seed in enumerate(eval_seeds):
+                torch.manual_seed(eval_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(eval_seed)
+                state = sim.reset(args.batch_size, device=device)
+                metrics, trajectory_rows = rollout_diagnostics(
+                    policy,
+                    sim,
+                    state,
+                    args,
+                    step_backend=diagnostic_backend,
+                    eval_seed=eval_seed,
+                    trajectory_count=args.trajectory_count if seed_i == 0 else 0,
+                )
+                elapsed = perf_counter() - start
+                row = {
+                    "eval_seed": eval_seed,
+                    "eval_batch_size": args.batch_size,
+                    "eval_horizon": args.horizon,
+                    "seconds": elapsed,
+                    **metrics,
+                }
+                eval_writer.writerow(row)
+                eval_handle.flush()
+                eval_rows.append(row)
+                trajectory_rows_all.extend(trajectory_rows)
+                print(
+                    "eval_seed={seed} success={success:.6f} tail_success={tail_success:.6f} "
+                    "tail_p={tail_p:.6f} tail_angle={tail_angle:.6f} tail_v={tail_v:.6f} tail_w={tail_w:.6f}".format(
+                        seed=eval_seed,
+                        success=row["success_rate"],
+                        tail_success=row["tail_success_rate"],
+                        tail_p=row["tail_position_mean"],
+                        tail_angle=row["tail_angle_mean"],
+                        tail_v=row["tail_linear_velocity_mean"],
+                        tail_w=row["tail_angular_velocity_mean"],
+                    ),
+                    flush=True,
+                )
+
+            numeric_fields = _status_fieldnames() + _raptor_fieldnames(args.settling_position_mm)
+            for aggregate_name, reducer in (
+                ("aggregate_mean", lambda tensor: tensor.mean()),
+                ("aggregate_std", lambda tensor: tensor.std(unbiased=False) if tensor.numel() > 1 else torch.zeros_like(tensor.mean())),
+            ):
+                aggregate_row: dict[str, float | int | str] = {
+                    "eval_seed": aggregate_name,
+                    "eval_batch_size": args.batch_size,
+                    "eval_horizon": args.horizon,
+                    "seconds": perf_counter() - start,
+                }
+                for field in numeric_fields:
+                    values = torch.tensor([float(row[field]) for row in eval_rows], dtype=torch.float64)
+                    aggregate_row[field] = float(reducer(values))
+                eval_writer.writerow(aggregate_row)
+                eval_handle.flush()
+        finally:
+            eval_handle.close()
+
+        if args.trajectory_path:
+            _write_trajectory_csv(Path(args.trajectory_path), trajectory_rows_all)
+            print(f"saved trajectories: {args.trajectory_path}")
+        print(f"saved eval log: {args.log_path}")
+        return
+
+    log_handle, log_writer = open_log(Path(args.log_path), args.settling_position_mm)
+    start = perf_counter()
+    print(f"device={device} sim_backend={sim_backend}")
+
+    try:
+        for step_idx in range(1, args.steps + 1):
+            state = sim.reset(args.batch_size, device=device)
+            diagnostic_initial_state = _clone_state(state)
+            if sim_backend == "cuda-full":
+                metrics_tensor = full_cuda_rollout_metrics(
+                    policy,
+                    state,
+                    sim.params,
+                    loss_config,
+                    horizon=args.horizon,
+                    tail_steps=args.tail_steps,
+                    state_step_decay=state_step_decay,
+                    hidden_step_decay=hidden_step_decay,
+                    clf_kappa=args.clf_kappa,
+                    u_soft=args.u_soft,
+                    lambda_clf=args.lambda_clf,
+                    lambda_out=args.lambda_out,
+                    lambda_tail=args.lambda_tail,
+                    lambda_du=args.lambda_du,
+                    lambda_ddu=args.lambda_ddu,
+                    lambda_sat=args.lambda_sat,
+                )
+                loss = metrics_tensor[0]
+
+                detached_metrics = metrics_tensor.detach()
+                metrics = {
+                    name: detached_metrics[idx].item()
+                    for idx, name in enumerate(METRIC_NAMES)
+                }
+                # CUDA-FULL backend currently does not expose step-wise trajectory tensors for RAPTOR-style metrics.
+                raptor_metrics = {
+                    "position_mean": float("nan"),
+                    "position_max_mean": float("nan"),
+                    "position_max_std": float("nan"),
+                    "angle_mean": float("nan"),
+                    "angle_max_mean": float("nan"),
+                    "angle_max_std": float("nan"),
+                    "linear_velocity_mean": float("nan"),
+                    "linear_velocity_max_mean": float("nan"),
+                    "linear_velocity_max_std": float("nan"),
+                    "angular_velocity_mean": float("nan"),
+                    "angular_velocity_max_mean": float("nan"),
+                    "angular_velocity_max_std": float("nan"),
+                    "angular_acceleration_mean": float("nan"),
+                    "angular_acceleration_max_mean": float("nan"),
+                    "angular_acceleration_max_std": float("nan"),
+                    "action_mean": float("nan"),
+                    "action_max_mean": float("nan"),
+                    "action_max_std": float("nan"),
+                    "action_relative_mean": float("nan"),
+                    "action_relative_max_mean": float("nan"),
+                    "action_relative_max_std": float("nan"),
+                    f"position_settling_fraction_{int(args.settling_position_mm)}mm": float("nan"),
+                }
+            else:
+                hidden = None
+                tracking_sum = torch.zeros((), device=device)
+                clf_sum = torch.zeros((), device=device)
+                outward_sum = torch.zeros((), device=device)
+                du_sum = torch.zeros((), device=device)
+                ddu_sum = torch.zeros((), device=device)
+                sat_sum = torch.zeros((), device=device)
+                previous_potential = sim.tracking_potential(state, loss_config)
+                tail_potentials: list[torch.Tensor] = []
+                previous_action_delta: torch.Tensor | None = None
+                previous_omega: torch.Tensor | None = None
+                metric_sums: dict[str, torch.Tensor] = {}
+
+                position_errors: list[torch.Tensor] = []
+                angle_errors: list[torch.Tensor] = []
+                linear_velocity_errors: list[torch.Tensor] = []
+                angular_velocity_errors: list[torch.Tensor] = []
+                angular_acceleration_errors: list[torch.Tensor] = []
+                action_errors: list[torch.Tensor] = []
+                action_relative_errors: list[torch.Tensor] = []
+
+                for _ in range(args.horizon):
+                    state_features = sim.state_features(state)
+                    error_features = sim.error_features(state)
+                    previous_action = state.previous_action
+                    action, hidden = policy(state_features, error_features, previous_action, hidden)
+                    hidden = apply_gradient_decay(hidden, hidden_step_decay)
+                    action_delta = action - previous_action
+
+                    position_errors.append(state.position.norm(dim=-1))
+                    angle_errors.append(_quat_angle_from_rotation_matrix(state.rotation))
+                    linear_velocity_errors.append(state.velocity.norm(dim=-1))
+                    angular_velocity_errors.append(state.omega.norm(dim=-1))
+                    action_metric, action_relative_metric = _action_metrics(action)
+                    action_errors.append(action_metric)
+                    action_relative_errors.append(action_relative_metric)
+
+                    if sim_backend == "cuda":
+                        state = cuda_step(state, action, sim.params, grad_decay=state_step_decay)
+                    else:
+                        state = sim.step(state, action, grad_decay=state_step_decay)
+                    # angular acceleration uses next-state omega
+                    if previous_omega is None:
+                        angular_acceleration_errors.append(torch.zeros_like(state.omega.norm(dim=-1)))
+                    else:
+                        angular_acceleration_errors.append((state.omega - previous_omega).norm(dim=-1) / args.dt)
+
+                    tracking_components = sim.tracking_components(state, loss_config)
+                    potential = sum(tracking_components.values())
+                    tracking_sum = tracking_sum + potential.mean()
+                    clf_target = (1.0 - args.clf_kappa * args.dt) * previous_potential.detach()
+                    clf_sum = clf_sum + F.relu(potential - clf_target).square().mean()
+                    outward_sum = outward_sum + sim.outward_velocity_loss(state, loss_config)
+                    du_sum = du_sum + action_delta.square().mean()
+                    sat_sum = sat_sum + F.relu(action.abs() - args.u_soft).square().mean()
+                    if previous_action_delta is not None:
+                        ddu_sum = ddu_sum + (action_delta - previous_action_delta).square().mean()
+
+                    tail_potentials.append(potential)
+                    previous_potential = potential
+                    previous_action_delta = action_delta
+                    previous_omega = state.omega.detach().clone()
+                    for name, value in tracking_components.items():
+                        value_mean = value.mean()
+                        metric_sums[name] = metric_sums.get(name, torch.zeros_like(value_mean)) + value_mean.detach()
+
+                horizon = float(args.horizon)
+                tracking_loss = tracking_sum / horizon
+                clf_loss = clf_sum / horizon
+                outward_loss = outward_sum / horizon
+                du_loss = du_sum / horizon
+                ddu_count = max(args.horizon - 1, 1)
+                ddu_loss = ddu_sum / ddu_count
+                sat_loss = sat_sum / horizon
+                tail_count = min(max(args.tail_steps, 1), len(tail_potentials))
+                tail_loss = torch.stack(tail_potentials[-tail_count:]).mean()
+                loss = (
+                    tracking_loss
+                    + args.lambda_clf * clf_loss
+                    + args.lambda_out * outward_loss
+                    + args.lambda_tail * tail_loss
+                    + args.lambda_du * du_loss
+                    + args.lambda_ddu * ddu_loss
+                    + args.lambda_sat * sat_loss
+                )
+
+                position_mean, position_max_mean, position_max_std = _metric_summary(position_errors)
+                angle_mean, angle_max_mean, angle_max_std = _metric_summary(angle_errors)
+                linear_velocity_mean, linear_velocity_max_mean, linear_velocity_max_std = _metric_summary(linear_velocity_errors)
+                angular_velocity_mean, angular_velocity_max_mean, angular_velocity_max_std = _metric_summary(angular_velocity_errors)
+                angular_acceleration_mean, angular_acceleration_max_mean, angular_acceleration_max_std = _metric_summary(angular_acceleration_errors)
+                action_mean, action_max_mean, action_max_std = _metric_summary(action_errors)
+                action_relative_mean, action_relative_max_mean, action_relative_max_std = _metric_summary(action_relative_errors)
+
+                settle_thr = args.settling_position_mm / 1000.0
+                final_position = state.position.norm(dim=-1)
+                settling_fraction = (final_position < settle_thr).float().mean().item()
+                raptor_metrics = {
+                    "position_mean": position_mean,
+                    "position_max_mean": position_max_mean,
+                    "position_max_std": position_max_std,
+                    "angle_mean": angle_mean,
+                    "angle_max_mean": angle_max_mean,
+                    "angle_max_std": angle_max_std,
+                    "linear_velocity_mean": linear_velocity_mean,
+                    "linear_velocity_max_mean": linear_velocity_max_mean,
+                    "linear_velocity_max_std": linear_velocity_max_std,
+                    "angular_velocity_mean": angular_velocity_mean,
+                    "angular_velocity_max_mean": angular_velocity_max_mean,
+                    "angular_velocity_max_std": angular_velocity_max_std,
+                    "angular_acceleration_mean": angular_acceleration_mean,
+                    "angular_acceleration_max_mean": angular_acceleration_max_mean,
+                    "angular_acceleration_max_std": angular_acceleration_max_std,
+                    "action_mean": action_mean,
+                    "action_max_mean": action_max_mean,
+                    "action_max_std": action_max_std,
+                    "action_relative_mean": action_relative_mean,
+                    "action_relative_max_mean": action_relative_max_mean,
+                    "action_relative_max_std": action_relative_max_std,
+                    f"position_settling_fraction_{int(args.settling_position_mm)}mm": settling_fraction,
+                }
+
+                metrics = {
+                    name: (value / args.horizon).item()
+                    for name, value in metric_sums.items()
+                }
+                metrics.update(
+                    {
+                        "loss": loss.item(),
+                        "tracking": tracking_loss.item(),
+                        "clf": clf_loss.item(),
+                        "outward": outward_loss.item(),
+                        "tail": tail_loss.item(),
+                        "du": du_loss.item(),
+                        "ddu": ddu_loss.item(),
+                        "sat": sat_loss.item(),
+                    }
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
+            optimizer.step()
+            policy.eval()
+            raptor_metrics, _ = rollout_diagnostics(
+                policy,
+                sim,
+                diagnostic_initial_state,
+                args,
+                step_backend=diagnostic_backend,
+                eval_seed=args.seed,
+                trajectory_count=0,
+            )
+            policy.train()
+
+            elapsed = perf_counter() - start
+            row = {
+                "step": step_idx,
+                "grad_norm": float(grad_norm),
+                "seconds": elapsed,
+                **metrics,
+                **raptor_metrics,
+            }
+            log_writer.writerow(row)
+            log_handle.flush()
+
+            if step_idx % args.log_every == 0 or step_idx == 1:
+                print(
+                    "step={step} loss={loss:.6f} track={tracking:.6f} "
+                    "clf={clf:.6f} tail={tail:.6f} grad={grad_norm:.3f}".format(
+                        step=step_idx,
+                        loss=row["loss"],
+                        tracking=row["tracking"],
+                        clf=row["clf"],
+                        tail=row["tail"],
+                        grad_norm=row["grad_norm"],
+                    ),
+                    flush=True,
+                )
+
+            if args.save_every > 0 and step_idx % args.save_every == 0:
+                torch.save(
+                    {
+                        "step": step_idx,
+                        "model": policy.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "args": vars(args),
+                    },
+                    checkpoint_path,
+                )
+
+        torch.save(
+            {
+                "step": args.steps,
+                "model": policy.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "args": vars(args),
+            },
+            checkpoint_path,
+        )
+    finally:
+        log_handle.close()
+
+    print(f"saved checkpoint: {checkpoint_path}")
+    print(f"saved log: {args.log_path}")
+
+
+if __name__ == "__main__":
+    main()
