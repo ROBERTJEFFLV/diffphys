@@ -34,6 +34,7 @@ class L2FRaptorEpisodeDynamics:
     thrust_coeff_c0: torch.Tensor
     thrust_coeff_c1: torch.Tensor
     thrust_coeff_c2: torch.Tensor
+    external_force: torch.Tensor
     thrust_to_weight: torch.Tensor
     torque_to_inertia: torch.Tensor
     rotor_distance_factor: torch.Tensor
@@ -217,6 +218,7 @@ def sample_raptor_episode_dynamics(
         thrust_coeff_c0=thrust_coeff_c0[:, None].expand(batch, 4),
         thrust_coeff_c1=thrust_coeff_c1[:, None].expand(batch, 4),
         thrust_coeff_c2=thrust_coeff_c2[:, None].expand(batch, 4),
+        external_force=external_force,
         thrust_to_weight=thrust_to_weight,
         torque_to_inertia=torque_to_inertia,
         rotor_distance_factor=rotor_distance_factor,
@@ -257,11 +259,13 @@ def _fixed_episode_dynamics(
     inertia_x = torch.full((batch,), float(nominal.inertia_x), device=device, dtype=dtype)
     inertia_y = torch.full((batch,), float(nominal.inertia_y), device=device, dtype=dtype)
     inertia_z = torch.full((batch,), float(nominal.inertia_z), device=device, dtype=dtype)
+    external_force = torch.zeros((batch, 3), device=device, dtype=dtype)
     return L2FRaptorEpisodeDynamics(
         mass=mass,
         thrust_coeff_c0=thrust_coeff_c0_nom[:, None].expand(batch, 4),
         thrust_coeff_c1=thrust_coeff_c1_nom[:, None].expand(batch, 4),
         thrust_coeff_c2=thrust_coeff_c2_nom[:, None].expand(batch, 4),
+        external_force=external_force,
         thrust_to_weight=thrust_to_weight,
         torque_to_inertia=torque_to_inertia,
         rotor_distance_factor=rotor_distance_factor,
@@ -485,7 +489,7 @@ class L2FSimulator:
             (
                 state.arm_length * (thrust[:, 1] - thrust[:, 3]),
                 state.arm_length * (thrust[:, 2] - thrust[:, 0]),
-                p.yaw_drag * (thrust[:, 0] - thrust[:, 1] + thrust[:, 2] - thrust[:, 3]),
+                state.rotor_torque_constant * (thrust[:, 0] - thrust[:, 1] + thrust[:, 2] - thrust[:, 3]),
             ),
             dim=-1,
         )

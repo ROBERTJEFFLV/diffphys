@@ -54,6 +54,17 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     torch::Tensor motor0,
     torch::Tensor previous_action0,
     torch::Tensor external_force0,
+    torch::Tensor mass,
+    torch::Tensor thrust_coeff_c0,
+    torch::Tensor thrust_coeff_c1,
+    torch::Tensor thrust_coeff_c2,
+    torch::Tensor motor_time_rising,
+    torch::Tensor motor_time_falling,
+    torch::Tensor arm_length,
+    torch::Tensor inertia_x,
+    torch::Tensor inertia_y,
+    torch::Tensor inertia_z,
+    torch::Tensor rotor_torque_constant,
     torch::Tensor encoder0_w,
     torch::Tensor encoder0_b,
     torch::Tensor encoder1_w,
@@ -67,15 +78,8 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     int horizon,
     int tail_steps,
     double dt,
-    double mass,
     double gravity,
-    double arm_length,
     double yaw_drag,
-    double motor_tau,
-    double motor_authority,
-    double inertia_x,
-    double inertia_y,
-    double inertia_z,
     double state_grad_decay,
     double hidden_grad_decay,
     double p_scale,
@@ -224,6 +228,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               torch::Tensor motor0,
                               torch::Tensor previous_action0,
                               torch::Tensor external_force0,
+                              torch::Tensor mass,
+                              torch::Tensor thrust_coeff_c0,
+                              torch::Tensor thrust_coeff_c1,
+                              torch::Tensor thrust_coeff_c2,
+                              torch::Tensor motor_time_rising,
+                              torch::Tensor motor_time_falling,
+                              torch::Tensor arm_length,
+                              torch::Tensor inertia_x,
+                              torch::Tensor inertia_y,
+                              torch::Tensor inertia_z,
+                              torch::Tensor rotor_torque_constant,
                               torch::Tensor encoder0_w,
                               torch::Tensor encoder0_b,
                               torch::Tensor encoder1_w,
@@ -237,15 +252,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               int horizon,
                               int tail_steps,
                               double dt,
-                              double mass,
                               double gravity,
-                              double arm_length,
                               double yaw_drag,
-                              double motor_tau,
-                              double motor_authority,
-                              double inertia_x,
-                              double inertia_y,
-                              double inertia_z,
                               double state_grad_decay,
                               double hidden_grad_decay,
                               double p_scale,
@@ -271,6 +279,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               double observation_noise_max) {
         check_state_inputs(position0, velocity0, rotation0, omega0, motor0, previous_action0);
         check_2d(external_force0, "external_force0", position0.size(0), 3);
+        check_1d(mass, "mass", position0.size(0));
+        check_2d(thrust_coeff_c0, "thrust_coeff_c0", position0.size(0), 4);
+        check_2d(thrust_coeff_c1, "thrust_coeff_c1", position0.size(0), 4);
+        check_2d(thrust_coeff_c2, "thrust_coeff_c2", position0.size(0), 4);
+        check_1d(motor_time_rising, "motor_time_rising", position0.size(0));
+        check_1d(motor_time_falling, "motor_time_falling", position0.size(0));
+        check_1d(arm_length, "arm_length", position0.size(0));
+        check_1d(inertia_x, "inertia_x", position0.size(0));
+        check_1d(inertia_y, "inertia_y", position0.size(0));
+        check_1d(inertia_z, "inertia_z", position0.size(0));
+        check_1d(rotor_torque_constant, "rotor_torque_constant", position0.size(0));
         check_2d(encoder0_w, "encoder0_w", 192, 40);
         check_1d(encoder0_b, "encoder0_b", 192);
         check_2d(encoder1_w, "encoder1_w", 192, 192);
@@ -284,12 +303,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         TORCH_CHECK(horizon > 0, "horizon must be positive");
         return l2f_full_rollout_cuda(
             position0, velocity0, rotation0, omega0, motor0, previous_action0, external_force0,
+            mass, thrust_coeff_c0, thrust_coeff_c1, thrust_coeff_c2,
+            motor_time_rising, motor_time_falling,
+            arm_length, inertia_x, inertia_y, inertia_z, rotor_torque_constant,
             encoder0_w, encoder0_b, encoder1_w, encoder1_b,
             gru_w_ih, gru_w_hh, gru_b_ih, gru_b_hh,
             motor_head_w, motor_head_b,
             horizon, tail_steps,
-            dt, mass, gravity, arm_length, yaw_drag, motor_tau, motor_authority,
-            inertia_x, inertia_y, inertia_z,
+            dt, gravity, yaw_drag,
             state_grad_decay, hidden_grad_decay,
             p_scale, v_scale, omega_scale, huber_beta,
             w_p, w_v, w_r, w_omega, clf_kappa, u_soft,

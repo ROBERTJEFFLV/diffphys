@@ -34,15 +34,19 @@ enum MetricIndex {
 
 struct DynamicsParams {
     float dt;
-    float mass;
     float gravity;
-    float arm_length;
+    const float* mass;
+    const float* thrust_coeff_c0;
+    const float* thrust_coeff_c1;
+    const float* thrust_coeff_c2;
+    const float* motor_time_rising;
+    const float* motor_time_falling;
+    const float* arm_length;
+    const float* inertia_x;
+    const float* inertia_y;
+    const float* inertia_z;
+    const float* rotor_torque_constant;
     float yaw_drag;
-    float motor_tau;
-    float motor_authority;
-    float inertia_x;
-    float inertia_y;
-    float inertia_z;
     float state_grad_decay;
     int noise_seed;
     float external_torque_max;
@@ -402,6 +406,13 @@ __global__ void physics_forward_kernel(
     DynamicsParams dp) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch) return;
+    const int coeff_base = b * 4;
+    const float mass_b = dp.mass[b];
+    const float arm_b = dp.arm_length[b];
+    const float inertia_x_b = dp.inertia_x[b];
+    const float inertia_y_b = dp.inertia_y[b];
+    const float inertia_z_b = dp.inertia_z[b];
+    const float rotor_torque_constant_b = dp.rotor_torque_constant[b];
     const int base3 = (t * batch + b) * 3;
     const int next3 = ((t + 1) * batch + b) * 3;
     const int base9 = (t * batch + b) * 9;
@@ -409,14 +420,19 @@ __global__ void physics_forward_kernel(
     const int base4 = (t * batch + b) * 4;
     const int next4 = ((t + 1) * batch + b) * 4;
     const int act4 = (t * batch + b) * 4;
-    const float alpha = clampf(dp.dt / dp.motor_tau, 0.0f, 1.0f);
-    const float hover = dp.mass * dp.gravity * 0.25f;
     float command[4], nm[4], thrust[4];
     for (int i = 0; i < 4; i++) {
         const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
         command[i] = clampf(actions[act4 + i] + action_noise, -1.0f, 1.0f);
+        const float tau_b = command[i] >= m[base4 + i] ? dp.motor_time_rising[b] : dp.motor_time_falling[b];
+        const float alpha = clampf(dp.dt / tau_b, 0.0f, 1.0f);
         nm[i] = m[base4 + i] + alpha * (command[i] - m[base4 + i]);
-        thrust[i] = fmaxf(hover * (1.0f + dp.motor_authority * nm[i]), 0.0f);
+        thrust[i] = fmaxf(
+            dp.thrust_coeff_c0[coeff_base + i] +
+                dp.thrust_coeff_c1[coeff_base + i] * nm[i] +
+                dp.thrust_coeff_c2[coeff_base + i] * nm[i] * nm[i],
+            0.0f
+        );
         m[next4 + i] = nm[i];
         pa[next4 + i] = command[i];
     }
@@ -424,9 +440,9 @@ __global__ void physics_forward_kernel(
     for (int i = 0; i < 9; i++) rmat[i] = R[base9 + i];
     const float total = thrust[0] + thrust[1] + thrust[2] + thrust[3];
     const float acc[3] = {
-        rmat[2] * total / dp.mass + external_force0[b * 3 + 0] / dp.mass,
-        rmat[5] * total / dp.mass + external_force0[b * 3 + 1] / dp.mass,
-        rmat[8] * total / dp.mass - dp.gravity + external_force0[b * 3 + 2] / dp.mass,
+        rmat[2] * total / mass_b + external_force0[b * 3 + 0] / mass_b,
+        rmat[5] * total / mass_b + external_force0[b * 3 + 1] / mass_b,
+        rmat[8] * total / mass_b - dp.gravity + external_force0[b * 3 + 2] / mass_b,
     };
     for (int i = 0; i < 3; i++) {
         const float nv = v[base3 + i] + dp.dt * acc[i];
@@ -434,11 +450,12 @@ __global__ void physics_forward_kernel(
         p[next3 + i] = p[base3 + i] + dp.dt * nv;
     }
     const float torque[3] = {
-        dp.arm_length * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
-        dp.arm_length * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
-        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
+        arm_b * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
+        arm_b * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
+        rotor_torque_constant_b * (thrust[0] - thrust[1] + thrust[2] - thrust[3])
+            + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
     };
-    const float inertia[3] = {dp.inertia_x, dp.inertia_y, dp.inertia_z};
+    const float inertia[3] = {inertia_x_b, inertia_y_b, inertia_z_b};
     float omega[3], iw[3], oc[3], nw[3];
     for (int i = 0; i < 3; i++) {
         omega[i] = w[base3 + i];
@@ -584,6 +601,13 @@ __global__ void physics_backward_kernel(
     DynamicsParams dp) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch) return;
+    const int coeff_base = b * 4;
+    const float mass_b = dp.mass[b];
+    const float arm_b = dp.arm_length[b];
+    const float inertia_x_b = dp.inertia_x[b];
+    const float inertia_y_b = dp.inertia_y[b];
+    const float inertia_z_b = dp.inertia_z[b];
+    const float rotor_torque_constant_b = dp.rotor_torque_constant[b];
     const int base3 = (t * batch + b) * 3;
     const int next3 = ((t + 1) * batch + b) * 3;
     const int base9 = (t * batch + b) * 9;
@@ -592,22 +616,28 @@ __global__ void physics_backward_kernel(
     const int next4 = ((t + 1) * batch + b) * 4;
     const int act4 = (t * batch + b) * 4;
 
-    const float alpha = clampf(dp.dt / dp.motor_tau, 0.0f, 1.0f);
-    const float hover = dp.mass * dp.gravity * 0.25f;
-    const float inertia[3] = {dp.inertia_x, dp.inertia_y, dp.inertia_z};
+    const float inertia[3] = {inertia_x_b, inertia_y_b, inertia_z_b};
     float rmat[9];
     for (int i = 0; i < 9; i++) rmat[i] = R[base9 + i];
     float command[4], nm[4], thrust[4];
     for (int i = 0; i < 4; i++) {
         const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
         command[i] = clampf(actions[act4 + i] + action_noise, -1.0f, 1.0f);
+        const float tau_b = command[i] >= m[base4 + i] ? dp.motor_time_rising[b] : dp.motor_time_falling[b];
+        const float alpha = clampf(dp.dt / tau_b, 0.0f, 1.0f);
         nm[i] = m[base4 + i] + alpha * (command[i] - m[base4 + i]);
-        thrust[i] = fmaxf(hover * (1.0f + dp.motor_authority * nm[i]), 0.0f);
+        thrust[i] = fmaxf(
+            dp.thrust_coeff_c0[coeff_base + i]
+                + dp.thrust_coeff_c1[coeff_base + i] * nm[i]
+                + dp.thrust_coeff_c2[coeff_base + i] * nm[i] * nm[i],
+            0.0f
+        );
     }
     const float torque[3] = {
-        dp.arm_length * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
-        dp.arm_length * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
-        dp.yaw_drag * (thrust[0] - thrust[1] + thrust[2] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
+        arm_b * (thrust[1] - thrust[3]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 0, 3) : 0.0f),
+        arm_b * (thrust[2] - thrust[0]) + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 1, 3) : 0.0f),
+        rotor_torque_constant_b * (thrust[0] - thrust[1] + thrust[2] - thrust[3])
+            + (dp.external_torque_max > 0.0f ? dp.external_torque_max * signed_noise(dp.noise_seed, t, b, 2, 3) : 0.0f),
     };
     float omega[3], iw[3], oc[3], nw[3];
     for (int i = 0; i < 3; i++) {
@@ -669,8 +699,8 @@ __global__ void physics_backward_kernel(
     const float total_thrust = thrust[0] + thrust[1] + thrust[2] + thrust[3];
     float gtotal = 0.0f;
     for (int i = 0; i < 3; i++) {
-        gr_in[i * 3 + 2] += gacc[i] * total_thrust / dp.mass;
-        gtotal += gacc[i] * rmat[i * 3 + 2] / dp.mass;
+        gr_in[i * 3 + 2] += gacc[i] * total_thrust / mass_b;
+        gtotal += gacc[i] * rmat[i * 3 + 2] / mass_b;
     }
     for (int i = 0; i < 4; i++) gthrust[i] += gtotal;
 
@@ -685,18 +715,23 @@ __global__ void physics_backward_kernel(
     cross3(gy, omega, tmp_b);
     for (int i = 0; i < 3; i++) gw_in[i] += tmp_a[i] + inertia[i] * tmp_b[i];
 
-    gthrust[1] += dp.arm_length * gtorque[0];
-    gthrust[3] -= dp.arm_length * gtorque[0];
-    gthrust[2] += dp.arm_length * gtorque[1];
-    gthrust[0] -= dp.arm_length * gtorque[1];
-    gthrust[0] += dp.yaw_drag * gtorque[2];
-    gthrust[1] -= dp.yaw_drag * gtorque[2];
-    gthrust[2] += dp.yaw_drag * gtorque[2];
-    gthrust[3] -= dp.yaw_drag * gtorque[2];
+    gthrust[1] += arm_b * gtorque[0];
+    gthrust[3] -= arm_b * gtorque[0];
+    gthrust[2] += arm_b * gtorque[1];
+    gthrust[0] -= arm_b * gtorque[1];
+    gthrust[0] += rotor_torque_constant_b * gtorque[2];
+    gthrust[1] -= rotor_torque_constant_b * gtorque[2];
+    gthrust[2] += rotor_torque_constant_b * gtorque[2];
+    gthrust[3] -= rotor_torque_constant_b * gtorque[2];
 
     for (int i = 0; i < 4; i++) {
-        const float thrust_pre = hover * (1.0f + dp.motor_authority * nm[i]);
-        if (thrust_pre > 0.0f) gm_next[i] += gthrust[i] * hover * dp.motor_authority;
+        const float thrust_pre = dp.thrust_coeff_c0[coeff_base + i]
+            + dp.thrust_coeff_c1[coeff_base + i] * nm[i]
+            + dp.thrust_coeff_c2[coeff_base + i] * nm[i] * nm[i];
+        const float dthrust = dp.thrust_coeff_c1[coeff_base + i] + 2.0f * dp.thrust_coeff_c2[coeff_base + i] * nm[i];
+        const float tau_b = command[i] >= m[base4 + i] ? dp.motor_time_rising[b] : dp.motor_time_falling[b];
+        const float alpha = clampf(dp.dt / tau_b, 0.0f, 1.0f);
+        if (thrust_pre > 0.0f) gm_next[i] += gthrust[i] * dthrust;
         gm_in[i] += (1.0f - alpha) * gm_next[i];
         gc[i] += alpha * gm_next[i];
         const float action_noise = dp.action_noise_max > 0.0f ? dp.action_noise_max * signed_noise(dp.noise_seed, t, b, i, 1) : 0.0f;
@@ -913,6 +948,17 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     torch::Tensor motor0,
     torch::Tensor previous_action0,
     torch::Tensor external_force0,
+    torch::Tensor mass,
+    torch::Tensor thrust_coeff_c0,
+    torch::Tensor thrust_coeff_c1,
+    torch::Tensor thrust_coeff_c2,
+    torch::Tensor motor_time_rising,
+    torch::Tensor motor_time_falling,
+    torch::Tensor arm_length,
+    torch::Tensor inertia_x,
+    torch::Tensor inertia_y,
+    torch::Tensor inertia_z,
+    torch::Tensor rotor_torque_constant,
     torch::Tensor encoder0_w,
     torch::Tensor encoder0_b,
     torch::Tensor encoder1_w,
@@ -926,15 +972,8 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
     int horizon,
     int tail_steps,
     double dt,
-    double mass,
     double gravity,
-    double arm_length,
     double yaw_drag,
-    double motor_tau,
-    double motor_authority,
-    double inertia_x,
-    double inertia_y,
-    double inertia_z,
     double state_grad_decay,
     double hidden_grad_decay,
     double p_scale,
@@ -999,15 +1038,19 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
 
     DynamicsParams dp{
         static_cast<float>(dt),
-        static_cast<float>(mass),
         static_cast<float>(gravity),
-        static_cast<float>(arm_length),
+        mass.data_ptr<float>(),
+        thrust_coeff_c0.data_ptr<float>(),
+        thrust_coeff_c1.data_ptr<float>(),
+        thrust_coeff_c2.data_ptr<float>(),
+        motor_time_rising.data_ptr<float>(),
+        motor_time_falling.data_ptr<float>(),
+        arm_length.data_ptr<float>(),
+        inertia_x.data_ptr<float>(),
+        inertia_y.data_ptr<float>(),
+        inertia_z.data_ptr<float>(),
+        rotor_torque_constant.data_ptr<float>(),
         static_cast<float>(yaw_drag),
-        static_cast<float>(motor_tau),
-        static_cast<float>(motor_authority),
-        static_cast<float>(inertia_x),
-        static_cast<float>(inertia_y),
-        static_cast<float>(inertia_z),
         static_cast<float>(state_grad_decay),
         noise_seed,
         static_cast<float>(external_torque_max),
@@ -1106,6 +1149,12 @@ std::vector<torch::Tensor> l2f_full_rollout_cuda(
 
     return {
         metrics,
+        p[states - 1],
+        v[states - 1],
+        R[states - 1],
+        w[states - 1],
+        m[states - 1],
+        pa[states - 1],
         g_encoder0_w, g_encoder0_b,
         g_encoder1_w, g_encoder1_b,
         g_gru_w_ih, g_gru_w_hh,

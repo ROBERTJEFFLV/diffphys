@@ -59,6 +59,17 @@ class _FullCudaRollout(torch.autograd.Function):
         motor0: torch.Tensor,
         previous_action0: torch.Tensor,
         external_force0: torch.Tensor,
+        mass: torch.Tensor,
+        thrust_coeff_c0: torch.Tensor,
+        thrust_coeff_c1: torch.Tensor,
+        thrust_coeff_c2: torch.Tensor,
+        motor_time_rising: torch.Tensor,
+        motor_time_falling: torch.Tensor,
+        arm_length: torch.Tensor,
+        inertia_x: torch.Tensor,
+        inertia_y: torch.Tensor,
+        inertia_z: torch.Tensor,
+        rotor_torque_constant: torch.Tensor,
         encoder0_w: torch.Tensor,
         encoder0_b: torch.Tensor,
         encoder1_w: torch.Tensor,
@@ -72,15 +83,8 @@ class _FullCudaRollout(torch.autograd.Function):
         horizon: int,
         tail_steps: int,
         dt: float,
-        mass: float,
         gravity: float,
-        arm_length: float,
         yaw_drag: float,
-        motor_tau: float,
-        motor_authority: float,
-        inertia_x: float,
-        inertia_y: float,
-        inertia_z: float,
         state_grad_decay: float,
         hidden_grad_decay: float,
         p_scale: float,
@@ -104,7 +108,7 @@ class _FullCudaRollout(torch.autograd.Function):
         external_torque_max: float,
         action_noise_max: float,
         observation_noise_max: float,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, ...]:
         ext = load_extension()
         outputs = ext.full_rollout(
             position0.contiguous(),
@@ -114,6 +118,17 @@ class _FullCudaRollout(torch.autograd.Function):
             motor0.contiguous(),
             previous_action0.contiguous(),
             external_force0.contiguous(),
+            mass.contiguous(),
+            thrust_coeff_c0.contiguous(),
+            thrust_coeff_c1.contiguous(),
+            thrust_coeff_c2.contiguous(),
+            motor_time_rising.contiguous(),
+            motor_time_falling.contiguous(),
+            arm_length.contiguous(),
+            inertia_x.contiguous(),
+            inertia_y.contiguous(),
+            inertia_z.contiguous(),
+            rotor_torque_constant.contiguous(),
             encoder0_w.contiguous(),
             encoder0_b.contiguous(),
             encoder1_w.contiguous(),
@@ -127,15 +142,8 @@ class _FullCudaRollout(torch.autograd.Function):
             int(horizon),
             int(tail_steps),
             float(dt),
-            float(mass),
             float(gravity),
-            float(arm_length),
             float(yaw_drag),
-            float(motor_tau),
-            float(motor_authority),
-            float(inertia_x),
-            float(inertia_y),
-            float(inertia_z),
             float(state_grad_decay),
             float(hidden_grad_decay),
             float(p_scale),
@@ -161,25 +169,38 @@ class _FullCudaRollout(torch.autograd.Function):
             float(observation_noise_max),
         )
         metrics = outputs[0]
-        ctx.save_for_backward(*outputs[1:])
-        return metrics
+        final_position = outputs[1]
+        final_velocity = outputs[2]
+        final_rotation = outputs[3]
+        final_omega = outputs[4]
+        final_motor = outputs[5]
+        final_previous_action = outputs[6]
+        ctx.save_for_backward(*outputs[7:])
+        return (
+            metrics,
+            final_position,
+            final_velocity,
+            final_rotation,
+            final_omega,
+            final_motor,
+            final_previous_action,
+        )
 
     @staticmethod
-    def backward(ctx, grad_metrics: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+    def backward(
+        ctx,
+        grad_metrics: torch.Tensor,
+        grad_final_position: torch.Tensor | None = None,
+        grad_final_velocity: torch.Tensor | None = None,
+        grad_final_rotation: torch.Tensor | None = None,
+        grad_final_omega: torch.Tensor | None = None,
+        grad_final_motor: torch.Tensor | None = None,
+        grad_final_previous_action: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, ...]:
         grads = ctx.saved_tensors
         scale = grad_metrics[0].contiguous()
         scaled_grads = tuple(grad * scale for grad in grads)
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            *scaled_grads,
-            *([None] * 35),
-        )
+        return (*([None] * 18), *scaled_grads, *([None] * 28))
 
 
 def full_cuda_rollout_metrics(
@@ -204,7 +225,7 @@ def full_cuda_rollout_metrics(
     external_torque_max: float = 0.0,
     action_noise_max: float = 0.0,
     observation_noise_max: float = 0.0,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not initial_state.position.is_cuda:
         raise RuntimeError("cuda-full backend requires CUDA initial state tensors")
     tensors = _policy_tensors(policy)
@@ -216,19 +237,23 @@ def full_cuda_rollout_metrics(
         initial_state.motor,
         initial_state.previous_action,
         initial_state.external_force,
+        initial_state.mass,
+        initial_state.thrust_coeff_c0,
+        initial_state.thrust_coeff_c1,
+        initial_state.thrust_coeff_c2,
+        initial_state.motor_time_rising,
+        initial_state.motor_time_falling,
+        initial_state.arm_length,
+        initial_state.inertia_x,
+        initial_state.inertia_y,
+        initial_state.inertia_z,
+        initial_state.rotor_torque_constant,
         *tensors,
         horizon,
         tail_steps,
         params.dt,
-        params.mass,
         params.gravity,
-        params.arm_length,
         params.yaw_drag,
-        params.motor_tau,
-        params.motor_authority,
-        params.inertia_x,
-        params.inertia_y,
-        params.inertia_z,
         state_step_decay,
         hidden_step_decay,
         loss_config.p_scale,

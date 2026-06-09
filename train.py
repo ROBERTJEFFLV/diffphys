@@ -667,7 +667,7 @@ def main() -> None:
 
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    diagnostic_backend = "cuda" if device.type == "cuda" and sim_backend in ("cuda", "cuda-full") else "torch"
+    diagnostic_backend = "cuda" if device.type == "cuda" and sim_backend == "cuda" else "torch"
 
     if args.eval_only:
         if not checkpoint_path.exists():
@@ -860,7 +860,6 @@ def main() -> None:
                     observation_noise_max=args.observation_noise_max,
                 )
                 loss = metrics_tensor[0]
-
                 if args.persistent_episode_training:
                     state = L2FState(
                         position=final_position.detach(),
@@ -888,6 +887,14 @@ def main() -> None:
                         inertia_y=state.inertia_y,
                         inertia_z=state.inertia_z,
                     )
+
+                current_finite_mask = torch.isfinite(final_position).all(dim=-1)
+                current_finite_mask &= torch.isfinite(final_velocity).all(dim=-1)
+                current_finite_mask &= torch.isfinite(final_rotation).reshape(args.batch_size, 9).all(dim=-1)
+                current_finite_mask &= torch.isfinite(final_omega).all(dim=-1)
+                current_finite_mask &= torch.isfinite(final_motor).all(dim=-1)
+                current_finite_mask &= torch.isfinite(final_previous_action).all(dim=-1)
+                current_finite_mask &= torch.isfinite(loss)
 
                 detached_metrics = metrics_tensor.detach()
                 metrics = {
@@ -1043,6 +1050,7 @@ def main() -> None:
                 }
 
                 current_finite_mask = torch.ones(args.batch_size, device=device, dtype=torch.bool)
+                current_finite_mask &= torch.isfinite(loss)
                 metrics = {
                     name: (value / args.horizon).item()
                     for name, value in metric_sums.items()
@@ -1059,10 +1067,15 @@ def main() -> None:
                         "sat": sat_loss.item(),
                     }
                 )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
-            optimizer.step()
+            do_backward = bool(torch.isfinite(loss).item()) and bool(current_finite_mask.all().item())
+            if do_backward:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
+                optimizer.step()
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                grad_norm = float("nan")
             if args.persistent_episode_training and sim_backend == "torch":
                 state = _clone_state(state)
             policy.eval()
