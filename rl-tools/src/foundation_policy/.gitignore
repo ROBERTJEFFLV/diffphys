@@ -1,5 +1,0 @@
-checkpoints.txt
-checkpoints_backup.txt
-*.txt
-!CMakeLists.txt
-shards

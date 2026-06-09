@@ -1,9 +1,0 @@
-eval_model,eval_horizon,mean_total_loss,mean_final_position_norm,mean_final_velocity_norm,mean_final_angular_velocity_norm,median_final_position_norm,median_final_velocity_norm,median_final_angular_velocity_norm,mean_action_norm,invalid_or_nan_rate
-euler,500,-nan,-nan,-nan,-nan,109.802,49.6064,372.475,0.977628,0.914062
-euler,800,-nan,-nan,-nan,-nan,0,0,0,1.35977,1
-euler,900,-nan,-nan,-nan,-nan,0,0,0,1.43091,1
-euler,1000,-nan,-nan,-nan,-nan,0,0,0,1.48782,1
-l2f,500,62148.5,122.546,61.1793,336.103,124.238,56.2875,381.16,0.844946,0
-l2f,800,479402,565.74,296.759,484.497,372.667,106.075,354.047,1.14509,0
-l2f,900,1.22881e+06,998.303,605.89,550.01,489.769,120.843,286.171,1.21345,0
-l2f,1000,3.72192e+06,1797.7,1002.08,567.514,623.64,135.582,335.699,1.28135,0

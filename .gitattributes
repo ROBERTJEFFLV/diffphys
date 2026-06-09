@@ -1,2 +1,0 @@
-logs/train.csv filter=lfs diff=lfs merge=lfs -text
-logs/train.stdout filter=lfs diff=lfs merge=lfs -text

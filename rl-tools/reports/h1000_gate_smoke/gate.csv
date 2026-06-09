@@ -1,3 +1,0 @@
-step,passed,rolled_back,weighted_cost,mean_max_position_norm,mean_max_velocity_norm,mean_max_angular_velocity_norm,max_angular_velocity_norm,max_action_abs,action_saturation_rate,nan_inf_count,best_available,best_weighted_cost
-1,true,false,10.2824,0.500475,1.29237,1.16418,1.83739,0.0741211,0,0,true,10.2824
-2,true,false,10.51,0.516007,1.37935,1.06168,1.53088,0.073309,0,0,true,10.2824

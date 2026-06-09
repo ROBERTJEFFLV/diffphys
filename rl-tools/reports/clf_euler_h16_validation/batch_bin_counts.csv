@@ -1,2 +1,0 @@
-step,batch_size,dynamics_num_groups,dynamics_group_count_min,dynamics_group_count_max,dynamics_batch_balanced,size_mass_bin_0,size_mass_bin_1,size_mass_bin_2,size_mass_bin_3,thrust_to_weight_bin_0,thrust_to_weight_bin_1,thrust_to_weight_bin_2,thrust_to_weight_bin_3,torque_to_inertia_bin_0,torque_to_inertia_bin_1,torque_to_inertia_bin_2,torque_to_inertia_bin_3,motor_delay_bin_0,motor_delay_bin_1,motor_delay_bin_2,motor_delay_bin_3,curve_shape_bin_0,curve_shape_bin_1,curve_shape_bin_2,curve_shape_bin_3
-0,8,1,8,8,true,8,0,0,0,8,0,0,0,8,0,0,0,8,0,0,0,8,0,0,0

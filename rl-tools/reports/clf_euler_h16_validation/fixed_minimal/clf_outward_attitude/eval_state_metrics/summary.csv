@@ -1,4 +1,0 @@
-eval_horizon,weighted_cost,position_cost,linear_velocity_cost,angular_velocity_cost,mean_final_position_norm,mean_final_velocity_norm,mean_final_angular_velocity_norm,mean_max_position_norm,mean_max_velocity_norm,mean_max_angular_velocity_norm,max_position_norm,max_velocity_norm,max_angular_velocity_norm,action_saturation_rate,nan_inf_count,finite
-500,2452.2,2368.81,67.3999,5.78902,32.7249,12.5984,5.74785,32.7411,13.792,5.98102,123.405,55.6637,15.0988,0,0,true
-800,72275.6,15041.1,219.614,57001.8,76.9495,26.608,239.907,77.5255,26.7059,240.223,361.047,108.801,34885.7,0.00450439,0,true
-1000,1.77021e+09,nan,nan,nan,120.982,34.9972,151592,121.021,36.5267,151593,597.74,159.711,1.54072e+07,0.0377128,28,false
