@@ -9,7 +9,13 @@ from time import perf_counter
 import torch
 from torch.nn import functional as F
 
-from env_l2f import L2FLossConfig, L2FParams, L2FSimulator, apply_gradient_decay
+from env_l2f import (
+    L2FState,
+    L2FLossConfig,
+    L2FParams,
+    L2FSimulator,
+    apply_gradient_decay,
+)
 from l2f_full_cuda_backend import METRIC_NAMES, full_cuda_rollout_metrics
 from l2f_cuda_backend import cuda_backend_available, cuda_step, load_extension
 from model import MotorGRUPolicy
@@ -610,10 +616,8 @@ def main() -> None:
         raise ValueError("--external-torque-max is not part of the RAPTOR-style external-force path")
     device = resolve_device(args.device)
     sim_backend = resolve_sim_backend(args.sim_backend, device)
-    if args.sample_dynamics and args.sampled_dynamics_level == "broad" and sim_backend in ("cuda", "cuda-full"):
+    if args.sample_dynamics and args.sampled_dynamics_level == "broad" and sim_backend == "cuda":
         sim_backend = "torch"
-    if args.persistent_episode_training and sim_backend == "cuda-full":
-        raise ValueError("--persistent-episode-training is not supported with --gpu-rollout")
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -825,7 +829,15 @@ def main() -> None:
             current_finite_mask = torch.ones(args.batch_size, device=device, dtype=torch.bool)
 
             if sim_backend == "cuda-full":
-                metrics_tensor = full_cuda_rollout_metrics(
+                (
+                    metrics_tensor,
+                    final_position,
+                    final_velocity,
+                    final_rotation,
+                    final_omega,
+                    final_motor,
+                    final_previous_action,
+                ) = full_cuda_rollout_metrics(
                     policy,
                     state,
                     sim.params,
@@ -848,6 +860,34 @@ def main() -> None:
                     observation_noise_max=args.observation_noise_max,
                 )
                 loss = metrics_tensor[0]
+
+                if args.persistent_episode_training:
+                    state = L2FState(
+                        position=final_position.detach(),
+                        velocity=final_velocity.detach(),
+                        rotation=final_rotation.detach(),
+                        omega=final_omega.detach(),
+                        motor=final_motor.detach(),
+                        previous_action=final_previous_action.detach(),
+                        external_force=state.external_force,
+                        mass=state.mass,
+                        thrust_coeff_c0=state.thrust_coeff_c0,
+                        thrust_coeff_c1=state.thrust_coeff_c1,
+                        thrust_coeff_c2=state.thrust_coeff_c2,
+                        thrust_to_weight=state.thrust_to_weight,
+                        torque_to_inertia=state.torque_to_inertia,
+                        rotor_distance_factor=state.rotor_distance_factor,
+                        inertia_factor=state.inertia_factor,
+                        motor_time_rising=state.motor_time_rising,
+                        motor_time_falling=state.motor_time_falling,
+                        rotor_torque_constant=state.rotor_torque_constant,
+                        cbrt_mass=state.cbrt_mass,
+                        force_std=state.force_std,
+                        arm_length=state.arm_length,
+                        inertia_x=state.inertia_x,
+                        inertia_y=state.inertia_y,
+                        inertia_z=state.inertia_z,
+                    )
 
                 detached_metrics = metrics_tensor.detach()
                 metrics = {
@@ -1023,6 +1063,8 @@ def main() -> None:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
             optimizer.step()
+            if args.persistent_episode_training and sim_backend == "torch":
+                state = _clone_state(state)
             policy.eval()
             raptor_metrics, _ = rollout_diagnostics(
                 policy,
@@ -1089,7 +1131,7 @@ def main() -> None:
                     checkpoint_path,
                 )
 
-            if args.persistent_episode_training and sim_backend in ("torch", "cuda"):
+            if args.persistent_episode_training:
                 episode_steps = torch.where(reset_mask, episode_steps, episode_steps + args.horizon)
             finite_mask = current_finite_mask
             invalid_mask = ~finite_mask
