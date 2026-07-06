@@ -22,6 +22,23 @@ def clone_state_for_grad(state: L2FState) -> L2FState:
         motor=state.motor.detach().clone().requires_grad_(True),
         previous_action=state.previous_action.detach().clone().requires_grad_(True),
         external_force=state.external_force.detach().clone(),
+        mass=state.mass.detach().clone(),
+        thrust_coeff_c0=state.thrust_coeff_c0.detach().clone(),
+        thrust_coeff_c1=state.thrust_coeff_c1.detach().clone(),
+        thrust_coeff_c2=state.thrust_coeff_c2.detach().clone(),
+        thrust_to_weight=state.thrust_to_weight.detach().clone(),
+        torque_to_inertia=state.torque_to_inertia.detach().clone(),
+        rotor_distance_factor=state.rotor_distance_factor.detach().clone(),
+        inertia_factor=state.inertia_factor.detach().clone(),
+        motor_time_rising=state.motor_time_rising.detach().clone(),
+        motor_time_falling=state.motor_time_falling.detach().clone(),
+        rotor_torque_constant=state.rotor_torque_constant.detach().clone(),
+        cbrt_mass=state.cbrt_mass.detach().clone(),
+        force_std=state.force_std.detach().clone(),
+        arm_length=state.arm_length.detach().clone(),
+        inertia_x=state.inertia_x.detach().clone(),
+        inertia_y=state.inertia_y.detach().clone(),
+        inertia_z=state.inertia_z.detach().clone(),
     )
 
 
