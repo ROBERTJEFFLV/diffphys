@@ -1,0 +1,310 @@
+--- diffphys_unzip/train.py	2026-07-06 20:42:08.000000000 +0000
++++ diffphys_physical_fit/train.py	2026-07-07 07:00:21.062327247 +0000
+@@ -117,7 +117,7 @@
+     parser.add_argument("--sample-dynamics", action="store_true")
+     parser.add_argument("--fixed-dynamics", action="store_true")
+     parser.add_argument("--sampled-dynamics-level", default="small", choices=("small", "medium", "broad"))
+-    parser.add_argument("--broad-sampler", default="legacy", choices=("legacy", "physical"))
++    parser.add_argument("--broad-sampler", default="legacy", choices=("legacy", "physical", "physical-fit"))
+     parser.add_argument("--balanced-dynamics-sampling", action="store_true")
+     parser.add_argument("--disable-balanced-dynamics-sampling", action="store_true")
+     parser.add_argument("--correlated-size-mass-sampling", action="store_true")
+--- diffphys_unzip/env_l2f.py	2026-07-06 02:21:50.000000000 +0000
++++ diffphys_physical_fit/env_l2f.py	2026-07-07 07:01:47.090101139 +0000
+@@ -168,6 +168,22 @@
+     return lower + unit * (upper - lower)
+ 
+ 
++def _stratified_unit(batch_size: int, device: torch.device, dtype: torch.dtype, bins: int, offset: int = 0) -> torch.Tensor:
++    """One-dimensional stratified U[0,1] samples.
++
++    For batch_size=256 and bins=4, different offsets give balanced coverage of
++    mass, thrust, inertia, and delay bins inside each batch instead of relying on
++    pure Monte-Carlo luck.
++    """
++    index = torch.arange(batch_size, device=device)
++    bin_id = ((index // max(1, int(offset))) % int(bins)).to(dtype=dtype)
++    return (bin_id + torch.rand((batch_size,), device=device, dtype=dtype)) / float(bins)
++
++
++def _range_from_unit(unit: torch.Tensor, low: torch.Tensor | float, high: torch.Tensor | float) -> torch.Tensor:
++    return low + unit * (high - low)
++
++
+ def sample_raptor_episode_dynamics(
+     nominal: L2FParams,
+     batch_size: int,
+@@ -355,6 +371,148 @@
+     )
+ 
+ 
++
++def sample_physical_fit_episode_dynamics(
++    nominal: L2FParams,
++    batch_size: int,
++    device: torch.device,
++    dtype: torch.dtype = torch.float32,
++) -> L2FRaptorEpisodeDynamics:
++    """Physically fitted broad sampler.
++
++    Difference from sample_physical_broad_episode_dynamics:
++    - root variables are mass, thrust reserve, inertia coefficient, yaw ratio,
++      motor torque constant, and motor time constant;
++    - arm length, inertia, roll/yaw authority are derived from rigid-body
++      equations, so the sampler does not create independent impossible tuples;
++    - sampling is stratified over 4 bins per batch for better coverage.
++
++    Fits are from the current code's named UAV anchors in l2f_uav_cfg_library.m:
++    nominal_50g, small150g, x500.
++    """
++    batch = batch_size
++    gravity = float(nominal.gravity)
++    bins = 4
++
++    # Stratified roots. With batch=256 this covers a 4x4x4x4 lattice per batch.
++    u_mass = _stratified_unit(batch, device, dtype, bins, offset=1)
++    u_tw = _stratified_unit(batch, device, dtype, bins, offset=bins)
++    u_k = _stratified_unit(batch, device, dtype, bins, offset=bins * bins)
++    u_tau = _stratified_unit(batch, device, dtype, bins, offset=bins * bins * bins)
++    u_misc = torch.rand((batch,), device=device, dtype=dtype)
++    u_misc2 = torch.rand((batch,), device=device, dtype=dtype)
++    u_misc3 = torch.rand((batch,), device=device, dtype=dtype)
++
++    # Mass: keep the current broad mass envelope, but sample log-uniform for
++    # equal attention to gram-scale, sub-kg, and kg-scale vehicles.
++    mass_min = torch.tensor(0.02, device=device, dtype=dtype)
++    mass_max = torch.tensor(5.00, device=device, dtype=dtype)
++    log_mass = torch.log(mass_min) + u_mass * (torch.log(mass_max) - torch.log(mass_min))
++    mass = torch.exp(log_mass).clamp_min(1.0e-12)
++    cbrt_mass = mass.pow(1.0 / 3.0)
++
++    # Fitted arm length: l ~= 0.21257 * m^0.5028, with +-20% multiplicative scatter.
++    # This fits the current code anchors approximately:
++    # 50g -> 4.7 cm, 150g -> 8.2 cm, 1.2kg -> 23.3 cm.
++    arm_center = 0.21257 * mass.pow(0.5028)
++    arm_length = arm_center * _sample_reciprocal_style_factor(u_misc, 0.20)
++    arm_length = arm_length.clamp(0.028, 0.50)
++    rotor_distance_factor = arm_length / float(nominal.arm_length)
++
++    # Thrust-to-weight: fitted weak mass trend plus broad but clipped scatter.
++    tw_center = 3.19478 * mass.pow(0.09285)
++    tw_low = torch.clamp(tw_center / 1.55, min=1.45, max=5.50)
++    tw_high = torch.clamp(tw_center * 1.70, min=1.45, max=5.50)
++    thrust_to_weight = _range_from_unit(u_tw, tw_low, tw_high)
++    thrust_to_weight = thrust_to_weight.clamp(1.45, 5.50)
++
++    hover_thrust_per_rotor = mass * gravity / 4.0
++    max_thrust_per_rotor = thrust_to_weight * mass * gravity / 4.0
++    min_thrust_per_rotor = torch.clamp(2.0 * hover_thrust_per_rotor - max_thrust_per_rotor, min=0.0)
++    thrust_delta_per_rotor = torch.clamp(max_thrust_per_rotor - min_thrust_per_rotor, min=1.0e-9)
++    thrust_coeff_c0 = hover_thrust_per_rotor
++    thrust_coeff_c1 = max_thrust_per_rotor - hover_thrust_per_rotor
++    thrust_coeff_c2 = torch.zeros((batch,), device=device, dtype=dtype)
++
++    # Inertia: Jxy = kxy * m * l^2. kxy fitted from current anchors, with scatter.
++    # Rejecting/clamping alpha is safer than sampling alpha independently.
++    kxy_center = 0.19013 * mass.pow(0.23165)
++    kxy = kxy_center * _sample_reciprocal_style_factor(u_k, 0.50)
++    kxy = kxy.clamp(0.045, 0.50)
++    jz_over_jxy = _range_from_unit(u_misc2, 1.45, 2.60)
++    inertia_x = torch.clamp(kxy * mass * arm_length * arm_length, min=1.0e-12)
++    inertia_y = inertia_x
++    inertia_z = jz_over_jxy * inertia_x
++
++    alpha_raw = arm_length * thrust_delta_per_rotor / torch.clamp(inertia_x, min=1.0e-12)
++    # Training-stable physical envelope. We do not sample alpha independently;
++    # when alpha is outside this envelope, we realize the nearest value by
++    # changing the inertia coefficient, which still corresponds to a valid rigid body.
++    alpha_roll_max = alpha_raw.clamp(35.0, 2200.0)
++    inertia_scale = alpha_raw / torch.clamp(alpha_roll_max, min=1.0e-9)
++    inertia_x = inertia_x * inertia_scale
++    inertia_y = inertia_y * inertia_scale
++    inertia_z = inertia_z * inertia_scale
++    alpha_pitch_max = alpha_roll_max
++
++    # Rotor torque constant: km ~= 0.01523 * m^-0.09015, with scatter.
++    # Yaw authority is derived: alpha_yaw = km * 2*dT / Jz.
++    km_center = 0.01523 * mass.pow(-0.09015)
++    rotor_torque_constant = km_center * _sample_reciprocal_style_factor(u_misc3, 0.45)
++    rotor_torque_constant = rotor_torque_constant.clamp(0.006, 0.035)
++    yaw_mix_thrust_max = 2.0 * thrust_delta_per_rotor
++    alpha_yaw_raw = rotor_torque_constant * yaw_mix_thrust_max / torch.clamp(inertia_z, min=1.0e-12)
++    eta_raw = alpha_yaw_raw / torch.clamp(alpha_roll_max, min=1.0e-9)
++    eta_yaw = eta_raw.clamp(0.02, 1.00)
++    rotor_torque_constant = rotor_torque_constant * eta_yaw / torch.clamp(eta_raw, min=1.0e-9)
++    alpha_yaw_max = eta_yaw * alpha_roll_max
++
++    # Motor response: tau ~= 0.10658 * m^0.18987. Falling edge is usually slower.
++    tau_center = 0.10658 * mass.pow(0.18987)
++    motor_time_rising = tau_center * _sample_reciprocal_style_factor(u_tau, 0.35)
++    motor_time_rising = motor_time_rising.clamp(0.025, 0.18)
++    fall_factor = _range_from_unit(torch.rand((batch,), device=device, dtype=dtype), 1.0, 2.6)
++    motor_time_falling = (motor_time_rising * fall_factor).clamp(0.03, 0.35)
++
++    # Hidden wind/disturbance: sample acceleration-like strength, then convert to force.
++    # This avoids making heavy vehicles automatically see enormous force magnitudes.
++    disturbance_acc_std = _range_from_unit(torch.rand((batch,), device=device, dtype=dtype), 0.0, 0.35)
++    disturbance_acc_std = disturbance_acc_std * torch.clamp(thrust_to_weight - 1.0, min=0.0)
++    force_std = mass * disturbance_acc_std
++    external_force = torch.randn((batch, 3), device=device, dtype=dtype) * force_std[:, None]
++
++    torque_to_inertia = alpha_roll_max
++    inertia_factor = torch.full((batch,), float(nominal.inertia_x), device=device, dtype=dtype) / torch.clamp(inertia_x, min=1.0e-12)
++
++    return L2FRaptorEpisodeDynamics(
++        mass=mass,
++        thrust_coeff_c0=thrust_coeff_c0[:, None].expand(batch, 4),
++        thrust_coeff_c1=thrust_coeff_c1[:, None].expand(batch, 4),
++        thrust_coeff_c2=thrust_coeff_c2[:, None].expand(batch, 4),
++        external_force=external_force,
++        thrust_to_weight=thrust_to_weight,
++        torque_to_inertia=torque_to_inertia,
++        rotor_distance_factor=rotor_distance_factor,
++        inertia_factor=inertia_factor,
++        motor_time_rising=motor_time_rising,
++        motor_time_falling=motor_time_falling,
++        rotor_torque_constant=rotor_torque_constant,
++        cbrt_mass=cbrt_mass,
++        force_std=force_std,
++        arm_length=arm_length,
++        inertia_x=inertia_x,
++        inertia_y=inertia_y,
++        inertia_z=inertia_z,
++        alpha_roll_max=alpha_roll_max,
++        alpha_pitch_max=alpha_pitch_max,
++        alpha_yaw_max=alpha_yaw_max,
++        eta_yaw=eta_yaw,
++        jz_over_jxy=jz_over_jxy,
++        dt_alpha_roll_max=alpha_roll_max * float(nominal.dt),
++        dt_alpha_yaw_max=alpha_yaw_max * float(nominal.dt),
++    )
++
++
+ def _fixed_episode_dynamics(
+     nominal: L2FParams,
+     batch_size: int,
+@@ -620,8 +778,15 @@
+                     device=device,
+                     dtype=dtype,
+                 )
++            elif broad_sampler == "physical-fit":
++                dynamics = sample_physical_fit_episode_dynamics(
++                    p,
++                    batch_size,
++                    device=device,
++                    dtype=dtype,
++                )
+             else:
+-                raise ValueError("broad_sampler must be 'legacy' or 'physical'")
++                raise ValueError("broad_sampler must be 'legacy', 'physical', or 'physical-fit'")
+             external_force = dynamics.external_force
+         else:
+             dynamics = _fixed_episode_dynamics(
+--- diffphys_unzip/matlab_l2f/l2f_sample_dynamics.m	2026-07-07 00:24:16.000000000 +0000
++++ diffphys_physical_fit/matlab_l2f/l2f_sample_dynamics.m	2026-07-07 07:02:14.219128802 +0000
+@@ -8,6 +8,8 @@
+     dynamics = raptor_broad_dynamics(params, batch_size);
+ elseif strcmp(profile, 'physical-broad') || (strcmp(profile, 'broad') && strcmp(params.broad_sampler, 'physical'))
+     dynamics = physical_broad_dynamics(params, batch_size);
++elseif strcmp(profile, 'physical-fit-broad') || strcmp(profile, 'physical-fit') || (strcmp(profile, 'broad') && strcmp(params.broad_sampler, 'physical-fit'))
++    dynamics = physical_fit_broad_dynamics(params, batch_size);
+ else
+     error('Unknown dynamics profile: %s', params.dynamics_profile);
+ end
+@@ -106,6 +108,96 @@
+     alpha_yaw_max, eta_yaw, jz_over_jxy, p.dt);
+ end
+ 
++
++function dynamics = physical_fit_broad_dynamics(p, batch)
++%PHYSICAL_FIT_BROAD_DYNAMICS Physically fitted broad sampler.
++% Root variables are sampled and the remaining quantities are derived from
++% rigid-body equations, instead of sampling roll/yaw authority independently.
++
++u_mass = stratified_unit(batch, 4, 1);
++u_tw = stratified_unit(batch, 4, 4);
++u_k = stratified_unit(batch, 4, 16);
++u_tau = stratified_unit(batch, 4, 64);
++u_misc = rand(batch, 1);
++u_misc2 = rand(batch, 1);
++u_misc3 = rand(batch, 1);
++
++mass_min = 0.02;
++mass_max = 5.0;
++log_mass = log(mass_min) + u_mass .* (log(mass_max) - log(mass_min));
++mass = max(exp(log_mass), 1.0e-12);
++cbrt_mass = cbrt_positive(mass);
++
++arm_center = 0.21257 .* mass .^ 0.5028;
++arm_length = arm_center .* reciprocal_factor(u_misc, 0.20);
++arm_length = min(max(arm_length, 0.028), 0.50);
++rotor_distance_factor = arm_length / p.arm_length;
++
++tw_center = 3.19478 .* mass .^ 0.09285;
++tw_low = min(max(tw_center / 1.55, 1.45), 5.50);
++tw_high = min(max(tw_center * 1.70, 1.45), 5.50);
++thrust_to_weight = tw_low + u_tw .* (tw_high - tw_low);
++thrust_to_weight = min(max(thrust_to_weight, 1.45), 5.50);
++
++hover_thrust = mass * p.gravity / 4;
++max_thrust_per_rotor = thrust_to_weight .* mass * p.gravity / 4;
++min_thrust_per_rotor = max(2.0 * hover_thrust - max_thrust_per_rotor, 0);
++thrust_delta = max(max_thrust_per_rotor - min_thrust_per_rotor, 1.0e-9);
++c0 = hover_thrust;
++c1 = max_thrust_per_rotor - hover_thrust;
++c2 = zeros(batch, 1);
++
++kxy_center = 0.19013 .* mass .^ 0.23165;
++kxy = kxy_center .* reciprocal_factor(u_k, 0.50);
++kxy = min(max(kxy, 0.045), 0.50);
++jz_over_jxy = 1.45 + u_misc2 .* (2.60 - 1.45);
++inertia_x = max(kxy .* mass .* arm_length .* arm_length, 1.0e-12);
++inertia_y = inertia_x;
++inertia_z = jz_over_jxy .* inertia_x;
++
++alpha_raw = arm_length .* thrust_delta ./ max(inertia_x, 1.0e-12);
++alpha_roll_max = min(max(alpha_raw, 35.0), 2200.0);
++inertia_scale = alpha_raw ./ max(alpha_roll_max, 1.0e-9);
++inertia_x = inertia_x .* inertia_scale;
++inertia_y = inertia_y .* inertia_scale;
++inertia_z = inertia_z .* inertia_scale;
++alpha_pitch_max = alpha_roll_max;
++
++km_center = 0.01523 .* mass .^ (-0.09015);
++rotor_torque_constant = km_center .* reciprocal_factor(u_misc3, 0.45);
++rotor_torque_constant = min(max(rotor_torque_constant, 0.006), 0.035);
++yaw_mix_thrust_max = 2.0 * thrust_delta;
++alpha_yaw_raw = rotor_torque_constant .* yaw_mix_thrust_max ./ max(inertia_z, 1.0e-12);
++eta_raw = alpha_yaw_raw ./ max(alpha_roll_max, 1.0e-9);
++eta_yaw = min(max(eta_raw, 0.02), 1.00);
++rotor_torque_constant = rotor_torque_constant .* eta_yaw ./ max(eta_raw, 1.0e-9);
++alpha_yaw_max = eta_yaw .* alpha_roll_max;
++
++tau_center = 0.10658 .* mass .^ 0.18987;
++motor_time_rising = tau_center .* reciprocal_factor(u_tau, 0.35);
++motor_time_rising = min(max(motor_time_rising, 0.025), 0.18);
++fall_factor = 1.0 + rand(batch, 1) .* (2.6 - 1.0);
++motor_time_falling = min(max(motor_time_rising .* fall_factor, 0.03), 0.35);
++
++disturbance_acc_std = rand(batch, 1) * 0.35 .* max(thrust_to_weight - 1.0, 0.0);
++force_std = mass .* disturbance_acc_std;
++external_force = randn(batch, 3) .* force_std;
++
++torque_to_inertia = alpha_roll_max;
++inertia_factor = p.inertia_x ./ max(inertia_x, 1.0e-12);
++
++dynamics = make_dynamics(mass, c0, c1, c2, external_force, thrust_to_weight, torque_to_inertia, ...
++    rotor_distance_factor, inertia_factor, motor_time_rising, motor_time_falling, rotor_torque_constant, ...
++    cbrt_mass, force_std, arm_length, inertia_x, inertia_y, inertia_z, alpha_roll_max, alpha_pitch_max, ...
++    alpha_yaw_max, eta_yaw, jz_over_jxy, p.dt);
++end
++
++function u = stratified_unit(batch, bins, offset)
++idx = (0:(batch-1)).';
++bin_id = mod(floor(idx / max(1, offset)), bins);
++u = (double(bin_id) + rand(batch, 1)) / double(bins);
++end
++
+ function dynamics = physical_broad_dynamics(p, batch)
+ relative_size_min = 0.27144176165949;
+ relative_size_max = 1.70997594667670;

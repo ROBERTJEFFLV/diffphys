@@ -1,0 +1,38 @@
+# Persistent-force position-hold ablation. Each outer step is a 250-step
+# truncated-BPTT segment; two segments form one H500 training episode and one
+# optimizer update. All groups use the same paired sampler stream.
+--device cuda
+--sim-backend cuda
+--observation-mode legacy40
+--horizon 250
+--training-episode-steps 500
+--persistent-episode-training
+--update-timing episode-boundary
+--batch-size 256
+--steps 500
+--encoder-dim 192
+--hidden-dim 192
+--encoder-depth 2
+--lr 5e-6
+--grad-clip 1.0
+--grad-skip-threshold 300
+--state-grad-decay 0.5
+--hidden-grad-decay 0.7
+--sample-dynamics
+--sampled-dynamics-level broad
+--broad-sampler physical
+--init-checkpoint-path reports/mainline_h500_finetune_safe_5000_lr5e6/model_step_4000.pt
+--motor-aux-burn-in 15
+--capability-aux-burn-in 35
+--response-aux-burn-in 10
+--response-dv-scale 0.1
+--response-domega-scale 1.0
+--aux-weight-ramp-updates 200
+--tail-steps 50
+--steady-window-steps 100
+--steady-required-fraction 0.95
+--log-every 2
+--save-every 100
+--checkpoint-steps 500
+--sampler-audit-resets-only
+--sampler-audit-hash-only

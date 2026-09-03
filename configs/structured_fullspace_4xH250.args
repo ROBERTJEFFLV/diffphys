@@ -1,0 +1,24 @@
+# Formal matrix-free full-space: B=64, alpha=.8, stride=1, safe residual head.
+--checkpoint {work}/migrated.pt
+--output {work}/fullspace_4xH250.pt
+--report {work}/fullspace4_report.json
+--device {device}
+--seed 7
+--batch-size 64
+--segment-steps 250
+--pre-rollout-steps 50
+--segments 4
+--outer-steps 1
+--damping 100
+--penalty 10
+--cg-iterations 16
+--max-backtracks 8
+--parameter-radius 0.05
+--action-radius 0.01
+--action-max-radius 0.05
+--action-probe-stride 1
+--alpha 0.8
+--risk-beta 0.01
+--heldout-seed-offset 1000003
+--heldout-maximum-risk-ratio 1.0
+--trainable-prefix residual_head.

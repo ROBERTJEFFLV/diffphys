@@ -1,0 +1,7 @@
+# Current R1 control: legacy 40D input, combined top-k and historical
+# episode-boundary scaling. This is the control for the paired experiment.
+@configs/compact_cvar_common.args
+--observation-mode legacy40
+--tail-selection-mode combined
+--w-tail 0.001
+--early-tail-weight 0.0

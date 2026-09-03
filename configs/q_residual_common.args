@@ -1,0 +1,20 @@
+# Q0-Q2 share the finished P4b checkpoint, H250x2 recurrent episode, hard
+# replay stream and independent position/omega CVaR.  Only the requested
+# deployable residual structure and Q2 decay objective vary.
+@configs/compact_cvar_P4b.args
+--init-checkpoint-path reports/compact_cvar_ablation_h500_u2000_gpu2_fresh/seed_7/group_P4b/checkpoints/model_update_2000.pt
+--integral-input-frame world
+--integral-residual-hidden-dim 16
+--damping-residual-hidden-dim 32
+--integral-residual-scale 1.0
+--damping-residual-scale 1.0
+--w-omega-decay 0.0
+--omega-decay-horizons 5,10,25
+--omega-decay-beta 0.2,0.3,0.5
+--omega-decay-rho 0.90,0.75,0.50
+--omega-decay-eps 1e-6
+--omega-decay-alpha-roll-max 154.0
+--omega-decay-alpha-yaw-max 13.81
+--lambda-capability-aux 0.0
+--lambda-response-aux 0.0
+--w-retain 0.0

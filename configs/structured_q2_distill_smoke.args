@@ -1,0 +1,15 @@
+--source-checkpoint reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
+--output checkpoints/structured_q2_distill_smoke.pt
+--report runs/structured_q2_distill_smoke.json
+--device cpu
+--seed 7
+--batch-size 2
+--horizon 4
+--updates 1
+--hidden-dim 8
+--identifier-dim 8
+--slow-cadence 2
+--detach-cadence 2
+--jacobian-samples 1
+--gain-init reference-lqr
+--residual-scale 0.05

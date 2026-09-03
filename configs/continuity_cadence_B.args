@@ -1,0 +1,6 @@
+# Arm B: exact 10% compressed T2 reset mixture, with legacy reset-boundary
+# optimization. Counts: 59xH500 + 8xH1000, 67 optimizer commits.
+@configs/continuity_cadence_common.args
+--episode-horizon-schedule compressed-t2-10pct
+--optimization-block-horizon 0
+

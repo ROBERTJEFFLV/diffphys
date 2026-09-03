@@ -1,0 +1,16 @@
+# Independent away-from-equilibrium residual oracle; screening diagnostic only.
+--checkpoint {work}/phase_b.pt
+--source-checkpoint {root}/reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
+--output {work}/residual_oracle.pt
+--report {work}/residual_oracle_report.json
+--device {device}
+--seed 7
+--train-count 64
+--heldout-count 64
+--horizon 125
+--updates 2
+--r-min 0.25
+--r-max 3.0
+--measurement-floor 0.0013
+--lr 0.0003
+--residual-scale 0.05

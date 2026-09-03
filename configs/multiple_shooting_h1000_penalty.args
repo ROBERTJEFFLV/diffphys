@@ -1,0 +1,3 @@
+@configs/multiple_shooting_h1000_common.args
+--mode multiple-shooting
+--output-dir reports/multiple_shooting_h1000_minimal/multiple_shooting

@@ -1,0 +1,5 @@
+@configs/temporal_decay_short_common.args
+--gradient-decay-mode current
+--log-path reports/temporal_decay_minimal/short_train/A_current/train.csv
+--checkpoint-path reports/temporal_decay_minimal/short_train/A_current/model.pt
+

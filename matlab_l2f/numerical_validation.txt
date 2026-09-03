@@ -1,0 +1,16 @@
+{
+  "core_physics_files_byte_identical": {
+    "l2f_step.m": true,
+    "l2f_implicit_midpoint_omega.m": true,
+    "l2f_so3_exp.m": true,
+    "l2f_motor_wrench.m": true,
+    "l2f_sample_dynamics.m": true
+  },
+  "observation_vectorization_exact": true,
+  "motor_gru_preparation_exact": true,
+  "settle_time_equivalence": true,
+  "invalid_fraction_equivalence": true,
+  "streaming_metric_accumulation_equivalence": true,
+  "estimated_full_log_gib": 3.9006881713867188,
+  "estimated_streaming_working_set_upper_mib": 100
+}

@@ -1,0 +1,6 @@
+# P0 with independent position and omega top-k selection.
+@configs/compact_cvar_common.args
+--observation-mode legacy40
+--tail-selection-mode independent
+--w-tail 0.0
+--early-tail-weight 0.0

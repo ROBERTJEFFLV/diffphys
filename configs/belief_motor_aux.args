@@ -1,0 +1,41 @@
+--device auto
+--sim-backend cuda
+--observation-mode legacy40
+--horizon 250
+--training-episode-steps 2000
+--persistent-episode-training
+--update-timing episode-boundary
+--batch-size 256
+--steps 2000
+--encoder-dim 192
+--hidden-dim 192
+--encoder-depth 2
+--lr 5e-6
+--grad-clip 1.0
+--grad-skip-threshold 300
+--adaptive-update-gate
+--gate-warmup-updates 1
+--gate-loss-factor 2.5
+--gate-loss-add 0.05
+--gate-grad-factor 4.0
+--gate-grad-floor 10.0
+--reset-after-skipped-update
+--reset-loss-spike-factor 20.0
+--reset-loss-spike-add 0.25
+--state-grad-decay 0.5
+--hidden-grad-decay 0.7
+--sample-dynamics
+--sampled-dynamics-level broad
+--broad-sampler physical
+--init-checkpoint-path reports/mainline_h500_finetune_safe_5000_lr5e6/model_step_4000.pt
+--lambda-motor-aux 0.03
+--lambda-capability-aux 0.0
+--motor-aux-burn-in 15
+--aux-weight-ramp-updates 200
+--tail-steps 50
+--steady-window-steps 100
+--steady-required-fraction 0.95
+--log-every 10
+--save-every 100
+--log-path runs/belief_motor_aux/train.csv
+--checkpoint-path checkpoints/belief_motor_aux.pt

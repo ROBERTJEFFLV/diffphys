@@ -1,0 +1,9 @@
+# Read-only formal causal-identification oracle.  The runner currently marks
+# this stage blocked until the diagnostic schema/blind gate is accepted.
+--checkpoint {root}/reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
+--probe-report {root}/reports/probe_v4_formal.json
+--output {work}/causal_identifier_oracle.json
+--stage collect-ceiling
+--scenarios 128
+--horizon 125
+--n-jobs 4

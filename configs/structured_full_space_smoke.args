@@ -1,0 +1,24 @@
+--checkpoint checkpoints/structured_q2_distill_smoke.pt
+--output checkpoints/structured_full_space_smoke.pt
+--report runs/structured_full_space_smoke.json
+--device cpu
+--seed 7
+--batch-size 1
+--segment-steps 2
+--pre-rollout-steps 50
+--segments 2
+--outer-steps 1
+--damping 100
+--penalty 10
+--cg-iterations 16
+--max-backtracks 6
+--parameter-radius 1
+--action-radius 1
+--action-max-radius 2
+--trainable-prefix residual_head.
+--allow-failed-migration-gate
+--allow-small-risk-smoke
+--minimum-ratio 0.05
+--maximum-ratio 10
+--maximum-linearized-constraint 1
+--maximum-relative-kkt 100

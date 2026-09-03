@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from env_l2f import L2FParams, L2FState
+
+
+_EXTENSION: Any | None = None
+_LOAD_ERROR: Exception | None = None
+
+
+def _ensure_msvc_environment() -> None:
+    """Populate the current process from vcvars64 when launched outside a VS shell."""
+    if os.name != "nt" or shutil.which("cl.exe") is not None:
+        return
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    vswhere = vswhere / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.exists():
+        return
+    install_path = subprocess.check_output(
+        [
+            str(vswhere),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        text=True,
+    ).strip()
+    if not install_path:
+        return
+    vcvars = Path(install_path) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    if not vcvars.exists():
+        return
+    output = subprocess.check_output(
+        f'call "{vcvars}" >nul && set',
+        shell=True,
+        text=True,
+        errors="replace",
+    )
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ[key] = value
+    os.environ.setdefault("VSLANG", "1033")
+
+
+def _source_paths() -> list[str]:
+    root = Path(__file__).resolve().parent
+    return [
+        str(root / "cuda_ext" / "binding.cpp"),
+        str(root / "cuda_ext" / "l2f_step_kernel.cu"),
+        str(root / "cuda_ext" / "full_rollout_kernel.cu"),
+    ]
+
+
+def _discover_cuda_home() -> str | None:
+    configured = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if configured and (Path(configured) / "bin" / "nvcc").exists():
+        return configured
+
+    torch_cuda = torch.version.cuda or ""
+    preferred_major = torch_cuda.split(".", 1)[0]
+    candidates = sorted(Path("/usr/local").glob("cuda-*"), reverse=True)
+    for candidate in candidates:
+        nvcc = candidate / "bin" / "nvcc"
+        if not nvcc.exists():
+            continue
+        if preferred_major and candidate.name.startswith(f"cuda-{preferred_major}."):
+            return str(candidate)
+    for candidate in [Path("/usr/local/cuda"), *candidates]:
+        if (candidate / "bin" / "nvcc").exists():
+            return str(candidate)
+    return None
+
+
+def load_extension() -> Any:
+    global _EXTENSION, _LOAD_ERROR
+    if _EXTENSION is not None:
+        return _EXTENSION
+    if _LOAD_ERROR is not None:
+        raise RuntimeError("L2F CUDA extension is unavailable") from _LOAD_ERROR
+
+    _ensure_msvc_environment()
+    if os.name == "nt":
+        # PyTorch's compiler probe cannot decode localized cl.exe output on
+        # some Windows locales; the installed MSVC toolset is validated above.
+        os.environ.setdefault("TORCH_DONT_CHECK_COMPILER_ABI", "1")
+    cuda_home = _discover_cuda_home()
+    if cuda_home is not None:
+        os.environ.setdefault("CUDA_HOME", cuda_home)
+    if not torch.cuda.is_available() and "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;8.9;9.0"
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        _LOAD_ERROR = RuntimeError("CUDA_HOME is not set; nvcc is required")
+        raise RuntimeError("L2F CUDA extension is unavailable") from _LOAD_ERROR
+
+    build_dir = Path(__file__).resolve().parent / ".torch_extensions" / "l2f_cuda_ext"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _EXTENSION = load(
+            name="l2f_cuda_ext",
+            sources=_source_paths(),
+            build_directory=str(build_dir),
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+    except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain
+        _LOAD_ERROR = exc
+        raise RuntimeError("L2F CUDA extension build/load failed") from exc
+    return _EXTENSION
+
+
+def cuda_backend_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        load_extension()
+    except RuntimeError:
+        return False
+    return True
+
+
+class _CudaL2FStep(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        position: torch.Tensor,
+        velocity: torch.Tensor,
+        rotation: torch.Tensor,
+        omega: torch.Tensor,
+        motor: torch.Tensor,
+        action: torch.Tensor,
+        external_force: torch.Tensor,
+        mass: torch.Tensor,
+        thrust_coeff_c0: torch.Tensor,
+        thrust_coeff_c1: torch.Tensor,
+        thrust_coeff_c2: torch.Tensor,
+        motor_time_rising: torch.Tensor,
+        motor_time_falling: torch.Tensor,
+        arm_length: torch.Tensor,
+        inertia_x: torch.Tensor,
+        inertia_y: torch.Tensor,
+        inertia_z: torch.Tensor,
+        rotor_torque_constant: torch.Tensor,
+        dt: float,
+        gravity: float,
+        grad_decay: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ext = load_extension()
+        tensors = (
+            position.contiguous(),
+            velocity.contiguous(),
+            rotation.contiguous(),
+            omega.contiguous(),
+            motor.contiguous(),
+            action.contiguous(),
+            external_force.contiguous(),
+            mass.contiguous(),
+            thrust_coeff_c0.contiguous(),
+            thrust_coeff_c1.contiguous(),
+            thrust_coeff_c2.contiguous(),
+            motor_time_rising.contiguous(),
+            motor_time_falling.contiguous(),
+            arm_length.contiguous(),
+            inertia_x.contiguous(),
+            inertia_y.contiguous(),
+            inertia_z.contiguous(),
+            rotor_torque_constant.contiguous(),
+        )
+        ctx.save_for_backward(*tensors[:6], *tensors[7:])
+        ctx.params = (
+            float(dt),
+            float(gravity),
+            float(grad_decay),
+        )
+        return tuple(ext.step_forward(*tensors, *ctx.params[:2]))
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_position: torch.Tensor,
+        grad_velocity: torch.Tensor,
+        grad_rotation: torch.Tensor,
+        grad_omega: torch.Tensor,
+        grad_motor: torch.Tensor,
+        grad_previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, ...]:
+        ext = load_extension()
+        saved = ctx.saved_tensors
+        grads = (
+            grad_position.contiguous(),
+            grad_velocity.contiguous(),
+            grad_rotation.contiguous(),
+            grad_omega.contiguous(),
+            grad_motor.contiguous(),
+            grad_previous_action.contiguous(),
+        )
+        outputs = ext.step_backward(*saved, *grads, ctx.params[0], ctx.params[2])
+        return (*outputs, *([None] * 15))
+
+
+def cuda_step(
+    state: L2FState,
+    action: torch.Tensor,
+    params: L2FParams,
+    *,
+    grad_decay: float,
+) -> L2FState:
+    if not state.position.is_cuda:
+        raise RuntimeError("cuda_step requires CUDA tensors")
+    outputs = _CudaL2FStep.apply(
+        state.position,
+        state.velocity,
+        state.rotation,
+        state.omega,
+        state.motor,
+        action,
+        state.external_force,
+        state.mass,
+        state.thrust_coeff_c0,
+        state.thrust_coeff_c1,
+        state.thrust_coeff_c2,
+        state.motor_time_rising,
+        state.motor_time_falling,
+        state.arm_length,
+        state.inertia_x,
+        state.inertia_y,
+        state.inertia_z,
+        state.rotor_torque_constant,
+        params.dt,
+        params.gravity,
+        grad_decay,
+    )
+    return L2FState(
+        position=outputs[0],
+        velocity=outputs[1],
+        rotation=outputs[2],
+        omega=outputs[3],
+        motor=outputs[4],
+        previous_action=outputs[5],
+        external_force=state.external_force,
+        mass=state.mass,
+        thrust_coeff_c0=state.thrust_coeff_c0,
+        thrust_coeff_c1=state.thrust_coeff_c1,
+        thrust_coeff_c2=state.thrust_coeff_c2,
+        thrust_to_weight=state.thrust_to_weight,
+        torque_to_inertia=state.torque_to_inertia,
+        rotor_distance_factor=state.rotor_distance_factor,
+        inertia_factor=state.inertia_factor,
+        motor_time_rising=state.motor_time_rising,
+        motor_time_falling=state.motor_time_falling,
+        rotor_torque_constant=state.rotor_torque_constant,
+        cbrt_mass=state.cbrt_mass,
+        force_std=state.force_std,
+        arm_length=state.arm_length,
+        inertia_x=state.inertia_x,
+        inertia_y=state.inertia_y,
+        inertia_z=state.inertia_z,
+        alpha_roll_max=state.alpha_roll_max,
+        alpha_pitch_max=state.alpha_pitch_max,
+        alpha_yaw_max=state.alpha_yaw_max,
+        eta_yaw=state.eta_yaw,
+        jz_over_jxy=state.jz_over_jxy,
+        dt_alpha_roll_max=state.dt_alpha_roll_max,
+        dt_alpha_yaw_max=state.dt_alpha_yaw_max,
+    )

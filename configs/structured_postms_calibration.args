@@ -1,0 +1,10 @@
+# Recalibrate after an accepted 4xH250 MS update; all pre-MS calibration evidence is stale.
+--checkpoint {work}/fullspace_4xH250.pt
+--source-checkpoint {root}/reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
+--output {work}/postms_calibrated.pt
+--report {work}/postms_calibration_report.json
+--device {device}
+--seed 7
+--horizon 76
+--miscoverage 0.01
+--maximum-self-calibration-rounds 3

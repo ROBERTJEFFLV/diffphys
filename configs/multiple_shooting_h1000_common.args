@@ -1,0 +1,17 @@
+# Minimal fixed-scenario H1000=4xH250 screen. Q2 policy, physics, loss,
+# sampler, temporal decay, and policy AdamW settings come from T2 unchanged.
+--base-config configs/time_horizon_T2.args
+--device cuda
+--batch-size 8
+--updates 20
+--segment-steps 250
+--segments 4
+--shooting-lr 0.0001
+--penalty-rho 0.25
+--dual-update-every 0
+--future-credit-probe-steps 8
+--continuity-tolerance 0.05
+--abort-continuity-rms 5.0
+--abort-policy-grad-norm 100.0
+--abort-shooting-grad-norm 1000.0
+--log-every 1

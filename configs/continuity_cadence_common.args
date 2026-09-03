@@ -1,0 +1,9 @@
+# Preregistered 9.6M continuity/cadence screen. This inherits the historical
+# Q2 sampler, losses, optimizer, H250 detach cadence, and common initialization.
+# Only reset scheduling and the explicitly configured optimizer/CVaR cadence vary.
+# Arm D additionally decouples independent CVaR blocks from optimizer commits.
+@configs/time_horizon_q2_common.args
+--physical-step-budget 9600000
+--checkpoint-physical-steps 9600000
+--post-update-check finite
+--save-every 0

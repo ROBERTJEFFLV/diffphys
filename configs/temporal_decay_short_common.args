@@ -1,0 +1,11 @@
+# Five-percent fixed-H500 screen from the same Q2 initialization and training
+# closure as time_horizon_T0.  The only experimental variable is temporal decay.
+@configs/time_horizon_T0.args
+--physical-step-budget 12800000
+--checkpoint-physical-steps 12800000
+--max-outer-steps 240
+--checkpoint-updates ""
+--save-every 0
+--log-every 1
+--training-diagnostics-every-updates 10
+

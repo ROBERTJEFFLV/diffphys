@@ -1,0 +1,6 @@
+@configs/retain_tail_common.args
+--lambda-motor-aux 0.03
+--lambda-capability-aux 0.01
+--lambda-response-aux 0.01
+--w-tail 0.001
+--w-retain 0.10
