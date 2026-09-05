@@ -82,8 +82,8 @@ def _slice_closed_loop(state: StructuredClosedLoopState, index: int) -> Structur
 
 
 @torch.no_grad()
-def _post_call75_states(student, simulator, bank) -> StructuredClosedLoopState:
-    """Roll the deployed student to the post-call75 complete state."""
+def _post_identification_states(student, simulator, bank) -> StructuredClosedLoopState:
+    """Roll the deployed student to the post-call125 complete state."""
 
     physical = bank.state
     batch = physical.position.shape[0]
@@ -94,7 +94,7 @@ def _post_call75_states(student, simulator, bank) -> StructuredClosedLoopState:
     )
     policy_state = student.initial_state(observation)
     closed = StructuredClosedLoopState(physical=physical, policy=policy_state)
-    for _ in range(75):
+    for _ in range(student.config.identification_publish_start + student.config.slow_cadence):
         observation = structured_observation(closed)
         output = student.forward_with_aux(observation, closed.policy, simulator.params.dt)
         closed = StructuredClosedLoopState(
@@ -139,11 +139,11 @@ def _force_bins(bank) -> torch.Tensor:
 def _augmented_stability_evidence(student, simulator, bank, deployment_hash: str) -> dict[str, Any]:
     """Probe complete v2 maps on every authority/force cell.
 
-    This deliberately uses the local 64-scenario post-call75 bank only.  It
+    This deliberately uses the local 64-scenario post-call125 bank only.  It
     does not draw blind seeds, fit thresholds, or run any training.
     """
 
-    closed = _post_call75_states(student, simulator, bank)
+    closed = _post_identification_states(student, simulator, bank)
     force_bins = _force_bins(bank)
     config = AugmentedStabilityConfig()
     rows: list[dict[str, Any]] = []
@@ -155,7 +155,7 @@ def _augmented_stability_evidence(student, simulator, bank, deployment_hash: str
             "force_bin": int(force_bins[index]),
             "deployment_policy_hash": deployment_hash,
             "evidence_hash": deployment_hash,
-            "post_call": 75,
+            "post_call": 125,
             "poincare_horizon_steps": config.horizon_steps,
         }
         try:
@@ -166,7 +166,7 @@ def _augmented_stability_evidence(student, simulator, bank, deployment_hash: str
             packed = codec.pack(selected)[0]
             yaw_basis = structured_global_yaw_basis(codec, packed)
             discrete = torch.zeros(codec.state_dim, dtype=torch.bool, device=packed.device)
-            for name in ("identification_failed", "slow_counter"):
+            for name in ("identification_failed", "slow_counter", "probe_aborted", "probe_omega_reference", "identification_information", "capability_authorized", "identification_actions", "identification_initial_motor"):
                 if name in codec.slices:
                     discrete[codec.slices[name]] = True
             step_map = make_structured_step_map(student, simulator, codec)
@@ -217,7 +217,7 @@ def _augmented_stability_evidence(student, simulator, bank, deployment_hash: str
                 and all(row.get("deployment_policy_hash") == deployment_hash for row in rows))
     return {
         "schema_version": AUGMENTED_STABILITY_SCHEMA_VERSION,
-        "post_call": 75,
+        "post_call": 125,
         "poincare_map": "complete_structured_boundary_codec_v2",
         "horizon_steps": config.horizon_steps,
         "fixed_point_anchor": {
@@ -366,7 +366,7 @@ def main() -> None:
     # beta0 means analytic equilibrium/trim is always the executed action;
     # Q2 is used only to define the fixed hidden-state near-equilibrium label.
     snapshots = collect_equilibrium_history(
-        teacher, student, simulator, bank, snapshot_steps=(50, 75)
+        teacher, student, simulator, bank, snapshot_steps=(100, 125)
     )
     batch = build_local_derivative_batch(
         teacher, student, snapshots, radii=(0.1, 0.05, 0.025), seed=args.seed + 1
@@ -389,7 +389,7 @@ def main() -> None:
         beta0_episode
     )
     h250 = lifted_h250_diagnostics(student, simulator, bank, horizon=250, segment_length=25)
-    # P1-6: mandatory complete-state, post-call75 matrix-free stability probe.
+    # P1-6: mandatory complete-state, post-call125 matrix-free stability probe.
     # This is intentionally local sampled evidence; it never consumes blind
     # seeds and never promotes itself to a nonlinear certificate.
     try:
@@ -397,7 +397,7 @@ def main() -> None:
     except (RuntimeError, ValueError, FloatingPointError) as error:
         stability = {
             "schema_version": AUGMENTED_STABILITY_SCHEMA_VERSION,
-            "post_call": 75,
+            "post_call": 125,
             "poincare_map": "complete_structured_boundary_codec_v2",
             "fixed_point_anchor": {
                 "method": "projected_picard_on_25_step_poincare_map",
@@ -495,10 +495,10 @@ def main() -> None:
         "cadence_semantics": {
             "call_index_completed_transitions": True,
             "call0_has_response": False,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "publication_rule_after_first": "positive slow_cadence offsets from call50",
-            "t50_call_index": 50,
+            "publication_rule_after_first": "positive slow_cadence offsets from call100",
+            "t50_call_index": 100,
         },
         "phase": "post-calibration-evidence",
         "active_phase": "C",
@@ -511,7 +511,7 @@ def main() -> None:
         "q2_checkpoint": str(args.source_checkpoint.resolve()),
         "scenario_count": bank.count,
         "beta": 0.0,
-        "snapshot_steps": [50, 75],
+        "snapshot_steps": [100, 125],
         "directions_per_snapshot_radius": batch.direction_count,
         "local_metrics": local,
         "local_mode_metrics": modes,

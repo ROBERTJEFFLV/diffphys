@@ -45,15 +45,15 @@ def test_banked_distillation_requires_formal_causal_oracle(tmp_path) -> None:
         "diagnostic": "causal-identifier-sequence-oracle",
         "formal_eligible": True,
         "gate_passed": True,
-        "probe_amplitude": 0.005,
+        "probe_amplitude": 0.0,
         "tau_grid_sizes": [35],
         "representation_grid_version": 2,
         "cadence_semantics_version": CADENCE_SEMANTICS_VERSION,
         "cadence_semantics": {
             "call_index_completed_transitions": True,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "t50_call_index": 50,
+            "t50_call_index": 100,
         },
         "checkpoint_sha256": __import__("hashlib").sha256(source.read_bytes()).hexdigest(),
         "code_sha256": "0" * 64,
@@ -142,11 +142,11 @@ def test_dagger_episode_uses_fixed_per_scenario_mask_and_real_window_loss() -> N
     bank = build_dagger_scenario_bank(seed=37)
     simulator = L2FSimulator(L2FParams(dt=0.01))
     episode = collect_dagger_episode(_MockTeacher(), _MockStudent(), simulator, bank,
-                                      beta=0.5, horizon=51, episode_seed=11)
-    assert episode.intervention_mask.shape == (51, 64)
+                                      beta=0.5, horizon=101, episode_seed=11)
+    assert episode.intervention_mask.shape == (101, 64)
     assert torch.equal(episode.intervention_mask[0], episode.intervention_mask[-1])
-    assert episode.teacher_same_latent_intercepts.shape == (51, 64, 4)
-    assert episode.teacher_fast_delta_actions.shape == (51, 64, 4)
+    assert episode.teacher_same_latent_intercepts.shape == (101, 64, 4)
+    assert episode.teacher_fast_delta_actions.shape == (101, 64, 4)
     assert episode.motor_trim_target.shape == (64, 4)
     assert episode.identification_norm_t50.shape == (64,)
     assert not bool(episode.identification_failure_t50.any())
@@ -160,7 +160,7 @@ def test_dagger_episode_uses_fixed_per_scenario_mask_and_real_window_loss() -> N
     with pytest.raises(ValueError, match="local-JVP"):
         dagger_window_loss(_MockStudent(), episode, prefix=25, phase="B")
     pure = collect_dagger_episode(_MockTeacher(), _MockStudent(), simulator, bank,
-                                  beta=0.0, horizon=51, episode_seed=11)
+                                  beta=0.0, horizon=101, episode_seed=11)
     assert int(pure.intervention_mask.sum()) == 0
 
 
@@ -241,7 +241,7 @@ def test_phase_a1_mean_pretraining_freezes_only_uncertainty_scale() -> None:
     observation = torch.zeros(2, 25)
     observation[:, (6, 10, 14)] = 1.0
     state = student.initial_state(observation)
-    for _ in range(50):
+    for _ in range(100):
         state = student.forward_with_aux(observation, state).next_state
     # Capability heads publish a new value at the cadence boundary.
     output = student.forward_with_aux(observation, state)
@@ -273,7 +273,7 @@ def test_phase_a2_scale_calibration_freezes_identifier_and_mean() -> None:
     observation = torch.zeros(2, 25)
     observation[:, (6, 10, 14)] = 1.0
     state = student.initial_state(observation)
-    for _ in range(50):
+    for _ in range(100):
         state = student.forward_with_aux(observation, state).next_state
     output = student.forward_with_aux(observation, state)
     output.auxiliary["capability_z_log_scale"].square().mean().backward()
@@ -288,7 +288,7 @@ def test_phase_a2_scale_calibration_freezes_identifier_and_mean() -> None:
 def test_phase_a1_mean_gate_ignores_width_latch_but_a2_gate_does_not() -> None:
     """A1 evaluates the frozen mean; only A2 may promote calibrated width."""
 
-    time, batch = 76, 2
+    time, batch = 126, 2
     values = torch.zeros(time, batch, 6)
     episode = SimpleNamespace(
         motor_trim_target=torch.zeros(batch, 4),
@@ -300,6 +300,7 @@ def test_phase_a1_mean_gate_ignores_width_latch_but_a2_gate_does_not() -> None:
         equilibrium_one_step_accel=torch.zeros(time, batch),
         equilibrium_one_step_omega=torch.zeros(time, batch),
         equilibrium_action_error=torch.zeros(time, batch),
+        motor_observer_rms_error=torch.zeros(time, batch),
         equilibrium_feasible=torch.ones(time, batch, dtype=torch.bool),
         identification_failure_t50=torch.tensor([True, True]),
         capability_z_mean=values,
@@ -314,6 +315,10 @@ def test_phase_a1_mean_gate_ignores_width_latch_but_a2_gate_does_not() -> None:
     )
     assert mean_passed and mean_report["identification_width_required"] is False
     assert not width_passed and width_report["identification_width_required"] is True
+    episode.motor_observer_rms_error.fill_(.01)
+    assert not phase_a_equilibrium_gate(episode, require_identification_width=False)[1]
+    episode.motor_observer_rms_error = None
+    assert not phase_a_equilibrium_gate(episode, require_identification_width=False)[1]
 
 
 def test_a2_has_an_explicit_phase_selector_for_width_and_calibration() -> None:
@@ -329,7 +334,7 @@ def test_a2_has_an_explicit_phase_selector_for_width_and_calibration() -> None:
 
 def test_four_stratum_effectiveness_conformal_uses_128_samples_each() -> None:
     bank = build_dagger_scenario_bank(512, seed=61, per_cell=32)
-    values = torch.zeros(76, 512, 6)
+    values = torch.zeros(126, 512, 6)
     episode = SimpleNamespace(
         log_alpha_bin=bank.log_alpha_bin,
         capability_target_z=torch.zeros(512, 6),
@@ -343,11 +348,11 @@ def test_four_stratum_effectiveness_conformal_uses_128_samples_each() -> None:
     assert len(rows) == 4
     assert all(row["calibration_samples"] == 128 for row in rows)
     assert all(row["validation_coverage"] == 1.0 for row in rows)
-    assert all(row["phase_steps"] == [50, 75] for row in rows)
+    assert all(row["phase_steps"] == [100, 125] for row in rows)
 
 
 def test_phase_a_equilibrium_gate_rejects_latched_identification_failure() -> None:
-    time, batch = 76, 2
+    time, batch = 126, 2
     episode = SimpleNamespace(
         motor_trim_target=torch.zeros(batch, 4),
         body_z_target=torch.tensor([[0.0, 0.0, 1.0]]).expand(batch, 3),
@@ -358,6 +363,7 @@ def test_phase_a_equilibrium_gate_rejects_latched_identification_failure() -> No
         equilibrium_one_step_accel=torch.zeros(time, batch),
         equilibrium_one_step_omega=torch.zeros(time, batch),
         equilibrium_action_error=torch.zeros(time, batch),
+        motor_observer_rms_error=torch.zeros(time, batch),
         equilibrium_feasible=torch.ones(time, batch, dtype=torch.bool),
         identification_failure_t50=torch.tensor([False, True]),
     )

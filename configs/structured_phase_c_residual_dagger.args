@@ -5,7 +5,7 @@
 --report {work}/phase_c_report.json
 --device {device}
 --seed 7
---horizon 125
+--horizon 126
 --prefix 25
 --updates-per-beta 1
 --maximum-buffer-episodes 10

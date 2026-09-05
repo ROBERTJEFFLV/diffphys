@@ -76,7 +76,7 @@ def test_default_availability_keeps_call25_hidden_and_publishes_call50() -> None
     call0 = policy.forward_with_aux(observation, state)
     assert bool(torch.isnan(call0.auxiliary["disturbance_limit"]).all())
     state = call0.next_state
-    for call_index in range(1, 76):
+    for call_index in range(1, 126):
         output = policy.forward_with_aux(observation, state)
         state = output.next_state
         if call_index == 25:
@@ -90,11 +90,11 @@ def test_default_availability_keeps_call25_hidden_and_publishes_call50() -> None
                 ).expand(1, 3),
             )
             assert float(output.auxiliary["contextual_gain_weight"].max()) == 0.0
-        if call_index == 50:
+        if call_index == 100:
             assert bool(output.auxiliary["identification_publication_available"].all())
             assert bool(output.auxiliary["identification_published"].all())
             assert bool(torch.isfinite(output.auxiliary["disturbance_limit"]).all())
-        if call_index == 75:
+        if call_index == 125:
             assert bool(output.auxiliary["identification_publication_available"].all())
             assert bool(output.auxiliary["identification_published"].all())
 
@@ -365,9 +365,9 @@ def test_contextual_gain_is_held_bounded_and_blended_after_burn_in() -> None:
     assert output.next_state.slow_counter == 25
     assert float(output.auxiliary["contextual_induced_norm"].max()) <= config.contextual_gain_rho + 1e-6
     assert float(output.auxiliary["contextual_blend"].max()) == 0.0
-    for _ in range(26):
+    for _ in range(76):
         output = policy.forward_with_aux(observation, output.next_state)
-    assert output.next_state.slow_counter == 51
+    assert output.next_state.slow_counter == 101
     assert 0.0 < float(output.auxiliary["contextual_blend"].max()) <= 1.0
 
 
@@ -381,7 +381,7 @@ def test_allocator_reports_trust_limited_burn_in_action() -> None:
     assert bool((output.action.abs() <= 1.0).all())
 
 
-def test_identification_probe_is_zero_mean_per_cadence_and_not_lag_aliased() -> None:
+def test_experimental_probe_is_collective_and_its_scalar_lags_are_independent() -> None:
     """Every publication block is zero-DC and lagged design stays full rank."""
 
     config = StructuredPolicyConfig(
@@ -389,18 +389,18 @@ def test_identification_probe_is_zero_mean_per_cadence_and_not_lag_aliased() -> 
         identifier_dim=6,
         burn_in_steps=25,
         contextual_blend_steps=25,
-        burn_in_probe_amplitude=0.01,
+        burn_in_probe_amplitude=0.005, burn_in_rate_limit=50.0,
     )
     policy = StructuredRecurrentPolicy(config)
     observation = torch.zeros(1, 25)
     observation[:, (6, 10, 14)] = 1.0
     state = policy.initial_state(observation)
     probes = []
-    for _ in range(IDENTIFICATION_PROBE_PERIOD):
+    for _ in range(25 + IDENTIFICATION_PROBE_PERIOD):
         output = policy.forward_with_aux(observation, state)
         probes.append(output.auxiliary["identification_probe_action"])
         state = output.next_state
-    cycle = torch.cat(probes, dim=0)
+    cycle = torch.cat(probes, dim=0)[25:]
     registered = identification_probe_patterns(device=cycle.device, dtype=cycle.dtype)
     torch.testing.assert_close(cycle, config.burn_in_probe_amplitude * registered)
     for block in cycle.reshape(2, 25, 4):
@@ -419,8 +419,9 @@ def test_identification_probe_is_zero_mean_per_cadence_and_not_lag_aliased() -> 
         dim=-1,
     )
     singular_values = torch.linalg.svdvals(design)
-    assert int(torch.linalg.matrix_rank(design)) == design.shape[-1]
-    assert float(singular_values.max() / singular_values.min()) < 30.0
+    assert int(torch.linalg.matrix_rank(design, atol=1e-6)) == 3
+    assert torch.allclose(cycle, cycle[:, :1].expand_as(cycle), atol=1e-7)
+    assert float(singular_values.max() / singular_values[2]) < 30.0
 
 
 def test_identification_probe_is_zero_after_transition_window() -> None:
@@ -431,7 +432,7 @@ def test_identification_probe_is_zero_after_transition_window() -> None:
         contextual_blend_steps=3,
         identification_publish_start=5,
         slow_cadence=1,
-        burn_in_probe_amplitude=0.01,
+        burn_in_probe_amplitude=0.005, burn_in_rate_limit=50.0,
     )
     policy = StructuredRecurrentPolicy(config)
     observation = torch.zeros(1, 25)

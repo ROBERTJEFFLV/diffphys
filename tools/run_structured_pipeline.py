@@ -126,7 +126,7 @@ def _read_report(path: Path) -> Mapping[str, object]:
 
 
 def _require_bool(report: Mapping[str, object], key: str, context: str) -> None:
-    if not bool(report.get(key, False)):
+    if report.get(key) is not True:
         raise RuntimeError(f"{context} requires {key}=true")
 
 
@@ -137,8 +137,8 @@ def _require_upstream(stage: str, work_dir: Path) -> None:
         # a production init), but it may run once the registered v4 probe is
         # frozen.  With today's debug report this rejects before spending any
         # K35 collection budget, preserving the fail-closed behavior.
-        from tools.diagnose_causal_identifier_oracle import probe_v4_eligibility
-        probe = probe_v4_eligibility()
+        from tools.diagnose_causal_identifier_oracle import probe_v5_eligibility
+        probe = probe_v5_eligibility()
         if not probe.get("eligible"):
             raise RuntimeError(
                 "identifier_oracle stage is blocked: formal causal oracle is not ready"
@@ -153,8 +153,8 @@ def _require_upstream(stage: str, work_dir: Path) -> None:
         _require_bool(oracle, "requested_formal_shape", "production identifier pretraining")
         _require_bool(oracle, "pretraining_gate_passed", "production identifier pretraining")
     elif stage == "phase_a1":
-        from tools.diagnose_causal_identifier_oracle import probe_v4_eligibility
-        probe = probe_v4_eligibility()
+        from tools.diagnose_causal_identifier_oracle import probe_v5_eligibility
+        probe = probe_v5_eligibility()
         if not probe.get("eligible"):
             raise RuntimeError(
                 "Phase A1 is blocked: the current formal v4 probe is not eligible"

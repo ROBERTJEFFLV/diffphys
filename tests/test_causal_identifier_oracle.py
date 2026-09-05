@@ -42,7 +42,7 @@ def test_observer_bank_initializes_from_deployable_previous_action() -> None:
 
 def test_q2_checkpoint_smoke_zero_arm_parity_and_cadence() -> None:
     assert DEFAULT_Q2_CHECKPOINT.is_file()
-    row = _collect_one(DEFAULT_Q2_CHECKPOINT, 3707, 0.0, 16, 75)
+    row = _collect_one(DEFAULT_Q2_CHECKPOINT, 3707, 0.0, 16, 126)
     assert row["q2_observation"] == {
         "mode": "integral25",
         "integral_input_frame": "body",
@@ -60,15 +60,15 @@ def test_q2_checkpoint_smoke_zero_arm_parity_and_cadence() -> None:
     assert row["features"]["S"].shape[:3] == (3, 16, 25)
     # Publication 25 contains transitions 1..25, and uses the post-step
     # observer bank with the response from that same transition.
-    assert row["commands"].shape == (75, 16, 4)
+    assert row["commands"].shape == (126, 16, 4)
     torch.testing.assert_close(row["previous_action_seen"][1], row["commands"][0])
     assert row["response_windows"].shape[:3] == (3, 16, 25)
     assert row["canonical_actions"].shape == row["q_actions"].shape
-    assert tuple(PUBLICATION_STEPS) == (25, 50, 75)
+    assert tuple(PUBLICATION_STEPS) == (25, 100, 125)
 
 
 def test_q2_residual_probe_is_bounded_and_actual_action_is_replayed() -> None:
-    row = _collect_one(DEFAULT_Q2_CHECKPOINT, 3707, 0.005, 16, 75)
+    row = _collect_one(DEFAULT_Q2_CHECKPOINT, 3707, 0.005, 16, 126)
     residual = row["residual_probe"]
     prior = torch.cat((torch.zeros_like(residual[:1]), residual[:-1]), dim=0)
     assert float(residual.abs().max()) <= 0.005 + 1.0e-7
@@ -76,7 +76,7 @@ def test_q2_residual_probe_is_bounded_and_actual_action_is_replayed() -> None:
     expected = row["q_actions"] + residual
     torch.testing.assert_close(row["commands"], expected)
     assert bool(((row["commands"] >= -1.0) & (row["commands"] <= 1.0)).all())
-    torch.testing.assert_close(row["requested_probe"][50:], torch.zeros_like(row["requested_probe"][50:]))
+    torch.testing.assert_close(row["requested_probe"][75:], torch.zeros_like(row["requested_probe"][75:]))
 
 
 def test_sol_residual_clip_uses_annulus_headroom_and_slews_back_after_call49() -> None:
@@ -223,8 +223,8 @@ def test_probe_v4_eligibility_binds_formal_seed_split_and_q2_hash(tmp_path) -> N
         },
         "gate_passed": True,
         "seed_split": {
-            "train": list(FORMAL_TRAIN_SEEDS),
-            "validation": [FORMAL_VALIDATION_SEED],
+            "train": [3707, 4707, 5707, 6707],
+            "validation": [7707],
             "blind_consumed": [],
         },
         "protocol": {
@@ -310,14 +310,14 @@ def test_v3_cadence_report_excludes_call25_from_active_publications(tmp_path) ->
 
     result = run(Namespace(
         checkpoint=DEFAULT_Q2_CHECKPOINT, output=tmp_path / "report.json",
-        stage="collect-ceiling", scenarios=16, horizon=75, n_jobs=1,
+        stage="collect-ceiling", scenarios=16, horizon=126, n_jobs=1,
         max_updates=1, dry_run=True, waveform=None,
     ))
     cadence = result["cadence_semantics"]
-    assert cadence["publication_calls"] == [50, 75]
+    assert cadence["publication_calls"] == [100, 125]
     assert cadence["diagnostic_calls"] == [25]
     assert cadence["availability_t25"] == [0, 0, 0, 0, 0, 0]
-    assert result["publications"] == [50, 75]
+    assert result["publications"] == [100, 125]
 
 
 def test_exact_physics_oracle_recovers_multi_axis_noiseless_transition() -> None:
@@ -352,15 +352,19 @@ def test_exact_physics_oracle_recovers_multi_axis_noiseless_transition() -> None
         (motor_next[:, 2] - motor_next[:, 0]) / 2.0,
         (motor_next[:, 0] - motor_next[:, 1] + motor_next[:, 2] - motor_next[:, 3]) / 4.0,
     ), dim=-1)
+    force = (1 + (tw - 1) * motor_next).clamp_min(0)
+    angular_modes = torch.stack(((force[:, 1] - force[:, 3]) / tw,
+        (force[:, 2] - force[:, 0]) / tw,
+        (force[:, 0] - force[:, 1] + force[:, 2] - force[:, 3]) / (2 * tw)), -1)
     omega_after = omega_before.clone()
     # Fixed-point solve makes the midpoint Coriolis response exact to float
     # precision while retaining nonzero omega in all three axes.
     for _ in range(12):
         mid = 0.5 * (omega_before + omega_after)
         acceleration = torch.stack((
-            local_roll * x[:, 1] - beta * mid[:, 1] * mid[:, 2],
-            local_roll * x[:, 2] + beta * mid[:, 2] * mid[:, 0],
-            local_yaw * x[:, 3],
+            alpha_roll * angular_modes[:, 0] - beta * mid[:, 1] * mid[:, 2],
+            alpha_roll * angular_modes[:, 1] + beta * mid[:, 2] * mid[:, 0],
+            alpha_roll * eta_yaw * angular_modes[:, 2],
         ), dim=-1)
         omega_after = omega_before + dt * acceleration
 
@@ -369,7 +373,7 @@ def test_exact_physics_oracle_recovers_multi_axis_noiseless_transition() -> None
     ext_body = torch.bmm(rotation.transpose(-1, -2),
                          (external_force / mass[:, None]).unsqueeze(-1)).squeeze(-1)
     corrected = torch.zeros(n, 3)
-    corrected[:, 2] = gravity * (1.0 + (tw - 1.0) * x[:, 0])
+    corrected[:, 2] = gravity * force.mean(-1)
     specific_body = corrected + ext_body
     fit = exact_physics_block_fit(
         motor_before, motor_next, command, specific_body, rotation,

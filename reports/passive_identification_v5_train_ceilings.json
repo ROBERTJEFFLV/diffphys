@@ -1,0 +1,1806 @@
+{
+  "diagnostic": "passive-identification-train-ceilings-v5",
+  "contract_sha256": "bca259140caa47e6dbec61ffb5b86afb7a4984ab2098658f4e82533829aed16b",
+  "code_sha256": {
+    "probe_contract_v5.py": "440e8b4ffa77b44062134eb9e8056e074c5e33dbfe523697a56fb473bcb6750b",
+    "tools/diagnose_probe_v5.py": "c8c84310ee07e41a11dd196eb76e8c70175e0d905e73b8de689f91a385b4c537",
+    "structured_distillation.py": "3148a9e933413184bbefc5919aa2a6c7ff419ac36229a851aa0a40309a5b37ad",
+    "tools/diagnose_probe_v4.py": "98c5ecacc39289d6e12af4a1a266a5a3b5ec3671b4d03ae4640192f4d7eae71c",
+    "tools/diagnose_causal_identifier_oracle.py": "fd16a40da4c942a3bb8f4dd27b95af9e25a6aa8a6258cfa68f83eb97c6129823",
+    "identification_information.py": "c720ce5c5884ab21df1606772a7b24433747ab5f6bbe5e330950685550ace8fe",
+    "structured_policy.py": "005316b53147d8b47d0e164cfac547b03c80395396e3606bc94ca366e3d750c9",
+    "identification_features.py": "392309ea8f4083a5398468c536eba2be639c74b6234be3bd491c5705f6ebbbbc",
+    "env_l2f.py": "863a68db366531689045348b382bc4be8508265f738ea2aa0a0e0148b9e6dd59",
+    "model.py": "101e168aa7dbd659ef230d8392fb3aacc2916bdbe59a37fdb4dae2c7832e6844",
+    "policy_observation.py": "a9994cffaff791f9f62f370862524cdac2125cabff58792959ee08f3a026c807",
+    "diagnostics/formal_rollout.py": "539f3af5135b5c11537d8795ca7823211cc8ee93702fa5f8e37fdd891c00eae0"
+  },
+  "audit_code_sha256": "18693f1c678d0b316902ff41c8b50c246ab8f15e8371426b56bbf051be28ef62",
+  "q2_sha256": "b401dc6f02beadf51d1b55b24b9056f0b00f17a7a8a5d94d3675554fdb15370d",
+  "train": [
+    {
+      "seed": 13707,
+      "scenarios": 128,
+      "horizon": 126,
+      "zero_parity": {
+        "max_action_error": 0.0,
+        "max_state_error": 0.0,
+        "max_integral_error": 0.0,
+        "max_hidden_error": 0.0,
+        "gate_passed": true
+      },
+      "finite": true,
+      "coverage": {
+        "K15": {
+          "25": {
+            "median_best_to_legacy": 0.14394865930080414,
+            "p95_best_to_legacy": 0.5678001046180725,
+            "rms": 0.017411556094884872,
+            "legacy_rms": 0.13037407398223877,
+            "motor_rms_p95": 0.03456299751996994,
+            "motor_rms_max": 0.047471072524785995,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.15076979994773865,
+            "p95_best_to_legacy": 0.7231942415237427,
+            "rms": 0.013777477666735649,
+            "legacy_rms": 0.10407788306474686,
+            "motor_rms_p95": 0.03877962753176689,
+            "motor_rms_max": 0.05634197220206261,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.14516966044902802,
+            "p95_best_to_legacy": 0.6577246785163879,
+            "rms": 0.012348592281341553,
+            "legacy_rms": 0.0952804684638977,
+            "motor_rms_p95": 0.0356561616063118,
+            "motor_rms_max": 0.05654316768050194,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          }
+        },
+        "K35": {
+          "25": {
+            "median_best_to_legacy": 0.09355233609676361,
+            "p95_best_to_legacy": 0.3329773545265198,
+            "rms": 0.011208337731659412,
+            "legacy_rms": 0.13037407398223877,
+            "motor_rms_p95": 0.024098584428429604,
+            "motor_rms_max": 0.028661299496889114,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.07889784872531891,
+            "p95_best_to_legacy": 0.3340189754962921,
+            "rms": 0.00841991975903511,
+            "legacy_rms": 0.10407788306474686,
+            "motor_rms_p95": 0.022333722561597824,
+            "motor_rms_max": 0.03690693527460098,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.08865153789520264,
+            "p95_best_to_legacy": 0.31894272565841675,
+            "rms": 0.007774355821311474,
+            "legacy_rms": 0.0952804684638977,
+            "motor_rms_p95": 0.021492552012205124,
+            "motor_rms_max": 0.034612081944942474,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          }
+        },
+        "K15_reference_passed": true,
+        "K35_gate_passed": true,
+        "continuous_observer_ceiling": {
+          "100": {
+            "fit_through_transition": 74,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.4768542136570588e-08,
+            "motor_rms_max": 3.980085980082695e-08,
+            "passed": true
+          },
+          "125": {
+            "fit_through_transition": 99,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.356052449773808e-08,
+            "motor_rms_max": 3.2662369698701054e-08,
+            "passed": true
+          }
+        },
+        "continuous_observer_gate_passed": true,
+        "passed": true,
+        "scope": "K35 relative representation coverage plus continuous-tau observer ceiling; not trained-identifier accuracy",
+        "failed_checks": {
+          "K15": {},
+          "K35": {}
+        }
+      },
+      "physics": {
+        "publication": {
+          "25": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1973743438720703,
+            "condition_p95": 2.123426675796509,
+            "condition_max": 5.282711982727051,
+            "capability_z_rms_per_dim": [
+              8.194961651497579e-07,
+              1.60548509597902e-07,
+              6.65370521346631e-07,
+              2.3997359676286578e-05,
+              1.0269207706414818e-07,
+              9.16962648034314e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              8.194961651497579e-07,
+              1.60548509597902e-07,
+              6.65370521346631e-07,
+              2.3997359676286578e-05,
+              1.0269207706414818e-07,
+              9.16962648034314e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              1.6093254089355469e-06,
+              2.384185791015625e-07,
+              1.7017119944284786e-06,
+              3.1758841942064464e-05,
+              2.384185791015625e-07,
+              1.9371509552001953e-07
+            ],
+            "effectiveness_z_rms": 1.201055056299083e-05,
+            "effectiveness_dims_0_3_z_rms": 6.164596584312676e-07,
+            "tau_z_rms": 9.734954176110477e-08,
+            "finite": true,
+            "tau_support_pooled": false,
+            "rise_support_min_per_motor": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "fall_support_min_per_motor": [
+              2,
+              0,
+              0,
+              1
+            ],
+            "tau_rise_support_min_pooled": 2,
+            "tau_fall_support_min_pooled": 13,
+            "tau_rise_distinct_calls_min": 2,
+            "tau_fall_distinct_calls_min": 9,
+            "tau_rise_motors_contributing_min": 1,
+            "tau_fall_motors_contributing_min": 3,
+            "tau_weighted_fisher_information_min": 0.0008148205759037873,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": false,
+            "support_per_motor_passed": false,
+            "active_gate": false,
+            "failed_checks": [
+              "shared_tau_pooled_time_motor_fisher"
+            ]
+          },
+          "100": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1293715238571167,
+            "condition_p95": 1.92655611038208,
+            "condition_max": 5.476754188537598,
+            "capability_z_rms_per_dim": [
+              1.0228017117697163e-06,
+              1.64128593382884e-07,
+              1.3060234493877942e-07,
+              2.1001453205826692e-05,
+              8.582426858083636e-08,
+              5.2286939222767614e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.0228017117697163e-06,
+              1.64128593382884e-07,
+              1.3060234493877942e-07,
+              2.1001453205826692e-05,
+              8.582426858083636e-08,
+              5.2286939222767614e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.1457672119140625e-06,
+              2.7716151862478e-07,
+              2.7716151862478e-07,
+              1.8748638467513956e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 1.0513695087865926e-05,
+            "effectiveness_dims_0_3_z_rms": 6.028041070749168e-07,
+            "tau_z_rms": 7.106240218490711e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              25,
+              30,
+              22,
+              29
+            ],
+            "fall_support_min_per_motor": [
+              35,
+              28,
+              32,
+              33
+            ],
+            "tau_rise_support_min_pooled": 121,
+            "tau_fall_support_min_pooled": 166,
+            "tau_rise_distinct_calls_min": 47,
+            "tau_fall_distinct_calls_min": 57,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.6700904110282683,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          },
+          "125": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.118018627166748,
+            "condition_p95": 1.8636077642440796,
+            "condition_max": 5.144404888153076,
+            "capability_z_rms_per_dim": [
+              1.1269703463767655e-06,
+              1.8300340798305115e-07,
+              1.2872769161731412e-07,
+              1.4380198081198614e-05,
+              8.513427474099444e-08,
+              5.032590166820228e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.1269703463767655e-06,
+              1.8300340798305115e-07,
+              1.2872769161731412e-07,
+              1.4380198081198614e-05,
+              8.513427474099444e-08,
+              5.032590166820228e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.3245811462402344e-06,
+              4.470348358154297e-07,
+              2.384185791015625e-07,
+              1.862347016867716e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 7.213013304863125e-06,
+            "effectiveness_dims_0_3_z_rms": 6.633559337387851e-07,
+            "tau_z_rms": 6.993046497427713e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              32,
+              33,
+              36,
+              35
+            ],
+            "fall_support_min_per_motor": [
+              45,
+              49,
+              48,
+              44
+            ],
+            "tau_rise_support_min_pooled": 167,
+            "tau_fall_support_min_pooled": 219,
+            "tau_rise_distinct_calls_min": 63,
+            "tau_fall_distinct_calls_min": 71,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.6866552290546735,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          }
+        },
+        "tau_wls_finite": true,
+        "effectiveness_finite": true,
+        "effectiveness_normalized_z_rms": 1.0113006283063442e-05,
+        "tau_wls_normalized_z_rms": 8.045095256647983e-08,
+        "response_regression_rank_min": 6,
+        "response_regression_condition_max": 5.476754188537598,
+        "response_regression_rank_passed": true,
+        "tau_wls_supported": true,
+        "uses_capability_labels_as_features": false,
+        "block_design_columns": [
+          "TW-1",
+          "alpha_roll",
+          "alpha_yaw",
+          "beta",
+          "inv_tau_up",
+          "inv_tau_down"
+        ],
+        "gate_passed": true,
+        "failed_checks": {},
+        "probe_contract": {
+          "version": "passive_identification_v5",
+          "amplitude": 0.0,
+          "mode": "passive_first",
+          "experimental_active_amplitude": 0.005,
+          "waveform": [
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "dwell_steps": 25,
+          "active_steps": 50,
+          "recovery_steps": 25,
+          "publication_calls": [
+            100,
+            125
+          ],
+          "guard_active_calls": [
+            25,
+            99
+          ],
+          "command_direction": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "residual_slew_per_call": 0.005,
+          "guards": {
+            "position_norm": 5.0,
+            "velocity_norm": 5.0,
+            "omega_norm": "max(5, 1.5*dwell_peak)",
+            "body_z_min": 0.0
+          },
+          "safety_ratio": 1.05,
+          "safety_atol": 1e-07,
+          "coverage_min": 0.9,
+          "coverage_per_cell_min": 0.5,
+          "energy_retention_min_for_active_experiments": 0.9,
+          "passive_support_window": [
+            0,
+            100
+          ],
+          "train_seeds": [
+            3707,
+            4707,
+            5707,
+            6707
+          ],
+          "validation_seed": 7707,
+          "formal_scenarios": 64,
+          "formal_horizon": 125,
+          "q2_sha256": "b401dc6f02beadf51d1b55b24b9056f0b00f17a7a8a5d94d3675554fdb15370d",
+          "identifies": [
+            "shared_tau_rise",
+            "shared_tau_fall"
+          ],
+          "angular_capability_authorization": false
+        },
+        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus a weighted excitation proxy (not a statistical Fisher matrix); per-motor counts are diagnostic only"
+      }
+    },
+    {
+      "seed": 14707,
+      "scenarios": 128,
+      "horizon": 126,
+      "zero_parity": {
+        "max_action_error": 0.0,
+        "max_state_error": 0.0,
+        "max_integral_error": 0.0,
+        "max_hidden_error": 0.0,
+        "gate_passed": true
+      },
+      "finite": true,
+      "coverage": {
+        "K15": {
+          "25": {
+            "median_best_to_legacy": 0.14959442615509033,
+            "p95_best_to_legacy": 0.5600709319114685,
+            "rms": 0.017327409237623215,
+            "legacy_rms": 0.12816773355007172,
+            "motor_rms_p95": 0.03577074036002159,
+            "motor_rms_max": 0.05075617879629135,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.12481656670570374,
+            "p95_best_to_legacy": 0.5840440392494202,
+            "rms": 0.013648392632603645,
+            "legacy_rms": 0.10442021489143372,
+            "motor_rms_p95": 0.03833338990807533,
+            "motor_rms_max": 0.0498725064098835,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.15611085295677185,
+            "p95_best_to_legacy": 0.6692481637001038,
+            "rms": 0.012355714105069637,
+            "legacy_rms": 0.08457997441291809,
+            "motor_rms_p95": 0.03756456822156906,
+            "motor_rms_max": 0.04791679605841637,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          }
+        },
+        "K35": {
+          "25": {
+            "median_best_to_legacy": 0.09543181955814362,
+            "p95_best_to_legacy": 0.32596245408058167,
+            "rms": 0.010614206083118916,
+            "legacy_rms": 0.12816773355007172,
+            "motor_rms_p95": 0.02102556638419628,
+            "motor_rms_max": 0.027523120865225792,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.09698707610368729,
+            "p95_best_to_legacy": 0.35570624470710754,
+            "rms": 0.009074361994862556,
+            "legacy_rms": 0.10442021489143372,
+            "motor_rms_p95": 0.02322121523320675,
+            "motor_rms_max": 0.037427663803100586,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.10406076908111572,
+            "p95_best_to_legacy": 0.4598250687122345,
+            "rms": 0.00775704812258482,
+            "legacy_rms": 0.08457997441291809,
+            "motor_rms_p95": 0.020688850432634354,
+            "motor_rms_max": 0.031985893845558167,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          }
+        },
+        "K15_reference_passed": true,
+        "K35_gate_passed": true,
+        "continuous_observer_ceiling": {
+          "100": {
+            "fit_through_transition": 74,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.331976678410614e-08,
+            "motor_rms_max": 6.502838410433018e-08,
+            "passed": true
+          },
+          "125": {
+            "fit_through_transition": 99,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.3430769552127196e-08,
+            "motor_rms_max": 3.4507935673882025e-08,
+            "passed": true
+          }
+        },
+        "continuous_observer_gate_passed": true,
+        "passed": true,
+        "scope": "K35 relative representation coverage plus continuous-tau observer ceiling; not trained-identifier accuracy",
+        "failed_checks": {
+          "K15": {},
+          "K35": {}
+        }
+      },
+      "physics": {
+        "publication": {
+          "25": {
+            "count": 128,
+            "rank_min": 5,
+            "rank_full_fraction": 0.9921875,
+            "condition_median": null,
+            "condition_p95": null,
+            "condition_max": null,
+            "capability_z_rms_per_dim": [
+              1.4664807395092794e-06,
+              3.3578913871679106e-07,
+              8.123787438307772e-07,
+              3.469429793767631e-05,
+              1.8209081888198853,
+              8.409796237174305e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.4664807395092794e-06,
+              3.3578913871679106e-07,
+              8.123787438307772e-07,
+              3.469429793767631e-05,
+              1.8209081888198853,
+              8.409796237174305e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              1.9043681049879524e-06,
+              4.5672055648537935e-07,
+              1.3709068298339844e-06,
+              4.733800597023219e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 1.736820013320539e-05,
+            "effectiveness_dims_0_3_z_rms": 9.871303063846426e-07,
+            "tau_z_rms": 1.2875765562057495,
+            "finite": true,
+            "tau_support_pooled": false,
+            "rise_support_min_per_motor": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "fall_support_min_per_motor": [
+              3,
+              0,
+              0,
+              0
+            ],
+            "tau_rise_support_min_pooled": 0,
+            "tau_fall_support_min_pooled": 17,
+            "tau_rise_distinct_calls_min": 0,
+            "tau_fall_distinct_calls_min": 10,
+            "tau_rise_motors_contributing_min": 0,
+            "tau_fall_motors_contributing_min": 3,
+            "tau_weighted_fisher_information_min": 0.0,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": false,
+            "support_per_motor_passed": false,
+            "active_gate": false,
+            "failed_checks": [
+              "rank6_per_scene",
+              "condition_median<=30",
+              "condition_p95<=100",
+              "condition_max<=300",
+              "normalized_z_rms_per_dim<=0.02",
+              "shared_tau_pooled_time_motor_fisher"
+            ]
+          },
+          "100": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.125482201576233,
+            "condition_p95": 1.855893611907959,
+            "condition_max": 4.742306709289551,
+            "capability_z_rms_per_dim": [
+              1.1679098861350212e-06,
+              2.6008387976617087e-07,
+              1.73633765143677e-07,
+              1.3877652236260474e-05,
+              8.657293193436999e-08,
+              4.8267313701444436e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.1679098861350212e-06,
+              2.6008387976617087e-07,
+              1.73633765143677e-07,
+              1.3877652236260474e-05,
+              8.657293193436999e-08,
+              4.8267313701444436e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.40951726482308e-06,
+              4.71621717679227e-07,
+              2.384185791015625e-07,
+              2.222805778728798e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 6.965110060264124e-06,
+            "effectiveness_dims_0_3_z_rms": 6.980462785577402e-07,
+            "tau_z_rms": 7.008782176853856e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              15,
+              29,
+              25,
+              21
+            ],
+            "fall_support_min_per_motor": [
+              39,
+              40,
+              24,
+              32
+            ],
+            "tau_rise_support_min_pooled": 110,
+            "tau_fall_support_min_pooled": 174,
+            "tau_rise_distinct_calls_min": 47,
+            "tau_fall_distinct_calls_min": 70,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.6653103510365768,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          },
+          "125": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1179165840148926,
+            "condition_p95": 1.80680251121521,
+            "condition_max": 4.748087406158447,
+            "capability_z_rms_per_dim": [
+              1.2723572808681638e-06,
+              2.615686582885246e-07,
+              1.236909668023145e-07,
+              1.3462818060361315e-05,
+              8.396894202178373e-08,
+              4.797893282670884e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.2723572808681638e-06,
+              2.615686582885246e-07,
+              1.236909668023145e-07,
+              1.3462818060361315e-05,
+              8.396894202178373e-08,
+              4.797893282670884e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.7984378903056495e-06,
+              6.750225338691962e-07,
+              1.1920928955078125e-07,
+              2.249031786050182e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 6.762952125427546e-06,
+            "effectiveness_dims_0_3_z_rms": 7.533504344792163e-07,
+            "tau_z_rms": 6.838406818587828e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              38,
+              32,
+              37,
+              31
+            ],
+            "fall_support_min_per_motor": [
+              43,
+              47,
+              46,
+              38
+            ],
+            "tau_rise_support_min_pooled": 171,
+            "tau_fall_support_min_pooled": 205,
+            "tau_rise_distinct_calls_min": 71,
+            "tau_fall_distinct_calls_min": 70,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.6653603932275466,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          }
+        },
+        "tau_wls_finite": true,
+        "effectiveness_finite": true,
+        "effectiveness_normalized_z_rms": 1.1487742995086592e-05,
+        "tau_wls_normalized_z_rms": 0.7433826327323914,
+        "response_regression_rank_min": 5,
+        "response_regression_condition_max": null,
+        "response_regression_rank_passed": true,
+        "tau_wls_supported": true,
+        "uses_capability_labels_as_features": false,
+        "block_design_columns": [
+          "TW-1",
+          "alpha_roll",
+          "alpha_yaw",
+          "beta",
+          "inv_tau_up",
+          "inv_tau_down"
+        ],
+        "gate_passed": true,
+        "failed_checks": {},
+        "probe_contract": {
+          "version": "passive_identification_v5",
+          "amplitude": 0.0,
+          "mode": "passive_first",
+          "experimental_active_amplitude": 0.005,
+          "waveform": [
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "dwell_steps": 25,
+          "active_steps": 50,
+          "recovery_steps": 25,
+          "publication_calls": [
+            100,
+            125
+          ],
+          "guard_active_calls": [
+            25,
+            99
+          ],
+          "command_direction": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "residual_slew_per_call": 0.005,
+          "guards": {
+            "position_norm": 5.0,
+            "velocity_norm": 5.0,
+            "omega_norm": "max(5, 1.5*dwell_peak)",
+            "body_z_min": 0.0
+          },
+          "safety_ratio": 1.05,
+          "safety_atol": 1e-07,
+          "coverage_min": 0.9,
+          "coverage_per_cell_min": 0.5,
+          "energy_retention_min_for_active_experiments": 0.9,
+          "passive_support_window": [
+            0,
+            100
+          ],
+          "train_seeds": [
+            3707,
+            4707,
+            5707,
+            6707
+          ],
+          "validation_seed": 7707,
+          "formal_scenarios": 64,
+          "formal_horizon": 125,
+          "q2_sha256": "b401dc6f02beadf51d1b55b24b9056f0b00f17a7a8a5d94d3675554fdb15370d",
+          "identifies": [
+            "shared_tau_rise",
+            "shared_tau_fall"
+          ],
+          "angular_capability_authorization": false
+        },
+        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus a weighted excitation proxy (not a statistical Fisher matrix); per-motor counts are diagnostic only"
+      }
+    },
+    {
+      "seed": 15707,
+      "scenarios": 128,
+      "horizon": 126,
+      "zero_parity": {
+        "max_action_error": 0.0,
+        "max_state_error": 0.0,
+        "max_integral_error": 0.0,
+        "max_hidden_error": 0.0,
+        "gate_passed": true
+      },
+      "finite": true,
+      "coverage": {
+        "K15": {
+          "25": {
+            "median_best_to_legacy": 0.13142293691635132,
+            "p95_best_to_legacy": 0.46668243408203125,
+            "rms": 0.0169790331274271,
+            "legacy_rms": 0.1369609385728836,
+            "motor_rms_p95": 0.03201558440923691,
+            "motor_rms_max": 0.038879189640283585,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.16609196364879608,
+            "p95_best_to_legacy": 0.6016445159912109,
+            "rms": 0.01436416245996952,
+            "legacy_rms": 0.10271961987018585,
+            "motor_rms_p95": 0.03708437457680702,
+            "motor_rms_max": 0.05566716939210892,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.1641538143157959,
+            "p95_best_to_legacy": 0.6194419860839844,
+            "rms": 0.013045653700828552,
+            "legacy_rms": 0.09388462454080582,
+            "motor_rms_p95": 0.0355810783803463,
+            "motor_rms_max": 0.050736334174871445,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          }
+        },
+        "K35": {
+          "25": {
+            "median_best_to_legacy": 0.07253895699977875,
+            "p95_best_to_legacy": 0.2945247292518616,
+            "rms": 0.01068959292024374,
+            "legacy_rms": 0.1369609385728836,
+            "motor_rms_p95": 0.024127373471856117,
+            "motor_rms_max": 0.028047991916537285,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.09051184356212616,
+            "p95_best_to_legacy": 0.2681897282600403,
+            "rms": 0.008922633714973927,
+            "legacy_rms": 0.10271961987018585,
+            "motor_rms_p95": 0.024729207158088684,
+            "motor_rms_max": 0.030251221731305122,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.0913933590054512,
+            "p95_best_to_legacy": 0.3083030581474304,
+            "rms": 0.008045082911849022,
+            "legacy_rms": 0.09388462454080582,
+            "motor_rms_p95": 0.024378761649131775,
+            "motor_rms_max": 0.03314955532550812,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          }
+        },
+        "K15_reference_passed": true,
+        "K35_gate_passed": true,
+        "continuous_observer_ceiling": {
+          "100": {
+            "fit_through_transition": 74,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.776133452115768e-08,
+            "motor_rms_max": 5.50404341346008e-08,
+            "passed": true
+          },
+          "125": {
+            "fit_through_transition": 99,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.1939507507788723e-08,
+            "motor_rms_max": 5.6600543114632564e-08,
+            "passed": true
+          }
+        },
+        "continuous_observer_gate_passed": true,
+        "passed": true,
+        "scope": "K35 relative representation coverage plus continuous-tau observer ceiling; not trained-identifier accuracy",
+        "failed_checks": {
+          "K15": {},
+          "K35": {}
+        }
+      },
+      "physics": {
+        "publication": {
+          "25": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1850144863128662,
+            "condition_p95": 1.7902227640151978,
+            "condition_max": 3.73378324508667,
+            "capability_z_rms_per_dim": [
+              1.2483141063057701e-06,
+              2.46048358576445e-07,
+              5.483043423737399e-07,
+              3.8409179978771135e-05,
+              1.743508306617514e-07,
+              6.06576335826503e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.2483141063057701e-06,
+              2.46048358576445e-07,
+              5.483043423737399e-07,
+              3.8409179978771135e-05,
+              1.743508306617514e-07,
+              6.06576335826503e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.5570386696927017e-06,
+              4.76837158203125e-07,
+              1.0728836059570312e-06,
+              5.7434095651842654e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 1.921707735164091e-05,
+            "effectiveness_dims_0_3_z_rms": 7.998886530913296e-07,
+            "tau_z_rms": 1.305326691181108e-07,
+            "finite": true,
+            "tau_support_pooled": false,
+            "rise_support_min_per_motor": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "fall_support_min_per_motor": [
+              1,
+              0,
+              0,
+              2
+            ],
+            "tau_rise_support_min_pooled": 1,
+            "tau_fall_support_min_pooled": 13,
+            "tau_rise_distinct_calls_min": 1,
+            "tau_fall_distinct_calls_min": 7,
+            "tau_rise_motors_contributing_min": 1,
+            "tau_fall_motors_contributing_min": 3,
+            "tau_weighted_fisher_information_min": 1.5691836675681712e-05,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": false,
+            "support_per_motor_passed": false,
+            "active_gate": false,
+            "failed_checks": [
+              "shared_tau_pooled_time_motor_fisher"
+            ]
+          },
+          "100": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1242338418960571,
+            "condition_p95": 1.5814013481140137,
+            "condition_max": 2.7392802238464355,
+            "capability_z_rms_per_dim": [
+              1.2710502232948784e-06,
+              2.030510302120092e-07,
+              9.761161123833517e-08,
+              1.4247772014641669e-05,
+              6.69032687028448e-08,
+              4.7176797579595586e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.2710502232948784e-06,
+              2.030510302120092e-07,
+              9.761161123833517e-08,
+              1.4247772014641669e-05,
+              6.69032687028448e-08,
+              4.7176797579595586e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.740323452599114e-06,
+              4.5672055648537935e-07,
+              1.392326822724499e-07,
+              2.611576928757131e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 7.1530639615957625e-06,
+            "effectiveness_dims_0_3_z_rms": 7.452799195561965e-07,
+            "tau_z_rms": 5.7886516913185915e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              24,
+              27,
+              25,
+              19
+            ],
+            "fall_support_min_per_motor": [
+              36,
+              41,
+              41,
+              32
+            ],
+            "tau_rise_support_min_pooled": 115,
+            "tau_fall_support_min_pooled": 186,
+            "tau_rise_distinct_calls_min": 55,
+            "tau_fall_distinct_calls_min": 60,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.7922926694466356,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          },
+          "125": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1244428157806396,
+            "condition_p95": 1.5755119323730469,
+            "condition_max": 2.1229164600372314,
+            "capability_z_rms_per_dim": [
+              1.478766648688179e-06,
+              2.2685287603962934e-07,
+              8.756941838328203e-08,
+              1.3815452803100925e-05,
+              6.69032687028448e-08,
+              4.7176797579595586e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.478766648688179e-06,
+              2.2685287603962934e-07,
+              8.756941838328203e-08,
+              1.3815452803100925e-05,
+              6.69032687028448e-08,
+              4.7176797579595586e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.969801471408573e-06,
+              4.76837158203125e-07,
+              1.2042001173995232e-07,
+              2.6880194127443247e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 6.9482480284932535e-06,
+            "effectiveness_dims_0_3_z_rms": 8.652324368085829e-07,
+            "tau_z_rms": 5.7886516913185915e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              34,
+              32,
+              35,
+              36
+            ],
+            "fall_support_min_per_motor": [
+              51,
+              45,
+              50,
+              45
+            ],
+            "tau_rise_support_min_pooled": 169,
+            "tau_fall_support_min_pooled": 223,
+            "tau_rise_distinct_calls_min": 74,
+            "tau_fall_distinct_calls_min": 84,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.796703733540002,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          }
+        },
+        "tau_wls_finite": true,
+        "effectiveness_finite": true,
+        "effectiveness_normalized_z_rms": 1.2499875083449297e-05,
+        "tau_wls_normalized_z_rms": 8.89578117835299e-08,
+        "response_regression_rank_min": 6,
+        "response_regression_condition_max": 3.73378324508667,
+        "response_regression_rank_passed": true,
+        "tau_wls_supported": true,
+        "uses_capability_labels_as_features": false,
+        "block_design_columns": [
+          "TW-1",
+          "alpha_roll",
+          "alpha_yaw",
+          "beta",
+          "inv_tau_up",
+          "inv_tau_down"
+        ],
+        "gate_passed": true,
+        "failed_checks": {},
+        "probe_contract": {
+          "version": "passive_identification_v5",
+          "amplitude": 0.0,
+          "mode": "passive_first",
+          "experimental_active_amplitude": 0.005,
+          "waveform": [
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "dwell_steps": 25,
+          "active_steps": 50,
+          "recovery_steps": 25,
+          "publication_calls": [
+            100,
+            125
+          ],
+          "guard_active_calls": [
+            25,
+            99
+          ],
+          "command_direction": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "residual_slew_per_call": 0.005,
+          "guards": {
+            "position_norm": 5.0,
+            "velocity_norm": 5.0,
+            "omega_norm": "max(5, 1.5*dwell_peak)",
+            "body_z_min": 0.0
+          },
+          "safety_ratio": 1.05,
+          "safety_atol": 1e-07,
+          "coverage_min": 0.9,
+          "coverage_per_cell_min": 0.5,
+          "energy_retention_min_for_active_experiments": 0.9,
+          "passive_support_window": [
+            0,
+            100
+          ],
+          "train_seeds": [
+            3707,
+            4707,
+            5707,
+            6707
+          ],
+          "validation_seed": 7707,
+          "formal_scenarios": 64,
+          "formal_horizon": 125,
+          "q2_sha256": "b401dc6f02beadf51d1b55b24b9056f0b00f17a7a8a5d94d3675554fdb15370d",
+          "identifies": [
+            "shared_tau_rise",
+            "shared_tau_fall"
+          ],
+          "angular_capability_authorization": false
+        },
+        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus a weighted excitation proxy (not a statistical Fisher matrix); per-motor counts are diagnostic only"
+      }
+    },
+    {
+      "seed": 16707,
+      "scenarios": 128,
+      "horizon": 126,
+      "zero_parity": {
+        "max_action_error": 0.0,
+        "max_state_error": 0.0,
+        "max_integral_error": 0.0,
+        "max_hidden_error": 0.0,
+        "gate_passed": true
+      },
+      "finite": true,
+      "coverage": {
+        "K15": {
+          "25": {
+            "median_best_to_legacy": 0.14576010406017303,
+            "p95_best_to_legacy": 0.6562776565551758,
+            "rms": 0.01806200109422207,
+            "legacy_rms": 0.13158001005649567,
+            "motor_rms_p95": 0.03490723296999931,
+            "motor_rms_max": 0.05633405223488808,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.14500826597213745,
+            "p95_best_to_legacy": 0.8172993659973145,
+            "rms": 0.014496895484626293,
+            "legacy_rms": 0.10531692951917648,
+            "motor_rms_p95": 0.03940381854772568,
+            "motor_rms_max": 0.048151642084121704,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "p95_best_to_legacy<=0.80"
+            ],
+            "failed_checks": [
+              "p95_best_to_legacy<=0.80"
+            ]
+          },
+          "125": {
+            "median_best_to_legacy": 0.16412264108657837,
+            "p95_best_to_legacy": 0.6752806305885315,
+            "rms": 0.013057350181043148,
+            "legacy_rms": 0.09226742386817932,
+            "motor_rms_p95": 0.03506966307759285,
+            "motor_rms_max": 0.04708319902420044,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [],
+            "failed_checks": []
+          }
+        },
+        "K35": {
+          "25": {
+            "median_best_to_legacy": 0.0810728594660759,
+            "p95_best_to_legacy": 0.4166097640991211,
+            "rms": 0.010813296772539616,
+            "legacy_rms": 0.13158001005649567,
+            "motor_rms_p95": 0.01993551291525364,
+            "motor_rms_max": 0.025792881846427917,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "100": {
+            "median_best_to_legacy": 0.09608573466539383,
+            "p95_best_to_legacy": 0.5200353860855103,
+            "rms": 0.008868045173585415,
+            "legacy_rms": 0.10531692951917648,
+            "motor_rms_p95": 0.020407021045684814,
+            "motor_rms_max": 0.03219909965991974,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          },
+          "125": {
+            "median_best_to_legacy": 0.10263781994581223,
+            "p95_best_to_legacy": 0.35563889145851135,
+            "rms": 0.008190427906811237,
+            "legacy_rms": 0.09226742386817932,
+            "motor_rms_p95": 0.02349960431456566,
+            "motor_rms_max": 0.03384049981832504,
+            "authority_cells_finite": true,
+            "finite": true,
+            "nearest_mode_failed_checks": [
+              "motor_rms_p95<=0.001",
+              "motor_rms_max<=0.005"
+            ],
+            "failed_checks": []
+          }
+        },
+        "K15_reference_passed": false,
+        "K35_gate_passed": true,
+        "continuous_observer_ceiling": {
+          "100": {
+            "fit_through_transition": 74,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.5820092311245173e-08,
+            "motor_rms_max": 5.021680741466781e-08,
+            "passed": true
+          },
+          "125": {
+            "fit_through_transition": 99,
+            "held_out_transition_count": 25,
+            "motor_rms_p95": 2.3420292348261793e-08,
+            "motor_rms_max": 4.6751045511301483e-08,
+            "passed": true
+          }
+        },
+        "continuous_observer_gate_passed": true,
+        "passed": true,
+        "scope": "K35 relative representation coverage plus continuous-tau observer ceiling; not trained-identifier accuracy",
+        "failed_checks": {
+          "K15": {
+            "100": [
+              "p95_best_to_legacy<=0.80"
+            ]
+          },
+          "K35": {}
+        }
+      },
+      "physics": {
+        "publication": {
+          "25": {
+            "count": 128,
+            "rank_min": 5,
+            "rank_full_fraction": 0.9921875,
+            "condition_median": null,
+            "condition_p95": null,
+            "condition_max": null,
+            "capability_z_rms_per_dim": [
+              1.1550412182259606e-06,
+              1.9795865568994486e-07,
+              4.0398327882940066e-07,
+              1.9935394448111765e-05,
+              1.833014965057373,
+              5.3613774753102916e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.1550412182259606e-06,
+              1.9795865568994486e-07,
+              4.0398327882940066e-07,
+              1.9935394448111765e-05,
+              1.833014965057373,
+              5.3613774753102916e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              2.0518893961707363e-06,
+              4.76837158203125e-07,
+              9.1046064198963e-07,
+              3.590099368011579e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 9.986946679418907e-06,
+            "effectiveness_dims_0_3_z_rms": 7.156605761338142e-07,
+            "tau_z_rms": 1.2961373329162598,
+            "finite": true,
+            "tau_support_pooled": false,
+            "rise_support_min_per_motor": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "fall_support_min_per_motor": [
+              1,
+              1,
+              1,
+              0
+            ],
+            "tau_rise_support_min_pooled": 0,
+            "tau_fall_support_min_pooled": 14,
+            "tau_rise_distinct_calls_min": 0,
+            "tau_fall_distinct_calls_min": 12,
+            "tau_rise_motors_contributing_min": 0,
+            "tau_fall_motors_contributing_min": 3,
+            "tau_weighted_fisher_information_min": 0.0,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": false,
+            "support_per_motor_passed": false,
+            "active_gate": false,
+            "failed_checks": [
+              "rank6_per_scene",
+              "condition_median<=30",
+              "condition_p95<=100",
+              "condition_max<=300",
+              "normalized_z_rms_per_dim<=0.02",
+              "shared_tau_pooled_time_motor_fisher"
+            ]
+          },
+          "100": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1453697681427002,
+            "condition_p95": 1.717100977897644,
+            "condition_max": 2.6363868713378906,
+            "capability_z_rms_per_dim": [
+              1.4013012332725339e-06,
+              2.2579963854241214e-07,
+              1.0605909039895778e-07,
+              1.2877770132035948e-05,
+              8.4057347748967e-08,
+              4.734197744937774e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.4013012332725339e-06,
+              2.2579963854241214e-07,
+              1.0605909039895778e-07,
+              1.2877770132035948e-05,
+              8.4057347748967e-08,
+              4.734197744937774e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              3.062187943214667e-06,
+              3.5464736924950557e-07,
+              2.1755685963853466e-07,
+              3.147720781271346e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 6.478094746853458e-06,
+            "effectiveness_dims_0_3_z_rms": 8.217621143558063e-07,
+            "tau_z_rms": 6.82161953591276e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              25,
+              24,
+              27,
+              26
+            ],
+            "fall_support_min_per_motor": [
+              34,
+              39,
+              40,
+              32
+            ],
+            "tau_rise_support_min_pooled": 100,
+            "tau_fall_support_min_pooled": 178,
+            "tau_rise_distinct_calls_min": 47,
+            "tau_fall_distinct_calls_min": 56,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.5738160892339278,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          },
+          "125": {
+            "count": 128,
+            "rank_min": 6,
+            "rank_full_fraction": 1.0,
+            "condition_median": 1.1253759860992432,
+            "condition_p95": 1.6852179765701294,
+            "condition_max": 2.61194109916687,
+            "capability_z_rms_per_dim": [
+              1.5672164863644866e-06,
+              2.583228422281536e-07,
+              8.221617520121072e-08,
+              1.2015381798846647e-05,
+              8.33943332168019e-08,
+              4.423537092179686e-08
+            ],
+            "normalized_z_rms_per_dim": [
+              1.5672164863644866e-06,
+              2.583228422281536e-07,
+              8.221617520121072e-08,
+              1.2015381798846647e-05,
+              8.33943332168019e-08,
+              4.423537092179686e-08
+            ],
+            "absolute_error_p95_per_dim": [
+              3.6895269204251235e-06,
+              4.71621717679227e-07,
+              1.2228265688918327e-07,
+              2.679526551219169e-05,
+              2.384185791015625e-07,
+              1.1920928955078125e-07
+            ],
+            "effectiveness_z_rms": 6.06009598413948e-06,
+            "effectiveness_dims_0_3_z_rms": 9.182697340293089e-07,
+            "tau_z_rms": 6.675096386743462e-08,
+            "finite": true,
+            "tau_support_pooled": true,
+            "rise_support_min_per_motor": [
+              32,
+              30,
+              36,
+              33
+            ],
+            "fall_support_min_per_motor": [
+              38,
+              50,
+              40,
+              49
+            ],
+            "tau_rise_support_min_pooled": 132,
+            "tau_fall_support_min_pooled": 223,
+            "tau_rise_distinct_calls_min": 63,
+            "tau_fall_distinct_calls_min": 77,
+            "tau_rise_motors_contributing_min": 4,
+            "tau_fall_motors_contributing_min": 4,
+            "tau_weighted_fisher_information_min": 0.5740655987332359,
+            "tau_weighted_fisher_information_floor": 1.8750000000000003e-07,
+            "shared_tau_support_passed": true,
+            "support_per_motor_passed": true,
+            "active_gate": true,
+            "failed_checks": []
+          }
+        },
+        "tau_wls_finite": true,
+        "effectiveness_finite": true,
+        "effectiveness_normalized_z_rms": 7.712103069934528e-06,
+        "tau_wls_normalized_z_rms": 0.7483252286911011,
+        "response_regression_rank_min": 5,
+        "response_regression_condition_max": null,
+        "response_regression_rank_passed": true,
+        "tau_wls_supported": true,
+        "uses_capability_labels_as_features": false,
+        "block_design_columns": [
+          "TW-1",
+          "alpha_roll",
+          "alpha_yaw",
+          "beta",
+          "inv_tau_up",
+          "inv_tau_down"
+        ],
+        "gate_passed": true,
+        "failed_checks": {},
+        "probe_contract": {
+          "version": "passive_identification_v5",
+          "amplitude": 0.0,
+          "mode": "passive_first",
+          "experimental_active_amplitude": 0.005,
+          "waveform": [
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "dwell_steps": 25,
+          "active_steps": 50,
+          "recovery_steps": 25,
+          "publication_calls": [
+            100,
+            125
+          ],
+          "guard_active_calls": [
+            25,
+            99
+          ],
+          "command_direction": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "residual_slew_per_call": 0.005,
+          "guards": {
+            "position_norm": 5.0,
+            "velocity_norm": 5.0,
+            "omega_norm": "max(5, 1.5*dwell_peak)",
+            "body_z_min": 0.0
+          },
+          "safety_ratio": 1.05,
+          "safety_atol": 1e-07,
+          "coverage_min": 0.9,
+          "coverage_per_cell_min": 0.5,
+          "energy_retention_min_for_active_experiments": 0.9,
+          "passive_support_window": [
+            0,
+            100
+          ],
+          "train_seeds": [
+            3707,
+            4707,
+            5707,
+            6707
+          ],
+          "validation_seed": 7707,
+          "formal_scenarios": 64,
+          "formal_horizon": 125,
+          "q2_sha256": "b401dc6f02beadf51d1b55b24b9056f0b00f17a7a8a5d94d3675554fdb15370d",
+          "identifies": [
+            "shared_tau_rise",
+            "shared_tau_fall"
+          ],
+          "angular_capability_authorization": false
+        },
+        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus a weighted excitation proxy (not a statistical Fisher matrix); per-motor counts are diagnostic only"
+      }
+    }
+  ],
+  "validation_consumed": [],
+  "blind_consumed": [],
+  "formal_eligible": false,
+  "optimizer_updates": 0,
+  "scope": "privileged physical feasibility and continuous-observer ceiling; not learned mean accuracy",
+  "train_passed": true
+}

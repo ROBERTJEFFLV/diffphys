@@ -106,7 +106,7 @@ def _two_sided_metadata(episode, *, miscoverage: float,
     return rows
 
 
-def _width_gate(episode, q: torch.Tensor, *, phase_step: int = 50) -> dict:
+def _width_gate(episode, q: torch.Tensor, *, phase_step: int = 100) -> dict:
     index = phase_step
     mean = episode.capability_z_mean[index, :, :3]
     sigma = episode.capability_z_log_scale[index, :, :3].exp()
@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=1707)
-    parser.add_argument("--horizon", type=int, default=76)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--miscoverage", type=float, default=0.01)
     parser.add_argument("--maximum-self-calibration-rounds", type=int, default=3)
     return parser.parse_args()
@@ -146,9 +146,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.horizon < 76 or not 0.0 < args.miscoverage < 1.0:
+    if args.horizon < 126 or not 0.0 < args.miscoverage < 1.0:
         raise ValueError(
-            "formal calibration needs horizon>=76 (through call75) and valid miscoverage"
+            "formal calibration needs horizon>=126 (through call125) and valid miscoverage"
         )
     device = _device(args.device)
     policy, source = load_structured_policy(args.checkpoint, device=device)
@@ -158,7 +158,7 @@ def main() -> None:
     policy.eval()
     teacher.eval()
     simulator = L2FSimulator(L2FParams(dt=float(teacher_args.get("dt", policy.config.dt))))
-    phase_steps = (50, 75)
+    phase_steps = (100, 125)
     if args.maximum_self_calibration_rounds < 2:
         raise ValueError("formal self-calibration requires at least two fresh rounds")
 
@@ -282,7 +282,7 @@ def main() -> None:
         phase_steps=phase_steps,
     )
     q_consistent = bool((q_check[:3] <= q[:3] + 1.0e-7).all().item())
-    width = _width_gate(validation_episode, q, phase_step=50)
+    width = _width_gate(validation_episode, q, phase_step=100)
     sufficient_samples = all(
         int(row["calibration_samples"]) >= 128 for row in rows
     )
@@ -307,13 +307,13 @@ def main() -> None:
         "cadence_semantics": {
             "call_index_completed_transitions": True,
             "call0_has_response": False,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "publication_rule_after_first": "positive slow_cadence offsets from call50",
-            "t50_call_index": 50,
+            "publication_rule_after_first": "positive slow_cadence offsets from call100",
+            "t50_call_index": 100,
         },
         "conditional_scope": "alpha_conditional_four_log_alpha_risk_strata",
-        "score_definition": "joint one-sided standardized upper score; max over effectiveness dimensions and phase steps 50/75",
+        "score_definition": "joint one-sided standardized upper score; max over effectiveness dimensions and phase steps 100/125",
         "cell_scope": "4x4_rollout_diagnostic_only",
         "miscoverage": args.miscoverage,
         "phase_steps": list(phase_steps),

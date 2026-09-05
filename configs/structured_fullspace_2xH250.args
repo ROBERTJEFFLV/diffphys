@@ -6,7 +6,7 @@
 --seed 7
 --batch-size 64
 --segment-steps 250
---pre-rollout-steps 50
+--pre-rollout-steps 100
 --segments 2
 --outer-steps 1
 --damping 100

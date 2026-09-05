@@ -41,7 +41,7 @@ def test_formal_stage_commands_are_fixed_and_dependencies_are_explicit(tmp_path:
         tmp_path / "identifier_pretrain_report.json"
     )
     assert _flag_value(phase_a, "--probe-v4-report") == str(
-        ROOT / "reports" / "probe_v4_formal.json"
+        ROOT / "reports" / "probe_v5_formal.json"
     )
     assert _flag_value(revalidation, "--phase-a1-checkpoint") == str(
         tmp_path / "phase_a1.pt"

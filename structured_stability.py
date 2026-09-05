@@ -442,6 +442,13 @@ def matrix_free_augmented_stability_report(
             result = step_map(result)
         return result
 
+    if basis is not None:
+        for column in range(basis.shape[1]):
+            tangent = basis[:, column]
+            image = _matrix_free_jvp(step_map, equilibrium, tangent)
+            if not bool(torch.isfinite(image).all()) or float((image - tangent).norm()) > 1e-5:
+                raise ValueError("declared yaw gauge is not a neutral symmetry of this closed-loop map")
+
     def hold_discrete(value: Tensor, reference: Tensor) -> Tensor:
         """Keep v2 latch coordinates on the Poincare section."""
 

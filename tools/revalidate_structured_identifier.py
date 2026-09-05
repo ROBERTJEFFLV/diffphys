@@ -40,7 +40,7 @@ from structured_policy import StructuredPolicyConfig, StructuredRecurrentPolicy 
 from structured_rollout import load_structured_policy  # noqa: E402
 from identification_features import feature_schema_sha256  # noqa: E402
 from probe_contract import PROBE_CONTRACT_VERSION, WAVEFORM_SHA256  # noqa: E402
-from tools.diagnose_causal_identifier_oracle import probe_v4_eligibility  # noqa: E402
+from tools.diagnose_causal_identifier_oracle import probe_v5_eligibility  # noqa: E402
 
 
 DEFAULT_Q2 = ROOT / "reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt"
@@ -95,11 +95,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-checkpoint", type=Path, default=DEFAULT_Q2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--probe-v4-report", type=Path, default=ROOT / "reports/probe_v4_formal.json")
+    parser.add_argument("--probe-v4-report", type=Path, default=ROOT / "reports/probe_v5_formal.json")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=64)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--teacher-forced-seed-offset", type=int, default=30001)
     parser.add_argument("--on-policy-seed-offset", type=int, default=40002)
     parser.add_argument("--dry-run", action="store_true")
@@ -107,7 +107,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _validate_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    probe = probe_v4_eligibility(
+    probe = probe_v5_eligibility(
         args.probe_v4_report, q2_checkpoint=args.source_checkpoint
     )
     if not probe.get("eligible"):
@@ -194,7 +194,7 @@ def _bank_result(
             horizon=horizon, episode_seed=episode_seed,
         )
         gate, passed = phase_a_equilibrium_gate(
-            episode, phase_steps=(50, 75), require_identification_width=False,
+            episode, phase_steps=(100, 125), require_identification_width=False,
         )
     teacher_count = int(episode.intervention_mask.sum().item())
     total = int(episode.intervention_mask.numel())
@@ -233,8 +233,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.dry_run:
         return {"stage": "identifier_revalidation", "dry_run": True,
                 "output": str(args.output), "report": str(args.report)}
-    if args.scenarios < 16 or args.scenarios % 16 or args.horizon < 76:
-        raise ValueError("scenarios must be a 4x4 bank and horizon must include calls 50/75")
+    if args.scenarios < 16 or args.scenarios % 16 or args.horizon < 126:
+        raise ValueError("scenarios must be a 4x4 bank and horizon must include calls 100/125")
     a1_report, pretrain, _ = _validate_inputs(args)
     device = _device(args.device)
     torch.manual_seed(args.seed)
@@ -320,7 +320,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "banks": {"teacher_forced": forced, "on_policy": on_policy},
         "teacher_is_frozen": True,
-        "capability_publication_calls": [50, 75],
+        "capability_publication_calls": [100, 125],
         "revalidation_contract": "both independent authority-stratified teacher-forced and beta0/on-policy banks must pass phase-A mean/equilibrium gate",
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)

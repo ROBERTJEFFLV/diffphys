@@ -6,7 +6,7 @@ for a later controlled experiment; it does not claim a stability certificate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import math
 from typing import Optional
 
@@ -23,7 +23,8 @@ from identification_features import (
     production_legacy24,
     sol_response,
 )
-from probe_contract import PROBE_CONTRACT_VERSION, PROBE_PERIOD, waveform_tensor
+from probe_contract_v5 import (VERSION as PROBE_CONTRACT_VERSION, ACTIVE_STEPS as PROBE_PERIOD,
+    PUBLISH_START, ProbeState, apply_probe, WAVEFORM)
 from structured_allocator import ActiveSetBoxQPAllocator
 
 
@@ -57,13 +58,15 @@ def motor_observer_tau_grid(version: int = 1) -> tuple[tuple[float, float], ...]
         for rise in rises for ratio in ratios
     )
 
+from identification_information import INFORMATION_DIM, advance_information, capability_support
+
 IDENTIFICATION_PROBE_PERIOD = PROBE_PERIOD
 
 
 def identification_probe_patterns(*, device: torch.device,
                                   dtype: torch.dtype) -> torch.Tensor:
     """Return the v4 artifact exactly; no policy-local waveform is allowed."""
-    return waveform_tensor(device=device, dtype=dtype)
+    return torch.tensor(WAVEFORM, device=device, dtype=dtype)[:, None].expand(-1, 4)
 
 
 def _so3_exp(rotation_vector: torch.Tensor) -> torch.Tensor:
@@ -75,7 +78,7 @@ def _so3_exp(rotation_vector: torch.Tensor) -> torch.Tensor:
     zeros = torch.zeros_like(x)
     skew = torch.stack((zeros, -z, y, z, zeros, -x, -y, x, zeros), -1).reshape(-1, 3, 3)
     theta2 = rotation_vector.square().sum(dim=-1, keepdim=True)
-    theta = theta2.sqrt()
+    theta = theta2.clamp_min(1.0e-12).sqrt()
     small = theta2 < 1.0e-8
     a = torch.where(
         small, 1.0 - theta2 / 6.0 + theta2.square() / 120.0,
@@ -172,13 +175,13 @@ class StructuredPolicyConfig:
     # coordinates and mapped through the same conservative mixer/allocator.
     # A four-bank H50 screen selected .005; larger values violated the
     # pre-registered 1.5x paired angular-rate gate on at least one bank.
-    burn_in_probe_amplitude: float = 0.005
+    burn_in_probe_amplitude: float = 0.0
     slow_cadence: int = 25
     # Capability/trim outputs are deliberately unavailable at call25.  The
     # recurrent identifier still consumes responses continuously, but the
     # conservative prior remains active until call50, when all 50 registered
     # probe transitions have been observed.
-    identification_publish_start: int = 50
+    identification_publish_start: int = PUBLISH_START
     # Constant external-force observer.  With cadence=25 and dt=.01, 0.2 s
     # leaves 8.2% startup bias at t50; the previous 0.5 s choice imposed a
     # 36.8% oracle bias and made the registered t50/t75 gate impossible.
@@ -219,6 +222,14 @@ class StructuredPolicyState:
     # Motor estimate immediately before the preceding executed command.  This
     # makes the observer's motor delta causal and action-aligned.
     previous_motor_estimate: Optional[torch.Tensor] = None
+    probe_residual: Optional[torch.Tensor] = None
+    probe_aborted: Optional[torch.Tensor] = None
+    probe_omega_reference: Optional[torch.Tensor] = None
+    identification_information: Optional[torch.Tensor] = None
+    capability_authorized: Optional[torch.Tensor] = None
+    identification_actions: Optional[torch.Tensor] = None
+    identification_initial_motor: Optional[torch.Tensor] = None
+    disturbance_history: Optional[torch.Tensor] = None
 
     @property
     def slow_hidden(self) -> torch.Tensor:
@@ -229,59 +240,11 @@ class StructuredPolicyState:
         return self.hidden
 
     def detach(self) -> "StructuredPolicyState":
-        return StructuredPolicyState(
-            hidden=self.hidden.detach(), identifier=self.identifier.detach(),
-            motor_estimate=self.motor_estimate.detach(), integral=self.integral.detach(),
-            motor_bank=None if self.motor_bank is None else self.motor_bank.detach(),
-            slow_trim=None if self.slow_trim is None else self.slow_trim.detach(),
-            slow_body_z=None if self.slow_body_z is None else self.slow_body_z.detach(),
-            capability=None if self.capability is None else self.capability.detach(),
-            slow_counter=self.slow_counter,
-            prev_velocity=None if self.prev_velocity is None else self.prev_velocity.detach(),
-            prev_omega=None if self.prev_omega is None else self.prev_omega.detach(),
-            context_sum=None if self.context_sum is None else self.context_sum.detach(),
-            capability_log_mean=(None if self.capability_log_mean is None
-                                 else self.capability_log_mean.detach()),
-            capability_log_scale=(None if self.capability_log_scale is None
-                                  else self.capability_log_scale.detach()),
-            capability_ucb=None if self.capability_ucb is None else self.capability_ucb.detach(),
-            contextual_gain=None if self.contextual_gain is None else self.contextual_gain.detach(),
-            contextual_gain_target=(None if self.contextual_gain_target is None
-                                    else self.contextual_gain_target.detach()),
-            contextual_blend=(None if self.contextual_blend is None
-                              else self.contextual_blend.detach()),
-            boot_progress=None if self.boot_progress is None else self.boot_progress.detach(),
-            capability_ucb_target=(None if self.capability_ucb_target is None
-                                   else self.capability_ucb_target.detach()),
-            identification_failed=(None if self.identification_failed is None
-                                    else self.identification_failed.detach()),
-            disturbance_accel=(None if self.disturbance_accel is None
-                               else self.disturbance_accel.detach()),
-            disturbance_residual_sum=(
-                None if self.disturbance_residual_sum is None
-                else self.disturbance_residual_sum.detach()
-            ),
-            disturbance_thrust_sum=(
-                None if self.disturbance_thrust_sum is None
-                else self.disturbance_thrust_sum.detach()
-            ),
-            previous_executed_action=(
-                None if self.previous_executed_action is None
-                else self.previous_executed_action.detach()
-            ),
-            disturbance_response_count=(
-                None if self.disturbance_response_count is None
-                else self.disturbance_response_count.detach()
-            ),
-            excitation_history=(
-                None if self.excitation_history is None
-                else self.excitation_history.detach()
-            ),
-            previous_motor_estimate=(
-                None if self.previous_motor_estimate is None
-                else self.previous_motor_estimate.detach()
-            ),
-        )
+        return StructuredPolicyState(**{
+            field.name: (getattr(self, field.name).detach()
+                         if torch.is_tensor(getattr(self, field.name)) else getattr(self, field.name))
+            for field in fields(self)
+        })
 
 
 @dataclass(frozen=True)
@@ -333,6 +296,18 @@ class MotorObserver(nn.Module):
         tau = torch.where(command >= estimate, tau_rise, tau_fall).clamp_min(1.0e-4)
         alpha = (float(dt) / tau).clamp(0.0, 1.0)
         return estimate + alpha * (command.clamp(-1.0, 1.0) - estimate)
+
+
+def replay_motor_history(observer: MotorObserver, initial: torch.Tensor,
+                         actions: torch.Tensor, tau_rise: torch.Tensor,
+                         tau_fall: torch.Tensor, dt: float, *, return_sequence: bool = False) -> torch.Tensor:
+    """Reconstruct the current motor state with inferred continuous lag."""
+    motor = initial
+    sequence = []
+    for command in actions.unbind(1):
+        motor = observer(motor, command, dt, tau_rise.expand_as(motor), tau_fall.expand_as(motor))
+        sequence.append(motor)
+    return torch.stack(sequence, 1) if return_sequence else motor
 
 
 class MultiTauMotorObserverBank(nn.Module):
@@ -748,9 +723,9 @@ class StructuredRecurrentPolicy(nn.Module):
             raise ValueError(
                 "identification_publish_start must be a positive multiple of slow_cadence"
             )
-        if c.identification_publish_start != c.burn_in_steps + c.contextual_blend_steps:
+        if c.identification_publish_start < c.burn_in_steps + c.contextual_blend_steps:
             raise ValueError(
-                "identification_publish_start must equal the complete probe window"
+                "identification_publish_start must cover burn-in and contextual transition"
             )
         if not 0.0 <= c.burn_in_probe_amplitude <= c.burn_in_action_cap:
             raise ValueError("burn-in probe must fit inside the burn-in action cap")
@@ -984,12 +959,22 @@ class StructuredRecurrentPolicy(nn.Module):
                 batch, EXCITATION_HISTORY_LEN, ACTION_DIM, device=device, dtype=dtype
             ),
             previous_motor_estimate=observation[:, 21:25].clone(),
+            probe_residual=observation.new_zeros((batch, 1)),
+            probe_omega_reference=observation.new_zeros((batch, 1)),
+            identification_information=observation.new_zeros((batch, INFORMATION_DIM)),
+            capability_authorized=torch.zeros(batch, 6, dtype=torch.bool, device=device),
+            identification_actions=observation.new_zeros((batch, PUBLISH_START, 4)),
+            identification_initial_motor=observation[:, 21:25].clone(),
+            disturbance_history=observation.new_zeros((batch, self.config.slow_cadence, 11)),
+            probe_aborted=torch.zeros(batch, dtype=torch.bool, device=device),
         )
 
     def forward_with_aux(self, observation: torch.Tensor,
                          state: Optional[StructuredPolicyState] = None,
                          dt: Optional[float] = None,
-                         applied_action: Optional[torch.Tensor] = None) -> StructuredPolicyOutput:
+                         applied_action: Optional[torch.Tensor] = None,
+                         applied_probe_residual: Optional[torch.Tensor] = None,
+                         applied_probe_aborted: Optional[torch.Tensor] = None) -> StructuredPolicyOutput:
         if observation.ndim != 2 or observation.shape[-1] != OBSERVATION_DIM:
             raise ValueError("observation must have shape [batch,25]")
         if dt is None:
@@ -1000,6 +985,8 @@ class StructuredRecurrentPolicy(nn.Module):
             if applied_action.shape != (observation.shape[0], ACTION_DIM):
                 raise ValueError("applied_action must have shape [batch,4]")
             applied_action = applied_action.to(device=observation.device, dtype=observation.dtype)
+            if not bool(torch.isfinite(applied_action).all()) or bool((applied_action.abs() > 1).any()):
+                raise ValueError("applied_action must be finite and inside [-1,1]")
         identification_failed = state.identification_failed
         if identification_failed is None:
             identification_failed = torch.zeros(
@@ -1013,7 +1000,7 @@ class StructuredRecurrentPolicy(nn.Module):
             boot_progress = observation.new_zeros((observation.shape[0], 1))
         burn_in_mask = (boot_progress < float(self.config.burn_in_steps)).to(observation.dtype)
         transition_mask = (
-            boot_progress < float(self.config.burn_in_steps + self.config.contextual_blend_steps)
+            boot_progress < float(self.config.identification_publish_start)
         ).to(observation.dtype)
         # The state already contains the previous motor estimate.  Updating it
         # toward ``previous_action`` here and toward the current action again
@@ -1076,6 +1063,16 @@ class StructuredRecurrentPolicy(nn.Module):
             excitation_history, force_feature, angular_feature, motor_delta,
             response_mask,
         )
+        ledger = state.identification_information
+        if ledger is None:
+            ledger = observation.new_zeros((observation.shape[0], INFORMATION_DIM))
+        ledger = advance_information(ledger, excitation_history[:, 0], force_feature,
+                                     angular_feature, prev_omega,
+                                     response_mask * float(state.slow_counter <= self.config.identification_publish_start))
+        supported_axes = capability_support(ledger.detach())
+        authorized_axes = state.capability_authorized
+        if authorized_axes is None:
+            authorized_axes = torch.zeros_like(supported_axes)
         legacy_identification_context = context
         bank_identification_features = None
         motor_bank = state.motor_bank
@@ -1103,38 +1100,21 @@ class StructuredRecurrentPolicy(nn.Module):
                 self.bank_adapter(bank_identification_features)
             )
             context = context + modal_context
-        # Keep sufficient statistics that are affine in thrust-to-weight.  At
-        # a cadence boundary the identifier has just produced a *new* TW
-        # estimate; evaluating the accumulated response with the stale TW
-        # from the previous window creates a deterministic false disturbance.
-        # For the physical-fit model
-        #   a_T = g * (1 + (TW - 1) * mean(m))
-        #       = g * (1 - mean(m)) + TW * g * mean(m).
-        disturbance_base = (
-            linear_accel_world + gravity_world
-            - previous_body_z_world * (9.80665 * (1.0 - motor_mean))
-        )
-        disturbance_thrust_term = previous_body_z_world * (9.80665 * motor_mean)
-        disturbance_residual = (
-            disturbance_base
-            - disturbance_thrust_term * capability_mean[:, 0:1]
-        )
-        old_disturbance_sum = state.disturbance_residual_sum
-        if old_disturbance_sum is None:
-            old_disturbance_sum = torch.zeros_like(disturbance_residual)
-        old_response_count = state.disturbance_response_count
-        if old_response_count is None:
-            old_response_count = observation.new_zeros((observation.shape[0], 1))
-        old_thrust_sum = state.disturbance_thrust_sum
-        if old_thrust_sum is None:
-            old_thrust_sum = torch.zeros_like(disturbance_thrust_term)
-        disturbance_residual_sum = (
-            old_disturbance_sum + response_mask * disturbance_base
-        )
-        disturbance_thrust_sum = (
-            old_thrust_sum + response_mask * disturbance_thrust_term
-        )
-        disturbance_response_count = old_response_count + response_mask
+        # Keep the measured cadence window: clipping negative rotor thrust
+        # makes force piecewise affine in TW, so two affine sums are not
+        # sufficient statistics when a new estimate crosses a clipping knee.
+        disturbance_history = state.disturbance_history
+        if disturbance_history is None:
+            disturbance_history = observation.new_zeros((observation.shape[0], self.config.slow_cadence, 11))
+        response_row = torch.cat((previous_body_z_world, specific_thrust_world,
+                                  motor_estimate, response_mask), -1)
+        disturbance_history = torch.cat((disturbance_history[:, 1:], response_row[:, None]), 1)
+        force_now = (1.0 + (capability_mean[:, 0:1] - 1.0) * motor_estimate).clamp_min(0).mean(-1, keepdim=True)
+        disturbance_residual = specific_thrust_world - previous_body_z_world * (9.80665 * force_now)
+        # Retain zero-valued fields only for explicit legacy codec readers.
+        disturbance_residual_sum = torch.zeros_like(disturbance_residual)
+        disturbance_thrust_sum = torch.zeros_like(disturbance_residual)
+        disturbance_response_count = disturbance_history[:, :, 10].sum(1, keepdim=True)
         # Preserve the ordered excitation/response history.  The recurrent
         # identifier advances each fast step, while capability/trim remain
         # sample-and-held at the slow cadence.  ``context_sum`` is retained as
@@ -1161,12 +1141,17 @@ class StructuredRecurrentPolicy(nn.Module):
             and bool(publication_available.all().item())
             and state.slow_counter % self.config.slow_cadence == 0
         )
-        recurrent_input = torch.cat((observation, ident, motor_estimate), -1)
-        latent = self.gru(self.encoder(recurrent_input), state.hidden)
         if update_slow:
             capability, log_mean, log_sigma, capability_ucb = self._capability_statistics(
                 ident
             )
+            authorized_axes = supported_axes
+            # Retain candidate log statistics for supervised fitting.  Only
+            # authorized physical means/authority reach the control branches.
+            prior = capability.new_tensor(CAPABILITY_DEFAULT).expand_as(capability)
+            capability = torch.where(authorized_axes, capability, prior)
+            capability_ucb = torch.where(authorized_axes & bool(self.capability_calibration_valid.item()), capability_ucb,
+                capability_ucb.new_tensor(CAPABILITY_HI).expand_as(capability_ucb))
             previous_disturbance = state.disturbance_accel
             if previous_disturbance is None:
                 previous_disturbance = observation.new_zeros((observation.shape[0], 3))
@@ -1174,10 +1159,23 @@ class StructuredRecurrentPolicy(nn.Module):
                 -float(self.config.slow_cadence) * float(dt)
                 / float(self.config.disturbance_observer_tau)
             )
-            mean_residual = (
-                disturbance_residual_sum
-                - disturbance_thrust_sum * capability[:, 0:1]
-            ) / disturbance_response_count.clamp_min(1.0)
+            # Reconstruct the startup motor trajectory once under the newly
+            # inferred lag, before using its last cadence window for force.
+            if state.slow_counter == self.config.identification_publish_start:
+                if state.identification_actions is not None and state.identification_initial_motor is not None:
+                    motors = replay_motor_history(self.motor_observer,
+                        state.identification_initial_motor,
+                        state.identification_actions[:, -min(state.slow_counter, PUBLISH_START):],
+                        capability[:, 4:5], capability[:, 5:6], float(dt), return_sequence=True)
+                    motor_estimate = motors[:, -1]
+                    count = min(motors.shape[1], self.config.slow_cadence)
+                    corrected = torch.cat((disturbance_history[:, -count:, :6],
+                        motors[:, -count:], disturbance_history[:, -count:, 10:]), -1)
+                    disturbance_history = torch.cat((disturbance_history[:, :-count], corrected), 1)
+            rotor_force = (1 + (capability[:, None, 0:1] - 1) * disturbance_history[:, :, 6:10]).clamp_min(0)
+            force_world = disturbance_history[:, :, :3] * (9.80665 * rotor_force.mean(-1, keepdim=True))
+            valid = disturbance_history[:, :, 10:]
+            mean_residual = ((disturbance_history[:, :, 3:6] - force_world) * valid).sum(1) / valid.sum(1).clamp_min(1)
             disturbance_accel = (
                 (1.0 - observer_gain) * previous_disturbance
                 + observer_gain * mean_residual
@@ -1236,12 +1234,15 @@ class StructuredRecurrentPolicy(nn.Module):
             if capability_ucb_target is None:
                 capability_ucb_target = capability_ucb
             if contextual_candidate is None:
-                contextual_candidate = torch.zeros(
-                    observation.shape[0], ACTION_DIM, ERROR_DIM,
-                    device=observation.device, dtype=observation.dtype
-                )
+                contextual_candidate = torch.zeros(observation.shape[0], ACTION_DIM, ERROR_DIM,
+                    device=observation.device, dtype=observation.dtype)
             if contextual_target is None:
                 contextual_target = contextual_candidate
+
+        tau_rise = capability[:, 4:5].expand_as(motor_estimate)
+        tau_fall = capability[:, 5:6].expand_as(motor_estimate)
+        recurrent_input = torch.cat((observation, ident, motor_estimate), -1)
+        latent = self.gru(self.encoder(recurrent_input), state.hidden)
 
         if contextual_candidate is None:
             contextual_candidate = torch.zeros(
@@ -1345,27 +1346,23 @@ class StructuredRecurrentPolicy(nn.Module):
         )
         width_ok = (effectiveness_log_width <= allowed_log_width).all(dim=-1)
         identification_failed = identification_failed | (t50_reached.squeeze(-1) & ~width_ok)
+        safety_ok = ~identification_failed
+        if state.probe_aborted is not None:
+            safety_ok = safety_ok & ~state.probe_aborted
+        authorized_axes = authorized_axes & safety_ok[:, None]
+        wrench_authorized = torch.stack((authorized_axes[:, (0, 4, 5)].all(-1),
+            authorized_axes[:, 1], authorized_axes[:, 1], authorized_axes[:, (2, 3)].all(-1)), -1)
+        wrench_authorized = wrench_authorized & bool(self.capability_calibration_valid.item())
         gain_weight = contextual_blend * capability_confidence
-        effective_gain = reference_gain.unsqueeze(0) + gain_weight[:, :, None] * projected_gain
+        effective_gain = reference_gain.unsqueeze(0) + gain_weight[:, :, None] * projected_gain * wrench_authorized[:, :, None]
         fast = torch.einsum("bae,be->ba", effective_gain, features)
         # Multiplication by ||e||² is deliberate: residual is O(||e||²).
         residual = torch.tanh(self.residual_head(torch.cat((latent, features), -1))) * (
             features.square().sum(-1, keepdim=True) / (1.0 + features.square().sum(-1, keepdim=True))
         ) * self.config.residual_scale
+        residual = residual * wrench_authorized.to(residual)
         correction_wrench = fast + residual
-        probe_patterns = identification_probe_patterns(
-            device=observation.device, dtype=observation.dtype
-        )
-        probe_phase = boot_progress.squeeze(-1).to(torch.long).remainder(
-            probe_patterns.shape[0]
-        )
-        probe_action = (
-            probe_patterns.index_select(0, probe_phase)
-            * float(self.config.burn_in_probe_amplitude)
-            * transition_mask
-        )
-        probe_wrench = torch.bmm(mixer, probe_action.unsqueeze(-1)).squeeze(-1)
-        desired_wrench = equilibrium_wrench + correction_wrench + probe_wrench
+        desired_wrench = equilibrium_wrench + correction_wrench
         action_cap = torch.where(
             transition_mask > 0.0,
             observation.new_full((observation.shape[0], 1), self.config.burn_in_action_cap),
@@ -1381,7 +1378,33 @@ class StructuredRecurrentPolicy(nn.Module):
             mixer=mixer, trim=equilibrium_trim,
             action_delta_cap=action_cap, rate_limit=effective_rate,
         )
-        executed_action = action if applied_action is None else applied_action.clamp(-1.0, 1.0)
+        # Preserve the exact collective direction AFTER allocation, intersecting
+        # every actuator/rate/trust bound before applying a scalar residual.
+        probe_state = ProbeState(
+            state.probe_residual if state.probe_residual is not None else observation.new_zeros((observation.shape[0], 1)),
+            state.probe_aborted if state.probe_aborted is not None else torch.zeros(observation.shape[0], dtype=torch.bool, device=observation.device), state.probe_omega_reference)
+        probe_lower = torch.maximum(torch.full_like(action, -1.0), equilibrium_trim - action_cap)
+        probe_upper = torch.minimum(torch.full_like(action, 1.0), equilibrium_trim + action_cap)
+        probe_lower = torch.where(effective_rate > 0, torch.maximum(probe_lower, previous_action - effective_rate * float(dt)), probe_lower)
+        probe_upper = torch.where(effective_rate > 0, torch.minimum(probe_upper, previous_action + effective_rate * float(dt)), probe_upper)
+        base_action = action
+        action, next_probe, requested = apply_probe(action, probe_state, boot_progress,
+            position=observation[:, :3], velocity=observation[:, 3:6], omega=observation[:, 15:18],
+            body_z=body_z_world, amplitude=self.config.burn_in_probe_amplitude,
+            lower=probe_lower, upper=probe_upper)
+        probe_action = action - base_action
+        # An externally selected action cannot inherit the unexecuted probe.
+        if applied_action is not None:
+            executed_scalar = (torch.zeros_like(next_probe.residual) if applied_probe_residual is None
+                        else applied_probe_residual.to(observation))
+            aborted = (probe_state.aborted if applied_probe_aborted is None
+                       else applied_probe_aborted.to(device=observation.device, dtype=torch.bool))
+            if executed_scalar.shape != next_probe.residual.shape or not bool(torch.isfinite(executed_scalar).all()) or bool((executed_scalar.abs() > .005001).any()):
+                raise ValueError("executed probe residual must be finite [batch,1] within the registered amplitude")
+            if aborted.shape != next_probe.aborted.shape:
+                raise ValueError("executed probe abort mask must be [batch]")
+            next_probe = ProbeState(executed_scalar, aborted | probe_state.aborted, next_probe.omega_reference)
+        executed_action = action if applied_action is None else applied_action
         # Advance the observer with the command the simulator actually
         # receives.  The resulting innovation is stored at history index zero
         # for the next call, where it is paired with that transition's
@@ -1406,8 +1429,19 @@ class StructuredRecurrentPolicy(nn.Module):
             0.0, 1.0
         ).unsqueeze(-1)
         next_integral = self.integrator(state.integral, observation[:, 0:3], dt, authority)
+        action_history = state.identification_actions
+        if action_history is None:
+            action_history = observation.new_zeros((observation.shape[0], PUBLISH_START, 4))
+        if state.slow_counter < self.config.identification_publish_start:
+            action_history = torch.cat((action_history[:, 1:], executed_action[:, None]), 1)
         next_state = StructuredPolicyState(
+            disturbance_history=disturbance_history,
+            identification_actions=action_history,
+            identification_initial_motor=state.identification_initial_motor,
             hidden=latent, identifier=ident,
+            probe_residual=next_probe.residual, probe_aborted=next_probe.aborted,
+            probe_omega_reference=next_probe.omega_reference,
+            identification_information=ledger, capability_authorized=authorized_axes,
             motor_estimate=next_motor_estimate, integral=next_integral,
             motor_bank=next_motor_bank,
             slow_trim=trim, slow_body_z=body_z, capability=capability,
@@ -1421,7 +1455,7 @@ class StructuredRecurrentPolicy(nn.Module):
             contextual_gain_target=contextual_target,
             contextual_blend=contextual_blend,
             boot_progress=(boot_progress + 1.0).clamp_max(float(
-                self.config.burn_in_steps + self.config.contextual_blend_steps
+                self.config.identification_publish_start
             )),
             capability_ucb_target=capability_ucb_target,
             identification_failed=identification_failed,
@@ -1495,6 +1529,9 @@ class StructuredRecurrentPolicy(nn.Module):
             "burn_in": burn_in_mask.squeeze(-1),
             "identification_prior_active": (~publication_available.bool()).squeeze(-1),
             "identification_probe_action": probe_action,
+            "probe_aborted": next_probe.aborted,
+            "capability_supported_axes": supported_axes,
+            "capability_authorized_axes": authorized_axes,
             "capability_ucb_active": publication_available.to(
                 dtype=observation.dtype
             ).squeeze(-1),

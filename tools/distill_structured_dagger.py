@@ -41,7 +41,7 @@ from structured_checkpoint import (  # noqa: E402
 )
 from tools.diagnose_causal_identifier_oracle import (  # noqa: E402
     DEFAULT_PROBE_V4_REPORT,
-    probe_v4_eligibility,
+    probe_v5_eligibility,
 )
 
 
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--prefix", type=int, default=25)
     parser.add_argument("--updates-per-beta", type=int, default=1)
     parser.add_argument("--maximum-buffer-episodes", type=int, default=10)
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--identifier-dim", type=int, default=64)
     parser.add_argument("--slow-cadence", type=int, default=25)
-    parser.add_argument("--identification-publish-start", type=int, default=50)
+    parser.add_argument("--identification-publish-start", type=int, default=100)
     parser.add_argument(
         "--motor-observer-bank-size", type=int, choices=(0, 15, 35), default=0,
         help="0 preserves legacy checkpoints; 15/35 enable fixed multi-tau v1/v2",
@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "--motor-tau-grid-version", type=int, choices=(0, 1, 2), default=0,
     )
     parser.add_argument(
-        "--burn-in-probe-amplitude", type=float, default=0.005,
+        "--burn-in-probe-amplitude", type=float, default=0.0,
         help=(
             "zero-mean motor-coordinate identification probe amplitude; "
             "the command still passes through the constrained allocator"
@@ -265,7 +265,7 @@ def _validate_identification_oracle_report(
     # therefore accepts its immutable pretraining contract; later stages can
     # still require the stronger formal fields.  Never treat a screening
     # report as either contract.
-    final_ready = bool(report.get("formal_eligible")) and bool(report.get("gate_passed"))
+    final_ready = report.get("formal_eligible") is True and report.get("gate_passed") is True
     pretraining_ready = (
         report.get("requested_formal_shape") is True
         and report.get("pretraining_gate_passed") is True
@@ -278,15 +278,15 @@ def _validate_identification_oracle_report(
     if pretraining_ready:
         checks = report.get("pretraining_checks")
         required_checks = {
-            "coverage", "physics_ceiling", "physics_finite",
+            "coverage", "paired_safety", "physics_ceiling", "physics_finite",
             "physics_branch_support", "finite_collection",
             "no_identification_failure", "zero_q2_parity",
         }
         if (not isinstance(checks, dict)
                 or any(checks.get(name) is not True for name in required_checks)):
             raise RuntimeError("identification oracle pretraining contract is incomplete")
-    if abs(float(report["probe_amplitude"]) - 0.005) > 1.0e-12:
-        raise RuntimeError("identification oracle must use probe amplitude 0.005")
+    if abs(float(report["probe_amplitude"])) > 1.0e-12:
+        raise RuntimeError("identification oracle must use passive v5 with probe amplitude 0.0")
     grid_sizes = report["tau_grid_sizes"]
     try:
         normalized_grid_sizes = sorted(set(int(value) for value in grid_sizes))
@@ -312,11 +312,11 @@ def _validate_identification_oracle_report(
     cadence = report["cadence_semantics"]
     if not isinstance(cadence, dict) or not bool(cadence.get("call_index_completed_transitions")):
         raise RuntimeError("identification oracle lacks completed-transition cadence semantics")
-    if list(cadence.get("publication_calls", ())) != [50, 75]:
-        raise RuntimeError("identification oracle active publications must be call50/call75")
+    if list(cadence.get("publication_calls", ())) != [100, 125]:
+        raise RuntimeError("identification oracle active publications must be call100/call125")
     if list(cadence.get("availability_t25", ())) != [0, 0, 0, 0, 0, 0]:
         raise RuntimeError("identification oracle must mark every t25 capability unavailable")
-    if int(cadence.get("t50_call_index", -1)) != 50:
+    if int(cadence.get("t50_call_index", -1)) != 100:
         raise RuntimeError("identification oracle t50 call index is invalid")
     checkpoint_hash = str(report["checkpoint_sha256"])
     if checkpoint_hash != _sha256_file(source_checkpoint):
@@ -378,7 +378,7 @@ def main() -> None:
             raise ValueError("Phase A1 requires --capability-nll-weight 0")
         if args.capability_mean_weight <= 0.0:
             raise ValueError("Phase A1 requires a positive capability mean weight")
-        probe_eligibility = probe_v4_eligibility(
+        probe_eligibility = probe_v5_eligibility(
             args.probe_v4_report, q2_checkpoint=args.source_checkpoint
         )
         if not probe_eligibility.get("eligible"):
@@ -531,7 +531,7 @@ def main() -> None:
         if args.identifier_pretraining_report is None:
             raise RuntimeError(
                 "Phase A1 requires --identifier-pretraining-report; "
-                "a structurally valid artifact alone does not certify calls50/75 accuracy"
+                "a structurally valid artifact alone does not certify calls100/125 accuracy"
             )
         identifier_pretraining_contract = validate_identifier_pretraining_report(
             args.identifier_pretraining_report,
@@ -628,7 +628,7 @@ def main() -> None:
         calibration_episode,
         validation_episode=validation_episode,
         miscoverage=0.10,
-        phase_steps=(50, 75),
+        phase_steps=(100, 125),
     )
     # The 64-scenario DAgger run installs a smoke calibration so phase B has a
     # nonzero, uncertainty-gated contextual path.  It is never labeled a 99%
@@ -690,10 +690,10 @@ def main() -> None:
         "cadence_semantics": {
             "call_index_completed_transitions": True,
             "call0_has_response": False,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "publication_rule_after_first": "positive slow_cadence offsets from call50",
-            "t50_call_index": 50,
+            "publication_rule_after_first": "positive slow_cadence offsets from call100",
+            "t50_call_index": 100,
         },
         "source_checkpoint": str(args.source_checkpoint.resolve()),
         "teacher_is_runtime_dependency": False,
@@ -732,7 +732,7 @@ def main() -> None:
         "conformal_coverage_by_stratum": conformal_rows,
         "effectiveness_conformal_q": [float(value) for value in conformal_q],
         "effectiveness_conformal_risk_rows": conformal_risk_rows,
-        "conformal_scope": "alpha_conditional_four_log_alpha_risk_strata; joint phase50_75 effectiveness dimensions",
+        "conformal_scope": "alpha_conditional_four_log_alpha_risk_strata; joint phase100_125 effectiveness dimensions",
         "validation_interpretation": "shift diagnostic only; not a coverage proof",
         "teacher_same_latent_intercept_is_equilibrium": False,
         "teacher_same_latent_intercept_usage": "diagnostic_only",

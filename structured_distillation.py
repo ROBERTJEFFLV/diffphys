@@ -46,6 +46,7 @@ class DistillationLoss:
 
 
 DAGGER_BETA_SCHEDULE = (0.5, 0.25, 0.1, 0.0, 0.0)
+from probe_contract_v5 import ProbeState, apply_probe
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,9 @@ class DAggerEpisode:
     equilibrium_template: L2FState
     simulator_dt: float
     simulator_gravity: float
+    executed_probe_residual: Optional[torch.Tensor] = None
+    executed_probe_aborted: Optional[torch.Tensor] = None
+    motor_observer_rms_error: Optional[torch.Tensor] = None
 
     @property
     def max_position_norm(self) -> torch.Tensor:
@@ -252,14 +256,22 @@ def _advance_student_with_executed_action(
     executed_action: torch.Tensor,
     *,
     dt: float,
+    executed_probe_residual: torch.Tensor | None = None,
+    executed_probe_aborted: torch.Tensor | None = None,
 ) -> object:
     """Advance action-dependent student state using the command actually sent.
 
-    Candidate action is evaluated before DAgger intervention is selected, so
-    patch the action-dependent fields in that one-call state.  A second forward
-    of the same observation would silently consume another call index and
-    duplicate its physical response.
+    Re-evaluate from the SAME immutable input state with the executed action.
+    This advances exactly one call and shares the deployment transition,
+    including first-publication observer reconstruction. Test doubles retain
+    the field-based compatibility path below.
     """
+    if isinstance(student, StructuredRecurrentPolicy) and isinstance(state, StructuredPolicyState):
+        return student.forward_with_aux(
+            observation, state, dt=dt, applied_action=executed_action,
+            applied_probe_residual=executed_probe_residual,
+            applied_probe_aborted=executed_probe_aborted,
+        ).next_state
     next_state = getattr(candidate, "next_state", candidate)
     observer = getattr(student, "motor_observer", None)
     previous_motor = getattr(state, "motor_estimate", None)
@@ -272,7 +284,9 @@ def _advance_student_with_executed_action(
     else:
         tau_rise = tau_fall = None
     motor = observer(previous_motor, executed_action, dt, tau_rise, tau_fall)
-    updates = {"motor_estimate": motor}
+    updates = {"motor_estimate": motor,
+               "previous_motor_estimate": previous_motor,
+               "previous_executed_action": observation[:, 21:25]}
     motor_bank = getattr(student, "motor_observer_bank", None)
     previous_bank = getattr(state, "motor_bank", None)
     if motor_bank is not None and torch.is_tensor(previous_bank):
@@ -295,6 +309,9 @@ def _advance_student_with_executed_action(
         updates["excitation_history"] = torch.cat(
             (innovation.unsqueeze(1), excitation_history[:, :-1]), dim=1
         )
+    history = getattr(state, "identification_actions", None)
+    if torch.is_tensor(history) and getattr(state, "slow_counter", 0) < student.config.identification_publish_start:
+        updates["identification_actions"] = torch.cat((history[:, 1:], executed_action[:, None]), 1)
     try:
         return replace(next_state, **updates)
     except TypeError:
@@ -309,14 +326,16 @@ def collect_dagger_episode(
     bank: DAggerScenarioBank,
     *,
     beta: float,
-    horizon: int = 125,
+    horizon: int = 126,
     episode_seed: int = 0,
+    teacher_probe: bool = False,
+    teacher_observation_settings: dict | None = None,
 ) -> DAggerEpisode:
-    """Collect one episode batch using identical actual observations for both RNNs."""
+    """Share the actual trajectory; each controller owns its integral state."""
 
-    if not 0.0 <= beta <= 1.0 or horizon < 51:
+    if not 0.0 <= beta <= 1.0 or horizon < 101:
         raise ValueError(
-            "beta must be in [0,1] and horizon must include call50 for the t50 diagnostic"
+            "beta must be in [0,1] and horizon must include the first publication"
         )
     state = _clone_l2f(bank.state)
     batch = bank.count
@@ -329,8 +348,17 @@ def collect_dagger_episode(
         state.external_force / state.mass[:, None].clamp_min(1.0e-12)
     ).detach()
     observation_state = initial_observation_state(batch, device=state.position.device, dtype=state.position.dtype)
+    settings = dict(mode="integral25", integral_input_frame="body",
+                    integral_input_multiplier=1.0, noise_max=0.0,
+                    integral_limit=0.5, integral_leak=0.0,
+                    integral_clamp_mode="box")
+    settings.update(getattr(teacher, "q2_observation_settings", {}))
+    if teacher_observation_settings is not None:
+        settings.update(teacher_observation_settings)
+    observation_options = {name: settings[name] for name in (
+        "mode", "integral_input_frame", "integral_input_multiplier", "noise_max")}
     teacher_hidden = teacher.initial_hidden(batch, device=state.position.device, dtype=state.position.dtype)
-    initial_obs, _ = build_policy_observation(state, observation_state, mode="integral25", integral_input_frame="body")
+    initial_obs, _ = build_policy_observation(state, observation_state, **observation_options)
     student_state: StructuredPolicyState = student.initial_state(initial_obs)
     observations, teacher_actions = [], []
     teacher_same_latent_intercepts, teacher_fast_delta_actions, student_actions = [], [], []
@@ -349,21 +377,46 @@ def collect_dagger_episode(
     generator.manual_seed(int(episode_seed))
     intervention = torch.rand(batch, device=state.position.device, generator=generator) < float(beta)
     previous_executed = state.previous_action
+    teacher_probe_state = ProbeState.initial(previous_executed)
+    executed_probe_rows, executed_abort_rows, observer_errors = [], [], []
     for step in range(horizon):
         observation, observed_position = build_policy_observation(
-            state, observation_state, mode="integral25", integral_input_frame="body"
+            state, observation_state, **observation_options
         )
-        observation, _ = _observation_from_student_integral(observation, student_state, observation_state)
+        # Q2 owns its original observation integral, updated on the actual
+        # trajectory. A student anti-windup state must not change its teacher.
         teacher_action, teacher_hidden_next, teacher_intercept = _q2_action_hidden_intercept(
             teacher, observation, teacher_hidden, state, simulator
         )
+        observation, _ = _observation_from_student_integral(observation, student_state, observation_state)
         student_output = student.forward_with_aux(observation, student_state)
         student_action = student_output.action
-        executed = torch.where(intervention[:, None], teacher_action, student_action)
+        observed_motor = student_output.auxiliary.get("motor_estimate")
+        if observed_motor is None:
+            observer_errors.append(torch.full_like(state.motor[:, 0], float("inf")))
+        else:
+            observer_errors.append((observed_motor - state.motor).square().mean(-1).sqrt().detach())
+        teacher_executed = teacher_action
+        if teacher_probe:
+            teacher_executed, teacher_probe_state, _ = apply_probe(
+                teacher_action, teacher_probe_state, step, position=state.position,
+                velocity=state.velocity, omega=state.omega, body_z=state.rotation[:, :, 2])
+        executed = torch.where(intervention[:, None], teacher_executed, student_action)
+        if hasattr(student_output.next_state, "probe_residual"):
+            candidate_probe = student_output.next_state.probe_residual
+            candidate_abort = student_output.next_state.probe_aborted
+            executed_probe = torch.where(intervention[:, None], teacher_probe_state.residual, candidate_probe)
+            executed_abort = torch.where(intervention, teacher_probe_state.aborted, candidate_abort)
+        else:
+            executed_probe = torch.zeros_like(executed[:, :1])
+            executed_abort = torch.zeros(batch, dtype=torch.bool, device=executed.device)
         student_state_next = _advance_student_with_executed_action(
             student, observation, student_state, student_output, executed,
-            dt=simulator.params.dt,
+            dt=simulator.params.dt, executed_probe_residual=executed_probe,
+            executed_probe_aborted=executed_abort,
         )
+        executed_probe_rows.append(executed_probe.detach())
+        executed_abort_rows.append(executed_abort.detach())
         observations.append(observation.detach())
         teacher_actions.append(teacher_action.detach())
         teacher_same_latent_intercepts.append(teacher_intercept.detach())
@@ -488,7 +541,8 @@ def collect_dagger_episode(
             )
         observation_state = update_position_integral(
             observation_state, observed_position, dt=simulator.params.dt,
-            integral_limit=0.5, integral_leak=0.0,
+            integral_limit=settings["integral_limit"], integral_leak=settings["integral_leak"],
+            integral_clamp_mode=settings["integral_clamp_mode"],
         )
         state = simulator.step(state, executed, grad_decay=1.0)
         teacher_hidden, student_state = teacher_hidden_next, student_state_next
@@ -499,7 +553,7 @@ def collect_dagger_episode(
     identification_norm = torch.stack(identification_values)
     # Episode rows are indexed by policy call: row 0 is call0, row 50 is
     # call50.  ``collect_dagger_episode`` requires that call to be present.
-    t50_index = _call_index(identification_norm.shape[0], 50)
+    t50_index = _call_index(identification_norm.shape[0], int(getattr(getattr(student, "config", None), "identification_publish_start", 100)))
     identification_t50 = identification_norm[t50_index]
     identification_failure_t50 = torch.stack(identification_failure_values)[t50_index]
     effectiveness_width_t50 = torch.stack(effectiveness_width_values)[t50_index]
@@ -519,6 +573,7 @@ def collect_dagger_episode(
         identification_norm_t50=identification_t50,
         effectiveness_log_interval_width_t50=effectiveness_width_t50,
         identification_failure_t50=identification_failure_t50,
+        motor_observer_rms_error=torch.stack(observer_errors),
         capability_z_mean=torch.stack(capability_means),
         capability_z_log_scale=torch.stack(capability_scales),
         student_trim=torch.stack(trim_values),
@@ -533,6 +588,8 @@ def collect_dagger_episode(
         equilibrium_template=_clone_l2f(bank.state),
         simulator_dt=float(simulator.params.dt),
         simulator_gravity=float(simulator.params.gravity),
+        executed_probe_residual=torch.stack(executed_probe_rows),
+        executed_probe_aborted=torch.stack(executed_abort_rows),
     )
 
 
@@ -561,7 +618,7 @@ def _call_index(length: int, call_index: int) -> int:
 def phase_a_equilibrium_gate(
     episode: DAggerEpisode,
     *,
-    phase_steps: tuple[int, ...] = (50, 75),
+    phase_steps: tuple[int, ...] = (100, 125),
     trim_rms_max: float = 1.3e-3,
     trim_absolute_max: float = 5.0e-3,
     body_z_p99_degrees: float = 1.0,
@@ -575,6 +632,8 @@ def phase_a_equilibrium_gate(
     effectiveness_z_rms_max: float = 0.15,
     capability_axis_z_rms_max: float = 0.25,
     require_identification_width: bool = True,
+    motor_observer_p95_max: float = 1e-3,
+    motor_observer_absolute_max: float = 5e-3,
 ) -> tuple[dict, bool]:
     """Strict held-out gate for the Phase-A physical equilibrium estimator."""
 
@@ -612,15 +671,18 @@ def phase_a_equilibrium_gate(
         )
         action_error = float(episode.equilibrium_action_error[index].max())
         feasible_fraction = float(episode.equilibrium_feasible[index].float().mean())
-        # Keep the gate helper usable with compact synthetic episodes used by
-        # unit tests and older screening artifacts.  Real DAgger episodes
-        # always provide the capability fields; absent fields contribute a
-        # neutral (zero-error, unit-scale) diagnostic rather than changing the
-        # equilibrium gate decision.
+        # Missing mean/observer evidence must not silently become zero error.
+        motor_errors = getattr(episode, "motor_observer_rms_error", None)
+        motor_p95 = float(motor_errors[index].quantile(.95)) if motor_errors is not None else None
+        motor_max = float(motor_errors[index].max()) if motor_errors is not None else None
+        observer_passed = (motor_p95 is not None and math.isfinite(motor_p95)
+                           and motor_max is not None and math.isfinite(motor_max)
+                           and motor_p95 <= motor_observer_p95_max and motor_max <= motor_observer_absolute_max)
         capability_mean = getattr(episode, "capability_z_mean", None)
         capability_target = getattr(episode, "capability_target_z", None)
         capability_log_scale = getattr(episode, "capability_z_log_scale", None)
-        if capability_mean is None or capability_target is None or capability_log_scale is None:
+        capability_evidence_present = capability_mean is not None and capability_target is not None and capability_log_scale is not None
+        if not capability_evidence_present:
             capability_error = trim_error.new_zeros(trim_error.shape[0], 6)
             capability_scale = trim_error.new_ones(trim_error.shape[0], 6)
         else:
@@ -632,7 +694,8 @@ def phase_a_equilibrium_gate(
         )
         capability_axis_z_rms = capability_error.square().mean(dim=0).sqrt()
         passed = bool(
-            trim_rms <= trim_rms_max
+            observer_passed and capability_evidence_present
+            and trim_rms <= trim_rms_max
             and trim_max <= trim_absolute_max
             and angle_p99 <= body_z_p99_degrees
             and angle_max <= body_z_max_degrees
@@ -648,6 +711,9 @@ def phase_a_equilibrium_gate(
         )
         rows.append({
             "phase_step": int(phase_step),
+            "motor_observer_p95": motor_p95, "motor_observer_max": motor_max,
+            "motor_observer_passed": observer_passed,
+            "capability_evidence_present": capability_evidence_present,
             "trim_rms": trim_rms,
             "trim_max": trim_max,
             "body_z_angle_p99_degrees": angle_p99,
@@ -672,6 +738,8 @@ def phase_a_equilibrium_gate(
         "phase_steps": list(phase_steps),
         "rows": rows,
         "thresholds": {
+            "motor_observer_p95": motor_observer_p95_max,
+            "motor_observer_max": motor_observer_absolute_max,
             "trim_rms": trim_rms_max,
             "trim_max": trim_absolute_max,
             "body_z_p99_degrees": body_z_p99_degrees,
@@ -807,7 +875,7 @@ def fit_effectiveness_conformal_q(
     *,
     validation_episode: Optional[DAggerEpisode] = None,
     miscoverage: float = 0.01,
-    phase_steps: tuple[int, ...] = (50, 75),
+    phase_steps: tuple[int, ...] = (100, 125),
 ) -> tuple[torch.Tensor, list[dict[str, object]]]:
     """Fit one conservative joint UCB score over four roll-authority strata.
 
@@ -982,13 +1050,15 @@ def dagger_window_loss(
     full_action_count = 0
     slow_cadence = int(getattr(getattr(student, "config", None), "slow_cadence", 25))
     publish_start = int(getattr(
-        getattr(student, "config", None), "identification_publish_start", 50
+        getattr(student, "config", None), "identification_publish_start", 100
     ))
     for step in range(episode.observations.shape[0]):
         try:
             output = student.forward_with_aux(
                 episode.observations[step], state,
                 applied_action=episode.executed_actions[step],
+                applied_probe_residual=(None if episode.executed_probe_residual is None else episode.executed_probe_residual[step]),
+                applied_probe_aborted=(None if episode.executed_probe_aborted is None else episode.executed_probe_aborted[step]),
             )
         except TypeError:
             output = student.forward_with_aux(episode.observations[step], state)
@@ -1224,12 +1294,7 @@ def student_action_jacobian(student: Callable, observation: torch.Tensor,
             sample_state = state
             if hasattr(state, "detach"):
                 sample_state = state.detach()
-                for name in ("hidden", "identifier", "motor_estimate", "integral",
-                             "slow_trim", "slow_body_z", "capability", "prev_velocity",
-                             "prev_omega", "context_sum", "disturbance_accel",
-                             "disturbance_residual_sum", "disturbance_thrust_sum",
-                             "previous_executed_action",
-                             "disturbance_response_count"):
+                for name in vars(sample_state):
                     value = getattr(sample_state, name, None)
                     if torch.is_tensor(value) and value.shape[0] == observation.shape[0]:
                         setattr(sample_state, name, value[index:index + 1])

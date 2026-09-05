@@ -5,6 +5,6 @@
 --report {work}/calibration_report.json
 --device {device}
 --seed 7
---horizon 76
+--horizon 126
 --miscoverage 0.01
 --maximum-self-calibration-rounds 3

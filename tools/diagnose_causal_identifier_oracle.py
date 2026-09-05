@@ -3,7 +3,7 @@
 This is a read-only diagnostic.  It never updates a production policy and it
 does not use capability labels to construct features.  The collector records
 the transition ``(state_t, u_t) -> state_(t+1)`` and publishes windows at
-calls 25/50/75.  The six arms are intentionally diagnostic representations:
+calls 25/100/125.  The six arms are intentionally diagnostic representations:
 
 The collector has the historical six-arm feature schema for auditability, but
 does not fit or release those arms.  All collection is driven by the frozen
@@ -67,12 +67,12 @@ from policy_observation import (  # noqa: E402
 from structured_policy import motor_observer_tau_grid  # noqa: E402
 
 
-FORMAL_TRAIN_SEEDS = (3707, 4707, 5707, 6707)
-FORMAL_VALIDATION_SEED = 7707
-FORMAL_FINAL_SEEDS = (8707, 9707)
+FORMAL_TRAIN_SEEDS = (13707, 14707, 15707, 16707)
+FORMAL_VALIDATION_SEED = 17707
+FORMAL_FINAL_SEEDS = (18707, 19707)
 FORMAL_BLIND_SEEDS = (10707, 11707)
-FORMAL_AMPLITUDES = (0.0, PROBE_AMPLITUDE)
-PUBLICATION_STEPS = (25, 50, 75)
+FORMAL_AMPLITUDES = (0.0,)
+PUBLICATION_STEPS = (25, 100, 125)
 LAMBDA_GRID = (1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0)
 BOOTSTRAP_SEED = 314159
 BANK_DIM = 35 * 8
@@ -81,9 +81,15 @@ DEFAULT_Q2_CHECKPOINT = (
 )
 OBSERVER_LEGACY_TAU = 0.06
 ZERO_PARITY_TOLERANCE = 1.0e-7
-ACTIVE_PUBLICATIONS = (50, 75)
+ACTIVE_PUBLICATIONS = (100, 125)
 PROBE_WAVEFORM_VERSION = PROBE_CONTRACT_VERSION
-DEFAULT_PROBE_V4_REPORT = ROOT / "reports/probe_v4_formal.json"
+DEFAULT_PROBE_V4_REPORT = ROOT / "reports/probe_v5_formal.json"
+
+
+def probe_v5_eligibility(path: Path = DEFAULT_PROBE_V4_REPORT, *, q2_checkpoint: Path = DEFAULT_Q2_CHECKPOINT) -> dict[str, Any]:
+    """Compatibility API name; current production requires the v5 record."""
+    from tools.diagnose_probe_v5 import eligibility
+    return eligibility(path, q2_checkpoint=q2_checkpoint)
 
 
 def _tau_grid(version: int) -> tuple[tuple[float, float], ...]:
@@ -108,7 +114,7 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def probe_v4_eligibility(
+def legacy_probe_v4_eligibility(
     path: Path = DEFAULT_PROBE_V4_REPORT,
     *,
     q2_checkpoint: Path = DEFAULT_Q2_CHECKPOINT,
@@ -119,6 +125,8 @@ def probe_v4_eligibility(
     an eligible probe.  In particular, ``formal_frozen_sha256: null`` in the
     checked-in debug report must keep the causal oracle ineligible.
     """
+    FORMAL_TRAIN_SEEDS = (3707, 4707, 5707, 6707)
+    FORMAL_VALIDATION_SEED = 7707
     result: dict[str, Any] = {
         "eligible": False,
         "report": str(path.resolve()),
@@ -306,6 +314,8 @@ def probe_v4_eligibility(
     return result
 
 
+probe_v4_eligibility = legacy_probe_v4_eligibility
+
 def _response(state: L2FState, next_state: L2FState, dt: float):
     acceleration = (next_state.velocity - state.velocity) / float(dt)
     gravity = acceleration.new_tensor((0.0, 0.0, 9.80665)).expand_as(acceleration)
@@ -358,13 +368,39 @@ def exact_physics_block_fit(
     if mass.shape != (n,):
         raise ValueError("mass must be scalar or shape [time]")
 
+    output_dtype = motor_before.dtype
+    motor_before, motor_next, command, specific_body, rotation_before, omega_before, omega_after, external_force, mass = (
+        value.double() for value in (motor_before, motor_next, command, specific_body,
+        rotation_before, omega_before, omega_after, external_force, mass))
     ext_body = torch.bmm(rotation_before.transpose(-1, -2),
                          (external_force / mass[:, None]).unsqueeze(-1)).squeeze(-1)
     corrected_specific = specific_body - ext_body
-    tw_response = corrected_specific[:, 2] / float(gravity) - 1.0
+    measured_collective = corrected_specific[:, 2] / float(gravity)
     omega_mid = 0.5 * (omega_before + omega_after)
     angular_accel = (omega_after - omega_before) / float(dt)
-    x = modal(motor_next)
+    # The simulator clips each rotor's thrust at zero.  A global linear
+    # regression in motor command is therefore misspecified when TW>2.
+    # Enumerate the scalar TW breakpoints; within each active set the force
+    # equation is affine, so its constrained least-squares optimum is exact.
+    breaks = (-1.0 / motor_next[motor_next < 0]).clamp(.45, 4.5)
+    breaks = torch.unique(torch.cat((breaks, motor_next.new_tensor((.45, 4.5))))).sort().values
+    middle = .5 * (breaks[:-1] + breaks[1:])
+    active = 1.0 + middle[:, None, None] * motor_next[None] > 0
+    slopes = (active * motor_next[None]).mean(-1)
+    offsets = active.double().mean(-1)
+    candidates = (slopes * (measured_collective[None] - offsets)).sum(-1) / slopes.square().sum(-1).clamp_min(1e-20)
+    candidates = candidates.clamp(min=breaks[:-1], max=breaks[1:])
+    errors = (offsets + slopes * candidates[:, None] - measured_collective[None]).square().sum(-1)
+    surplus = candidates[errors.argmin()]
+    rotor_force = (1.0 + surplus * motor_next).clamp_min(0)
+    force_active = rotor_force > 0
+    tw_response = measured_collective - force_active.double().mean(-1)
+    force_slope = (force_active * motor_next).mean(-1)
+    full_range = 1.0 + surplus - (1.0 - surplus).clamp_min(0)
+    x = torch.stack((force_slope,
+        (rotor_force[:, 1] - rotor_force[:, 3]) / full_range,
+        (rotor_force[:, 2] - rotor_force[:, 0]) / full_range,
+        (rotor_force[:, 0] - rotor_force[:, 1] + rotor_force[:, 2] - rotor_force[:, 3]) / (2 * full_range)), -1)
 
     # Each block is one row family in a common six-column linear model:
     # [TW-1, local_roll, local_yaw, beta, inv_tau_up, inv_tau_down].
@@ -430,18 +466,9 @@ def exact_physics_block_fit(
     coefficients = normalized_coefficients / column_norm.clamp_min(1.0e-12)
     inv_tau = coefficients[4:6]
     tw_estimate = coefficients[0] + 1.0
-    # For the L2F thrust parameterization, the local modal roll/yaw slope is
-    # ``2*q`` times the reported full-range authority, where q=1/2 below
-    # TW=2 and q=(TW-1)/TW otherwise.  Comparing the raw local slope with
-    # alpha_roll_max made low-TW scenes look biased even for exact data.
-    local_authority_scale = torch.where(
-        tw_estimate < 2.0,
-        torch.ones_like(tw_estimate),
-        2.0 * (tw_estimate - 1.0) / tw_estimate.clamp_min(1.0e-8),
-    ).clamp_min(1.0e-8)
     estimate = torch.stack((
         tw_estimate,
-        coefficients[1] / local_authority_scale,
+        coefficients[1],
         coefficients[2] / coefficients[1].clamp_min(1.0e-8),
         coefficients[3] + 1.0,
         1.0 / inv_tau[0].clamp_min(1.0e-8),
@@ -457,7 +484,7 @@ def exact_physics_block_fit(
     rise_support = (valid_delta & (command_delta >= 0.0)).sum(dim=0)
     fall_support = (valid_delta & (command_delta < 0.0)).sum(dim=0)
     shared_support = shared_tau_support(command, motor_before)
-    return {"estimate": estimate.to(motor_before.dtype), "coefficients": coefficients.to(motor_before.dtype),
+    return {"estimate": estimate.to(output_dtype), "coefficients": coefficients.to(output_dtype),
             "rank": rank, "condition": condition, "design": normalized_design.to(motor_before.dtype),
             "fit_rms": float((prediction - response).square().mean().sqrt()),
             "rise_support": int(rise_support.sum()), "fall_support": int(fall_support.sum()),
@@ -657,7 +684,7 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
                  horizon: int, waveform: torch.Tensor | None = None) -> dict[str, Any]:
     torch.set_num_threads(1)
     if horizon < max(PUBLICATION_STEPS):
-        raise ValueError("horizon must include calls 25/50/75")
+        raise ValueError("horizon must include calls 25/100/125")
     # Formal collection always loads the untouched Q2 artifact through the
     # shared loader.  In particular, this path never reconstructs a structured
     # policy from a migration/config payload.
@@ -686,6 +713,9 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
     observer_initial_k15 = candidate15.clone()
     observer_initial_k35 = candidate.clone()
     residual_previous = torch.zeros_like(physical.previous_action)
+    from probe_contract_v5 import ProbeState, apply_probe, CONTRACT_SHA256
+    safe_probe = ProbeState.initial(physical.previous_action)
+    metric_rows = {name: [] for name in ("position", "velocity", "omega")}
     excitation_history = torch.zeros(scenarios, 13, 4, dtype=physical.position.dtype)
     sequence: dict[str, list[torch.Tensor]] = {name: [] for name in ("L", "S", "U", "T")}
     true_motor_rows, initial_motor_rows, legacy_rows, candidate_rows, candidate15_rows = [], [], [], [], []
@@ -712,12 +742,11 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
                 integral_input_multiplier=settings["integral_input_multiplier"],
             )
             canonical_q, canonical_next_hidden = policy(canonical_obs, canonical_hidden)
-            residual = residual_probe_step(
-                residual_previous, step, float(amplitude), q_action=q, waveform=waveform)
-            requested = float(amplitude) * (
-                waveform[step] if step < PROBE_PERIOD else torch.zeros(4))
-            requested_rows.append(requested.view(1, 4).expand_as(q).clone())
-            action = q + residual
+            action, safe_probe, requested_scalar = apply_probe(q, safe_probe, step,
+                position=physical.position, velocity=physical.velocity,
+                omega=physical.omega, body_z=physical.rotation[:, :, 2], amplitude=float(amplitude))
+            residual = action - q
+            requested_rows.append(requested_scalar.expand_as(q).clone())
             # Update the exact Q2 integral with the observed position, then
             # advance physics.  The simulator stores the actual action in
             # previous_action, which is what Q2 sees on the next call.
@@ -759,7 +788,9 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
             legacy_rows.append(legacy_next)
             candidate_rows.append(candidate_next)
             candidate15_rows.append(candidate15_next)
-            failure_rows.append(torch.zeros(scenarios, dtype=torch.bool))
+            failure_rows.append(safe_probe.aborted.clone())
+            for name in metric_rows:
+                metric_rows[name].append(getattr(next_physical, name).norm(dim=-1))
             residual_rows.append(residual)
             q_rows.append(q)
             excitation_rows.append(excitation_history.clone())
@@ -804,6 +835,8 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
     windows["P"] = torch.zeros_like(windows["T"])
     return {
         "seed": int(seed), "amplitude": float(amplitude), "strata": list(bank.stratum),
+        "metrics": {name: torch.stack(values).cpu() for name, values in metric_rows.items()},
+        "cells": (bank.tw_bin * 4 + bank.log_alpha_bin).cpu(),
         "features": {k: v.cpu() for k, v in windows.items()}, "legacy_features": legacy_windows.cpu(),
         "target": target.cpu(), "p_available": False,
         "q_actions": torch.stack(q_rows).cpu(), "commands": torch.stack(command_rows).cpu(),
@@ -833,8 +866,8 @@ def _collect_one(checkpoint: Path, seed: int, amplitude: float, scenarios: int,
             "K35": observer_initial_k35.cpu(),
         },
         "q2_observation": settings,
-        "probe_waveform": waveform.cpu(),
-        "probe_waveform_sha256": _probe_waveform_sha256(waveform),
+        "probe_waveform": torch.zeros(PROBE_PERIOD, 4),
+        "probe_waveform_sha256": CONTRACT_SHA256,
     }
 
 
@@ -1010,6 +1043,7 @@ def fit_motor_tau_wls_split(command: torch.Tensor, motor: torch.Tensor,
 
 
 def analytic_privileged_ceiling(rows: list[dict[str, Any]], dt: float = 0.01) -> dict[str, Any]:
+    from probe_contract_v5 import metadata as v5_metadata
     """Report exact six-parameter physics ceilings at each publication."""
     by_publication: dict[str, list[dict[str, Any]]] = {str(step): [] for step in PUBLICATION_STEPS}
     for row in rows:
@@ -1094,7 +1128,7 @@ def analytic_privileged_ceiling(rows: list[dict[str, Any]], dt: float = 0.01) ->
             "tau_weighted_fisher_information_floor": SHARED_TAU_MIN_WEIGHTED_FISHER_INFORMATION,
             "shared_tau_support_passed": bool(all(v["gate_passed"] for v in shared_values)),
             "support_per_motor_passed": bool((rise_per_motor >= 1).all() and (fall_per_motor >= 1).all()),
-            "active_gate": step in tuple(ACTIVE_PUBLICATIONS),
+            "active_gate": int(step) in ACTIVE_PUBLICATIONS,
         }
         failed_checks = physics_gate_failed_checks(publication_report[step])
         publication_report[step]["failed_checks"] = failed_checks
@@ -1122,11 +1156,11 @@ def analytic_privileged_ceiling(rows: list[dict[str, Any]], dt: float = 0.01) ->
             for step in ACTIVE_PUBLICATIONS
         )),
         "uses_capability_labels_as_features": False,
-        "block_design_columns": ["TW-1", "local_roll", "local_yaw", "beta", "inv_tau_up", "inv_tau_down"],
+        "block_design_columns": ["TW-1", "alpha_roll", "alpha_yaw", "beta", "inv_tau_up", "inv_tau_down"],
         "gate_passed": gate,
         "failed_checks": failed_checks,
-        "probe_contract": waveform_metadata(),
-        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus weighted Fisher information; per-motor counts are diagnostic only",
+        "probe_contract": v5_metadata(),
+        "note": "external acceleration is projected with rotation_before; rise/fall tau are shared and gated on pooled time/motor support plus a weighted excitation proxy (not a statistical Fisher matrix); per-motor counts are diagnostic only",
     }
 
 
@@ -1160,8 +1194,10 @@ def _coverage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "authority_cells_finite": authority_finite,
                 "finite": bool(torch.isfinite(ratio).all()),
             }
-            by_step[str(step)]["failed_checks"] = coverage_gate_failed_checks(
+            by_step[str(step)]["nearest_mode_failed_checks"] = coverage_gate_failed_checks(
                 by_step[str(step)], strict_motor_rms=(label == "K35"))
+            by_step[str(step)]["failed_checks"] = coverage_gate_failed_checks(
+                by_step[str(step)], strict_motor_rms=False)
         result[label] = by_step
     # K15 is retained as a registered control arm.  The promotion coverage
     # gate is K35-only; a failing K15 reference is reported but cannot be
@@ -1170,7 +1206,35 @@ def _coverage_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
                                               for step in ACTIVE_PUBLICATIONS))
     result["K35_gate_passed"] = bool(all(not result["K35"][str(step)]["failed_checks"]
                                          for step in ACTIVE_PUBLICATIONS))
-    result["passed"] = result["K35_gate_passed"]
+    continuous = {}
+    for step in ACTIVE_PUBLICATIONS:
+        errors = []
+        for row in rows:
+            prefix = step - 25
+            delta = (row["commands"][:prefix] - row["initial_motor"][:prefix]).double()
+            change = (row["true_motor"][:prefix] - row["initial_motor"][:prefix]).double()
+            taus = []
+            for sign in (1, -1):
+                mask = delta * sign > 1e-8
+                denominator = (delta * change * mask).sum((0, 2))
+                tau = .01 * (delta.square() * mask).sum((0, 2)) / denominator.clamp_min(1e-20)
+                taus.append(tau)
+            # Exactly the production continuous-tau observer, initialized
+            # from previous_action, with no future target/true-state reset.
+            motor = row["previous_action_seen"][0].double().clone()
+            for command in row["commands"][:step].double():
+                tau = torch.where(command >= motor, taus[0][:, None], taus[1][:, None])
+                motor = motor + (.01 / tau.clamp_min(1e-8)).clamp_max(1) * (command - motor)
+            errors.append((motor - row["true_motor"][step - 1]).square().mean(-1).sqrt())
+        error = torch.cat(errors)
+        continuous[str(step)] = {"fit_through_transition": step - 26,
+            "held_out_transition_count": 25, "motor_rms_p95": float(error.quantile(.95)),
+            "motor_rms_max": float(error.max()),
+            "passed": bool(torch.isfinite(error).all() and error.quantile(.95) <= .001 and error.max() <= .005)}
+    result["continuous_observer_ceiling"] = continuous
+    result["continuous_observer_gate_passed"] = all(row["passed"] for row in continuous.values())
+    result["passed"] = result["K35_gate_passed"] and result["continuous_observer_gate_passed"]
+    result["scope"] = "K35 relative representation coverage plus continuous-tau observer ceiling; not trained-identifier accuracy"
     result["failed_checks"] = {
         label: {str(step): result[label][str(step)]["failed_checks"]
                 for step in ACTIVE_PUBLICATIONS if result[label][str(step)]["failed_checks"]}
@@ -1202,8 +1266,10 @@ def _collect(args: argparse.Namespace) -> list[dict[str, Any]]:
     # frozen; this evolving diagnostic must not spend them accidentally.
     seeds = tuple(dict.fromkeys(FORMAL_TRAIN_SEEDS + (FORMAL_VALIDATION_SEED,) + FORMAL_FINAL_SEEDS))
     if args.dry_run:
-        seeds, args.scenarios, args.horizon = (FORMAL_TRAIN_SEEDS[:1] + (FORMAL_VALIDATION_SEED,), 16, 75)
-    waveform = load_probe_waveform(getattr(args, "waveform", None))
+        seeds, args.scenarios, args.horizon = (FORMAL_TRAIN_SEEDS[:1] + (FORMAL_VALIDATION_SEED,), 16, 126)
+    if getattr(args, "waveform", None) is not None:
+        raise ValueError("v5 passive identification does not consume a v4 waveform file")
+    waveform = load_probe_waveform()
     jobs = max(1, int(args.n_jobs))
     fn = lambda seed, amp: _collect_one(
         args.checkpoint, seed, amp, args.scenarios, args.horizon, waveform)
@@ -1218,11 +1284,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--stage must be collect-ceiling, train, or all")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if not args.dry_run:
+        gate = probe_v5_eligibility(Path(args.probe_report), q2_checkpoint=args.checkpoint)
+        if gate.get("eligible") is not True:
+            raise RuntimeError("K35 collection requires the current frozen v5 probe")
     collected = _collect(args)
-    active_rows = [r for r in collected if r["amplitude"] == PROBE_AMPLITUDE]
+    active_rows = collected
+    from tools.diagnose_probe_v5 import paired_metrics
+    from probe_contract_v5 import metadata as v5_metadata, VERSION
+    zero_by_seed = {r["seed"]: r for r in collected if r["amplitude"] == 0.0}
+    paired_safety = {}
+    for row in active_rows:
+        zero = zero_by_seed[row["seed"]]
+        actual = dict(row["metrics"], action=row["commands"])
+        baseline = dict(zero["metrics"], action=zero["commands"])
+        paired_safety[str(row["seed"])] = paired_metrics(baseline, actual, row["cells"])
     ceiling = analytic_privileged_ceiling(active_rows)
     coverage = _coverage_summary(active_rows)
-    probe_eligibility = probe_v4_eligibility(
+    probe_eligibility = probe_v5_eligibility(
         Path(getattr(args, "probe_report", DEFAULT_PROBE_V4_REPORT)),
         q2_checkpoint=args.checkpoint,
     )
@@ -1240,7 +1319,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "probe_eligibility": probe_eligibility,
         "release_status": "blocked_pending_frozen_sequence_and_blind_protocol",
         "requested_formal_shape": bool(
-            not args.dry_run and args.scenarios == 128 and args.horizon == 125 and args.n_jobs == 4
+            not args.dry_run and args.scenarios == 128 and args.horizon == 126 and args.n_jobs == 4
         ), "seed_split": {"train": list(FORMAL_TRAIN_SEEDS), "validation": [FORMAL_VALIDATION_SEED],
             "final": list(FORMAL_FINAL_SEEDS), "blind": list(FORMAL_BLIND_SEEDS)},
         "amplitudes": list(FORMAL_AMPLITUDES), "publications": list(ACTIVE_PUBLICATIONS),
@@ -1249,19 +1328,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cadence_semantics": {
             "call_index_completed_transitions": True,
             "call0_has_response": False,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
+            "t50_call_index": 100,
             "diagnostic_calls": [25],
             "diagnostic_publications": [25],
             "active_publications": list(ACTIVE_PUBLICATIONS),
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "publication_rule": "call50 and call75 only; call25 diagnostic/unavailable",
+            "publication_rule": "call100 and call125 only; call25 diagnostic/unavailable",
         },
-        "probe_waveform_version": PROBE_WAVEFORM_VERSION,
+        "probe_waveform_version": VERSION,
         "probe_amplitudes": list(FORMAL_AMPLITUDES),
         "probe_amplitude": float(FORMAL_AMPLITUDES[-1]),
         "probe_waveform_sha256": collected[0]["probe_waveform_sha256"] if collected else None,
-        "probe_waveform_source": "probe_contract.py:v4",
-        "probe_waveform_metadata": waveform_metadata(),
+        "probe_waveform_source": "probe_contract_v5.py",
+        "probe_waveform_metadata": v5_metadata(),
         "feature_schema": feature_schema_metadata(),
         "feature_schema_sha256": feature_schema_sha256(),
         # The sequence model used by this diagnostic is intentionally a
@@ -1282,6 +1362,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                          "T": "legacy24 + privileged true-motor bank",
                          "P": "unavailable: no pre-registered deconfounded response model"},
         "p_available": False,
+        "representation_grid_version": 2,
         "tau_grid_sizes": sorted({len(r["tau_pairs"]) for r in collected}), "ceiling": ceiling,
         "coverage": coverage,
         "safety": {"finite_collected": bool(all(_finite_collection(r) for r in collected)),
@@ -1291,6 +1372,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     tensor_path = args.output.with_suffix(args.output.suffix + ".pt")
     torch.save(collected, tensor_path)
     result["collection_path"] = str(tensor_path.resolve())
+    result["collection_sha256"] = _hash_file(tensor_path)
+    result["paired_safety"] = paired_safety
     zero_rows = [r for r in collected if r["amplitude"] == 0.0]
     parity_values = [r["zero_parity"] for r in zero_rows]
     result["zero_parity"] = {
@@ -1302,6 +1385,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "tolerance": ZERO_PARITY_TOLERANCE,
     }
     pretraining_checks = {
+        "paired_safety": bool(paired_safety) and all(v["passed"] for row in paired_safety.values() for v in row.values()),
         "coverage": bool(coverage["passed"]),
         "physics_ceiling": bool(ceiling.get("gate_passed", False)),
         "physics_finite": bool(
@@ -1354,7 +1438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stage", choices=("collect-ceiling", "train", "all"), default="all")
     parser.add_argument("--scenarios", type=int, default=128)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--n-jobs", type=int, default=4)
     parser.add_argument("--max-updates", type=int, default=1000)
     parser.add_argument("--waveform", type=Path, default=None,

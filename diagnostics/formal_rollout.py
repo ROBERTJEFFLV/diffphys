@@ -84,6 +84,17 @@ def load_q2_policy(
     if missing or unexpected:
         raise RuntimeError(f"formal Q2 load mismatch: missing={missing}, unexpected={unexpected}")
     policy.eval()
+    # Preserve the teacher's observation contract wherever it is replayed.
+    # In particular DAgger must not replace its integral with a student's.
+    policy.q2_observation_settings = {
+        "mode": str(args.get("observation_mode", "integral25")),
+        "integral_input_frame": str(args.get("integral_input_frame", "world")),
+        "integral_input_multiplier": float(args.get("integral_input_multiplier", 1.0)),
+        "noise_max": float(args.get("observation_noise_max", 0.0)),
+        "integral_limit": float(args.get("integral_limit", 0.5)),
+        "integral_leak": float(args.get("integral_leak", 0.0)),
+        "integral_clamp_mode": str(args.get("integral_clamp_mode", LEGACY_BOX_INTEGRAL_CLAMP_MODE)),
+    }
     return policy, args
 
 

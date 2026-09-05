@@ -85,7 +85,7 @@ def test_boundary_codec_v2_preserves_cadence_latches_and_v1_is_explicitly_legacy
 
     codec = StructuredBoundaryCodec(closed.physical, policy)
     restored = codec.unpack(codec.pack(closed))
-    assert codec.codec_version == 2
+    assert codec.codec_version == 3
     assert restored.policy.slow_counter == 19
     torch.testing.assert_close(
         restored.policy.disturbance_response_count,
@@ -415,7 +415,7 @@ def test_boot_completed_codec_fixes_timer_outside_shooting_variables() -> None:
         assert "unfinished" in str(error)
     else:
         raise AssertionError("unfinished burn-in was accepted")
-    total = policy.config.burn_in_steps + policy.config.contextual_blend_steps
+    total = policy.config.identification_publish_start
     closed.policy.boot_progress.fill_(float(total))
     packed = codec.pack(closed)
     restored = codec.unpack(packed)
@@ -432,6 +432,12 @@ def test_phase_space_contraction_risk_has_policy_credit() -> None:
     # parameter-independent conservative prior used before call50.
     closed.policy.boot_progress.fill_(float(policy.config.identification_publish_start))
     closed.policy.slow_counter = policy.config.identification_publish_start
+    # An identified, calibrated fixture is required before adaptive policy credit.
+    ledger = closed.policy.identification_information
+    ledger[:, 0] = 128
+    ledger[:, 7:43] = torch.eye(6, dtype=ledger.dtype).flatten()
+    ledger[:, 43:] = 1.
+    policy.install_capability_conformal_q(torch.zeros(6, dtype=ledger.dtype), 512)
     codec = StructuredBoundaryCodec(closed.physical, policy)
     spec = ParameterVectorSpec.from_module(policy)
     theta = spec.flatten(policy).detach().requires_grad_(True)

@@ -56,9 +56,10 @@ def test_artificial_per_motor_tau_configuration_is_rejected() -> None:
     assert result["rising_spread"] > 0.0
 
 
-def test_policy_probe_is_exactly_the_shared_v4_artifact() -> None:
+def test_legacy_v4_artifact_is_preserved_but_policy_uses_collective_experiment() -> None:
     policy_probe = identification_probe_patterns(device=torch.device("cpu"), dtype=torch.float64)
-    torch.testing.assert_close(policy_probe, waveform_tensor(dtype=torch.float64))
+    assert torch.equal(policy_probe, policy_probe[:, :1].expand_as(policy_probe))
+    assert not torch.equal(policy_probe, waveform_tensor(dtype=torch.float64))
     assert len(WAVEFORM_SHA256) == 64
     assert (
         waveform_metadata()["shared_tau_min_weighted_fisher_information"]

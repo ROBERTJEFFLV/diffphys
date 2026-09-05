@@ -134,7 +134,10 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     policy, source = load_structured_policy(args.checkpoint, device=device)
-    migration_passed = bool(source.get("report", {}).get("migration_gate_passed", False))
+    from structured_checkpoint import require_formal_identification_config
+    if not args.allow_failed_migration_gate:
+        require_formal_identification_config(policy.config)
+    migration_passed = source.get("report", {}).get("migration_gate_passed") is True
     if not migration_passed and not args.allow_failed_migration_gate:
         raise RuntimeError(
             "structured checkpoint failed the Q2 migration gate; refusing long-horizon optimization"
@@ -227,7 +230,7 @@ def main() -> None:
         raise RuntimeError(
             "identifier confidence failed before shooting; refusing to remove the burn-in guard"
         )
-    boot_total = policy.config.burn_in_steps + policy.config.contextual_blend_steps
+    boot_total = policy.config.identification_publish_start
     boot_completed = args.pre_rollout_steps >= boot_total
     if not boot_completed and not args.allow_failed_migration_gate:
         raise ValueError(
@@ -285,6 +288,7 @@ def main() -> None:
             theta=theta,
             segment_map=segment_map,
             layout=codec.layout,
+            fixed_boundary_mask=codec.fixed_boundary_mask,
             task_residual=lambda starts, ends, value: phase_space_contraction_risk_residual(
                 codec, starts, ends,
                 metric=metric.matrix,
