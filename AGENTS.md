@@ -4,7 +4,11 @@
 
 This repository contains a compact PyTorch/CUDA training chain for an L2F-style quadrotor motor policy. Main Python modules live at the repository root:
 
-- `train.py`: primary training entry point and CLI argument parser.
+- `tools/train_response_control.py`: primary response-conditioned task-learning entry point.
+- `response_policy.py`: deployable response memory and conditioned motor controller.
+- `response_task.py`: teacher-free physical rollouts and task/CVaR objectives.
+- `response_training.py` and `response_shooting.py`: resumable task training and joint MS.
+- `train.py`: earlier direct-training baseline and CLI argument parser.
 - `main_cuda.py`: compatibility wrapper that calls `train.main()`.
 - `model.py`: `MotorGRUPolicy`, the state/error/previous-action GRU controller.
 - `env_l2f.py`: differentiable Euler quadrotor simulator and loss terms.
@@ -40,7 +44,7 @@ Use Python 3 type hints, `from __future__ import annotations`, and four-space in
 
 ## Testing Guidelines
 
-No pytest suite is checked in. Validate changes with the smoke command before handoff. For simulator or model changes, also run a tiny CPU invocation to catch device-agnostic issues. If adding tests, place them under `tests/`, name files `test_*.py`, and keep fixtures small enough to run without a GPU.
+Tests live under `tests/`. New response-control checks are in `test_response_control.py` and `test_response_training.py`. Keep fixtures small enough to run without a GPU. Run validation and training only when requested; distinguish code correctness, learned performance, and deployment safety. See `docs/response_control_v1.md` for the new protocol. The Q2 migration pipeline is historical and requires `--historical-q2-distillation`.
 
 ## Commit & Pull Request Guidelines
 

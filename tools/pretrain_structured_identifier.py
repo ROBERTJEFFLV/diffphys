@@ -6,7 +6,7 @@ oracle GRU.  The teacher supplies the action that is executed in the
 simulator, while capability values are simulator-side training targets and
 never part of the policy observation.
 
-The formal path is deliberately fail-closed: a frozen v4 probe record and a
+The formal path is deliberately fail-closed: a frozen v5 identification record and a
 hash-bound causal-oracle collector release report with all pretraining checks
 passed must already exist before
 the Q2 checkpoint is loaded or any optimizer is created.  ``--dry-run`` only
@@ -32,6 +32,7 @@ from env_l2f import L2FParams, L2FSimulator  # noqa: E402
 from structured_checkpoint import (  # noqa: E402
     CADENCE_SEMANTICS_VERSION,
     identifier_weights_hash,
+    require_formal_identification_config,
     sha256_file,
     write_identifier_init_artifact,
 )
@@ -45,9 +46,9 @@ from structured_distillation import (  # noqa: E402
 from structured_policy import StructuredPolicyConfig, StructuredRecurrentPolicy  # noqa: E402
 from tools.diagnose_causal_identifier_oracle import (  # noqa: E402
     DEFAULT_PROBE_V4_REPORT,
-    probe_v4_eligibility,
+    probe_v5_eligibility,
 )
-from probe_contract import WAVEFORM_SHA256  # noqa: E402
+from probe_contract_v5 import CONTRACT_SHA256 as WAVEFORM_SHA256  # noqa: E402
 
 
 DEFAULT_Q2 = ROOT / "reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt"
@@ -74,7 +75,7 @@ def validate_pretraining_gates(
 ) -> dict[str, Any]:
     """Validate all immutable gates required before identifier pretraining.
 
-    The causal report is intentionally checked independently of the v4 probe.
+    The causal report is intentionally checked independently of the v5 identification.
     In particular, an eligible probe with a failed causal gate cannot authorize
     training.  The returned mapping is JSON-safe and is copied into the run
     report for provenance.
@@ -85,14 +86,14 @@ def validate_pretraining_gates(
     causal_oracle_report = Path(causal_oracle_report)
     if not source_checkpoint.is_file():
         raise RuntimeError(f"Q2 source checkpoint is missing: {source_checkpoint}")
-    probe_payload = _read_json(probe_report, "v4 probe report")
-    probe = probe_v4_eligibility(
+    probe_payload = _read_json(probe_report, "v5 identification report")
+    probe = probe_v5_eligibility(
         probe_report, q2_checkpoint=source_checkpoint
     )
     formal = probe_payload.get("formal")
     if not isinstance(formal, Mapping):
-        raise RuntimeError("v4 probe report has no formal freeze record")
-    # probe_v4_eligibility checks the contract and frozen SHA.  Keep the gate
+        raise RuntimeError("v5 identification report has no formal freeze record")
+    # probe_v5_eligibility checks the contract and frozen SHA.  Keep the gate
     # check explicit here because old debug reports contain eligible/frozen
     # fields but no release gate.
     frozen_sha = probe.get("frozen_sha256")
@@ -100,13 +101,13 @@ def validate_pretraining_gates(
     top_gate = probe_payload.get("gate_passed")
     if not probe.get("eligible") or frozen_sha != WAVEFORM_SHA256:
         raise RuntimeError(
-            "identifier pretraining requires an eligible frozen v4 probe "
+            "identifier pretraining requires an eligible frozen v5 identification "
             f"(reason={probe.get('reason')})"
         )
     if formal.get("eligible") is not True:
-        raise RuntimeError("identifier pretraining requires formal.eligible=true in v4 probe report")
+        raise RuntimeError("identifier pretraining requires formal.eligible=true in v5 identification report")
     if formal_gate is False or top_gate is False or (formal_gate is not True and top_gate is not True):
-        raise RuntimeError("identifier pretraining requires the v4 probe formal gate to pass")
+        raise RuntimeError("identifier pretraining requires the v5 identification formal gate to pass")
 
     causal = _read_json(causal_oracle_report, "causal oracle report")
     required = ("diagnostic", "requested_formal_shape", "pretraining_gate_passed",
@@ -128,7 +129,7 @@ def validate_pretraining_gates(
         raise RuntimeError("causal oracle pretraining gate is not passed")
     checks = causal.get("pretraining_checks")
     required_checks = (
-        "coverage", "physics_ceiling", "physics_finite", "physics_branch_support",
+        "coverage", "paired_safety", "physics_ceiling", "physics_finite", "physics_branch_support",
         "finite_collection", "no_identification_failure", "zero_q2_parity",
     )
     if not isinstance(checks, Mapping) or any(checks.get(key) is not True for key in required_checks):
@@ -138,6 +139,7 @@ def validate_pretraining_gates(
     safety = causal.get("safety")
     parity = causal.get("zero_parity")
     if (not isinstance(coverage, Mapping) or coverage.get("K35_gate_passed") is not True
+            or coverage.get("continuous_observer_gate_passed") is not True
             or not isinstance(ceiling, Mapping) or ceiling.get("gate_passed") is not True
             or ceiling.get("tau_wls_finite") is not True
             or ceiling.get("effectiveness_finite") is not True
@@ -149,6 +151,9 @@ def validate_pretraining_gates(
     if causal.get("cadence_semantics_version") != CADENCE_SEMANTICS_VERSION:
         raise RuntimeError("causal oracle report has stale cadence semantics")
 
+    collection_path = Path(str(causal.get("collection_path", "")))
+    if not collection_path.is_file() or causal.get("collection_sha256") != sha256_file(collection_path):
+        raise RuntimeError("K35 collection artifact is missing or differs from its report")
     # Bind the causal report to this exact frozen Q2 file.  Importing the
     # shared hash helper avoids a second, subtly different digest definition.
     source_sha = sha256_file(source_checkpoint)
@@ -190,20 +195,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=64)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--updates", type=int, default=5)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--identifier-dim", type=int, default=64)
     parser.add_argument("--slow-cadence", type=int, default=25)
-    parser.add_argument("--identification-publish-start", type=int, default=50)
+    parser.add_argument("--identification-publish-start", type=int, default=100)
     parser.add_argument("--motor-observer-bank-size", type=int, choices=(0, 15, 35), default=35)
     parser.add_argument("--motor-observer-mode", choices=("legacy", "fixed_multi_tau_v1", "fixed_multi_tau_v2"), default="fixed_multi_tau_v2")
     parser.add_argument("--motor-tau-grid-version", type=int, choices=(0, 1, 2), default=2)
-    parser.add_argument("--burn-in-probe-amplitude", type=float, default=0.005)
+    parser.add_argument("--burn-in-probe-amplitude", type=float, default=0.0)
     parser.add_argument("--allocator-solver", choices=("smooth_dls", "box_qp"), default="box_qp")
     parser.add_argument("--allocator-rate-limit", type=float, default=50.0)
     parser.add_argument("--prefix", type=int, default=25)
+    from structured_training_runtime import add_training_arguments
+    add_training_arguments(parser)
     parser.add_argument("--dry-run", action="store_true",
                         help="resolve the command without validating inputs or writing files")
     return parser.parse_args(argv)
@@ -257,8 +264,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "probe_v4_report": str(args.probe_v4_report),
             "causal_oracle_report": str(args.causal_oracle_report),
         }
-    if args.horizon < 76 or args.prefix < 1 or args.prefix >= args.horizon:
-        raise ValueError("horizon must include calls 50 and 75 and prefix must be inside it")
+    if args.horizon < 126 or args.prefix < 1 or args.prefix >= args.horizon:
+        raise ValueError("horizon must include calls 100 and 125 and prefix must be inside it")
     if args.updates < 1 or args.scenarios < 16 or args.scenarios % 16:
         raise ValueError("scenarios must be a positive 4x4 bank and updates must be positive")
     # This is intentionally the first operation in a real run.  A failed
@@ -268,6 +275,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         probe_report=args.probe_v4_report,
         causal_oracle_report=args.causal_oracle_report,
     )
+    torch.set_num_threads(1)
     device = _device(args.device)
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -278,6 +286,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         parameter.requires_grad_(False)
     dt = float(teacher_args.get("dt", 0.01))
     config = _config(args, dt)
+    require_formal_identification_config(config)
     student = StructuredRecurrentPolicy(config).to(device)
     active = set_distillation_phase(student, "A1")
     expected = tuple(name for name in student.state_dict()
@@ -288,51 +297,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         (parameter for parameter in student.parameters() if parameter.requires_grad),
         lr=args.lr, weight_decay=1.0e-5,
     )
-    history: list[dict[str, Any]] = []
-    training_bank_seeds: list[int] = []
+    from structured_training_runtime import TrainingSession, equilibrium_score
+    session = TrainingSession(args, student, optimizer, stage="identifier_pretrain")
+    history = session.progress["history"]
+    training_bank_seeds = session.progress.setdefault("training_bank_seeds", [])
     simulator = L2FSimulator(L2FParams(dt=dt))
-    for update in range(args.updates):
-        # Use a fresh deterministic 4x4 authority-stratified bank for every
-        # update.  Validation and final banks occupy disjoint seed ranges.
-        bank_seed = args.seed + 100 + update
-        training_bank_seeds.append(bank_seed)
-        bank = _move_bank(build_dagger_scenario_bank(
-            args.scenarios, seed=bank_seed, dt=dt,
-            per_cell=args.scenarios // 16,
-        ), device)
-        episode = collect_dagger_episode(
-            teacher, student, simulator,
-            bank, beta=1.0, horizon=args.horizon,
-            episode_seed=args.seed + 1000 + update,
-        )
-        # Phase A1 uses simulator capability targets and analytic equilibrium
-        # targets.  It deliberately leaves the uncertainty scale frozen.
-        loss, components = dagger_window_loss(
-            student, episode, prefix=args.prefix, phase="A1",
-            capability_weight=0.0, capability_mean_weight=1.0,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        gradient_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
-        if not bool(torch.isfinite(gradient_norm).item()) or not bool(torch.isfinite(loss).item()):
-            raise RuntimeError("non-finite identifier pretraining update")
-        optimizer.step()
-        teacher_steps = int(episode.intervention_mask.sum().item())
-        expected_teacher_steps = int(episode.intervention_mask.numel())
-        if teacher_steps != expected_teacher_steps:
-            raise RuntimeError("identifier pretraining must execute the frozen teacher action")
-        history.append({
-            "update": update + 1, "loss": float(loss.detach()),
-            "gradient_norm": float(gradient_norm.detach()), **components,
-            "teacher_execution_count": teacher_steps,
-            "student_execution_count": expected_teacher_steps - teacher_steps,
-        })
 
     def evaluate_bank(seed: int) -> dict[str, Any]:
         episode = collect_dagger_episode(
             teacher, student, simulator, _move_bank(build_dagger_scenario_bank(
                 args.scenarios, seed=seed, dt=dt, per_cell=args.scenarios // 16,
-            ), device), beta=1.0, horizon=args.horizon, episode_seed=seed + 10000,
+            ), device), beta=1.0, horizon=args.horizon, teacher_probe=True, episode_seed=seed + 10000,
         )
         teacher_steps = int(episode.intervention_mask.sum().item())
         expected_steps = int(episode.intervention_mask.numel())
@@ -356,6 +331,66 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "phase_a_mean_gate_passed": bool(mean_gate_passed),
         }
 
+    if not args.final_evaluation:
+        if args.updates >= 9800:
+            raise ValueError("training seeds must remain disjoint from the registered evaluation banks")
+        session.save()
+        try:
+            for update in range(session.updates, args.updates):
+                if session.should_stop():
+                    break
+                bank_seed = args.seed + 100 + update
+                bank = _move_bank(build_dagger_scenario_bank(
+                    args.scenarios, seed=bank_seed, dt=dt,
+                    per_cell=args.scenarios // 16,
+                ), device)
+                episode = collect_dagger_episode(
+                    teacher, student, simulator, bank, beta=1.0,
+                    horizon=args.horizon, teacher_probe=True,
+                    episode_seed=args.seed + 1000 + update,
+                )
+                loss, components = dagger_window_loss(
+                    student, episode, prefix=args.prefix, phase="A1",
+                    capability_weight=0.0, capability_mean_weight=1.0,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                gradient_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
+                if not bool(torch.isfinite(gradient_norm)) or not bool(torch.isfinite(loss)):
+                    raise RuntimeError("non-finite identifier pretraining update")
+                teacher_steps = int(episode.intervention_mask.sum())
+                if teacher_steps != episode.intervention_mask.numel():
+                    raise RuntimeError("pretraining must execute frozen Q2 actions")
+                optimizer.step()
+                training_bank_seeds.append(bank_seed)
+                session.record_update({"loss": float(loss.detach()),
+                    "gradient_norm": float(gradient_norm.detach()), **components,
+                    "teacher_execution_count": teacher_steps, "student_execution_count": 0,
+                    "train_bank_seed": bank_seed})
+                del loss, episode, bank
+                if session.development_due():
+                    development = evaluate_bank(args.seed + 2000000)
+                    session.record_development(
+                        score=equilibrium_score(development["phase_a_mean_gate"]),
+                        passed=development["phase_a_mean_gate_passed"],
+                        metrics=development)
+            if (not session.progress["development"]
+                    or session.progress["development"][-1]["update"] != session.updates):
+                development = evaluate_bank(args.seed + 2000000)
+                session.record_development(
+                    score=equilibrium_score(development["phase_a_mean_gate"]),
+                    passed=development["phase_a_mean_gate_passed"], metrics=development)
+            return session.finish_development()
+        except Exception:
+            session.progress["status"] = "training_error"
+            session.save()
+            from structured_training_runtime import atomic_json
+            atomic_json(session.development_report, session.summary())
+            raise
+
+    session.begin_final([args.seed + 10000, args.seed + 20000])
+    history = session.progress["history"]
+    training_bank_seeds = session.progress["training_bank_seeds"]
     validation = evaluate_bank(args.seed + 10000)
     final = evaluate_bank(args.seed + 20000)
     formal_gate_passed = bool(
@@ -375,7 +410,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "config": asdict(config),
             "device": str(device), "seed": args.seed,
             "scenario_count": args.scenarios, "horizon": args.horizon,
-            "updates": args.updates, "history": history,
+"updates": session.updates, "history": history,
+            "training_session": session.summary(),
             "validation": validation, "final": final,
             "bank_seeds": {
                 "train": training_bank_seeds,
@@ -402,7 +438,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             encoding="utf-8",
         )
         raise RuntimeError(
-            "production identifier failed independent calls50/75 mean-accuracy gates; "
+            "production identifier failed independent calls100/125 mean-accuracy gates; "
             "no identifier artifact was written"
         )
     artifact = write_identifier_init_artifact(
@@ -426,7 +462,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "config": asdict(config),
         "device": str(device), "seed": args.seed,
         "scenario_count": args.scenarios, "horizon": args.horizon,
-        "updates": args.updates, "history": history,
+"updates": session.updates, "history": history,
+            "training_session": session.summary(),
         "validation": validation, "final": final,
         "bank_seeds": {"train": training_bank_seeds,
                        "validation": args.seed + 10000,

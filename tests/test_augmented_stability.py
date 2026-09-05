@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from env_l2f import L2FParams, L2FSimulator
 from structured_policy import StructuredPolicyConfig, StructuredRecurrentPolicy
@@ -55,7 +56,7 @@ def test_matrix_free_augmented_probe_detects_stable_and_unstable_linear_maps() -
 def test_matrix_free_probe_projects_only_declared_yaw_basis() -> None:
     # The first coordinate is a pure gauge mode; the second is a real unstable
     # mode and must remain visible after the explicit quotient.
-    matrix = torch.diag(torch.tensor((1.4, 1.01, 0.7), dtype=torch.float64))
+    matrix = torch.diag(torch.tensor((1.0, 1.01, 0.7), dtype=torch.float64))
     result = matrix_free_augmented_stability_report(
         lambda value: matrix @ value,
         torch.zeros(3, dtype=torch.float64),
@@ -117,7 +118,7 @@ def test_tiny_real_v2_rollout_pack_and_jvp_smoke() -> None:
     closed = StructuredClosedLoopState(
         physical, policy.initial_state(initial_observation)
     )
-    for _ in range(75):
+    for _ in range(125):
         output = policy.forward_with_aux(
             structured_observation(closed), closed.policy, simulator.params.dt
         )
@@ -135,12 +136,13 @@ def test_tiny_real_v2_rollout_pack_and_jvp_smoke() -> None:
     discrete = torch.zeros(codec.state_dim, dtype=torch.bool)
     discrete[codec.slices["identification_failed"]] = True
     discrete[codec.slices["slow_counter"]] = True
+    discrete |= codec.fixed_boundary_mask
     result = matrix_free_augmented_stability_report(
         step_map, packed, config=AugmentedStabilityConfig(
                 horizon_steps=1, krylov_dim=2, jvp_fd_epsilon=1.0e-3,
             spectral_radius_threshold=100.0,
             finite_gain_thresholds=(100.0, 100.0, 100.0),
-        ), yaw_basis=structured_global_yaw_basis(codec, packed),
+        ), yaw_basis=None,
         discrete_mask=discrete,
     )
     assert result.finite

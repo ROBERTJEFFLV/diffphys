@@ -41,7 +41,7 @@ def test_formal_stage_commands_are_fixed_and_dependencies_are_explicit(tmp_path:
         tmp_path / "identifier_pretrain_report.json"
     )
     assert _flag_value(phase_a, "--probe-v4-report") == str(
-        ROOT / "reports" / "probe_v4_formal.json"
+        ROOT / "reports" / "probe_v5_formal.json"
     )
     assert _flag_value(revalidation, "--phase-a1-checkpoint") == str(
         tmp_path / "phase_a1.pt"
@@ -70,7 +70,9 @@ def test_all_dry_run_expands_every_stage_without_writing_artifacts(tmp_path: Pat
                for command in commands)
 
 
-def test_identifier_oracle_is_first_and_explicitly_blocked_until_ready(tmp_path: Path) -> None:
+def test_identifier_oracle_is_first_and_explicitly_blocked_until_ready(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("tools.diagnose_causal_identifier_oracle.probe_v5_eligibility",
+                        lambda *args, **kwargs: {"eligible": False})
     command = stage_command("identifier_oracle", work_dir=tmp_path, device="cpu")
     assert command[-1] == "4"
     assert "diagnose_causal_identifier_oracle.py" in command[1]

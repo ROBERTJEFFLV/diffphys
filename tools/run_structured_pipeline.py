@@ -12,6 +12,8 @@ import json
 import shlex
 import subprocess
 import sys
+import time
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
@@ -126,7 +128,7 @@ def _read_report(path: Path) -> Mapping[str, object]:
 
 
 def _require_bool(report: Mapping[str, object], key: str, context: str) -> None:
-    if not bool(report.get(key, False)):
+    if report.get(key) is not True:
         raise RuntimeError(f"{context} requires {key}=true")
 
 
@@ -137,8 +139,8 @@ def _require_upstream(stage: str, work_dir: Path) -> None:
         # a production init), but it may run once the registered v4 probe is
         # frozen.  With today's debug report this rejects before spending any
         # K35 collection budget, preserving the fail-closed behavior.
-        from tools.diagnose_causal_identifier_oracle import probe_v4_eligibility
-        probe = probe_v4_eligibility()
+        from tools.diagnose_causal_identifier_oracle import probe_v5_eligibility
+        probe = probe_v5_eligibility()
         if not probe.get("eligible"):
             raise RuntimeError(
                 "identifier_oracle stage is blocked: formal causal oracle is not ready"
@@ -153,8 +155,8 @@ def _require_upstream(stage: str, work_dir: Path) -> None:
         _require_bool(oracle, "requested_formal_shape", "production identifier pretraining")
         _require_bool(oracle, "pretraining_gate_passed", "production identifier pretraining")
     elif stage == "phase_a1":
-        from tools.diagnose_causal_identifier_oracle import probe_v4_eligibility
-        probe = probe_v4_eligibility()
+        from tools.diagnose_causal_identifier_oracle import probe_v5_eligibility
+        probe = probe_v5_eligibility()
         if not probe.get("eligible"):
             raise RuntimeError(
                 "Phase A1 is blocked: the current formal v4 probe is not eligible"
@@ -295,9 +297,30 @@ def _require_upstream(stage: str, work_dir: Path) -> None:
 
 def run_pipeline(stages: Sequence[str], *, root: Path = ROOT,
                  work_dir: Path = DEFAULT_WORK, device: str = "auto",
-                 dry_run: bool = False) -> List[List[str]]:
+                 dry_run: bool = False, max_total_seconds: float = 28800.0) -> List[List[str]]:
     if not dry_run:
         work_dir.mkdir(parents=True, exist_ok=True)
+        from structured_training_runtime import atomic_json, training_code_hash
+        from structured_checkpoint import sha256_file
+        code_sha = training_code_hash()
+        manifest_path = work_dir / "execution_manifest.json"
+        manifest = (json.loads(manifest_path.read_text()) if manifest_path.exists()
+                    else {"training_seed": 7, "code_sha256": code_sha, "stages": {},
+                          "elapsed_seconds": 0.0, "deployment_authorized": False})
+        if manifest["code_sha256"] != code_sha:
+            raise RuntimeError("pipeline code changed; preserve the old run and use a new work directory")
+        started = time.monotonic()
+        previous_elapsed = float(manifest["elapsed_seconds"])
+    train_then_final = {"identifier_pretrain", "phase_a1", "phase_a2", "phase_b", "residual_oracle", "phase_c"}
+    gate_names = {"identifier_oracle": "pretraining_gate_passed",
+        "identifier_pretrain": "pretraining_gate_passed", "phase_a1": "phase_a_mean_gate_passed",
+        "identifier_revalidation": "causal_gate_revalidated", "phase_a2": "equilibrium_gate_passed",
+        "phase_b": "phase_b_gate_passed", "residual_oracle": "oracle_gate_passed",
+        "phase_c": "phase_c_gate_passed", "calibration": "promotion_gate_passed",
+        "postcheck": "postcheck_gate_passed", "migration": "migration_gate_passed",
+        "fullspace2": "formal_gate_passed", "fullspace4": "formal_gate_passed",
+        "postms_calibration": "promotion_gate_passed", "postms_postcheck": "postcheck_gate_passed",
+        "postms_migration": "migration_gate_passed"}
     commands: List[List[str]] = []
     for stage in stages:
         if not dry_run:
@@ -313,9 +336,101 @@ def run_pipeline(stages: Sequence[str], *, root: Path = ROOT,
         print("[dry-run]" if dry_run else "[run]", shlex.join(command))
         if dry_run:
             continue
-        completed = subprocess.run(command, cwd=root, check=False)
-        if completed.returncode != 0:
-            raise RuntimeError(f"structured pipeline stage {stage} failed with exit {completed.returncode}")
+        if any(flag.startswith("--allow-") for flag in command):
+            raise RuntimeError("formal pipeline refuses failed-gate or smoke override flags")
+        report_path = _report_path(stage, work_dir)
+        input_hashes = {}
+        for index, flag in enumerate(command[:-1]):
+            if (flag.startswith("--") and flag not in {"--report"}
+                    and any(word in flag for word in ("checkpoint", "report", "artifact"))):
+                path = Path(command[index + 1])
+                if path.is_file():
+                    input_hashes[str(path.resolve())] = sha256_file(path)
+        cached = manifest["stages"].get(stage, {})
+        if (cached.get("status") == "passed" and cached.get("command") == command
+                and cached.get("input_sha256") == input_hashes
+                and report_path.is_file() and cached.get("report_sha256") == sha256_file(report_path)
+                and all(Path(path).is_file() and sha256_file(path) == digest
+                        for path, digest in cached.get("artifact_sha256", {}).items())):
+            print("[reuse]", stage, flush=True)
+            continue
+        elapsed = previous_elapsed + time.monotonic() - started
+        remaining = max_total_seconds - elapsed
+        if remaining <= 0:
+            raise RuntimeError("total pipeline walltime budget exhausted; saved progress is resumable")
+        record = {"command": command, "status": "running", "attempts": [], "gate": gate_names[stage],
+                  "input_sha256": input_hashes}
+        manifest["stages"][stage] = record
+        atomic_json(manifest_path, manifest)
+
+        def execute(argv: List[str], label: str) -> None:
+            began = time.monotonic()
+            log_path = work_dir / (stage + "_" + label + ".log")
+            with log_path.open("a") as log:
+                process = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+                remaining_seconds = max(0.01, max_total_seconds - previous_elapsed - (time.monotonic() - started))
+                timer = threading.Timer(remaining_seconds, process.terminate)
+                timer.daemon = True
+                timer.start()
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                    log.flush()
+                returncode = process.wait()
+                timer.cancel()
+            record["attempts"].append({"command": argv, "mode": label, "returncode": returncode,
+                "seconds": time.monotonic() - began, "log": str(log_path)})
+            manifest["elapsed_seconds"] = previous_elapsed + time.monotonic() - started
+            atomic_json(manifest_path, manifest)
+            if returncode:
+                record["status"] = "process_failed"
+                atomic_json(manifest_path, manifest)
+                raise RuntimeError(f"structured pipeline stage {stage} failed with exit {returncode}")
+
+        if stage in {"identifier_revalidation", "calibration", "postcheck", "migration",
+                     "postms_calibration", "postms_postcheck", "postms_migration"}:
+            claim_path = root / "reports/structured_seed7_final_claims" / (stage + ".json")
+            inputs = {}
+            for flag in ("--checkpoint", "--student-checkpoint", "--phase-a1-checkpoint"):
+                if flag in command:
+                    path = Path(command[command.index(flag) + 1])
+                    inputs[str(path.resolve())] = sha256_file(path)
+            claim_path.parent.mkdir(parents=True, exist_ok=True)
+            with claim_path.open("x") as stream:
+                json.dump({"stage": stage, "code_sha256": code_sha, "command": command,
+                           "candidate_inputs": inputs, "status": "claimed_before_collection"}, stream, indent=2)
+                stream.flush()
+                import os
+                os.fsync(stream.fileno())
+        execute(command, "development" if stage in train_then_final else "run")
+        if stage in train_then_final:
+            dev_path = report_path.with_name(report_path.stem + "_development.json")
+            development = _read_report(dev_path)
+            if development.get("candidate_ready") is not True:
+                record.update(status="development_gate_blocked", development_report=str(dev_path),
+                              blocker=development.get("status"))
+                atomic_json(manifest_path, manifest)
+                raise RuntimeError(f"{stage} development gate did not authorize final evaluation: {development.get('status')}")
+            execute([*command, "--final-evaluation"], "final")
+        report = _read_report(report_path)
+        if report.get(gate_names[stage]) is not True:
+            record.update(status="gate_failed", report_sha256=sha256_file(report_path))
+            atomic_json(manifest_path, manifest)
+            raise RuntimeError(f"{stage} failed {gate_names[stage]}; downstream stages remain blocked")
+        artifacts = {}
+        for flag in ("--output", "--output-checkpoint"):
+            if flag in command:
+                path = Path(command[command.index(flag) + 1])
+                if path.is_file():
+                    artifacts[str(path.resolve())] = sha256_file(path)
+        if stage == "identifier_oracle":
+            path = Path(report["collection_path"])
+            artifacts[str(path.resolve())] = sha256_file(path)
+        record.update(status="passed", report_sha256=sha256_file(report_path), artifact_sha256=artifacts)
+        manifest["elapsed_seconds"] = previous_elapsed + time.monotonic() - started
+        manifest["deployment_authorized"] = stage == "postms_migration"
+        atomic_json(manifest_path, manifest)
     return commands
 
 
@@ -325,6 +440,7 @@ def parse_cli(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max-total-seconds", type=float, default=28800.0)
     return parser.parse_args(argv)
 
 
@@ -333,7 +449,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     stages = STAGES if args.stage == "all" else (args.stage,)
     try:
         run_pipeline(stages, work_dir=args.work_dir, device=args.device,
-                     dry_run=args.dry_run)
+                     dry_run=args.dry_run, max_total_seconds=args.max_total_seconds)
     except RuntimeError as exc:
         print(f"pipeline stopped: {exc}", file=sys.stderr)
         return 1
@@ -341,4 +457,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # The task-learning method is the default. This explicit historical switch
+    # preserves old experiments without making Q2 migration a prerequisite.
+    if "--historical-q2-distillation" not in sys.argv:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tools.train_response_control import main as response_task_main
+        raise SystemExit(response_task_main(sys.argv[1:]))
+    sys.argv.remove("--historical-q2-distillation")
+    import os
+    os.environ["DIFFPHYS_HISTORICAL_Q2"] = "1"
     raise SystemExit(main())

@@ -5,3 +5,4 @@
 --report {work}/postms_postcheck_report.json
 --device {device}
 --seed 7
+--scenario-seed-offset 710000

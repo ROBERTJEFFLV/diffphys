@@ -187,57 +187,25 @@ class ActiveSetBoxQPAllocator(nn.Module):
             weighted_mixer.transpose(1, 2) @ weighted_wrench.unsqueeze(-1)
         ).squeeze(-1) + self.damping * trim
 
-        candidates = []
-        objectives = []
         tolerance = self.feasibility_tolerance
-        # Four variables make explicit face enumeration both clearer and more
-        # reliable than an approximate unrolled projected-gradient iteration.
-        for pattern in self.active_patterns.tolist():
-            active = [index for index, value in enumerate(pattern) if value]
-            free = [index for index, value in enumerate(pattern) if not value]
-            candidate = torch.zeros_like(desired_wrench)
-            if active:
-                active_index = torch.tensor(active, device=mixer.device)
-                statuses = torch.tensor([pattern[index] for index in active],
-                                        device=mixer.device)
-                fixed = torch.where(
-                    statuses[None, :] < 0,
-                    lower.index_select(1, active_index),
-                    upper.index_select(1, active_index),
-                )
-                candidate = candidate.scatter(1, active_index[None, :].expand(batch, -1), fixed)
-            if free:
-                free_index = torch.tensor(free, device=mixer.device)
-                h_ff = hessian.index_select(1, free_index).index_select(2, free_index)
-                free_rhs = rhs.index_select(1, free_index)
-                if active:
-                    h_fa = hessian.index_select(1, free_index).index_select(2, active_index)
-                    free_rhs = free_rhs - (
-                        h_fa @ candidate.index_select(1, active_index).unsqueeze(-1)
-                    ).squeeze(-1)
-                free_value = torch.linalg.solve(h_ff, free_rhs.unsqueeze(-1)).squeeze(-1)
-                candidate = candidate.scatter(
-                    1, free_index[None, :].expand(batch, -1), free_value
-                )
-            feasible = (
-                (candidate >= lower - tolerance)
-                & (candidate <= upper + tolerance)
-                & torch.isfinite(candidate)
-            ).all(dim=-1)
-            wrench_error = (
-                torch.bmm(mixer, candidate.unsqueeze(-1)).squeeze(-1)
-                - desired_wrench
-            ) * weights
-            objective = 0.5 * wrench_error.square().sum(-1)
-            objective = objective + 0.5 * self.damping * (candidate - trim).square().sum(-1)
-            objective = torch.where(
-                feasible, objective,
-                torch.full_like(objective, torch.finfo(objective.dtype).max),
-            )
-            candidates.append(candidate)
-            objectives.append(objective)
-        candidate_stack = torch.stack(candidates, dim=1)
-        objective_stack = torch.stack(objectives, dim=1)
+        # Evaluate the same 81 faces in one batched solve. Active coordinates
+        # get identity rows; the free block is exactly the original H_ff.
+        patterns = self.active_patterns.to(device=mixer.device)
+        free = (patterns == 0).to(mixer.dtype)[None]
+        active = 1.0 - free
+        fixed = torch.where(patterns[None] < 0, lower[:, None], upper[:, None]) * active
+        face_hessian = (hessian[:, None] * free[..., :, None] * free[..., None, :]
+                        + torch.diag_embed(active))
+        face_rhs = free * (rhs[:, None] - (hessian[:, None] @ fixed[..., None]).squeeze(-1)) + fixed
+        candidate_stack = torch.linalg.solve(face_hessian, face_rhs[..., None]).squeeze(-1)
+        feasible = ((candidate_stack >= lower[:, None] - tolerance)
+                    & (candidate_stack <= upper[:, None] + tolerance)
+                    & torch.isfinite(candidate_stack)).all(-1)
+        wrench_error = ((mixer[:, None] @ candidate_stack[..., None]).squeeze(-1)
+                        - desired_wrench[:, None]) * weights
+        objective_stack = (0.5 * wrench_error.square().sum(-1)
+                           + 0.5 * self.damping * (candidate_stack - trim[:, None]).square().sum(-1))
+        objective_stack = torch.where(feasible, objective_stack, torch.full_like(objective_stack, torch.inf))
         selected = objective_stack.argmin(dim=1)
         action = candidate_stack.gather(
             1, selected[:, None, None].expand(batch, 1, ACTION_DIM)

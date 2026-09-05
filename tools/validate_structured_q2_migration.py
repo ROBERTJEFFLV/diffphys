@@ -601,7 +601,8 @@ def validate(args: argparse.Namespace) -> Dict[str, Any]:
     all_rows: List[Dict[str, Any]] = []
     rollout_completed = True
     try:
-        for regime, balanced in (("natural", False), ("balanced", True)):
+        for regime_index, (regime, balanced) in enumerate((("natural", False), ("balanced", True))):
+            torch.manual_seed(args.seed + getattr(args, "scenario_seed_offset", 520000) + regime_index)
             initial = simulator.reset(
                 256, device=device, dtype=torch.float32, sample_dynamics=True,
                 sampled_dynamics_level="broad", broad_sampler="physical-fit",
@@ -659,6 +660,7 @@ def validate(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_checkpoint": str(Path(args.teacher_checkpoint).resolve()),
         "student_checkpoint": str(Path(args.student_checkpoint).resolve()),
         "device": str(device), "seed": args.seed,
+        "scenario_seeds": [args.seed + getattr(args, "scenario_seed_offset", 520000) + i for i in (0, 1)],
         "scenario_count_per_regime": 256, "regimes": ["natural", "balanced"],
         "horizons": [250, 500], "prerequisites": prerequisites, "gates": gates,
         "migration_gate_passed": bool(gates.get("migration_gate_passed", False)),
@@ -705,6 +707,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-output", type=Path, default=ROOT / "runs/structured_q2_migration.json")
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--scenario-seed-offset", type=int, default=520000)
     return parser.parse_args()
 
 

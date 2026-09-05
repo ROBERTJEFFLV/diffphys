@@ -40,7 +40,22 @@ def so3_local_residual(predicted: Tensor, actual: Tensor) -> Tensor:
     sine = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
     cosine = 0.5 * (relative.diagonal(dim1=-2, dim2=-1).sum(-1, keepdim=True) - 1.0)
     angle = torch.atan2(sine, cosine.clamp(-1.0, 1.0))
-    return angle * vector / sine.clamp_min(1.0e-12)
+    # angle*vector/clamp(sine) has ZERO derivative at identity.  The log
+    # derivative there must be the identity on the tangent space.
+    scale = torch.where(cosine > 0.9999,
+                        1.0 + sine.square() / 6.0 + 3.0 * sine.pow(4) / 40.0,
+                        angle / sine.clamp_min(1.0e-12))
+    result = scale * vector
+    # At pi the skew part vanishes: recover the axis from R + I.  Choosing
+    # the longest column avoids division by a small axis component.  The
+    # logarithm's cut is inherently non-smooth; no smoothness claim is made.
+    identity = torch.eye(3, device=relative.device, dtype=relative.dtype)
+    symmetric = relative + relative.transpose(-1, -2) + 2.0 * identity
+    column = symmetric.diagonal(dim1=-2, dim2=-1).argmax(-1)
+    axis = symmetric.gather(-1, column[..., None, None].expand(*column.shape, 3, 1)).squeeze(-1)
+    axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    axis = torch.where((axis * vector).sum(-1, keepdim=True) < 0, -axis, axis)
+    return torch.where(cosine < -0.9999, angle * axis, result)
 
 
 def so3_exp(tangent: Tensor) -> Tensor:
@@ -202,10 +217,13 @@ class FullSpaceProblem:
     layout: BoundaryLayout
     objective: Objective | None = None
     task_residual: TaskResidual | None = None
+    fixed_boundary_mask: Tensor | None = None
 
     def _all_boundaries(self, boundaries: Tensor) -> Tensor:
         if boundaries.ndim < 2 or boundaries.shape[-1] != self.layout.state_dim:
             raise ValueError("boundaries must end in BoundaryLayout.state_dim")
+        if self.fixed_boundary_mask is not None:
+            boundaries = torch.where(self.fixed_boundary_mask, self.boundaries.detach(), boundaries)
         return torch.cat((self.initial.unsqueeze(0), boundaries), dim=0)
 
     def segment_ends(self, boundaries: Tensor | None = None, theta: Tensor | None = None) -> Tensor:
@@ -561,7 +579,10 @@ def solve_joint_sqp_step(
         )
     theta = problem.theta.detach().requires_grad_(True)
     boundaries = problem.boundaries.detach().requires_grad_(True)
-    local = FullSpaceProblem(problem.initial, boundaries, theta, problem.segment_map, problem.layout, problem.objective, problem.task_residual)
+    local = FullSpaceProblem(
+        problem.initial, boundaries, theta, problem.segment_map, problem.layout,
+        problem.objective, problem.task_residual, problem.fixed_boundary_mask,
+    )
     merit, defects, task = local.merit(boundaries, theta, penalty)
     c = defects.detach()
     r = task.detach()

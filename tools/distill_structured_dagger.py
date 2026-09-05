@@ -41,7 +41,7 @@ from structured_checkpoint import (  # noqa: E402
 )
 from tools.diagnose_causal_identifier_oracle import (  # noqa: E402
     DEFAULT_PROBE_V4_REPORT,
-    probe_v4_eligibility,
+    probe_v5_eligibility,
 )
 
 
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--horizon", type=int, default=126)
     parser.add_argument("--prefix", type=int, default=25)
     parser.add_argument("--updates-per-beta", type=int, default=1)
     parser.add_argument("--maximum-buffer-episodes", type=int, default=10)
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--identifier-dim", type=int, default=64)
     parser.add_argument("--slow-cadence", type=int, default=25)
-    parser.add_argument("--identification-publish-start", type=int, default=50)
+    parser.add_argument("--identification-publish-start", type=int, default=100)
     parser.add_argument(
         "--motor-observer-bank-size", type=int, choices=(0, 15, 35), default=0,
         help="0 preserves legacy checkpoints; 15/35 enable fixed multi-tau v1/v2",
@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "--motor-tau-grid-version", type=int, choices=(0, 1, 2), default=0,
     )
     parser.add_argument(
-        "--burn-in-probe-amplitude", type=float, default=0.005,
+        "--burn-in-probe-amplitude", type=float, default=0.0,
         help=(
             "zero-mean motor-coordinate identification probe amplitude; "
             "the command still passes through the constrained allocator"
@@ -146,6 +146,8 @@ def parse_args() -> argparse.Namespace:
         "--external-residual-oracle-report", type=Path, default=None,
         help="pre-registered residual oracle report authorizing Phase C",
     )
+    from structured_training_runtime import add_training_arguments
+    add_training_arguments(parser)
     return parser.parse_args()
 
 
@@ -265,7 +267,7 @@ def _validate_identification_oracle_report(
     # therefore accepts its immutable pretraining contract; later stages can
     # still require the stronger formal fields.  Never treat a screening
     # report as either contract.
-    final_ready = bool(report.get("formal_eligible")) and bool(report.get("gate_passed"))
+    final_ready = report.get("formal_eligible") is True and report.get("gate_passed") is True
     pretraining_ready = (
         report.get("requested_formal_shape") is True
         and report.get("pretraining_gate_passed") is True
@@ -278,15 +280,15 @@ def _validate_identification_oracle_report(
     if pretraining_ready:
         checks = report.get("pretraining_checks")
         required_checks = {
-            "coverage", "physics_ceiling", "physics_finite",
+            "coverage", "paired_safety", "physics_ceiling", "physics_finite",
             "physics_branch_support", "finite_collection",
             "no_identification_failure", "zero_q2_parity",
         }
         if (not isinstance(checks, dict)
                 or any(checks.get(name) is not True for name in required_checks)):
             raise RuntimeError("identification oracle pretraining contract is incomplete")
-    if abs(float(report["probe_amplitude"]) - 0.005) > 1.0e-12:
-        raise RuntimeError("identification oracle must use probe amplitude 0.005")
+    if abs(float(report["probe_amplitude"])) > 1.0e-12:
+        raise RuntimeError("identification oracle must use passive v5 with probe amplitude 0.0")
     grid_sizes = report["tau_grid_sizes"]
     try:
         normalized_grid_sizes = sorted(set(int(value) for value in grid_sizes))
@@ -312,11 +314,11 @@ def _validate_identification_oracle_report(
     cadence = report["cadence_semantics"]
     if not isinstance(cadence, dict) or not bool(cadence.get("call_index_completed_transitions")):
         raise RuntimeError("identification oracle lacks completed-transition cadence semantics")
-    if list(cadence.get("publication_calls", ())) != [50, 75]:
-        raise RuntimeError("identification oracle active publications must be call50/call75")
+    if list(cadence.get("publication_calls", ())) != [100, 125]:
+        raise RuntimeError("identification oracle active publications must be call100/call125")
     if list(cadence.get("availability_t25", ())) != [0, 0, 0, 0, 0, 0]:
         raise RuntimeError("identification oracle must mark every t25 capability unavailable")
-    if int(cadence.get("t50_call_index", -1)) != 50:
+    if int(cadence.get("t50_call_index", -1)) != 100:
         raise RuntimeError("identification oracle t50 call index is invalid")
     checkpoint_hash = str(report["checkpoint_sha256"])
     if checkpoint_hash != _sha256_file(source_checkpoint):
@@ -378,7 +380,7 @@ def main() -> None:
             raise ValueError("Phase A1 requires --capability-nll-weight 0")
         if args.capability_mean_weight <= 0.0:
             raise ValueError("Phase A1 requires a positive capability mean weight")
-        probe_eligibility = probe_v4_eligibility(
+        probe_eligibility = probe_v5_eligibility(
             args.probe_v4_report, q2_checkpoint=args.source_checkpoint
         )
         if not probe_eligibility.get("eligible"):
@@ -391,6 +393,7 @@ def main() -> None:
             raise ValueError("Phase A2 requires a positive capability NLL weight")
         if args.capability_mean_weight != 0.0:
             raise ValueError("Phase A2 requires --capability-mean-weight 0")
+    torch.set_num_threads(1)
     device = _device(args.device)
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -404,9 +407,6 @@ def main() -> None:
         build_dagger_scenario_bank(64, seed=args.seed + 100 + round, dt=simulator.params.dt)
         for round in range(len(DAGGER_BETA_SCHEDULE))
     ]
-    calibration_bank_cpu = build_dagger_scenario_bank(64, seed=args.seed + 1, dt=simulator.params.dt)
-    validation_bank_cpu = build_dagger_scenario_bank(64, seed=args.seed + 2, dt=simulator.params.dt)
-    final_bank_cpu = build_dagger_scenario_bank(64, seed=args.seed + 3, dt=simulator.params.dt)
 
     def move_bank(bank_cpu):
         if device.type == "cpu":
@@ -421,9 +421,6 @@ def main() -> None:
 
     train_banks = [move_bank(item) for item in train_bank_cpus]
     bank = train_banks[0]
-    calibration_bank = move_bank(calibration_bank_cpu)
-    validation_bank = move_bank(validation_bank_cpu)
-    final_bank = move_bank(final_bank_cpu)
     if args.phase in ("A2", "C") and args.student_checkpoint is None:
         required = "phase-A1" if args.phase == "A2" else "phase-B local-gain"
         raise RuntimeError(f"phase {args.phase} requires a {required} checkpoint")
@@ -526,12 +523,11 @@ def main() -> None:
             student,
             q2_checkpoint=args.source_checkpoint,
             causal_oracle_report=args.identification_oracle_report,
-            probe_v4_report=args.probe_v4_report,
         )
         if args.identifier_pretraining_report is None:
             raise RuntimeError(
                 "Phase A1 requires --identifier-pretraining-report; "
-                "a structurally valid artifact alone does not certify calls50/75 accuracy"
+                "a structurally valid artifact alone does not certify calls100/125 accuracy"
             )
         identifier_pretraining_contract = validate_identifier_pretraining_report(
             args.identifier_pretraining_report,
@@ -540,6 +536,7 @@ def main() -> None:
             policy=student,
             q2_checkpoint=args.source_checkpoint,
             causal_oracle_report=args.identification_oracle_report,
+            probe_v4_report=args.probe_v4_report,
         )
     external_h250 = None
     if args.phase == "C":
@@ -552,68 +549,108 @@ def main() -> None:
     if not active_parameters:
         raise RuntimeError("selected distillation phase has no trainable parameters")
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=args.lr, weight_decay=1.0e-5)
-    history = []
-    final_episodes = []
-    # Keep a stratified recurrent replay across all DAgger rounds.  A plain
-    # FIFO of the last two episodes made the identifier chase the newest bank
-    # and forget the previous authority strata/distributions.
-    replay_by_round: dict[int, list] = {}
-    replay_slots_per_round = max(
-        1, args.maximum_buffer_episodes // len(DAGGER_BETA_SCHEDULE)
-    )
-    replay_buffer = []
-    for round_index, beta in enumerate(DAGGER_BETA_SCHEDULE, start=1):
-        episodes = []
-        for _ in range(args.updates_per_beta):
-            episode = collect_dagger_episode(
-                teacher, student, simulator, train_banks[round_index - 1], beta=beta,
-                horizon=args.horizon, episode_seed=args.seed + round_index * 1000,
-            )
-            round_replay = replay_by_round.setdefault(round_index, [])
-            round_replay.append(episode)
-            del round_replay[:-replay_slots_per_round]
-            replay_buffer = [
-                stored
-                for replay_round in sorted(replay_by_round)
-                for stored in replay_by_round[replay_round]
-            ]
-            buffered = [
-                dagger_window_loss(
-                    student, stored, prefix=args.prefix,
-                    delta_action_weight=args.delta_action_weight,
-                    capability_weight=args.capability_nll_weight,
-                    capability_mean_weight=args.capability_mean_weight,
-                    phase=active_phase,
-                    body_z_weight=args.body_z_weight,
-                )
-                for stored in replay_buffer
-            ]
-            loss = torch.stack([item[0] for item in buffered]).mean()
-            components = {
-                key: sum(item[1][key] for item in buffered) / len(buffered)
-                for key in ("action", "full_action", "analytic_trim", "body_z",
-                            "disturbance", "one_step_equilibrium",
-                            "capability_nll", "capability_mean", "delta_action",
-                            "same_latent_intercept_diagnostic")
-            }
-            components["beta"] = beta
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            gradient_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
-            if not bool(torch.isfinite(gradient_norm).item()):
-                raise RuntimeError("non-finite DAgger gradient")
-            optimizer.step()
-            episodes.append(episode)
-            history.append({"round": round_index, "beta": beta, "loss": float(loss.detach()),
-                            "gradient_norm": float(gradient_norm.detach()), **components})
-            history[-1].update({
-                "train_bank_seed": args.seed + 100 + (round_index - 1),
-                "teacher_execution_count": int(episode.intervention_mask.sum().item()),
-                "student_execution_count": int(episode.intervention_mask.numel() - episode.intervention_mask.sum().item()),
-                "intervention_mode": "teacher_or_student_per_episode",
-                "identification_failure_t50_count": int(episode.identification_failure_t50.sum().item()),
-            })
-        final_episodes = episodes
+    from structured_training_runtime import TrainingSession, equilibrium_score
+    session = TrainingSession(args, student, optimizer, stage="phase_" + active_phase.lower())
+    history = session.progress["history"]
+    replay_by_round = session.progress.setdefault("replay_by_round", {})
+    replay_slots_per_round = max(1, args.maximum_buffer_episodes // len(DAGGER_BETA_SCHEDULE))
+    replay_buffer = [stored for index in sorted(replay_by_round) for stored in replay_by_round[index]]
+    split_offset = {"A1": 100000, "A2": 110000, "C": 130000}[active_phase]
+    calibration_seed, validation_seed, final_seed = (args.seed + split_offset + i for i in (1, 2, 3))
+
+    def development_result():
+        dev_seed = args.seed + 2100000 + split_offset
+        dev_bank = move_bank(build_dagger_scenario_bank(64, seed=dev_seed, dt=simulator.params.dt))
+        saved_calibration = {name: value.detach().clone() for name, value in student.named_buffers()
+                             if name.startswith("capability_calibr")}
+        saved_q = student.capability_conformal_q.detach().clone()
+        try:
+            if active_phase == "A2":
+                dev_cal = move_bank(build_dagger_scenario_bank(64, seed=dev_seed + 1, dt=simulator.params.dt))
+                ep_cal = collect_dagger_episode(teacher, student, simulator, dev_cal, beta=0.0,
+                                                horizon=args.horizon, episode_seed=dev_seed + 90)
+                q, _ = fit_effectiveness_conformal_q(ep_cal, miscoverage=0.10, phase_steps=(100, 125))
+                student.install_capability_conformal_q(q, sample_count=64)
+            episode = collect_dagger_episode(teacher, student, simulator, dev_bank, beta=0.0,
+                                             horizon=args.horizon, episode_seed=dev_seed + 99)
+            if active_phase == "C":
+                rows, passed, score = _annulus_action_gate(student, episode,
+                    r_min=external_h250["r_min"], r_max=external_h250["r_max"],
+                    threshold=external_h250["threshold"])
+                return score / external_h250["threshold"], passed, {"seed": dev_seed, "rows": rows}
+            metrics, passed = phase_a_equilibrium_gate(episode,
+                require_identification_width=active_phase == "A2")
+            return equilibrium_score(metrics), passed, {"seed": dev_seed, "equilibrium": metrics}
+        finally:
+            with torch.no_grad():
+                student.capability_conformal_q.copy_(saved_q)
+                for name, value in student.named_buffers():
+                    if name in saved_calibration:
+                        value.copy_(saved_calibration[name])
+
+    if not args.final_evaluation:
+        session.save()
+        first_round = int(session.progress.get("round_index", 1))
+        for round_index in range(first_round, len(DAGGER_BETA_SCHEDULE) + 1):
+            beta = DAGGER_BETA_SCHEDULE[round_index - 1]
+            start_update = int(session.progress.get("round_update", 0)) if round_index == first_round else 0
+            for local_update in range(start_update, args.updates_per_beta):
+                if session.stop_requested or session.elapsed >= args.max_seconds:
+                    break
+                episode = collect_dagger_episode(teacher, student, simulator,
+                    train_banks[round_index - 1], beta=beta, horizon=args.horizon,
+                    episode_seed=args.seed + round_index * 1000 + local_update)
+                round_replay = replay_by_round.setdefault(round_index, [])
+                round_replay.append(episode)
+                del round_replay[:-replay_slots_per_round]
+                replay_buffer = [values[local_update % len(values)]
+                    for index, values in sorted(replay_by_round.items())]
+                optimizer.zero_grad(set_to_none=True)
+                components = {}
+                total_loss = 0.0
+                for stored in replay_buffer:
+                    loss, values = dagger_window_loss(student, stored, prefix=args.prefix,
+                        delta_action_weight=args.delta_action_weight,
+                        capability_weight=args.capability_nll_weight,
+                        capability_mean_weight=args.capability_mean_weight,
+                        phase=active_phase, body_z_weight=args.body_z_weight)
+                    (loss / len(replay_buffer)).backward()
+                    total_loss += float(loss.detach()) / len(replay_buffer)
+                    for key, value in values.items():
+                        components[key] = components.get(key, 0.0) + value / len(replay_buffer)
+                norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
+                if not bool(torch.isfinite(norm)) or not math.isfinite(total_loss):
+                    session.progress["status"] = "nonfinite_gradient"
+                    session.save()
+                    raise RuntimeError("non-finite DAgger update")
+                optimizer.step()
+                session.progress.update(round_index=round_index, round_update=local_update + 1)
+                session.record_update({"round": round_index, "beta": beta, "loss": total_loss,
+                    "gradient_norm": float(norm), **components,
+                    "train_bank_seed": args.seed + 100 + round_index - 1,
+                    "teacher_execution_count": int(episode.intervention_mask.sum()),
+                    "student_execution_count": int(episode.intervention_mask.numel() - episode.intervention_mask.sum()),
+                    "intervention_mode": "teacher_or_student_per_episode"})
+                if session.development_due():
+                    score, passed, metrics = development_result()
+                    session.record_development(score=score, passed=passed and round_index == 5, metrics=metrics)
+            if session.stop_requested or session.elapsed >= args.max_seconds:
+                break
+            session.progress.update(round_index=round_index + 1, round_update=0)
+            session.save()
+        score, passed, metrics = development_result()
+        session.record_development(score=score, passed=passed and session.progress.get("round_index", 1) > 5, metrics=metrics)
+        result = session.finish_development(complete_schedule=session.progress.get("round_index", 1) > 5)
+        print(json.dumps({"stage": session.stage, "status": result["status"]}), flush=True)
+        return
+
+    session.begin_final([calibration_seed, validation_seed, final_seed])
+    history = session.progress["history"]
+    replay_by_round = session.progress.get("replay_by_round", {})
+    replay_buffer = [stored for index in sorted(replay_by_round) for stored in replay_by_round[index]]
+    calibration_bank = move_bank(build_dagger_scenario_bank(64, seed=calibration_seed, dt=simulator.params.dt))
+    validation_bank = move_bank(build_dagger_scenario_bank(64, seed=validation_seed, dt=simulator.params.dt))
+    final_bank = move_bank(build_dagger_scenario_bank(64, seed=final_seed, dt=simulator.params.dt))
     # Calibration and validation are held out from the training bank.  The
     # final gate is a third fresh bank collected after the last update.
     calibration_episode = collect_dagger_episode(
@@ -628,7 +665,7 @@ def main() -> None:
         calibration_episode,
         validation_episode=validation_episode,
         miscoverage=0.10,
-        phase_steps=(50, 75),
+        phase_steps=(100, 125),
     )
     # The 64-scenario DAgger run installs a smoke calibration so phase B has a
     # nonzero, uncertainty-gated contextual path.  It is never labeled a 99%
@@ -690,21 +727,22 @@ def main() -> None:
         "cadence_semantics": {
             "call_index_completed_transitions": True,
             "call0_has_response": False,
-            "publication_calls": [50, 75],
+            "publication_calls": [100, 125],
             "availability_t25": [0, 0, 0, 0, 0, 0],
-            "publication_rule_after_first": "positive slow_cadence offsets from call50",
-            "t50_call_index": 50,
+            "publication_rule_after_first": "positive slow_cadence offsets from call100",
+            "t50_call_index": 100,
         },
         "source_checkpoint": str(args.source_checkpoint.resolve()),
         "teacher_is_runtime_dependency": False,
         "teacher_is_training_dependency": True,
         "device": str(device), "seed": args.seed, "scenario_count": bank.count,
-        "bank_seeds": {"train": [args.seed + 100 + round for round in range(len(DAGGER_BETA_SCHEDULE))], "calibration": args.seed + 1,
-                       "validation": args.seed + 2, "final_gate": args.seed + 3},
+        "bank_seeds": {"train": [args.seed + 100 + round for round in range(len(DAGGER_BETA_SCHEDULE))], "calibration": calibration_seed,
+                       "validation": validation_seed, "final_gate": final_seed},
         "tw_bins": 4, "log_alpha_bins": 4, "scenarios_per_cell": 4,
         "horizon": args.horizon, "prefix": args.prefix, "window": args.horizon - args.prefix,
         "beta_schedule": list(DAGGER_BETA_SCHEDULE), "final_beta": DAGGER_BETA_SCHEDULE[-1],
         "config": asdict(config), "history": history, "layered_gate_passed": gate_passed,
+        "training_session": session.summary(),
         "identification_oracle": oracle_contract,
         "identifier_init_artifact": identifier_contract,
         "identifier_pretraining_report": identifier_pretraining_contract,
@@ -732,7 +770,7 @@ def main() -> None:
         "conformal_coverage_by_stratum": conformal_rows,
         "effectiveness_conformal_q": [float(value) for value in conformal_q],
         "effectiveness_conformal_risk_rows": conformal_risk_rows,
-        "conformal_scope": "alpha_conditional_four_log_alpha_risk_strata; joint phase50_75 effectiveness dimensions",
+        "conformal_scope": "alpha_conditional_four_log_alpha_risk_strata; joint phase100_125 effectiveness dimensions",
         "validation_interpretation": "shift diagnostic only; not a coverage proof",
         "teacher_same_latent_intercept_is_equilibrium": False,
         "teacher_same_latent_intercept_usage": "diagnostic_only",

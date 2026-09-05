@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-small-risk-smoke", action="store_true")
     parser.add_argument("--allow-failed-migration-gate", action="store_true")
+    from structured_training_runtime import add_training_arguments
+    add_training_arguments(parser)
     return parser.parse_args()
 
 
@@ -117,6 +119,9 @@ def _initial_observation(state) -> torch.Tensor:
 
 def main() -> None:
     args = parse_args()
+    torch.set_num_threads(1)
+    if args.final_evaluation:
+        raise ValueError("MS acceptance is development data; final release is the separate post-MS pipeline")
     if args.outer_steps < 1 or args.batch_size < 1:
         raise ValueError("outer steps and batch size must be positive")
     if args.heldout_seed_offset == 0 or args.heldout_maximum_risk_ratio <= 0.0:
@@ -134,7 +139,10 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     policy, source = load_structured_policy(args.checkpoint, device=device)
-    migration_passed = bool(source.get("report", {}).get("migration_gate_passed", False))
+    from structured_checkpoint import require_formal_identification_config
+    if not args.allow_failed_migration_gate:
+        require_formal_identification_config(policy.config)
+    migration_passed = source.get("report", {}).get("migration_gate_passed") is True
     if not migration_passed and not args.allow_failed_migration_gate:
         raise RuntimeError(
             "structured checkpoint failed the Q2 migration gate; refusing long-horizon optimization"
@@ -160,6 +168,8 @@ def main() -> None:
     if args.action_probe_stride != 1 and not args.allow_small_risk_smoke:
         raise ValueError("formal action trust region must evaluate every reference action")
 
+    from structured_training_runtime import TrainingSession
+    session = TrainingSession(args, policy, None, stage="fullspace" + str(args.segments))
     simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
 
     def scenario_state(seed: int):
@@ -227,7 +237,7 @@ def main() -> None:
         raise RuntimeError(
             "identifier confidence failed before shooting; refusing to remove the burn-in guard"
         )
-    boot_total = policy.config.burn_in_steps + policy.config.contextual_blend_steps
+    boot_total = policy.config.identification_publish_start
     boot_completed = args.pre_rollout_steps >= boot_total
     if not boot_completed and not args.allow_failed_migration_gate:
         raise ValueError(
@@ -262,7 +272,12 @@ def main() -> None:
     )
     initial = codec.pack(closed).detach()
     heldout_initial = heldout_codec.pack(heldout_closed).detach()
-    endpoints = initialize_exact_endpoints(segment_map, initial, theta, args.segments)
+    saved_solver = session.progress.get("solver")
+    if saved_solver is not None:
+        initial, heldout_initial = saved_solver["initial"], saved_solver["heldout_initial"]
+        theta, endpoints = saved_solver["theta"], saved_solver["endpoints"]
+    else:
+        endpoints = initialize_exact_endpoints(segment_map, initial, theta, args.segments)
     metric = default_phase_space_metric(
         dt=policy.config.dt,
         sample_steps=args.segment_steps,
@@ -273,18 +288,23 @@ def main() -> None:
         device=device,
         dtype=theta.dtype,
     )
-    rows = []
-    damping = float(args.damping)
-    parameter_radius = float(args.parameter_radius)
-    action_radius = float(args.action_radius)
-    consecutive_rejections = 0
-    for outer in range(1, args.outer_steps + 1):
+    rows = session.progress.setdefault("solver_rows", [])
+    saved_solver = saved_solver or {}
+    damping = float(saved_solver.get("damping", args.damping))
+    parameter_radius = float(saved_solver.get("parameter_radius", args.parameter_radius))
+    action_radius = float(saved_solver.get("action_radius", args.action_radius))
+    consecutive_rejections = int(saved_solver.get("consecutive_rejections", 0))
+    session.save()
+    for outer in range(session.updates + 1, args.outer_steps + 1):
+        if session.should_stop():
+            break
         problem = FullSpaceProblem(
             initial=initial,
             boundaries=endpoints,
             theta=theta,
             segment_map=segment_map,
             layout=codec.layout,
+            fixed_boundary_mask=codec.fixed_boundary_mask,
             task_residual=lambda starts, ends, value: phase_space_contraction_risk_residual(
                 codec, starts, ends,
                 metric=metric.matrix,
@@ -503,6 +523,7 @@ def main() -> None:
             preliminary_gate and row["restoration_gate_passed"]
         )
         rows.append(row)
+        stop_after_step = False
         if rows[-1]["solver_gate_passed"]:
             consecutive_rejections = 0
             accepted_ratio = float(row["restored_ratio"])
@@ -519,10 +540,21 @@ def main() -> None:
                 consecutive_rejections >= args.maximum_rejections
                 or min(parameter_radius, action_radius) < args.minimum_radius
             ):
-                break
+                stop_after_step = True
+        parameter_spec.assign_(policy, theta)
+        session.progress["solver"] = {"initial": initial, "heldout_initial": heldout_initial,
+            "theta": theta, "endpoints": endpoints, "damping": damping,
+            "parameter_radius": parameter_radius, "action_radius": action_radius,
+            "consecutive_rejections": consecutive_rejections}
+        session.record_update({"accepted": row["solver_gate_passed"], "outer_step": outer})
+        session.save()
+        if stop_after_step:
+            break
 
     parameter_spec.assign_(policy, theta)
     accepted_steps = sum(int(row["solver_gate_passed"]) for row in rows)
+    if accepted_steps:
+        policy.invalidate_capability_calibration()
     # This gate certifies only that the requested horizon admitted at least
     # one numerically acceptable full-space step.  It deliberately does not
     # re-promote the changed controller: any accepted theta update still has
@@ -587,6 +619,8 @@ def main() -> None:
         "trainable_parameter_names": list(parameter_spec.names),
         "parameter_trust_norm": "block-scaled-rms",
         "rows": rows,
+        "training_session": session.summary(),
+        "acceptance_bank_is_development_data": True,
         "accepted_steps": accepted_steps,
         "formal_gate_passed": formal_gate_passed,
         "formal_gate_scope": (
@@ -615,4 +649,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import os
+    historical = (
+        "--historical-q2-distillation" in sys.argv
+        or os.environ.get("DIFFPHYS_HISTORICAL_Q2") == "1"
+    )
+    if not historical:
+        from tools.train_response_control import main as response_task_main
+        raise SystemExit(response_task_main(["--optimizer", "full-space-ms", *sys.argv[1:]]))
+    if "--historical-q2-distillation" in sys.argv:
+        sys.argv.remove("--historical-q2-distillation")
     main()

@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
         "--allow-screening-only", action="store_true",
         help="run a non-promotable smoke when Phase-A release gates are false",
     )
+    from structured_training_runtime import add_training_arguments
+    add_training_arguments(parser)
     return parser.parse_args()
 
 
@@ -82,6 +84,7 @@ def _move_bank(bank, device: torch.device):
 
 def main() -> None:
     args = parse_args()
+    torch.set_num_threads(1)
     device = _device(args.device)
     torch.manual_seed(args.seed)
     student, student_source = load_structured_policy(args.checkpoint, device=device)
@@ -103,26 +106,36 @@ def main() -> None:
         raise RuntimeError("local Phase-B prototype requires residual_scale=0")
     simulator = L2FSimulator(L2FParams(dt=float(teacher_args.get("dt", student.config.dt))))
     train = _move_bank(build_dagger_scenario_bank(64, seed=args.seed, dt=simulator.params.dt), device)
-    heldout = _move_bank(build_dagger_scenario_bank(64, seed=args.seed + 1, dt=simulator.params.dt), device)
+    development = _move_bank(build_dagger_scenario_bank(64, seed=args.seed + 2200000, dt=simulator.params.dt), device)
     # The local-JVP target is built only from a fixed analytic-equilibrium
     # recurrent history.  Moving Q2 trajectories are collected separately as
     # a distribution-shift diagnostic and never enter the fit.
     train_snapshots = collect_equilibrium_history(
-        teacher, student, simulator, train, snapshot_steps=(50, 75)
+        teacher, student, simulator, train, snapshot_steps=(100, 125)
     )
-    heldout_snapshots = collect_equilibrium_history(
-        teacher, student, simulator, heldout, snapshot_steps=(50, 75)
+    development_snapshots = collect_equilibrium_history(
+        teacher, student, simulator, development, snapshot_steps=(100, 125)
     )
     train_shift_snapshots = collect_common_history(
-        teacher, student, simulator, train, snapshot_steps=(50, 75)
+        teacher, student, simulator, train, snapshot_steps=(100, 125)
     )
-    heldout_shift_snapshots = collect_common_history(
-        teacher, student, simulator, heldout, snapshot_steps=(50, 75)
-    )
+    def check_development():
+        batch = build_local_derivative_batch(teacher, student, development_snapshots,
+                                             radii=LOCAL_RADII, seed=args.seed + 2200010)
+        metrics = local_mode_diagnostics(teacher, student, development_snapshots, batch)
+        error = metrics["selected_gate_error_p95"]
+        score = float(error) / LOCAL_PRECAL_SURROGATE_P95_THRESHOLD if error is not None else float("inf")
+        return score, False, metrics
     derivative_batch, loss_history = fit_contextual_gain_local(
         student, teacher, train_snapshots, iterations=args.iterations,
         radii=LOCAL_RADII, seed=args.seed + 10,
+        training_args=args, development_callback=check_development,
     )
+    session = student._training_session
+    heldout_seed = args.seed + 120001 if args.final_evaluation else args.seed + 2200000
+    heldout = _move_bank(build_dagger_scenario_bank(64, seed=heldout_seed, dt=simulator.params.dt), device)
+    heldout_snapshots = collect_equilibrium_history(teacher, student, simulator, heldout, snapshot_steps=(100, 125))
+    heldout_shift_snapshots = collect_common_history(teacher, student, simulator, heldout, snapshot_steps=(100, 125))
     heldout_batch = build_local_derivative_batch(
         teacher, student, heldout_snapshots, radii=LOCAL_RADII, seed=args.seed + 11
     )
@@ -202,8 +215,8 @@ def main() -> None:
         "capability_calibration_valid": bool(student.capability_calibration_valid.item()),
         "requires_final_calibration": True,
         "authority_layout": "4x4 TW/log-alpha; 4 scenarios/cell",
-        "snapshot_steps": [50, 75],
-        "shift_diagnostic_snapshot_steps": [50, 75],
+        "snapshot_steps": [100, 125],
+        "shift_diagnostic_snapshot_steps": [100, 125],
         "shift_diagnostic_snapshot_count_train": len(train_shift_snapshots),
         "shift_diagnostic_snapshot_count_heldout": len(heldout_shift_snapshots),
         "jvp_state_contract": (
@@ -252,6 +265,14 @@ def main() -> None:
             "local derivative sample is directional finite-difference, not deployment certificate",
         ],
     })
+    report["training_session"] = session.summary()
+    report["heldout_scenario_seed"] = heldout_seed
+    if not args.final_evaluation:
+        error = mode_metrics["selected_gate_error_p95"]
+        session.record_development(score=float(error) / LOCAL_PRECAL_SURROGATE_P95_THRESHOLD if error is not None else float("inf"),
+            passed=phase_b_gate_passed, metrics=report)
+        session.finish_development()
+        return
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "architecture": "structured-recurrent-motor-policy",

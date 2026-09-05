@@ -5,9 +5,13 @@
 --report {work}/phase_c_report.json
 --device {device}
 --seed 7
---horizon 125
+--horizon 126
 --prefix 25
---updates-per-beta 1
+--updates-per-beta 120
+--minimum-updates 300
+--development-every 50
+--checkpoint-every 10
+--max-seconds 3600
 --maximum-buffer-episodes 10
 --delta-action-weight 0.1
 --body-z-weight 0.25

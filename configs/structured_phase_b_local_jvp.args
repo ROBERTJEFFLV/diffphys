@@ -5,6 +5,10 @@
 --report {work}/phase_b_report.json
 --device {device}
 --seed 7
---iterations 2
+--iterations 300
+--minimum-updates 100
+--development-every 25
+--checkpoint-every 5
+--max-seconds 1800
 --hidden-dim 64
 --identifier-dim 64

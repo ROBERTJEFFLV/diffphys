@@ -22,7 +22,7 @@ from structured_checkpoint import require_current_cadence_semantics
 
 
 Tensor = torch.Tensor
-BOUNDARY_CODEC_VERSION = 2
+BOUNDARY_CODEC_VERSION = 3
 LEGACY_BOUNDARY_CODEC_VERSION = 1
 STRUCTURED_BOUNDARY_CODEC_VERSION = BOUNDARY_CODEC_VERSION
 
@@ -130,64 +130,11 @@ def clone_l2f_state(state: L2FState) -> L2FState:
 
 
 def clone_policy_state(state: StructuredPolicyState) -> StructuredPolicyState:
-    return StructuredPolicyState(
-        hidden=state.hidden.detach().clone(),
-        identifier=state.identifier.detach().clone(),
-        motor_estimate=state.motor_estimate.detach().clone(),
-        integral=state.integral.detach().clone(),
-        motor_bank=None if state.motor_bank is None else state.motor_bank.detach().clone(),
-        slow_trim=None if state.slow_trim is None else state.slow_trim.detach().clone(),
-        slow_body_z=None if state.slow_body_z is None else state.slow_body_z.detach().clone(),
-        capability=None if state.capability is None else state.capability.detach().clone(),
-        slow_counter=int(state.slow_counter),
-        prev_velocity=None if state.prev_velocity is None else state.prev_velocity.detach().clone(),
-        prev_omega=None if state.prev_omega is None else state.prev_omega.detach().clone(),
-        context_sum=None if state.context_sum is None else state.context_sum.detach().clone(),
-        capability_log_mean=(None if state.capability_log_mean is None
-                             else state.capability_log_mean.detach().clone()),
-        capability_log_scale=(None if state.capability_log_scale is None
-                              else state.capability_log_scale.detach().clone()),
-        capability_ucb=(None if state.capability_ucb is None
-                        else state.capability_ucb.detach().clone()),
-        capability_ucb_target=(None if state.capability_ucb_target is None
-                               else state.capability_ucb_target.detach().clone()),
-        contextual_gain=(None if state.contextual_gain is None
-                         else state.contextual_gain.detach().clone()),
-        contextual_gain_target=(None if state.contextual_gain_target is None
-                                else state.contextual_gain_target.detach().clone()),
-        contextual_blend=(None if state.contextual_blend is None
-                          else state.contextual_blend.detach().clone()),
-        boot_progress=(None if state.boot_progress is None
-                       else state.boot_progress.detach().clone()),
-        identification_failed=(None if state.identification_failed is None
-                               else state.identification_failed.detach().clone()),
-        disturbance_accel=(None if state.disturbance_accel is None
-                           else state.disturbance_accel.detach().clone()),
-        disturbance_residual_sum=(
-            None if state.disturbance_residual_sum is None
-            else state.disturbance_residual_sum.detach().clone()
-        ),
-        disturbance_thrust_sum=(
-            None if state.disturbance_thrust_sum is None
-            else state.disturbance_thrust_sum.detach().clone()
-        ),
-        previous_executed_action=(
-            None if state.previous_executed_action is None
-            else state.previous_executed_action.detach().clone()
-        ),
-        disturbance_response_count=(
-            None if state.disturbance_response_count is None
-            else state.disturbance_response_count.detach().clone()
-        ),
-        excitation_history=(
-            None if state.excitation_history is None
-            else state.excitation_history.detach().clone()
-        ),
-        previous_motor_estimate=(
-            None if state.previous_motor_estimate is None
-            else state.previous_motor_estimate.detach().clone()
-        ),
-    )
+    return StructuredPolicyState(**{
+        field.name: (getattr(state, field.name).detach().clone()
+                     if torch.is_tensor(getattr(state, field.name)) else getattr(state, field.name))
+        for field in fields(state)
+    })
 
 
 def clone_closed_loop(state: StructuredClosedLoopState) -> StructuredClosedLoopState:
@@ -235,7 +182,7 @@ class StructuredBoundaryCodec:
     def __init__(self, template: L2FState, policy: StructuredRecurrentPolicy,
                  *, boot_completed: bool = False,
                  codec_version: int = BOUNDARY_CODEC_VERSION) -> None:
-        if codec_version not in (LEGACY_BOUNDARY_CODEC_VERSION, BOUNDARY_CODEC_VERSION):
+        if codec_version not in (LEGACY_BOUNDARY_CODEC_VERSION, 2, BOUNDARY_CODEC_VERSION):
             raise ValueError("codec_version must be 1 (legacy) or 2 (complete state)")
         self.template = template
         self.policy = policy
@@ -281,12 +228,17 @@ class StructuredBoundaryCodec:
             ("contextual_gain_target", 4 * 15),
             ("contextual_blend", 1),
         ])
-        if self.codec_version >= BOUNDARY_CODEC_VERSION:
+        if self.codec_version >= 2:
             widths.extend([
                 ("disturbance_response_count", 1),
                 ("identification_failed", 1),
                 ("slow_counter", 1),
             ])
+        if self.codec_version >= 3:
+            widths.extend([("probe_residual", 1), ("probe_aborted", 1), ("probe_omega_reference", 1),
+                           ("identification_information", 49), ("capability_authorized", 6),
+                           ("identification_actions", 400), ("identification_initial_motor", 4),
+                           ("disturbance_history", policy.config.slow_cadence * 11)])
         if not self.boot_completed:
             widths.append(("boot_progress", 1))
         self.slices: Dict[str, slice] = {}
@@ -323,7 +275,7 @@ class StructuredBoundaryCodec:
         }
         if policy.config.motor_observer_bank_size:
             scale_values["motor_bank"] = (0.10,) * (4 * policy.config.motor_observer_bank_size)
-        if self.codec_version >= BOUNDARY_CODEC_VERSION:
+        if self.codec_version >= 2:
             scale_values.update({
                 "disturbance_response_count": (1.0,),
                 "identification_failed": (1.0,),
@@ -332,6 +284,13 @@ class StructuredBoundaryCodec:
         for name, value in scale_values.items():
             scales[self.slices[name]] = scales.new_tensor(value)
         self.scales = scales
+        self.fixed_boundary_mask = torch.zeros(self.state_dim, dtype=torch.bool, device=scales.device)
+        # This episode's identification evidence is finalized at call100.
+        # It cannot be optimized into an authorization by a free shooting node.
+        for name in ("identification_information", "capability_authorized", "probe_aborted",
+                     "probe_omega_reference", "identification_failed", "slow_counter", "identification_actions", "identification_initial_motor"):
+            if name in self.slices:
+                self.fixed_boundary_mask[self.slices[name]] = True
         self.layout = BoundaryLayout(
             self.state_dim,
             rotation_slice=self.slices["orientation"],
@@ -390,7 +349,7 @@ class StructuredBoundaryCodec:
             ),
             self._required(policy.contextual_blend, "contextual_blend"),
         ])
-        if self.codec_version >= BOUNDARY_CODEC_VERSION:
+        if self.codec_version >= 2:
             response_count = self._required(
                 policy.disturbance_response_count, "disturbance_response_count"
             ).reshape(-1, 1)
@@ -400,11 +359,19 @@ class StructuredBoundaryCodec:
                 failed.to(dtype=policy.hidden.dtype).reshape(-1, 1),
                 policy.hidden.new_full((policy.hidden.shape[0], 1), float(policy.slow_counter)),
             ])
+        if self.codec_version >= 3:
+            values.extend([self._required(policy.probe_residual, "probe_residual"),
+                           self._required(policy.probe_aborted, "probe_aborted").to(policy.hidden).reshape(-1, 1),
+                           self._required(policy.probe_omega_reference, "probe_omega_reference"),
+                           self._required(policy.identification_information, "identification_information"),
+                           self._required(policy.capability_authorized, "capability_authorized").to(policy.hidden),
+                           self._required(policy.identification_actions, "identification_actions").flatten(1),
+                           self._required(policy.identification_initial_motor, "identification_initial_motor"),
+                           self._required(policy.disturbance_history, "disturbance_history").flatten(1)])
         if self.boot_completed:
             progress = self._required(policy.boot_progress, "boot_progress")
             required = float(
-                self.policy.config.burn_in_steps
-                + self.policy.config.contextual_blend_steps
+                self.policy.config.identification_publish_start
             )
             if bool((progress < required - 1.0e-6).any().item()):
                 raise ValueError("boot-completed codec received an unfinished policy state")
@@ -434,7 +401,7 @@ class StructuredBoundaryCodec:
         encoded_slow_counter = None
         encoded_identification_failed = None
         encoded_response_count = raw.new_zeros((raw.shape[0], 1))
-        if self.codec_version >= BOUNDARY_CODEC_VERSION:
+        if self.codec_version >= 2:
             encoded_response_count = raw[:, self.slices["disturbance_response_count"]]
             encoded_identification_failed = (
                 raw[:, self.slices["identification_failed"]] >= 0.5
@@ -451,6 +418,14 @@ class StructuredBoundaryCodec:
             else (encoded_slow_counter if encoded_slow_counter is not None else 0)
         )
         policy = StructuredPolicyState(
+            probe_residual=(raw[:, self.slices["probe_residual"]] if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], 1))),
+            probe_aborted=((raw[:, self.slices["probe_aborted"]] >= .5).squeeze(-1) if self.codec_version >= 3 else torch.ones(raw.shape[0], dtype=torch.bool, device=raw.device)),
+            probe_omega_reference=(raw[:, self.slices["probe_omega_reference"]] if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], 1))),
+            identification_information=(raw[:, self.slices["identification_information"]] if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], 49))),
+            capability_authorized=((raw[:, self.slices["capability_authorized"]] >= .5) if self.codec_version >= 3 else torch.zeros(raw.shape[0], 6, device=raw.device, dtype=torch.bool)),
+            identification_actions=(raw[:, self.slices["identification_actions"]].reshape(-1, 100, 4) if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], 100, 4))),
+            disturbance_history=(raw[:, self.slices["disturbance_history"]].reshape(-1, self.policy.config.slow_cadence, 11) if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], self.policy.config.slow_cadence, 11))),
+            identification_initial_motor=(raw[:, self.slices["identification_initial_motor"]] if self.codec_version >= 3 else raw.new_zeros((raw.shape[0], 4))),
             hidden=raw[:, self.slices["fast_hidden"]],
             identifier=raw[:, self.slices["slow_hidden"]],
             motor_estimate=raw[:, self.slices["motor_estimate"]],
@@ -487,8 +462,7 @@ class StructuredBoundaryCodec:
             boot_progress=(
                 raw.new_full(
                     (raw.shape[0], 1),
-                    float(self.policy.config.burn_in_steps
-                          + self.policy.config.contextual_blend_steps),
+                    float(self.policy.config.identification_publish_start),
                 )
                 if self.boot_completed
                 else raw[:, self.slices["boot_progress"]]
@@ -513,7 +487,7 @@ def make_structured_step_map(
     """
 
     latch_slices = tuple(codec.slices[name] for name in
-                         ("identification_failed", "slow_counter")
+                         ("identification_failed", "slow_counter", "probe_aborted", "probe_omega_reference", "identification_information", "capability_authorized", "identification_actions", "identification_initial_motor")
                          if name in codec.slices)
 
     def step_map(value: Tensor) -> Tensor:

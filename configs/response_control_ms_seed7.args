@@ -1,0 +1,16 @@
+--mode train
+--optimizer full-space-ms
+--device cuda
+--dtype float64
+--seed 7
+--scenarios 64
+--segments 2
+--segment-steps 250
+--updates 12
+--minimum-updates 1
+--max-seconds 1800
+--development-every 1
+--checkpoint-every 1
+--cg-iterations 16
+--maximum-ms-rejections 3
+--work-dir runs/response_control_v1_ms_seed7

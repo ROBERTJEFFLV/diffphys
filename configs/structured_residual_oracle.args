@@ -7,8 +7,11 @@
 --seed 7
 --train-count 64
 --heldout-count 64
---horizon 125
---updates 2
+--horizon 126
+--updates 400
+--minimum-updates 100
+--checkpoint-every 10
+--max-seconds 1800
 --r-min 0.25
 --r-max 3.0
 --measurement-floor 0.0013

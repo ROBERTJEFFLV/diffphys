@@ -165,11 +165,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-floor", type=float, default=1.3e-3)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--residual-scale", type=float, default=0.05)
+    from structured_training_runtime import add_training_arguments
+    add_training_arguments(parser)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    torch.set_num_threads(1)
     if not (0.0 < args.r_min < args.r_max and args.measurement_floor > 0.0):
         raise ValueError("require 0 < r_min < r_max and positive measurement floor")
     device = _device(args.device)
@@ -198,19 +201,33 @@ def main() -> None:
     )
     train_cpu = build_dagger_scenario_bank(args.train_count, seed=args.seed + 401,
                                            dt=simulator.params.dt)
-    heldout_cpu = build_dagger_scenario_bank(args.heldout_count, seed=args.seed + 402,
-                                             dt=simulator.params.dt)
-    train_bank, heldout_bank = _move_bank(train_cpu, device), _move_bank(heldout_cpu, device)
-    history = []
-    for update in range(args.updates):
+    from structured_training_runtime import TrainingSession
+    session = TrainingSession(args, candidate, optimizer, stage="residual_oracle")
+    train_bank = _move_bank(train_cpu, device)
+    history = session.progress["history"]
+    if args.final_evaluation:
+        session.begin_final([args.seed + 140002])
+        history = session.progress["history"]
+    session.save()
+    for update in range(session.updates, session.updates if args.final_evaluation else args.updates):
+        if session.should_stop():
+            break
         optimizer.zero_grad(set_to_none=True)
         loss, selected = _masked_train_step(
             candidate, teacher, simulator, train_bank, horizon=args.horizon,
             r_min=args.r_min, r_max=args.r_max,
         )
         if selected:
+            norm = torch.nn.utils.clip_grad_norm_(candidate.parameters(), 10.0)
+            if not bool(torch.isfinite(norm)) or not math.isfinite(loss):
+                session.save()
+                raise RuntimeError("non-finite residual-oracle update")
             optimizer.step()
-        history.append({"update": update + 1, "loss": loss, "annulus_samples": selected})
+        session.record_update({"loss": loss, "annulus_samples": selected})
+    heldout_seed = args.seed + (140002 if args.final_evaluation else 2300000)
+    heldout_cpu = build_dagger_scenario_bank(args.heldout_count, seed=heldout_seed,
+        dt=simulator.params.dt, per_cell=args.heldout_count // 16)
+    heldout_bank = _move_bank(heldout_cpu, device)
     heldout_episode = collect_dagger_episode(
         teacher, candidate, simulator, heldout_bank, beta=0.0,
         horizon=args.horizon, episode_seed=args.seed + 499,
@@ -276,7 +293,7 @@ def main() -> None:
         "candidate_deployment_hash": deployment_policy_hash(candidate),
         "train_bank_hash": _bank_hash(train_cpu), "heldout_bank_hash": _bank_hash(heldout_cpu),
         "train_count": args.train_count, "heldout_count": args.heldout_count,
-        "seed": args.seed, "bank_seeds": {"train": args.seed + 401, "heldout": args.seed + 402},
+        "seed": args.seed, "bank_seeds": {"train": args.seed + 401, "heldout": heldout_seed},
         "horizon": args.horizon, "updates": args.updates,
         "annulus": {"r_min": args.r_min, "r_max": args.r_max,
                      "normalized_feedback_feature": True},
@@ -298,6 +315,11 @@ def main() -> None:
         "optimizer_scope": ["encoder", "gru", "residual_head"],
         "teacher_runtime_dependency": True,
     }
+    if not args.final_evaluation:
+        session.record_development(score=oracle_rms, passed=oracle_gate_passed, metrics=report)
+        session.finish_development()
+        return
+    report["training_session"] = session.summary()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"architecture": "structured-residual-oracle-copy",
                 "model": candidate.state_dict(), "config": asdict(candidate.config),

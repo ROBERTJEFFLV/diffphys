@@ -427,3 +427,21 @@ The Simulink scaffold can be generated from MATLAB with:
 addpath('matlab_l2f');
 build_l2f_simulink_model;
 ```
+# Primary method: response-conditioned task learning
+
+The primary experiment now jointly learns response memory and direct motor
+control from differentiable physical task rollouts, without Q2 action or JVP
+labels. Start with `tools/train_response_control.py`; see
+[`docs/response_control_v1.md`](docs/response_control_v1.md) for architecture,
+gradient semantics, proposed budgets, exact resume, MS, and evaluation splits.
+
+`tools/run_structured_pipeline.py` and
+`tools/train_structured_full_space.py` select the new task method by default.
+Their old Q2 migration methods require `--historical-q2-distillation`.
+Historical V4/V5 failures, reports, and validation-consumption records are
+preserved and do not certify this new method.
+
+This implementation has not yet been validated or trained. It does not establish
+flight safety, near-optimal control, or calibration-free real motor commands.
+The current simulator action interface is airframe-normalized around hover.
+The remaining sections below describe the earlier baseline and experiments.

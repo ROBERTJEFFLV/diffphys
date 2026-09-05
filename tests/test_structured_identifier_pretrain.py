@@ -14,6 +14,7 @@ from probe_contract import (
     canonical_waveform_json,
     waveform_metadata,
 )
+from probe_contract_v5 import CONTRACT_SHA256 as WAVEFORM_SHA256
 from structured_checkpoint import sha256_file
 from structured_policy import StructuredPolicyConfig, StructuredRecurrentPolicy
 from tools.pretrain_structured_identifier import (
@@ -22,103 +23,29 @@ from tools.pretrain_structured_identifier import (
 )
 
 
-def _passing_probe(path: Path) -> None:
-    metadata = waveform_metadata()
-    def seed_evidence(passed: bool) -> dict:
-        paired = {}
-        checks = {}
-        for section in ("h75", "h125", "tail_h75_h125"):
-            for metric in ("position", "velocity", "omega"):
-                for statistic in ("mean", "p99"):
-                    name = f"paired_{section}_{metric}_{statistic}"
-                    value_passed = passed or bool(paired)
-                    paired[name] = {
-                        "actual": 0.5 if value_passed else 2.0,
-                        "allowed": 1.0,
-                        "passed": value_passed,
-                    }
-                    checks[name] = value_passed
-        peaks = {
-            name: {"actual": 0.5, "allowed": 1.0, "passed": True}
-            for name in ("peak_position", "peak_velocity", "peak_omega")
-        }
-        checks.update({name: True for name in peaks})
-        checks["paired_mean_p99_max_absolute_or_ratio"] = passed
-        checks["shared_tau_pooled_time_motor_fisher"] = True
-        return {
-            "passed": passed,
-            "checks": checks,
-            "shared_tau": {"gate_passed": True},
-            "safety_metrics": {"paired": paired, "peaks": peaks},
-        }
-
-    family = (
-        WAVEFORM,
-        tuple(tuple(-value for value in row) for row in WAVEFORM),
-        tuple(reversed(WAVEFORM)),
-    )
-    candidate_scores = []
-    for index, table in enumerate(family):
-        passed = index == 0
-        candidate_scores.append({
-            "index": index,
-            "sha256": hashlib.sha256(canonical_waveform_json(table)).hexdigest(),
-            "train_gate_passed": passed,
-            "worst_X_condition": float(index + 1),
-            "checks": {"seed_results": [seed_evidence(passed) for _ in range(4)]},
-        })
-    path.write_text(json.dumps({
-        "status": "formal_frozen",
-        "contract": metadata,
-        "waveform_sha256": WAVEFORM_SHA256,
-        "formal_frozen_sha256": WAVEFORM_SHA256,
-        "formal": {
-            "eligible": True,
-            "frozen_sha256": WAVEFORM_SHA256,
-            "gate_passed": True,
-            "selection_train_gate_passed": True,
-            "independent_validation_gate_passed": True,
-            "blind_consumed": [],
-        },
-        "gate_passed": True,
-        "seed_split": {
-            "train": [3707, 4707, 5707, 6707],
-            "validation": [7707],
-            "blind_consumed": [],
-        },
-        "protocol": {
-            "scenarios": 16, "horizon": 125,
-            "formal_scenarios": 16, "formal_horizon": 125,
-        },
-        "producer_code_sha256": sha256_file(
-            Path(__file__).resolve().parents[1] / "tools" / "diagnose_probe_v4.py"
-        ),
-        "candidate_scores": candidate_scores,
-        "validation": {
-            "index": 0, "gate_passed": True,
-            "checks": {"seed_results": [seed_evidence(True)]},
-        },
-        "source_checkpoint_sha256": sha256_file(
-            Path("reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt")
-        ),
-    }), encoding="utf-8")
+def _passing_probe(path: Path, monkeypatch) -> None:
+    from test_probe_v5 import passing_freeze
+    passing_freeze(path, monkeypatch)
 
 
 def _passing_oracle(path: Path, source: Path) -> None:
     checks = {
         key: True for key in (
-            "coverage", "physics_ceiling", "physics_finite", "physics_branch_support",
+            "coverage", "paired_safety", "physics_ceiling", "physics_finite", "physics_branch_support",
             "finite_collection", "no_identification_failure", "zero_q2_parity",
         )
     }
+    collection = path.with_suffix(".pt")
+    torch.save([], collection)
     path.write_text(json.dumps({
+        "collection_path": str(collection), "collection_sha256": sha256_file(collection),
         "diagnostic": "causal-identifier-sequence-oracle",
         "requested_formal_shape": True,
         "pretraining_gate_passed": True,
         "pretraining_checks": checks,
         "checkpoint_sha256": sha256_file(source),
-        "cadence_semantics_version": "call50_first_publication_v3",
-        "coverage": {"K35_gate_passed": True},
+        "cadence_semantics_version": "call100_passive_identification_v5",
+        "coverage": {"K35_gate_passed": True, "continuous_observer_gate_passed": True},
         "ceiling": {"gate_passed": True, "tau_wls_finite": True,
                      "effectiveness_finite": True, "tau_wls_supported": True},
         "safety": {"finite_collected": True, "no_identification_failure": True},
@@ -141,19 +68,21 @@ def test_identifier_pretrain_dry_run_has_no_side_effects(tmp_path: Path) -> None
 
 def test_identifier_pretrain_rejects_unfrozen_current_probe(tmp_path: Path) -> None:
     source = Path("reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt")
-    with pytest.raises(RuntimeError, match="eligible frozen v4 probe"):
+    probe = tmp_path / "unfrozen.json"
+    probe.write_text(json.dumps({"formal": {"eligible": False}, "gate_passed": False}))
+    with pytest.raises(RuntimeError, match="eligible frozen v5 identification"):
         validate_pretraining_gates(
             source_checkpoint=source,
-            probe_report=Path("reports/probe_v4_q2_debug.json"),
+            probe_report=probe,
             causal_oracle_report=tmp_path / "missing-oracle.json",
         )
 
 
-def test_identifier_pretrain_gate_binds_source_and_reports_all_checks(tmp_path: Path) -> None:
+def test_identifier_pretrain_gate_binds_source_and_reports_all_checks(tmp_path: Path, monkeypatch) -> None:
     source = Path("reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt")
     probe = tmp_path / "probe.json"
     oracle = tmp_path / "oracle.json"
-    _passing_probe(probe)
+    _passing_probe(probe, monkeypatch)
     _passing_oracle(oracle, source)
     result = validate_pretraining_gates(
         source_checkpoint=source, probe_report=probe, causal_oracle_report=oracle,
@@ -202,8 +131,8 @@ def test_identifier_pretraining_report_binds_artifact_and_mean_gates(tmp_path: P
         artifact_path, policy, q2_checkpoint=source, causal_oracle_report=oracle,
     )
     passed_gate = {"gate_passed": True, "rows": [
-        {"phase_step": 50, "passed": True},
-        {"phase_step": 75, "passed": True},
+        {"phase_step": 100, "passed": True},
+        {"phase_step": 125, "passed": True},
     ]}
     report = {
         "stage": "identifier_pretrain",
@@ -246,7 +175,7 @@ def test_identifier_pretraining_report_binds_artifact_and_mean_gates(tmp_path: P
 
     report["final"]["phase_a_mean_gate_passed"] = False
     report_path.write_text(json.dumps(report), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="final calls50/75 mean gate"):
+    with pytest.raises(RuntimeError, match="final calls100/125 mean gate"):
         validate_identifier_pretraining_report(
             report_path, identifier_artifact=artifact_path,
             identifier_contract=contract, policy=policy,

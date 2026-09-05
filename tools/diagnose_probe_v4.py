@@ -86,15 +86,16 @@ def shared_tau_diagnostics(
     *,
     motor_after: torch.Tensor | None = None,
     amplitude: float = PROBE_AMPLITUDE,
+    support_steps: int = PROBE_PERIOD,
 ) -> dict[str, Any]:
     """Compute pooled branch support and weighted Fisher information per scene."""
     if command.shape != motor_before.shape or command.ndim != 3 or command.shape[-1] != 4:
         raise ValueError("command and motor_before must have shape [time,scene,4]")
     if motor_after is not None and motor_after.shape != command.shape:
         raise ValueError("motor_after must match command shape")
-    if command.shape[0] < PROBE_PERIOD:
+    if command.shape[0] < support_steps or support_steps < PROBE_PERIOD:
         raise ValueError("shared-tau diagnostics require the 50-step probe")
-    u, m = command[:PROBE_PERIOD].double(), motor_before[:PROBE_PERIOD].double()
+    u, m = command[:support_steps].double(), motor_before[:support_steps].double()
     delta = u - m
     threshold = float(amplitude) / 2.0
     rows: list[dict[str, Any]] = []
@@ -112,7 +113,7 @@ def shared_tau_diagnostics(
             weighted_information = (delta[:, scene].square() * delta[:, scene].abs() * scene_valid).sum()
             tau_estimate = None
             if motor_after is not None:
-                dm = motor_after[:PROBE_PERIOD, scene].double() - m[:, scene]
+                dm = motor_after[:support_steps, scene].double() - m[:, scene]
                 valid_tau = valid[:, scene] & (dm.abs() > 1.0e-10)
                 tau_values = (0.01 * delta[:, scene] / dm.clamp_min(1.0e-10).where(
                     dm >= 0, dm.clamp_max(-1.0e-10)

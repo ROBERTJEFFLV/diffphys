@@ -1,0 +1,17 @@
+--mode train
+--optimizer adam
+--device cuda
+--dtype float32
+--seed 7
+--scenarios 64
+--horizon 250
+--updates 150
+--minimum-updates 100
+--max-seconds 1800
+--development-every 25
+--checkpoint-every 10
+--patience 12
+--lr 0.0003
+--prediction-weight 0.01
+--contract-report runs/response_minimal_v1/contract.json
+--work-dir runs/response_minimal_v1/seed7

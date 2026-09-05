@@ -449,6 +449,8 @@ def fit_contextual_gain_local(
     learning_rate: float = 3.0e-4,
     radii: Sequence[float] = LOCAL_RADII,
     seed: int = 7,
+    training_args=None,
+    development_callback=None,
 ) -> tuple[LocalDerivativeBatch, list[float]]:
     """Fit only cap-conditioned contextual K to Q2 directional derivatives."""
     for parameter in student.parameters():
@@ -459,6 +461,16 @@ def fit_contextual_gain_local(
         student.contextual_gain_head.parameters(), lr=learning_rate, weight_decay=1.0e-5
     )
     history: list[float] = []
+    session = None
+    if training_args is not None:
+        from structured_training_runtime import TrainingSession
+        session = TrainingSession(training_args, student, optimizer, stage="phase_b")
+        student._training_session = session
+        history = [row["loss"] for row in session.progress["history"]]
+        if training_args.final_evaluation:
+            session.begin_final([training_args.seed + 120001])
+            return build_local_derivative_batch(teacher, student, snapshots, radii=radii, seed=seed), history
+        session.save()
     # Targets are fixed teacher derivatives. Recompute student JVP estimates
     # each iteration so updates affect the actual projected K path.
     with torch.no_grad():
@@ -505,7 +517,9 @@ def fit_contextual_gain_local(
             # the pre-gate fallback.
             pre_gate_targets.append(torch.stack(jacobians).mean(0))
         pre_gate_targets = torch.stack(pre_gate_targets)
-    for _ in range(max(1, int(iterations))):
+    for _ in range(session.updates if session is not None else 0, max(1, int(iterations))):
+        if session is not None and session.should_stop():
+            break
         optimizer.zero_grad(set_to_none=True)
         losses = []
         for snapshot_index, snapshot in enumerate(snapshots):
@@ -557,9 +571,18 @@ def fit_contextual_gain_local(
                         ))
         loss = torch.stack(losses).mean()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.contextual_gain_head.parameters(), 10.0)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(student.contextual_gain_head.parameters(), 10.0)
+        if not bool(torch.isfinite(gradient_norm)):
+            if session is not None:
+                session.save()
+            raise RuntimeError("non-finite local-gain gradient")
         optimizer.step()
         history.append(float(loss.detach()))
+        if session is not None:
+            session.record_update({"loss": float(loss.detach()), "gradient_norm": float(gradient_norm)})
+            if development_callback is not None and session.development_due():
+                score, passed, metrics = development_callback()
+                session.record_development(score=score, passed=passed, metrics=metrics)
     final = build_local_derivative_batch(teacher, student, snapshots, radii=radii, seed=seed)
     return final, history
 

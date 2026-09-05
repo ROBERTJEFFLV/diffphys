@@ -5,6 +5,7 @@
 --report {work}/postms_calibration_report.json
 --device {device}
 --seed 7
---horizon 76
+--scenario-seed-offset 700000
+--horizon 126
 --miscoverage 0.01
 --maximum-self-calibration-rounds 3

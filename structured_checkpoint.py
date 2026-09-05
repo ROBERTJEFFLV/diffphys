@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,7 +12,7 @@ from typing import Any, Mapping
 import torch
 
 from identification_features import feature_schema_metadata, feature_schema_sha256
-from probe_contract import PROBE_CONTRACT_VERSION, PROBE_PERIOD, WAVEFORM_SHA256
+from probe_contract_v5 import (VERSION as PROBE_CONTRACT_VERSION, ACTIVE_STEPS as PROBE_PERIOD, CONTRACT_SHA256 as WAVEFORM_SHA256)
 
 
 CALIBRATION_STATE_NAMES = frozenset({
@@ -23,16 +24,16 @@ CALIBRATION_STATE_NAMES = frozenset({
 # Bump whenever call-index/publication semantics change.  Including this in
 # structured deployment hashes prevents pre-migration artifacts from being
 # accepted as same-behavior calibration or oracle inputs.
-CADENCE_SEMANTICS_VERSION = "call50_first_publication_v3"
+CADENCE_SEMANTICS_VERSION = "call100_passive_identification_v5"
 
 IDENTIFIER_ARTIFACT_SCHEMA_VERSION = "structured_identifier_init_v1"
 IDENTIFIER_ARTIFACT_ARCHITECTURE = "structured-recurrent-motor-policy"
 IDENTIFIER_ARTIFACT_CADENCE = {
     "call_index_completed_transitions": True,
     "call0_has_response": False,
-    "publication_calls": [50, 75],
+    "publication_calls": [100, 125],
     "availability_t25": [0, 0, 0, 0, 0, 0],
-    "t50_call_index": 50,
+    "t50_call_index": 100,
 }
 
 
@@ -44,6 +45,17 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: stream.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def runtime_contract_hash() -> str:
+    """Bind artifacts to inference equations and state/probe semantics."""
+    root = Path(__file__).resolve().parent
+    names = ("structured_policy.py", "structured_allocator.py", "structured_rollout.py",
+             "identification_features.py", "identification_information.py",
+             "probe_contract_v5.py", "env_l2f.py")
+    return hashlib.sha256(json.dumps({name: sha256_file(root / name) for name in names},
+                                   sort_keys=True).encode()).hexdigest()
 
 
 def identifier_artifact_weight_names(config: Any) -> tuple[str, ...]:
@@ -116,6 +128,7 @@ def build_identifier_init_artifact(
         "weights": weights,
         "weight_names": list(names),
         "identifier_weights_sha256": identifier_weights_hash(weights),
+        "runtime_contract_sha256": runtime_contract_hash(),
         "cadence_semantics_version": CADENCE_SEMANTICS_VERSION,
         "cadence_semantics": dict(IDENTIFIER_ARTIFACT_CADENCE),
         "probe": {
@@ -208,6 +221,8 @@ def load_identifier_init_artifact(
         raise _artifact_error("policy configuration does not match A1")
     if payload.get("cadence_semantics_version") != CADENCE_SEMANTICS_VERSION:
         raise _artifact_error("cadence semantics are stale")
+    if payload.get("runtime_contract_sha256") != runtime_contract_hash():
+        raise _artifact_error("runtime equations or state contract changed")
     if payload.get("cadence_semantics") != IDENTIFIER_ARTIFACT_CADENCE:
         raise _artifact_error("cadence contract does not match production")
     probe = payload.get("probe")
@@ -268,7 +283,7 @@ def validate_identifier_pretraining_report(
     """Bind an A1 identifier init to its independent accuracy gates.
 
     Loading a structurally valid tensor artifact is not sufficient: a stale
-    artifact from a failed producer run must not bypass the calls50/75
+    artifact from a failed producer run must not bypass the calls100/125
     capability-mean validation.  This report is therefore a mandatory second
     half of the production identifier-init contract.
     """
@@ -344,7 +359,7 @@ def validate_identifier_pretraining_report(
                 or not isinstance(record.get("phase_a_mean_gate"), Mapping)
                 or record["phase_a_mean_gate"].get("gate_passed") is not True):
             raise RuntimeError(
-                f"identifier pretraining {split} calls50/75 mean gate is not passed"
+                f"identifier pretraining {split} calls100/125 mean gate is not passed"
             )
     return {"path": str(report_path.resolve()), "sha256": sha256_file(report_path)}
 
@@ -393,6 +408,13 @@ def require_current_cadence_semantics(payload: dict, *, context: str) -> None:
         )
 
 
+def require_formal_identification_config(config) -> None:
+    if (config.identification_publish_start != 100 or config.slow_cadence != 25
+            or config.burn_in_probe_amplitude != 0.0 or config.motor_observer_bank_size != 35
+            or config.motor_tau_grid_version != 2):
+        raise RuntimeError("formal identification requires passive v5, call100, cadence25, and K35 grid v2")
+
+
 def deployment_policy_hash(policy) -> str:
     """Hash the exact deployed policy, including calibration buffers.
 
@@ -421,4 +443,5 @@ def _hash_policy(policy, *, excluded) -> str:
         digest.update(value.detach().cpu().contiguous().numpy().tobytes())
     digest.update(json.dumps(asdict(policy.config), sort_keys=True).encode("utf-8"))
     digest.update(CADENCE_SEMANTICS_VERSION.encode("utf-8"))
+    digest.update(runtime_contract_hash().encode("utf-8"))
     return digest.hexdigest()
