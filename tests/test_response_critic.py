@@ -131,7 +131,7 @@ def trainer_fixture():
     assert hasattr(critic, "CriticTrainer"), "missing transactional Critic/Actor proposal"
     policy, simulator, initial = fixture()
     state = critic.CriticTrainer(policy, task.initialize(policy, initial), 6,
-                                critic.CriticConfig(window_steps=2, batch_size=32))
+                                critic.CriticConfig(window_steps=2, batch_size=32, proposal="smoothmax-adam"))
     optimizer = torch.optim.AdamW(policy.parameters(), lr=0.)
     return critic, policy, simulator, initial, state, optimizer
 
@@ -222,7 +222,7 @@ def test_short_window_checkpoint_exact_resume_includes_critic_target_and_both_op
     assert hasattr(training, "critic_configuration"), "missing Critic trainer integration"
     monkeypatch.setattr(training, "FINAL_CLAIM", tmp_path / "unused-claim.json")
     def run(path, budget):
-        args = parse_args(["--optimizer", "short-window", "--work-dir", str(path),
+        args = parse_args(["--optimizer", "short-window", "--actor-proposal", "smoothmax-adam", "--work-dir", str(path),
                            "--updates", str(budget), "--horizon", "4", "--window-steps", "2",
                            "--scenarios", "16", "--memory-dim", "4", "--hidden-dim", "8",
                            "--checkpoint-every", "1", "--development-every", "2",
@@ -406,7 +406,17 @@ def test_periodic_dev_rollback_preserves_accumulated_critic_and_rng(tmp_path, mo
                 "steady_success_rate": 0., "motor_saturation_fraction": 0.,
                 "risk_objective": 1., "risk_components": {"position": 1., "velocity": 0., "omega": 0., "saturation": 0.}}
     monkeypatch.setattr(training, "evaluate", development)
-    args = parse_args(["--optimizer", "short-window", "--work-dir", str(tmp_path),
+    # Exercise the periodic rollback after an Actor change. An unchanged,
+    # rejected Actor now correctly reuses its existing development report.
+    module = critic_module()
+    guarded = module.CriticTrainer.guarded_step
+    def changed_candidate(self, policy, *args, **kwargs):
+        record = guarded(self, policy, *args, **kwargs)
+        with torch.no_grad():
+            policy.controller[-1].bias.add_(1.e-5)
+        return {**record, "accepted": True, "rejection_reason": None}
+    monkeypatch.setattr(module.CriticTrainer, "guarded_step", changed_candidate)
+    args = parse_args(["--optimizer", "short-window", "--actor-proposal", "smoothmax-adam", "--work-dir", str(tmp_path),
                        "--updates", "2", "--horizon", "4", "--window-steps", "2",
                        "--scenarios", "16", "--minimum-updates", "1",
                        "--checkpoint-every", "1", "--development-every", "2", "--lr", "1e-6"])

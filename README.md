@@ -436,10 +436,16 @@ labels. Start with `tools/train_response_control.py`; see
 current H500 / ten-H50 trainer. A training-only nonnegative Risk-to-Go MLP supplies
 terminal risk gradients and learns from exact risk suffixes plus a few reachable
 motor perturbation rankings; the deployed Actor is unchanged. Two independent
-64-scene TRAIN banks determine one update, followed by continuous TRAIN and
-both-DEV performance and physical-risk acceptance with Actor rollback. Total
+64-scene TRAIN banks determine one proposal. Five separate short-window gradients
+form a small parameter subspace; real H500 TRAIN forwards correct the direction
+before a direct parameter step. Continuous TRAIN gates run before candidate DEV,
+with both DEV banks required for acceptance. Total
 risk and each risk component must not worsen. Completed finite Critic fits persist
-across Actor rejections. MS is an optional debug path.
+across Actor rejections. Supervision uses fixed TRAIN component scales; saturation
+risk starts only in the actuator warning band. Performance directions are
+projected onto the risk non-increase cone. A failed proposal retains Critic
+learning and continues; consecutive failures stop at a configured
+`proposal_plateau` that cannot auto-resume. MS is an optional debug path. Use `configs/response_risk_subspace.args` for the new CUDA profile setup.
 
 `tools/run_structured_pipeline.py` and
 `tools/train_structured_full_space.py` select the new task method by default.

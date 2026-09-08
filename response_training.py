@@ -19,6 +19,7 @@ import torch
 
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from response_execution import BUSINESS_STOPS, exit_class, training_summary
 from response_task import (
     RiskConfig, TaskLossConfig, observation, physical_risk_metrics, prediction_residual, rollout, sample_scenarios,
     scenario_costs, task_loss, trajectory_metrics, initialize,
@@ -37,7 +38,7 @@ SOURCE_FILES = (
     "response_training.py", "tools/train_response_control.py",
     "env_l2f.py", "full_space_shooting.py", "petsc_kkt_solver.py",
     "tools/check_response_training_contract.py", "tools/check_response_preflight.py",
-    "response_critic.py",
+    "response_critic.py", "response_proposals.py", "response_execution.py",
 )
 
 
@@ -145,6 +146,7 @@ def training_batch_count(args) -> int:
 
 def critic_configuration(args):
     from response_critic import CriticConfig
+    from response_proposals import SubspaceConfig
     return CriticConfig(window_steps=args.window_steps, lr=args.critic_lr,
                         epochs=args.critic_epochs, batch_size=args.critic_batch_size,
                         dev_relative_tolerance=args.critic_dev_relative_tolerance,
@@ -155,7 +157,19 @@ def critic_configuration(args):
                         direction_epsilon=args.critic_direction_epsilon,
                         direction_weight=args.critic_direction_weight,
                         direction_temperature=args.critic_direction_temperature,
-                        direction_min_gap=args.critic_direction_min_gap)
+                        direction_min_gap=args.critic_direction_min_gap,
+                        return_scale_floor=args.critic_return_scale_floor, proposal=args.actor_proposal,
+                        subspace=SubspaceConfig(fd_relative_step=args.subspace_fd_relative_step,
+                            parameter_relative_step=args.subspace_parameter_relative_step,
+                            fd_relative_tolerance=args.subspace_fd_relative_tolerance,
+                            fd_absolute_tolerance=args.subspace_fd_absolute_tolerance,
+                            backtracks=args.subspace_backtracks))
+
+
+def actor_optimizer(args, policy):
+    if args.optimizer == "full-space-ms" or (args.optimizer == "short-window" and args.actor_proposal == "physics-subspace"):
+        return None
+    return torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 
 def sample_training_scenarios(
@@ -215,7 +229,9 @@ def binding(args, policy_config, loss_config) -> dict:
             "max_dev_loss_ratio": args.adam_max_dev_loss_ratio,
             "maximum_consecutive_rejections": args.maximum_adam_rejections,
         },
-        "gradient_norm_kind": ("mean_window_performance_plus_local_and_terminal_risk_before_clipping"
+        "gradient_norm_kind": ("separate_window_performance_and_risk_components_no_Adam"
+                               if args.optimizer == "short-window" and args.actor_proposal == "physics-subspace"
+                               else "mean_window_performance_plus_local_and_terminal_risk_before_clipping"
                                if args.optimizer == "short-window" else "combined_task_plus_weighted_auxiliary_before_clipping"),
         "contract_sha256": None if args.contract_report is None else file_hash(args.contract_report),
     }
@@ -456,6 +472,8 @@ def evaluate(
 
 
 def train(args, policy_config, loss_config):
+    if args.initialize_from is not None and (args.work_dir / "latest.training.pt").exists():
+        raise ValueError("weights-only initialization requires a new work directory; do not inherit old training state")
     if args.updates is None or not 1 <= args.updates < 1_000_000:
         raise ValueError("set an explicit --updates budget below 1000000 after profiling")
     if args.seed != 7:
@@ -489,9 +507,7 @@ def train(args, policy_config, loss_config):
         if initialized.config != policy.config:
             raise ValueError("weights-only initialization requires the same policy configuration")
         policy.load_state_dict(initialized.state_dict())
-    optimizer = None if args.optimizer == "full-space-ms" else torch.optim.AdamW(
-        policy.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    optimizer = actor_optimizer(args, policy)
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
     critic = None
     development_initials = ()
@@ -528,6 +544,9 @@ def train(args, policy_config, loss_config):
             critic.load_state_dict(saved["critic_training"])
         progress, solver, initial_model = saved["progress"], saved["solver"], saved["initial_model"]
         restore_rng(saved["rng"])
+        if progress["status"] in BUSINESS_STOPS:
+            # A supervisor must not turn a business stop into another proposal.
+            return {**training_summary(progress, PROTOCOL_VERSION), "resume_blocked": True}
     work.mkdir(parents=True, exist_ok=True)
     atomic_json(work / "configuration.json", {
         "binding": run_binding,
@@ -543,6 +562,7 @@ def train(args, policy_config, loss_config):
 
     def save(path=latest):
         progress["elapsed_seconds"] = previous_seconds + time.monotonic() - started
+        progress["exit_class"] = exit_class(progress["status"])
         save_training(path, policy, optimizer, progress, solver, run_binding, initial_model, critic=critic)
 
 
@@ -552,7 +572,8 @@ def train(args, policy_config, loss_config):
         save(rejected_path)
         stable = torch.load(work / "best.training.pt", map_location="cpu")
         policy.load_state_dict(stable["model"])
-        optimizer.load_state_dict(stable["optimizer"])
+        if optimizer is not None:
+            optimizer.load_state_dict(stable["optimizer"])
         # Completed supervised Critic fits survive an Actor DEV rollback too.
         # Their RNG progression must remain consistent with the retained fits.
         if critic is None:
@@ -578,6 +599,9 @@ def train(args, policy_config, loss_config):
         }
 
     def development():
+        current_model = model_hash(policy)
+        if progress["development"] and progress["development"][-1].get("model_sha256") == current_model:
+            return True
         try:
             report = evaluate(
                 policy, loss_config, seeds=DEVELOPMENT_SEEDS, horizons=(args.horizon,),
@@ -586,7 +610,7 @@ def train(args, policy_config, loss_config):
                 risk_config=None if critic is None else critic.config.risk,
             )
         except BaseException:
-            if optimizer is not None and progress["best_score"] is not None:
+            if args.optimizer != "full-space-ms" and progress["best_score"] is not None:
                 restore_best_after_development_failure("development_evaluation_failed")
             raise
         if progress["baseline_score"] is None:
@@ -595,12 +619,12 @@ def train(args, policy_config, loss_config):
             "score", "finite", "position_rms", "velocity_rms", "omega_rms",
             "steady_success_rate", "motor_saturation_fraction",
         )}
-        compact.update(attempt=progress["attempts"], update=progress["updates"])
+        compact.update(attempt=progress["attempts"], update=progress["updates"], model_sha256=current_model)
         if critic is not None:
             compact.update({key: report[key] for key in ("risk_objective", "risk_components")})
         progress["development"].append(compact)
         old_score = progress["best_score"]
-        catastrophic = optimizer is not None and old_score is not None and (
+        catastrophic = args.optimizer != "full-space-ms" and old_score is not None and (
             report["score"] > args.adam_max_dev_loss_ratio * max(old_score, 1.0e-6)
             or report["omega_rms"] > args.adam_max_omega_ratio * max(progress["best_omega_rms"], 0.5)
         )
@@ -620,7 +644,7 @@ def train(args, policy_config, loss_config):
         return True
 
     try:
-        if optimizer is not None and progress["best_score"] is not None and not (work / "best.training.pt").exists():
+        if args.optimizer != "full-space-ms" and progress["best_score"] is not None and not (work / "best.training.pt").exists():
             if progress["updates"] != progress["best_update"]:
                 raise ValueError("guarded resume needs the best checkpoint in the original work directory")
             save(work / "best.training.pt")
@@ -639,7 +663,7 @@ def train(args, policy_config, loss_config):
                 dt=policy_config.dt, device=device, dtype=dtype,
             )
             scenario_seed = scenario_seeds[0]
-            if optimizer is None:
+            if args.optimizer == "full-space-ms":
                 from response_shooting import task_shooting_step
                 development_initial, _ = sample_scenarios(
                     args.scenarios, seed=MS_ACCEPTANCE_SEED, dt=policy_config.dt, device=device, dtype=dtype
@@ -664,7 +688,8 @@ def train(args, policy_config, loss_config):
                     development_initials=development_initials, gradient_clip=args.gradient_clip,
                 )
                 accepted = record["accepted"]
-                solver["consecutive_adam_rejections"] = 0 if accepted else solver.get("consecutive_adam_rejections", 0) + 1
+                solver["consecutive_proposal_rejections"] = 0 if accepted else solver.get("consecutive_proposal_rejections", 0) + 1
+                record["consecutive_proposal_rejections"] = solver["consecutive_proposal_rejections"]
             else:
                 # Every bank uses the same pre-update parameters. Keep one
                 # pooled task loss, one backward, one clip and one Adam step.
@@ -723,14 +748,16 @@ def train(args, policy_config, loss_config):
             if progress["attempts"] % args.checkpoint_every == 0:
                 save()
                 print(json.dumps(record), flush=True)
-            if optimizer is not None and (
-                not record["proposal_finite"]
-                or solver.get("consecutive_adam_rejections", 0) >= args.maximum_adam_rejections
-            ):
-                progress["status"] = "adam_nonfinite_proposal" if not record["proposal_finite"] else "adam_rejections"
+            if args.optimizer != "full-space-ms" and not record["proposal_finite"]:
+                # The guard has restored unchecked Actor state and retained only
+                # completed Critic fits. Surface corruption as an error, not a plateau.
+                raise FloatingPointError(record["rejection_reason"])
+            rejection_key = "consecutive_proposal_rejections" if critic is not None else "consecutive_adam_rejections"
+            if args.optimizer != "full-space-ms" and solver.get(rejection_key, 0) >= args.maximum_adam_rejections:
+                progress["status"] = "proposal_plateau" if critic is not None else "adam_rejections"
                 save()
                 break
-            if optimizer is None and solver.get("consecutive_rejections", 0) >= args.maximum_ms_rejections:
+            if args.optimizer == "full-space-ms" and solver.get("consecutive_rejections", 0) >= args.maximum_ms_rejections:
                 progress["status"] = "solver_rejections"
                 break
             if progress["attempts"] % args.development_every == 0:
@@ -743,7 +770,7 @@ def train(args, policy_config, loss_config):
                     break
         if progress["status"] == "training":
             progress["status"] = "update_budget"
-        if progress["development"][-1]["attempt"] != progress["attempts"]:
+        if progress["status"] not in BUSINESS_STOPS and progress["development"][-1]["attempt"] != progress["attempts"]:
             development()
         save()
     except BaseException as error:
@@ -754,15 +781,7 @@ def train(args, policy_config, loss_config):
     finally:
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
-    summary = {
-        "protocol": PROTOCOL_VERSION, "status": progress["status"],
-        "actual_attempts": progress["attempts"], "actual_updates": progress["updates"],
-        "elapsed_seconds": progress["elapsed_seconds"], "best_update": progress["best_update"],
-        "baseline_development_score": progress["baseline_score"],
-        "best_development_score": progress["best_score"],
-        "rollback": progress.get("rollback"),
-        "final_seeds_consumed": [], "formal_eligible": False, "deployment_authorized": False,
-    }
+    summary = training_summary(progress, PROTOCOL_VERSION)
     atomic_json(work / "training_report.json", summary)
     return summary
 
@@ -784,7 +803,8 @@ def profile(args, policy_config, loss_config):
         device=device, dtype=dtype,
     )
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = (actor_optimizer(args, policy) if args.optimizer == "short-window" else
+                 torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay))
     if args.optimizer == "short-window":
         from response_critic import CriticTrainer
         critic = CriticTrainer(policy, initialize(policy, initial), args.horizon, critic_configuration(args))

@@ -34,6 +34,15 @@ def parse_args(argv=None):
                         help="bank count for legacy Adam; short-window always uses two, MS uses one")
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--window-steps", type=int, default=50)
+    parser.add_argument("--actor-proposal", choices=("physics-subspace", "smoothmax-adam"), default="physics-subspace",
+                        help="TRAIN forward correction and direct step; Adam is a regression backend")
+    parser.add_argument("--subspace-fd-relative-step", type=float, default=1.e-4)
+    parser.add_argument("--subspace-parameter-relative-step", type=float, default=1.e-4)
+    parser.add_argument("--subspace-fd-relative-tolerance", type=float, default=.1)
+    parser.add_argument("--subspace-fd-atol", dest="subspace_fd_absolute_tolerance", type=float, default=0.,
+                        help="absolute tolerance in normalized slope units; calibrate with a TRAIN CUDA numerical probe")
+    parser.add_argument("--subspace-backtracks", type=int, default=4)
+    parser.add_argument("--critic-return-scale-floor", type=float, default=1.e-3)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--critic-epochs", type=int, default=1)
     parser.add_argument("--critic-batch-size", type=int, default=1024)
@@ -62,7 +71,9 @@ def parse_args(argv=None):
     parser.add_argument("--adam-max-loss-ratio", type=float, default=2.0)
     parser.add_argument("--adam-max-omega-ratio", type=float, default=2.0)
     parser.add_argument("--adam-max-dev-loss-ratio", type=float, default=2.0)
-    parser.add_argument("--maximum-adam-rejections", type=int, default=3)
+    parser.add_argument("--maximum-proposal-rejections", "--maximum-adam-rejections",
+                        dest="maximum_adam_rejections", type=int, default=3,
+                        help="consecutive Actor proposal rejection limit")
     parser.add_argument("--dt", type=float, default=.01)
     parser.add_argument("--memory-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=64)

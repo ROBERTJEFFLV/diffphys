@@ -206,7 +206,7 @@ def test_physical_performance_and_risk_improvement_commits_one_actor_update():
                       velocity=initial.velocity.new_tensor([[0., 0., .2]]).repeat(2, 1),
                       omega=torch.zeros_like(initial.omega))
     state = critic.CriticTrainer(policy, task.initialize(policy, initial), 6,
-                                 critic.CriticConfig(window_steps=2, batch_size=32))
+                                 critic.CriticConfig(window_steps=2, batch_size=32, proposal="smoothmax-adam"))
     optimizer = torch.optim.AdamW(policy.parameters(), lr=0.)
     original = optimizer.step
     def reduce_collective(*args, **kwargs):

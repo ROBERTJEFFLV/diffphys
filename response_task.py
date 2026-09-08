@@ -58,8 +58,8 @@ class RiskConfig:
         if any(not math.isfinite(getattr(self, f.name)) or getattr(self, f.name) <= 0
                for f in fields(self)):
             raise ValueError("risk limits and sharpness must be finite and positive")
-        if self.saturation_limit > 1:
-            raise ValueError("risk saturation limit must be at most normalized full command 1")
+        if self.saturation_limit >= 1:
+            raise ValueError("risk saturation warning must be below normalized hard command limit 1")
 
 
 @dataclass(frozen=True)
@@ -209,7 +209,10 @@ def risk_components(trajectory, config: RiskConfig, *, position_reference=0.,
         "position": barrier((trajectory.positions - position_reference).norm(dim=-1), config.position_limit),
         "velocity": barrier((trajectory.velocities - velocity_reference).norm(dim=-1), config.velocity_limit),
         "omega": barrier((trajectory.omegas - omega_reference).norm(dim=-1), config.omega_limit),
-        "saturation": barrier(trajectory.actions.abs(), config.saturation_limit).mean(-1),
+        # Normal control effort remains a soft task cost. Safety risk starts
+        # only in the warning band, and reaches one at the hard command limit.
+        "saturation": ((trajectory.actions.abs() - config.saturation_limit)
+                       / (1 - config.saturation_limit)).clamp_min(0).square().mean(-1),
     }
 
 

@@ -53,30 +53,19 @@ def test_component_labels_match_real_suffixes_and_critic_has_four_outputs():
     assert net(record.inputs[0]).shape == (2, 4)
 
 
-def test_scalar_migration_preserves_total_prediction_and_hidden_optimizer_history():
+def test_scalar_migration_rejects_old_risk_semantics_and_keeps_fresh_state():
     import copy
     import response_task as task
     from test_response_control import fixture
+    from test_response_guarded_updates import assert_nested_equal
     policy, _, initial = fixture()
     state = critic.CriticTrainer(policy, task.initialize(policy, initial), 6,
                                  critic.CriticConfig(window_steps=2))
-    assert hasattr(state, 'initialize_from_scalar'), 'missing explicit scalar checkpoint migration'
-    inputs = critic.critic_features(task.initialize(policy, initial), 0, 6)
-    old_net = torch.nn.Sequential(torch.nn.Linear(inputs.shape[-1],256),torch.nn.SiLU(),
-             torch.nn.Linear(256,256),torch.nn.SiLU(),torch.nn.Linear(256,1),torch.nn.Softplus()).double()
-    opt = torch.optim.Adam(old_net.parameters(),lr=.001)
-    old_net(inputs).sum().backward(); opt.step()
-    old_weights = {'network.'+k:v for k,v in old_net.state_dict().items()}
-    saved = {'objective':'risk-to-go-v1-fixed-physical-scales','critic':old_weights,
-             'target':old_weights,'optimizer':opt.state_dict(),'completed_fits':146}
-    state.initialize_from_scalar(saved, inputs.new_tensor([.5,.3,.199,.001]))
-    torch.testing.assert_close(state.critic(inputs).sum(-1),old_net(inputs).squeeze(-1))
-    assert state.completed_fits == 146
-    for old, new in zip(list(opt.state.values())[:4], list(state.optimizer.state.values())[:4]):
-        for key in old:
-            torch.testing.assert_close(old[key],new[key])
-    assert len(state.optimizer.state) == 4 # Only the changed output layer starts fresh.
-    assert all(torch.equal(v,state.target.state_dict()[k]) for k,v in state.critic.state_dict().items())
+    before = copy.deepcopy(state.state_dict())
+    with pytest.raises(ValueError, match="new weights-only Actor experiment"):
+        state.initialize_from_scalar({'objective': 'risk-to-go-v1-fixed-physical-scales'},
+                                     torch.tensor([.5, .3, .199, .001]))
+    assert_nested_equal(state.state_dict(), before)
 
 
 def test_short_window_component_objective_matches_independent_physics_oracle():
