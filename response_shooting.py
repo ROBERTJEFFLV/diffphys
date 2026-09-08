@@ -29,6 +29,16 @@ class ResponseBoundaryCodec:
         self.clock_index = self.state_dim - 1
         self.rotation_slices = (slice(6, 9), slice(29 + memory_dim, 32 + memory_dim))
 
+    def characteristic_scales(self) -> torch.Tensor:
+        """Physical units for symmetric primal and continuity normalization."""
+        scale = self.template.position.new_ones(self.state_dim)
+        m = self.memory_dim
+        scale[9:12] = 10.0
+        scale[20+m:23+m] = 0.5
+        scale[23+m:26+m] = 3.0
+        scale[26+m:29+m] = 10.0
+        return scale
+
     @staticmethod
     def _log(rotation):
         identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device).expand_as(rotation)
@@ -138,8 +148,14 @@ def make_problem(policy, simulator, initial, loss_config, *, segment_steps, segm
 def task_shooting_step(
     policy, simulator, initial, development_initial, loss_config, *,
     segment_steps=250, segments=2, damping=100.0, cg_iterations=16,
+    linear_solver="petsc-minres", kkt_rtol=1.0e-6, kkt_atol=1.0e-10,
+    kkt_max_iterations=200, kkt_monitor=False,
+    kkt_preconditioner="curvature-diagonal", kkt_curvature_probes=8,
     parameter_radius=0.05, action_radius=0.01, action_max_radius=0.05, debug_solver=False,
 ):
+    if linear_solver == "petsc-minres":
+        from petsc_kkt_solver import require_petsc
+        require_petsc(next(policy.parameters()))
     problem, codec, vector = make_problem(
         policy, simulator, initial, loss_config,
         segment_steps=segment_steps, segments=segments,
@@ -160,6 +176,10 @@ def task_shooting_step(
 
     step = solve_joint_sqp_step(
         problem, damping=damping, penalty=10.0, cg_iterations=cg_iterations,
+        linear_solver=linear_solver, kkt_rtol=kkt_rtol, kkt_atol=kkt_atol,
+        kkt_max_iterations=kkt_max_iterations, kkt_monitor=kkt_monitor,
+        kkt_preconditioner=kkt_preconditioner, kkt_curvature_probes=kkt_curvature_probes,
+        boundary_scale=codec.characteristic_scales(), constraint_scale=codec.characteristic_scales(),
         parameter_radius=parameter_radius,
         parameter_scale=theta_before.abs().clamp_min(1.0e-2),
         action_radius=action_radius, action_max_radius=action_max_radius,
@@ -180,22 +200,36 @@ def task_shooting_step(
         restored = torch.stack(restored)
         continuity = float(problem.defects(restored, step.theta).abs().max())
     accepted = bool(
-        torch.isfinite(step.theta).all()
+        (linear_solver != "petsc-minres" or step.linear_solver_converged)
+        and torch.isfinite(step.theta).all()
         and math.isfinite(after_value) and math.isfinite(dev_after_value)
         and math.isfinite(continuity)
         and after_value < before_value and dev_after_value <= dev_before_value
     )
     if accepted:
         vector.install(policy, step.theta)
-    # Solver telemetry is debugging information, not a second performance gate.
+    # Linear certification is enforced inside SQP; performance gates stay continuous.
+    def diagnostic(value):
+        # Preserve failed-solve evidence in strict JSON; a missing numerical
+        # residual is null, never an apparent zero/convergence certificate.
+        return None if isinstance(value, float) and not math.isfinite(value) else value
+
     evidence = {
         "continuous_loss_before": before_value, "continuous_loss_after": after_value,
         "heldout_loss_before": dev_before_value, "heldout_loss_after": dev_after_value,
         "continuity_defect_after_restoration": continuity, "accepted": accepted,
+        "linear_solver": step.linear_solver,
+        "linear_solver_preconditioner": step.linear_solver_preconditioner,
+        "linear_solver_curvature_probes": step.linear_solver_curvature_probes,
+        "linear_solver_converged": step.linear_solver_converged,
+        "linear_solver_reason": step.linear_solver_reason,
+        "linear_solver_iterations": step.linear_solver_iterations,
+        "linear_solver_relative_residual": diagnostic(step.linear_solver_relative_residual),
+        "linear_solver_scaled_relative_residual": diagnostic(step.linear_solver_scaled_relative_residual),
     }
     if debug_solver:
         evidence["solver_debug"] = {
-            field.name: getattr(step, field.name)
+            field.name: diagnostic(getattr(step, field.name))
             for field in fields(step) if field.name not in ("theta", "boundaries")
         }
     state = {

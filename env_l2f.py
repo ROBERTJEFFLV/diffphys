@@ -661,7 +661,9 @@ def _orthonormalize(rotation: torch.Tensor) -> torch.Tensor:
 
 def _so3_exp(phi: torch.Tensor) -> torch.Tensor:
     theta_sq = phi.square().sum(dim=-1, keepdim=True)
-    theta = torch.sqrt(theta_sq)
+    # Guard before sqrt: masking its result with where still permits 0 * inf
+    # in backward at phi=0. Keep theta_sq unchanged for the small-angle series.
+    theta = torch.sqrt(theta_sq.clamp_min(torch.finfo(phi.dtype).tiny))
     theta_sq_matrix = theta_sq.view(-1, 1, 1)
     theta_matrix = theta.view(-1, 1, 1)
     theta_sq_safe = torch.clamp(theta_sq_matrix, min=1.0e-8)

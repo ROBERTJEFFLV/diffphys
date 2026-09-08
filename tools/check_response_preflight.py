@@ -67,8 +67,8 @@ def assess(progress):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=Path("runs/response_minimal_v1/seed7/latest.training.pt"))
-    parser.add_argument("--output", type=Path, default=Path("runs/response_minimal_v1/preflight.json"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("runs/response_pooled_v1/seed7/latest.training.pt"))
+    parser.add_argument("--output", type=Path, default=Path("runs/response_pooled_v1/preflight.json"))
     args = parser.parse_args()
     value = torch.load(args.checkpoint, map_location="cpu")
     if value.get("binding", {}).get("source_sha256") != source_hash():

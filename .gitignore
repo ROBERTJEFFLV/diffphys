@@ -28,3 +28,28 @@ checkpoints/
 
 .agents/
 .codex/
+
+# Local caches, credentials, and editor state.
+.cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+coverage.xml
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tmp
+*.swp
+skills-lock.json
+
+# Generated validation and experiment reports outside reports/.
+DELIVERABLE_README_20260806.md
+docs/passive_identification_v5_verification.md
+docs/structured_rebuild_status.md
+docs/structured_seed7_training.md
+matlab_l2f/VALIDATION.md
+matlab_l2f/validation_results.json
+matlab_l2f/numerical_validation.txt
+matlab_l2f/syntax_validation.txt
+matlab_l2f/SHA256SUMS.txt

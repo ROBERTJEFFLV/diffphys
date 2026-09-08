@@ -27,6 +27,7 @@ class TaskLossConfig:
     tail_weight: float = 0.5
     tail_fraction: float = 0.2
     prediction_weight: float = 0.01
+    huber_delta: float = 1.0
 
     def __post_init__(self) -> None:
         weights = [getattr(self, f.name) for f in fields(self) if f.name.endswith("weight")]
@@ -36,6 +37,29 @@ class TaskLossConfig:
             raise ValueError("position holding and full angular velocity must be penalized")
         if self.steady_steps < 1 or not 0 < self.tail_fraction <= 1:
             raise ValueError("invalid steady window or CVaR tail fraction")
+        if not math.isfinite(self.huber_delta) or self.huber_delta < 0:
+            raise ValueError("Huber delta must be finite and non-negative (0 selects historical squares)")
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    """Fixed hover operating limits, independent of task precision weights.
+
+    These are configurable engineering starting points, not certified limits.
+    Risk is an undiscounted sum of per-transition dimensionless barriers.
+    """
+    position_limit: float = 5.0
+    velocity_limit: float = 5.0
+    omega_limit: float = 10.0
+    saturation_limit: float = 0.95
+    sharpness: float = 10.0
+
+    def __post_init__(self) -> None:
+        if any(not math.isfinite(getattr(self, f.name)) or getattr(self, f.name) <= 0
+               for f in fields(self)):
+            raise ValueError("risk limits and sharpness must be finite and positive")
+        if self.saturation_limit > 1:
+            raise ValueError("risk saturation limit must be at most normalized full command 1")
 
 
 @dataclass(frozen=True)
@@ -125,27 +149,100 @@ def concatenate(parts: list[TaskTrajectory]) -> TaskTrajectory:
     return TaskTrajectory(parts[-1].end, observations=observations, **values)
 
 
-def weighted_task_features(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
-    """Dense squared residuals: no horizontal-attitude or absolute-yaw target."""
+def weighted_task_features(
+    trajectory: TaskTrajectory, config: TaskLossConfig, *, start: int = 0,
+    horizon: Optional[int] = None,
+) -> torch.Tensor:
+    """Signed sqrt(2 Huber) residuals, with the original small-error curvature.
+
+    Robustify physical errors before applying their weights. Global time indices
+    retain the full-flight mean and final steady window when used on short slices.
+    Delta=0 is available only to reproduce historical quadratic objectives.
+    """
+    def robust(value):
+        delta = config.huber_delta
+        if delta == 0:
+            return value
+        outer = value.sign() * (2 * delta * value.abs() - delta ** 2).clamp_min(delta ** 2).sqrt()
+        return torch.where(value.abs() <= delta, value, outer)
+
     features = torch.cat((
-        math.sqrt(config.position_weight) * trajectory.positions,
-        math.sqrt(config.velocity_weight) * trajectory.velocities,
-        math.sqrt(config.omega_weight) * trajectory.omegas,
-        0.5 * math.sqrt(config.action_weight) * trajectory.actions,
-        0.5 * math.sqrt(config.action_delta_weight) * trajectory.action_deltas,
-        math.sqrt(config.omega_delta_weight) * trajectory.omega_deltas,
+        math.sqrt(config.position_weight) * robust(trajectory.positions),
+        math.sqrt(config.velocity_weight) * robust(trajectory.velocities),
+        math.sqrt(config.omega_weight) * robust(trajectory.omegas),
+        math.sqrt(config.action_weight) * robust(0.5 * trajectory.actions),
+        math.sqrt(config.action_delta_weight) * robust(0.5 * trajectory.action_deltas),
+        math.sqrt(config.omega_delta_weight) * robust(trajectory.omega_deltas),
     ), -1)
-    horizon = features.shape[0]
+    steps = features.shape[0]
+    horizon = steps if horizon is None else horizon
+    if start < 0 or horizon < 1 or start + steps > horizon:
+        raise ValueError("cost slice must lie inside the full horizon")
     tail = min(config.steady_steps, horizon)
-    time_weights = features.new_full((horizon,), 1.0 / horizon)
+    time_weights = features.new_full((steps,), 1.0 / horizon)
     time_weights = time_weights + (
-        torch.arange(horizon, device=features.device) >= horizon - tail
+        torch.arange(start, start + steps, device=features.device) >= horizon - tail
     ).to(features) * (config.steady_weight / tail)
     return features * time_weights.sqrt()[:, None, None]
 
 
 def scenario_costs(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
-    return weighted_task_features(trajectory, config).square().sum(dim=(0, 2))
+    return step_costs(trajectory, config).sum(0)
+
+
+def step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
+    """Additive [time, scenario] costs, without mean/CVaR scenario weights."""
+    return weighted_task_features(trajectory, config, start=start, horizon=horizon).square().sum(-1)
+
+
+def risk_components(trajectory, config: RiskConfig, *, position_reference=0.,
+                    velocity_reference=0., omega_reference=0.) -> dict[str, torch.Tensor]:
+    """[time, scene] barriers on task errors and normalized command saturation.
+
+    Hover references are zero. A future tracking task must supply its references
+    consistently in collection, continuation, Actor loss and acceptance.
+    """
+    def barrier(magnitude, limit):
+        return torch.nn.functional.softplus(config.sharpness * (magnitude / limit - 1)) / config.sharpness
+
+    return {
+        "position": barrier((trajectory.positions - position_reference).norm(dim=-1), config.position_limit),
+        "velocity": barrier((trajectory.velocities - velocity_reference).norm(dim=-1), config.velocity_limit),
+        "omega": barrier((trajectory.omegas - omega_reference).norm(dim=-1), config.omega_limit),
+        "saturation": barrier(trajectory.actions.abs(), config.saturation_limit).mean(-1),
+    }
+
+
+def step_risks(trajectory, config: RiskConfig, **references) -> torch.Tensor:
+    return torch.stack(tuple(risk_components(trajectory, config, **references).values())).sum(0)
+
+
+def suffix_risks(risks: torch.Tensor) -> torch.Tensor:
+    """Exact remaining risk at Z_0 ... Z_H; b_t belongs to Z_t -> Z_{t+1}."""
+    return torch.cat((risks.flip(0).cumsum(0).flip(0), torch.zeros_like(risks[:1])))
+
+
+def physical_risk_metrics(trajectory, config: RiskConfig, loss_config: TaskLossConfig) -> dict:
+    """Real flight risk, with independent full-flight mean+CVaR per component."""
+    components = {name: value.detach().sum(0) for name, value in risk_components(trajectory, config).items()}
+    total = torch.stack(tuple(components.values())).sum(0)
+
+    def aggregate(value):
+        count = max(1, math.ceil(loss_config.tail_fraction * value.numel()))
+        return float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
+
+    return {"risk_objective": aggregate(total),
+            "risk_components": {name: aggregate(value) for name, value in components.items()}}
+
+
+def risk_weights(costs: torch.Tensor, config: TaskLossConfig) -> torch.Tensor:
+    """Choose the pooled full-flight tail once; reuse these detached weights."""
+    if costs.ndim != 1 or costs.numel() == 0 or not bool(torch.isfinite(costs).all()):
+        raise ValueError("risk weights need finite per-scenario full-flight costs")
+    count = max(1, math.ceil(config.tail_fraction * costs.numel()))
+    weights = torch.full_like(costs, 1.0 / costs.numel())
+    weights[costs.detach().topk(count).indices] += config.tail_weight / count
+    return weights.detach()
 
 
 def task_residual(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:

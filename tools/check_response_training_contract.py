@@ -30,12 +30,13 @@ def inspect_calls(function):
             and isinstance(node.func, (ast.Name, ast.Attribute))}
 
 
-def run_contract(*, device="cuda"):
+def run_contract(*, device="cuda", loss_config=None):
     torch.set_num_threads(1)
     torch.manual_seed(7)
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but unavailable; do not call a skipped check passed")
-    config, loss_config = ResponsePolicyConfig(), TaskLossConfig()
+    config = ResponsePolicyConfig()
+    loss_config = TaskLossConfig(prediction_weight=0) if loss_config is None else loss_config
     policy = ResponseMotorPolicy(config).to(device)
     simulator = L2FSimulator(L2FParams(dt=config.dt))
     initial, _ = sample_scenarios(16, seed=TRAIN_SEED_BASE, dt=config.dt, device=torch.device(device))
@@ -101,9 +102,13 @@ def run_contract(*, device="cuda"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--output", type=Path, default=Path("runs/response_minimal_v1/contract.json"))
+    parser.add_argument("--output", type=Path, default=Path("runs/response_guarded_v1/contract.json"))
+    parser.add_argument("--prediction-weight", type=float, default=0.)
+    parser.add_argument("--huber-delta", type=float, default=1.)
     args = parser.parse_args()
-    report = run_contract(device=args.device)
+    report = run_contract(device=args.device, loss_config=TaskLossConfig(
+        prediction_weight=args.prediction_weight, huber_delta=args.huber_delta,
+    ))
     atomic_json(args.output, report)
     print(json.dumps(report, sort_keys=True), flush=True)
     return 0 if report["passed"] else 1

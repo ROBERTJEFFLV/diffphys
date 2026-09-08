@@ -17,11 +17,11 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from env_l2f import L2FParams, L2FSimulator
+from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import (
-    TaskLossConfig, observation, prediction_residual, rollout, sample_scenarios,
-    scenario_costs, task_loss, trajectory_metrics,
+    RiskConfig, TaskLossConfig, observation, physical_risk_metrics, prediction_residual, rollout, sample_scenarios,
+    scenario_costs, task_loss, trajectory_metrics, initialize,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -35,8 +35,9 @@ FINAL_CLAIM = ROOT / "reports" / "response_control_v1_final_claim.json"
 SOURCE_FILES = (
     "response_policy.py", "response_task.py", "response_shooting.py",
     "response_training.py", "tools/train_response_control.py",
-    "env_l2f.py", "full_space_shooting.py",
+    "env_l2f.py", "full_space_shooting.py", "petsc_kkt_solver.py",
     "tools/check_response_training_contract.py", "tools/check_response_preflight.py",
+    "response_critic.py",
 )
 
 
@@ -132,26 +133,101 @@ def protocol(policy_config, loss_config, scenarios) -> dict:
     }
 
 
+def training_batch_count(args) -> int:
+    """Short-window proposals pool exactly two independent stratified banks."""
+    if args.optimizer == "short-window":
+        return 2
+    count = getattr(args, "adam_train_batches", 2) if args.optimizer == "adam" else 1
+    if count < 1:
+        raise ValueError("training batches must be positive")
+    return count
+
+
+def critic_configuration(args):
+    from response_critic import CriticConfig
+    return CriticConfig(window_steps=args.window_steps, lr=args.critic_lr,
+                        epochs=args.critic_epochs, batch_size=args.critic_batch_size,
+                        dev_relative_tolerance=args.critic_dev_relative_tolerance,
+                        risk=RiskConfig(**{f.name: getattr(args, "risk_" + f.name) for f in fields(RiskConfig)}),
+                        risk_weight=args.risk_weight, risk_smoothmax_beta=args.risk_smoothmax_beta,
+                        risk_relative_tolerance=args.risk_relative_tolerance,
+                        direction_samples=args.critic_direction_samples,
+                        direction_epsilon=args.critic_direction_epsilon,
+                        direction_weight=args.critic_direction_weight,
+                        direction_temperature=args.critic_direction_temperature,
+                        direction_min_gap=args.critic_direction_min_gap)
+
+
+def sample_training_scenarios(
+    scenarios: int, attempt_index: int, *, batches: int, dt: float,
+    device: torch.device, dtype: torch.dtype,
+) -> tuple[L2FState, list[int]]:
+    """Pool independent, stratified TRAIN banks before any policy update.
+
+    Concatenating physical initial states preserves per-episode recurrent
+    initialization. The existing task loss then selects its CVaR tail over
+    the entire pooled rollout, not independently within each bank.
+    """
+    if attempt_index < 0 or batches < 1:
+        raise ValueError("invalid TRAIN attempt index or bank count")
+    seeds = [TRAIN_SEED_BASE + batches * attempt_index + bank for bank in range(batches)]
+    reserved_start = min((*DEVELOPMENT_SEEDS, MS_ACCEPTANCE_SEED, *FINAL_SEEDS))
+    if seeds[-1] >= reserved_start:
+        raise ValueError("TRAIN sampling budget would enter the reserved DEV/FINAL seed range")
+    states = [
+        sample_scenarios(scenarios, seed=seed, dt=dt, device=device, dtype=dtype)[0]
+        for seed in seeds
+    ]
+    if len(states) == 1:
+        return states[0], seeds
+    pooled = L2FState(**{
+        field.name: torch.cat([getattr(state, field.name) for state in states], dim=0)
+        for field in fields(states[0])
+    })
+    return pooled, seeds
+
+
 def binding(args, policy_config, loss_config) -> dict:
+    batches = training_batch_count(args)
     return {
         "source_sha256": source_hash(), "protocol": protocol(policy_config, loss_config, args.scenarios),
         "optimizer": args.optimizer, "horizon": args.horizon, "segments": args.segments,
+        "critic": asdict(critic_configuration(args)) if args.optimizer == "short-window" else None,
+        "training_sampling": {
+            "batches_per_proposal": batches,
+            "scenarios_per_bank": args.scenarios,
+            "scenarios_per_proposal": batches * args.scenarios,
+            "seed_rule": "TRAIN_SEED_BASE + batches_per_proposal * zero_based_attempt + bank_index",
+            "risk_aggregation": "mean_and_CVaR_over_all_proposal_scenarios",
+        },
         "segment_steps": args.segment_steps, "lr": args.lr,
         "weight_decay": args.weight_decay, "gradient_clip": args.gradient_clip,
         "device": args.device, "dtype": args.dtype, "torch_version": str(torch.__version__),
+        "linear_solver": args.linear_solver, "kkt_rtol": args.kkt_rtol,
+        "kkt_atol": args.kkt_atol, "kkt_max_iterations": args.kkt_max_iterations,
+        "kkt_preconditioner": args.kkt_preconditioner, "kkt_curvature_probes": args.kkt_curvature_probes,
         "cg_iterations": args.cg_iterations, "parameter_radius": args.parameter_radius,
         "action_radius": args.action_radius, "action_max_radius": args.action_max_radius,
         "development_every": args.development_every,
+        "adam_guard": {
+            "max_loss_ratio": args.adam_max_loss_ratio,
+            "max_omega_ratio": args.adam_max_omega_ratio,
+            "max_dev_loss_ratio": args.adam_max_dev_loss_ratio,
+            "maximum_consecutive_rejections": args.maximum_adam_rejections,
+        },
+        "gradient_norm_kind": ("mean_window_performance_plus_local_and_terminal_risk_before_clipping"
+                               if args.optimizer == "short-window" else "combined_task_plus_weighted_auxiliary_before_clipping"),
         "contract_sha256": None if args.contract_report is None else file_hash(args.contract_report),
     }
 
 
-def save_training(path, policy, optimizer, progress, solver, run_binding, initial_model):
+def save_training(path, policy, optimizer, progress, solver, run_binding, initial_model, *, critic=None):
     atomic_torch(path, {
         "schema": PROTOCOL_VERSION, "architecture": ARCHITECTURE,
         "model": policy.state_dict(), "model_sha256": model_hash(policy),
         "policy_config": asdict(policy.config), "binding": run_binding,
         "optimizer": None if optimizer is None else optimizer.state_dict(),
+        "critic_training": None if critic is None else critic.state_dict(),
         "rng": capture_rng(), "progress": copy.deepcopy(progress), "solver": solver,
         "initial_model": initial_model, "deployment_authorized": False,
         "formal_eligible": False,
@@ -178,6 +254,78 @@ def task_gradient_norms(loss, policy):
         if gradient is not None:
             squared[key] += float(gradient.detach().double().square().sum())
     return {"task_" + name + "_gradient_norm": math.sqrt(value) for name, value in squared.items()}
+
+
+def guarded_adam_step(
+    policy, optimizer, simulator, initial, horizon, loss_config, before_metrics,
+    *, max_loss_ratio, max_omega_ratio, rejection_path=None, context=None,
+):
+    """Accept finite proposals only after a fresh continuous physical rollout.
+
+    Gradients have already been computed/clipped by the caller. This no-grad
+    acceptance replay is separate from the fully differentiated training rollout.
+    Rejection restores Adam moments and RNG, not just model weights.
+    """
+    before_model = copy.deepcopy(policy.state_dict())
+    before_optimizer = copy.deepcopy(optimizer.state_dict())
+    before_rng = capture_rng()
+    accepted = False
+    after = None
+    candidate = None
+    try:
+        optimizer.step()
+        finite = all(bool(torch.isfinite(value).all()) for value in policy.state_dict().values())
+        finite = finite and all(
+            bool(torch.isfinite(value).all())
+            for state in optimizer.state.values() for value in state.values()
+            if isinstance(value, torch.Tensor)
+        )
+        reason = None
+        if not finite:
+            reason = "nonfinite_model_or_optimizer"
+        else:
+            with torch.no_grad():
+                candidate = rollout(policy, simulator, initial, horizon)
+                after = trajectory_metrics(candidate, loss_config)
+            finite = after["finite"] and math.isfinite(after["task_objective"]) and math.isfinite(after["omega_rms"])
+            if not finite:
+                reason = "nonfinite_continuous_rollout"
+            elif after["task_objective"] > max_loss_ratio * max(before_metrics["task_objective"], 1.0e-6):
+                reason = "continuous_task_loss_catastrophe"
+            elif after["omega_rms"] > max_omega_ratio * max(before_metrics["omega_rms"], 0.5):
+                reason = "continuous_omega_catastrophe"
+            else:
+                accepted = True
+        evidence = {
+            "accepted": accepted, "rejection_reason": reason,
+            "proposal_finite": finite,
+            "continuous_loss_before": before_metrics["task_objective"],
+            "continuous_loss_after": None if after is None or not math.isfinite(after["task_objective"]) else after["task_objective"],
+            "continuous_omega_before": before_metrics["omega_rms"],
+            "continuous_omega_after": None if after is None or not math.isfinite(after["omega_rms"]) else after["omega_rms"],
+        }
+        if not accepted and rejection_path is not None:
+            atomic_torch(rejection_path, {
+                "kind": "rejected-adam-proposal", "context": context,
+                "before_model": before_model, "before_optimizer": before_optimizer,
+                "before_rng": before_rng,
+                "candidate_model": policy.state_dict(),
+                "candidate_optimizer": optimizer.state_dict(),
+                "initial_state": {f.name: getattr(initial, f.name).detach().cpu() for f in fields(initial)},
+                "candidate_trajectory": None if candidate is None else {
+                    name: getattr(candidate, name).detach().cpu()
+                    for name in ("observations", "actions", "positions", "velocities", "omegas")
+                },
+                "guard": evidence, "deployment_authorized": False,
+            })
+        return evidence
+    finally:
+        # This also handles exceptions during the proposal, replay or artifact
+        # write: the outer failure checkpoint must never contain unchecked weights.
+        if not accepted:
+            policy.load_state_dict(before_model)
+            optimizer.load_state_dict(before_optimizer)
+            restore_rng(before_rng)
 
 
 def _reference_rollout(checkpoint, simulator, initial, horizon):
@@ -225,7 +373,7 @@ def _select_trace(trace, mask):
 @torch.no_grad()
 def evaluate(
     policy, loss_config, *, seeds, horizons, scenarios, output=None,
-    q2_checkpoint=None, split="development", save_trajectories=False,
+    q2_checkpoint=None, split="development", save_trajectories=False, risk_config=None,
 ):
     device, dtype = next(policy.parameters()).device, next(policy.parameters()).dtype
     simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
@@ -235,6 +383,11 @@ def evaluate(
         for horizon in horizons:
             trace = rollout(policy, simulator, initial, horizon)
             metrics = trajectory_metrics(trace, loss_config)
+            if risk_config is not None:
+                metrics.update(physical_risk_metrics(trace, risk_config, loss_config))
+                metrics["finite"] = metrics["finite"] and all(math.isfinite(x) for x in (
+                    metrics["risk_objective"], *metrics["risk_components"].values()
+                ))
             if not metrics["finite"] or not math.isfinite(metrics["task_objective"]):
                 if output is not None:
                     atomic_torch(output.with_suffix(".nonfinite.pt"), {
@@ -283,6 +436,15 @@ def evaluate(
         "best_known_per_airframe_optimality_reference_available": False,
         "formal_eligible": False, "deployment_authorized": False,
     }
+    if risk_config is not None:
+        report.update(
+            risk_config=asdict(risk_config),
+            risk_objective=sum(row["policy"]["risk_objective"] for row in records) / len(records),
+            risk_components={
+                name: sum(row["policy"]["risk_components"][name] for row in records) / len(records)
+                for name in records[0]["policy"]["risk_components"]
+            },
+        )
     if output is not None:
         atomic_json(output, report)
         if save_trajectories:
@@ -298,6 +460,10 @@ def train(args, policy_config, loss_config):
         raise ValueError("set an explicit --updates budget below 1000000 after profiling")
     if args.seed != 7:
         raise ValueError("this mechanism-screening protocol trains only initialization seed7")
+    train_batches = training_batch_count(args)
+    reserved_start = min((*DEVELOPMENT_SEEDS, MS_ACCEPTANCE_SEED, *FINAL_SEEDS))
+    if args.updates * train_batches > reserved_start - TRAIN_SEED_BASE:
+        raise ValueError("proposal budget exceeds the independent TRAIN seed range")
     if args.q2_checkpoint is not None:
         raise ValueError("Q2 is an optional evaluation reference, not a training input")
     if FINAL_CLAIM.exists():
@@ -315,6 +481,9 @@ def train(args, policy_config, loss_config):
     if device.type == "cuda":
         torch.cuda.manual_seed_all(7)
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
+    if args.optimizer == "full-space-ms" and args.linear_solver == "petsc-minres":
+        from petsc_kkt_solver import require_petsc
+        require_petsc(next(policy.parameters()))
     if args.initialize_from is not None:
         initialized, source = load_policy_checkpoint(args.initialize_from, device, dtype)
         if initialized.config != policy.config:
@@ -323,6 +492,18 @@ def train(args, policy_config, loss_config):
     optimizer = None if args.optimizer == "full-space-ms" else torch.optim.AdamW(
         policy.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
+    critic = None
+    development_initials = ()
+    if args.optimizer == "short-window":
+        from response_critic import CriticTrainer
+        if loss_config.prediction_weight != 0 or loss_config.huber_delta <= 0:
+            raise ValueError("short-window training requires Huber task cost and no prediction auxiliary")
+        development_initials = tuple(sample_scenarios(
+            args.scenarios, seed=seed, dt=policy_config.dt, device=device, dtype=dtype
+        )[0] for seed in DEVELOPMENT_SEEDS)
+        critic = CriticTrainer(policy, initialize(policy, development_initials[0]), args.horizon,
+                               critic_configuration(args))
     run_binding = binding(args, policy_config, loss_config)
     work = args.work_dir
     latest = work / "latest.training.pt"
@@ -330,7 +511,7 @@ def train(args, policy_config, loss_config):
     initial_model = copy.deepcopy(policy.state_dict())
     progress = {
         "attempts": 0, "updates": 0, "elapsed_seconds": 0.0,
-        "best_score": None, "best_update": None, "bad_checks": 0,
+        "best_score": None, "best_update": None, "best_omega_rms": None, "bad_checks": 0,
         "history": [], "development": [], "training_seeds": [],
         "baseline_score": None, "status": "training",
         "initialization_checkpoint_sha256": None if args.initialize_from is None else file_hash(args.initialize_from),
@@ -343,6 +524,8 @@ def train(args, policy_config, loss_config):
         policy.load_state_dict(saved["model"])
         if optimizer is not None:
             optimizer.load_state_dict(saved["optimizer"])
+        if critic is not None:
+            critic.load_state_dict(saved["critic_training"])
         progress, solver, initial_model = saved["progress"], saved["solver"], saved["initial_model"]
         restore_rng(saved["rng"])
     work.mkdir(parents=True, exist_ok=True)
@@ -352,7 +535,6 @@ def train(args, policy_config, loss_config):
         "resume": None if resume is None else str(resume),
         "deployment_authorized": False,
     })
-    simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
     started, previous_seconds = time.monotonic(), progress["elapsed_seconds"]
     stop = {"requested": False}
     old_handlers = {}
@@ -361,14 +543,52 @@ def train(args, policy_config, loss_config):
 
     def save(path=latest):
         progress["elapsed_seconds"] = previous_seconds + time.monotonic() - started
-        save_training(path, policy, optimizer, progress, solver, run_binding, initial_model)
+        save_training(path, policy, optimizer, progress, solver, run_binding, initial_model, critic=critic)
+
+
+    def restore_best_after_development_failure(reason):
+        candidate_update = progress["updates"]
+        rejected_path = work / "rejected_development" / ("%07d.training.pt" % progress["attempts"])
+        save(rejected_path)
+        stable = torch.load(work / "best.training.pt", map_location="cpu")
+        policy.load_state_dict(stable["model"])
+        optimizer.load_state_dict(stable["optimizer"])
+        # Completed supervised Critic fits survive an Actor DEV rollback too.
+        # Their RNG progression must remain consistent with the retained fits.
+        if critic is None:
+            restore_rng(stable["rng"])
+        solver.clear()
+        solver.update(stable["solver"])
+        stable_attempt = stable["progress"]["attempts"]
+        for row in progress["history"]:
+            if row["attempt"] > stable_attempt and row["accepted"]:
+                row["provisionally_accepted"] = True
+                row["accepted"] = False
+                row["rolled_back"] = True
+                row["rejection_reason"] = "development_catastrophe"
+        # Attempts and sampled seeds are not rewound or hidden. Only the number
+        # of retained updates is restored to the accepted checkpoint's progress.
+        progress["updates"] = stable["progress"]["updates"]
+        progress["status"] = "adam_development_rollback"
+        progress["rollback"] = {
+            "reason": reason, "candidate_update": candidate_update,
+            "restored_update": progress["updates"],
+            "restored_attempt": stable_attempt,
+            "rejected_checkpoint": str(rejected_path),
+        }
 
     def development():
-        report = evaluate(
-            policy, loss_config, seeds=DEVELOPMENT_SEEDS, horizons=(args.horizon,),
-            scenarios=args.scenarios,
-            output=work / "development" / ("%07d.json" % progress["attempts"]),
-        )
+        try:
+            report = evaluate(
+                policy, loss_config, seeds=DEVELOPMENT_SEEDS, horizons=(args.horizon,),
+                scenarios=args.scenarios,
+                output=work / "development" / ("%07d.json" % progress["attempts"]),
+                risk_config=None if critic is None else critic.config.risk,
+            )
+        except BaseException:
+            if optimizer is not None and progress["best_score"] is not None:
+                restore_best_after_development_failure("development_evaluation_failed")
+            raise
         if progress["baseline_score"] is None:
             progress["baseline_score"] = report["score"]
         compact = {key: report[key] for key in (
@@ -376,18 +596,34 @@ def train(args, policy_config, loss_config):
             "steady_success_rate", "motor_saturation_fraction",
         )}
         compact.update(attempt=progress["attempts"], update=progress["updates"])
+        if critic is not None:
+            compact.update({key: report[key] for key in ("risk_objective", "risk_components")})
         progress["development"].append(compact)
         old_score = progress["best_score"]
+        catastrophic = optimizer is not None and old_score is not None and (
+            report["score"] > args.adam_max_dev_loss_ratio * max(old_score, 1.0e-6)
+            or report["omega_rms"] > args.adam_max_omega_ratio * max(progress["best_omega_rms"], 0.5)
+        )
+        if catastrophic:
+            compact["accepted"] = False
+            restore_best_after_development_failure("finite_development_catastrophe")
+            print(json.dumps({"development": compact, "rollback": progress["rollback"]}), flush=True)
+            return False
         improved = old_score is None or report["score"] < old_score * (1 - args.min_relative_improvement)
         if improved:
-            progress.update(best_score=report["score"], best_update=progress["updates"], bad_checks=0)
+            progress.update(best_score=report["score"], best_update=progress["updates"], best_omega_rms=report["omega_rms"], bad_checks=0)
             save(work / "best.training.pt")
             atomic_json(work / "best.development.json", report)
         else:
             progress["bad_checks"] += 1
         print(json.dumps({"development": compact}), flush=True)
+        return True
 
     try:
+        if optimizer is not None and progress["best_score"] is not None and not (work / "best.training.pt").exists():
+            if progress["updates"] != progress["best_update"]:
+                raise ValueError("guarded resume needs the best checkpoint in the original work directory")
+            save(work / "best.training.pt")
         if not progress["development"]:
             development()
             save()
@@ -398,10 +634,11 @@ def train(args, policy_config, loss_config):
                 progress["status"] = "interrupted" if stop["requested"] else "time_budget"
                 break
             index = progress["attempts"]
-            scenario_seed = TRAIN_SEED_BASE + index
-            initial, _ = sample_scenarios(
-                args.scenarios, seed=scenario_seed, dt=policy_config.dt, device=device, dtype=dtype
+            initial, scenario_seeds = sample_training_scenarios(
+                args.scenarios, index, batches=train_batches,
+                dt=policy_config.dt, device=device, dtype=dtype,
             )
+            scenario_seed = scenario_seeds[0]
             if optimizer is None:
                 from response_shooting import task_shooting_step
                 development_initial, _ = sample_scenarios(
@@ -412,12 +649,26 @@ def train(args, policy_config, loss_config):
                     policy, simulator, initial, development_initial, loss_config,
                     segment_steps=args.segment_steps, segments=args.segments,
                     damping=solver["damping"], cg_iterations=args.cg_iterations,
+                    linear_solver=args.linear_solver, kkt_rtol=args.kkt_rtol,
+                    kkt_atol=args.kkt_atol, kkt_max_iterations=args.kkt_max_iterations,
+                    kkt_monitor=args.kkt_monitor, kkt_preconditioner=args.kkt_preconditioner,
+                    kkt_curvature_probes=args.kkt_curvature_probes,
                     parameter_radius=args.parameter_radius, action_radius=args.action_radius,
                     action_max_radius=args.action_max_radius, debug_solver=args.ms_debug,
                 )
                 accepted = record["accepted"]
                 solver["consecutive_rejections"] = 0 if accepted else previous_rejections + 1
+            elif critic is not None:
+                record = critic.guarded_step(
+                    policy, optimizer, simulator, initial, args.horizon, loss_config,
+                    development_initials=development_initials, gradient_clip=args.gradient_clip,
+                )
+                accepted = record["accepted"]
+                solver["consecutive_adam_rejections"] = 0 if accepted else solver.get("consecutive_adam_rejections", 0) + 1
             else:
+                # Every bank uses the same pre-update parameters. Keep one
+                # pooled task loss, one backward, one clip and one Adam step.
+                # task_loss selects CVaR globally across all pooled scenarios.
                 trace = rollout(policy, simulator, initial, args.horizon)
                 control = task_loss(trace, loss_config)
                 with torch.no_grad():
@@ -432,36 +683,60 @@ def train(args, policy_config, loss_config):
                 loss.backward()
                 gradient_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.gradient_clip)
                 if not bool(torch.isfinite(gradient_norm)):
-                    raise RuntimeError("non-finite task gradient")
-                before_model, before_optimizer = copy.deepcopy(policy.state_dict()), copy.deepcopy(optimizer.state_dict())
-                optimizer.step()
-                if not all(bool(torch.isfinite(value).all()) for value in policy.state_dict().values()):
-                    policy.load_state_dict(before_model); optimizer.load_state_dict(before_optimizer)
-                    raise RuntimeError("non-finite optimizer result; restored pre-update state")
+                    raise RuntimeError("non-finite combined-loss gradient before clipping")
                 record = {
                     "task_loss": float(control.detach()),
+                    "auxiliary_loss": float(auxiliary.detach()),
+                    "total_loss": float(loss.detach()),
                     **{key: metrics[key] for key in (
                         "position_rms", "velocity_rms", "omega_rms",
                         "steady_success_rate", "motor_saturation_fraction",
                     )},
-                    "gradient_norm": float(gradient_norm), "numerics_finite": True,
-                    "accepted": True,
+                    "gradient_norm": float(gradient_norm),
                 }
-                accepted = True
                 del trace, control, auxiliary, loss
+                proposal = guarded_adam_step(
+                    policy, optimizer, simulator, initial, args.horizon, loss_config, metrics,
+                    max_loss_ratio=args.adam_max_loss_ratio,
+                    max_omega_ratio=args.adam_max_omega_ratio,
+                    rejection_path=work / "rejected_adam" / ("%07d.pt" % (progress["attempts"] + 1)),
+                    context={
+                        "binding": run_binding, "attempt": progress["attempts"] + 1,
+                        "scenario_seed": scenario_seed, "scenario_seeds": scenario_seeds,
+                        "scenarios_per_bank": args.scenarios,
+                        "training_scenarios": train_batches * args.scenarios,
+                    },
+                )
+                record.update(proposal, numerics_finite=proposal["proposal_finite"])
+                accepted = proposal["accepted"]
+                solver["consecutive_adam_rejections"] = 0 if accepted else solver.get("consecutive_adam_rejections", 0) + 1
             progress["attempts"] += 1
             progress["updates"] += int(accepted)
-            progress["training_seeds"].append(scenario_seed)
-            record.update(attempt=progress["attempts"], update=progress["updates"], scenario_seed=scenario_seed)
+            progress["training_seeds"].extend(scenario_seeds)
+            record.update(
+                attempt=progress["attempts"], update=progress["updates"],
+                scenario_seed=scenario_seed, scenario_seeds=scenario_seeds,
+                training_batches=train_batches,
+                training_scenarios=train_batches * args.scenarios,
+            )
             progress["history"].append(record)
             if progress["attempts"] % args.checkpoint_every == 0:
                 save()
                 print(json.dumps(record), flush=True)
+            if optimizer is not None and (
+                not record["proposal_finite"]
+                or solver.get("consecutive_adam_rejections", 0) >= args.maximum_adam_rejections
+            ):
+                progress["status"] = "adam_nonfinite_proposal" if not record["proposal_finite"] else "adam_rejections"
+                save()
+                break
             if optimizer is None and solver.get("consecutive_rejections", 0) >= args.maximum_ms_rejections:
                 progress["status"] = "solver_rejections"
                 break
             if progress["attempts"] % args.development_every == 0:
-                development()
+                if not development():
+                    save()
+                    break
                 save()
                 if progress["updates"] >= args.minimum_updates and progress["bad_checks"] >= args.patience:
                     progress["status"] = "development_plateau"
@@ -485,6 +760,7 @@ def train(args, policy_config, loss_config):
         "elapsed_seconds": progress["elapsed_seconds"], "best_update": progress["best_update"],
         "baseline_development_score": progress["baseline_score"],
         "best_development_score": progress["best_score"],
+        "rollback": progress.get("rollback"),
         "final_seeds_consumed": [], "formal_eligible": False, "deployment_authorized": False,
     }
     atomic_json(work / "training_report.json", summary)
@@ -496,15 +772,55 @@ def profile(args, policy_config, loss_config):
     torch.manual_seed(7)
     device, dtype = torch.device(args.device), getattr(torch, args.dtype)
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
-    initial, _ = sample_scenarios(args.scenarios, seed=TRAIN_SEED_BASE, dt=policy_config.dt,
-                                  device=device, dtype=dtype)
+    if args.initialize_from is not None:
+        initialized, _ = load_policy_checkpoint(args.initialize_from, device, dtype)
+        if initialized.config != policy.config:
+            raise ValueError("weights-only initialization requires the same policy configuration")
+        policy.load_state_dict(initialized.state_dict())
+    initial_model_sha256 = model_hash(policy)
+    train_batches = training_batch_count(args)
+    initial, scenario_seeds = sample_training_scenarios(
+        args.scenarios, 0, batches=train_batches, dt=policy_config.dt,
+        device=device, dtype=dtype,
+    )
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "short-window":
+        from response_critic import CriticTrainer
+        critic = CriticTrainer(policy, initialize(policy, initial), args.horizon, critic_configuration(args))
+        dev = tuple(sample_scenarios(args.scenarios, seed=seed, dt=policy_config.dt,
+                                     device=device, dtype=dtype)[0] for seed in DEVELOPMENT_SEEDS)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        started = time.monotonic()
+        guard = critic.guarded_step(policy, optimizer, simulator, initial, args.horizon, loss_config,
+                                    development_initials=dev, gradient_clip=args.gradient_clip)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        report = {
+            "protocol": PROTOCOL_VERSION, "optimizer": "short-window",
+            "initial_model_sha256": initial_model_sha256,
+            "scope": "one Monte Carlo risk/ranking Critic fit and windowed Actor proposal with continuous performance/risk gates",
+            "critic": asdict(critic.config),
+            "guard": guard, "device": str(device), "dtype": args.dtype,
+            "scenarios": train_batches * args.scenarios, "scenarios_per_bank": args.scenarios,
+            "training_batches": train_batches, "scenario_seeds": scenario_seeds,
+            "horizon": args.horizon, "window_steps": args.window_steps,
+            "proposal_seconds": time.monotonic() - started,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
+            "production_checkpoint_written": False, "deployment_authorized": False,
+        }
+        atomic_json(args.work_dir / "profile.json", report)
+        return report
     if device.type == "cuda":
         torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
     start = time.monotonic()
     trace = rollout(policy, simulator, initial, args.horizon)
     loss = task_loss(trace, loss_config)
+    with torch.no_grad():
+        before_metrics = trajectory_metrics(trace, loss_config)
     if loss_config.prediction_weight:
         loss = loss + loss_config.prediction_weight * prediction_residual(
             policy, trace.observations, trace.actions
@@ -513,12 +829,23 @@ def profile(args, policy_config, loss_config):
         torch.cuda.synchronize()
     forward = time.monotonic() - start
     start = time.monotonic()
-    loss.backward(); optimizer.step()
+    loss.backward()
+    gradient_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.gradient_clip)
+    if not bool(torch.isfinite(gradient_norm)):
+        raise RuntimeError("non-finite combined-loss gradient in guarded profile")
+    del loss, trace
+    guard = guarded_adam_step(
+        policy, optimizer, simulator, initial, args.horizon, loss_config, before_metrics,
+        max_loss_ratio=args.adam_max_loss_ratio, max_omega_ratio=args.adam_max_omega_ratio,
+    )
     if device.type == "cuda":
         torch.cuda.synchronize()
     report = {
-        "protocol": PROTOCOL_VERSION, "scope": "one Adam task update, not an MS throughput estimate",
-        "device": str(device), "dtype": args.dtype, "scenarios": args.scenarios,
+        "protocol": PROTOCOL_VERSION, "scope": "one guarded AdamW proposal including acceptance replay; excludes periodic DEV and MS",
+        "guard": guard,
+        "device": str(device), "dtype": args.dtype,
+        "scenarios": train_batches * args.scenarios, "scenarios_per_bank": args.scenarios,
+        "training_batches": train_batches, "scenario_seeds": scenario_seeds,
         "horizon": args.horizon, "forward_seconds": forward,
         "backward_update_seconds": time.monotonic() - start,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
@@ -576,7 +903,7 @@ def evaluate_checkpoint(args):
     policy, _ = load_policy_checkpoint(path, torch.device(args.device), getattr(torch, saved["binding"]["dtype"]))
     if model_hash(policy) != saved["model_sha256"]:
         raise ValueError("checkpoint model digest mismatch")
-    loss_config = TaskLossConfig(**saved["binding"]["protocol"]["loss"])
+    loss_config = TaskLossConfig(**{"huber_delta": 0., **saved["binding"]["protocol"]["loss"]})
     scenarios = saved["binding"]["protocol"]["scenarios_per_bank"]
     if final:
         if not args.consume_final:
@@ -601,6 +928,8 @@ def evaluate_checkpoint(args):
         output=args.work_dir / ("final_evaluation.json" if final else "evaluation.json"),
         q2_checkpoint=args.q2_checkpoint, split="final" if final else "development",
         save_trajectories=True,
+        risk_config=RiskConfig(**saved["binding"]["critic"]["risk"])
+                    if (saved["binding"].get("critic") or {}).get("risk") else None,
     )
     report["candidate_frozen"] = final
     report["final_evaluation_complete"] = final
@@ -651,7 +980,7 @@ def evaluate_hidden_reset(args):
     output = args.work_dir / "hidden_reset.json"
     if output.exists():
         raise FileExistsError("preserve the existing hidden-reset experiment rather than overwrite it")
-    config = TaskLossConfig(**saved["binding"]["protocol"]["loss"])
+    config = TaskLossConfig(**{"huber_delta": 0., **saved["binding"]["protocol"]["loss"]})
     count = saved["binding"]["protocol"]["scenarios_per_bank"]
     simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
     rows, trajectories = [], []

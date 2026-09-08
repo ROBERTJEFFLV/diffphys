@@ -12,6 +12,7 @@ from tools.train_response_control import parse_args
 
 def arguments(path, updates):
     return parse_args([
+        "--optimizer", "adam",
         "--device", "cpu", "--work-dir", str(path), "--updates", str(updates),
         "--horizon", "4", "--scenarios", "16", "--memory-dim", "4", "--hidden-dim", "8",
         "--minimum-updates", "1", "--checkpoint-every", "1", "--development-every", "2",

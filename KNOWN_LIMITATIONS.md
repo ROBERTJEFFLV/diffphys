@@ -1,5 +1,19 @@
 # Known limitations of this revision
 
+## Current response Critic trainer (2026-09-07)
+
+The primary response trainer now uses a training-only Monte Carlo MLP Critic
+and short-window differentiable physics, with the deployed Actor unchanged.
+Deterministic CPU tests cover returns, gradients, continuous-state boundaries,
+acceptance/rollback and resume. CUDA execution and H500 learned performance have
+not been established by this change. The raw privileged Critic input features
+retain mixed physical units; regression accuracy and value-gradient usefulness
+still require evidence from an explicitly budgeted performance run. Strict
+continuous TRAIN/both-DEV acceptance remains mandatory regardless of Critic fit.
+See [the current training path](docs/response_critic_training.md).
+
+The sections below describe historical structured-controller experiments.
+
 This revision contains the complete experimental implementation of the
 physics-structured recurrent controller and the matrix-free full-space
 multiple-shooting training path.  It must not be interpreted as a promoted
@@ -51,11 +65,20 @@ direction, action/parameter trust regions, nonlinear trajectory restoration,
 and a disjoint held-out acceptance bank.  It no longer uses the old exact
 reduced H1000 gradient.
 
-However, its nested conjugate-gradient solve is not block-preconditioned and
-is not a production sparse SQP implementation.  Smoke runs can finish without
+The historical structured trainer explicitly retains its nested
+conjugate-gradient backend, which is not block-preconditioned and is not a
+production sparse SQP implementation. Smoke runs can finish without
 meeting the strict formal linear-solver tolerances.  Scaling and conditioning
 must be revalidated at 2xH250 and 4xH250 after a structured controller passes
 the migration gate.
+
+The response MS default now uses reduced PETSc MINRES with symmetric scaling
+and a fixed curvature-diagonal SPD PC. CPU/CUDA tiny dense-oracle checks pass.
+The bounded 825-checkpoint, 64-scenario, 2xH125 run still fails the independent
+KKT residual threshold on all three 200-iteration proposals, with zero model
+updates. This is a remaining full-size linear-convergence limitation. See
+[backend details](docs/petsc_kkt_backend.md) and
+[experiment evidence](reports/petsc_kkt_implementation/SUMMARY_ZH.md).
 
 ## 4. Stability diagnostics are sampled evidence, not a proof
 

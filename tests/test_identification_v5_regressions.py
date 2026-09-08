@@ -57,6 +57,8 @@ def test_actual_action_replay_matches_every_recurrent_field_at_publication():
 
 def test_teacher_only_collection_preserves_q2_trajectory_and_integral():
     checkpoint = Path("reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt")
+    if not checkpoint.is_file():
+        pytest.skip("Historical Q2 integration test requires the external model_update_2000.pt checkpoint")
     teacher, args = load_q2_policy(checkpoint, device="cpu", dtype=torch.float32)
     student = StructuredRecurrentPolicy(StructuredPolicyConfig(hidden_dim=4, identifier_dim=4, allocator_solver="smooth_dls"))
     simulator = L2FSimulator(L2FParams(dt=.01))

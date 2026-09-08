@@ -432,8 +432,14 @@ build_l2f_simulink_model;
 The primary experiment now jointly learns response memory and direct motor
 control from differentiable physical task rollouts, without Q2 action or JVP
 labels. Start with `tools/train_response_control.py`; see
-[`docs/response_control_v1.md`](docs/response_control_v1.md) for architecture,
-gradient semantics, proposed budgets, exact resume, MS, and evaluation splits.
+[`docs/response_critic_training.md`](docs/response_critic_training.md) for the
+current H500 / ten-H50 trainer. A training-only nonnegative Risk-to-Go MLP supplies
+terminal risk gradients and learns from exact risk suffixes plus a few reachable
+motor perturbation rankings; the deployed Actor is unchanged. Two independent
+64-scene TRAIN banks determine one update, followed by continuous TRAIN and
+both-DEV performance and physical-risk acceptance with Actor rollback. Total
+risk and each risk component must not worsen. Completed finite Critic fits persist
+across Actor rejections. MS is an optional debug path.
 
 `tools/run_structured_pipeline.py` and
 `tools/train_structured_full_space.py` select the new task method by default.
@@ -441,7 +447,8 @@ Their old Q2 migration methods require `--historical-q2-distillation`.
 Historical V4/V5 failures, reports, and validation-consumption records are
 preserved and do not certify this new method.
 
-This implementation has not yet been validated or trained. It does not establish
+The short-window trainer has deterministic CPU correctness tests; long-horizon
+learning improvement and CUDA performance remain unverified. It does not establish
 flight safety, near-optimal control, or calibration-free real motor commands.
 The current simulator action interface is airframe-normalized around hover.
 The remaining sections below describe the earlier baseline and experiments.

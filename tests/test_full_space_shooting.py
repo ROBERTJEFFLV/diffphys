@@ -121,7 +121,7 @@ def _joint_problem() -> FullSpaceProblem:
 
 def test_joint_sqp_updates_theta_and_boundaries_with_linearized_equality() -> None:
     problem = _joint_problem()
-    result = solve_joint_sqp_step(problem, damping=1.0e-3, cg_iterations=64, max_backtracks=4)
+    result = solve_joint_sqp_step(problem, linear_solver="legacy-cg", damping=1.0e-3, cg_iterations=64, max_backtracks=4)
     assert result.accepted
     assert not torch.allclose(result.theta, problem.theta)
     assert not torch.allclose(result.boundaries, problem.boundaries)
@@ -140,7 +140,7 @@ def test_joint_sqp_rejects_dangerous_action_step() -> None:
         return theta.expand(4)
 
     result = solve_joint_sqp_step(
-        problem, damping=1.0e-3, cg_iterations=64, action_evaluator=actions,
+        problem, linear_solver="legacy-cg", damping=1.0e-3, cg_iterations=64, action_evaluator=actions,
         action_radius=1.0e-6, max_backtracks=4,
     )
     assert not result.accepted
@@ -155,7 +155,7 @@ def test_joint_sqp_backtracks_to_action_radius_and_recomputes_reduction() -> Non
         return theta.expand(4)
 
     result = solve_joint_sqp_step(
-        problem, damping=1.0e-3, cg_iterations=64, action_evaluator=actions,
+        problem, linear_solver="legacy-cg", damping=1.0e-3, cg_iterations=64, action_evaluator=actions,
         action_radius=0.5, max_backtracks=8,
     )
     assert result.accepted
@@ -173,7 +173,7 @@ def test_joint_sqp_rejects_silent_scalar_objective() -> None:
         task_residual=problem.task_residual,
     )
     with pytest.raises(ValueError, match="task_residual"):
-        solve_joint_sqp_step(problem)
+        solve_joint_sqp_step(problem, linear_solver="legacy-cg")
 
 
 def test_checked_cg_stops_on_negative_curvature_without_huge_step() -> None:

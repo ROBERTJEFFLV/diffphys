@@ -321,7 +321,7 @@ def main() -> None:
             policy, codec, parameter_spec, value, action_probes
         )
         step = solve_joint_sqp_step(
-            problem,
+            problem, linear_solver="legacy-cg",
             damping=damping,
             penalty=args.penalty,
             cg_iterations=args.cg_iterations,

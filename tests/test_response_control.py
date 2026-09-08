@@ -205,5 +205,5 @@ def test_joint_solver_keeps_fixed_clock_in_its_internal_problem():
         initial, boundaries, theta, segment, BoundaryLayout(2), task_residual=residual,
         fixed_boundary_mask=torch.tensor([[[False, True]]]),
     )
-    result = solve_joint_sqp_step(problem, damping=1., cg_iterations=8, max_backtracks=2)
+    result = solve_joint_sqp_step(problem, linear_solver="legacy-cg", damping=1., cg_iterations=8, max_backtracks=2)
     assert torch.equal(result.boundaries[..., 1], boundaries[..., 1])

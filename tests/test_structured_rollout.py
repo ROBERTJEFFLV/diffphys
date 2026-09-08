@@ -337,7 +337,7 @@ def test_l2f_full_space_step_updates_policy_then_exactly_restores_defects() -> N
         task_residual=lambda starts, ends, value: terminal_risk_residual(codec, ends),
     )
     step = solve_joint_sqp_step(
-        problem,
+        problem, linear_solver="legacy-cg",
         damping=100.0,
         penalty=1.0,
         cg_iterations=4,

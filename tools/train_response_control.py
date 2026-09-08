@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -15,20 +16,39 @@ from response_policy import ResponsePolicyConfig
 from response_task import TaskLossConfig
 from response_training import (
     evaluate_checkpoint, evaluate_hidden_reset, freeze_candidate, profile, protocol, train,
+    training_batch_count, critic_configuration,
 )
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("train", "profile", "evaluate", "hidden-reset", "freeze", "final"), default="train")
-    parser.add_argument("--optimizer", choices=("adam", "full-space-ms"), default="adam")
-    parser.add_argument("--work-dir", type=Path, default=Path("runs/response_control_v1_seed7"))
+    parser.add_argument("--optimizer", choices=("short-window", "adam", "full-space-ms"), default="short-window")
+    parser.add_argument("--work-dir", type=Path, default=Path("runs/response_risk_critic_v1/seed7"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--scenarios", type=int, default=64)
-    parser.add_argument("--horizon", type=int, default=125)
+    parser.add_argument("--scenarios", type=int, default=64, help="scenarios per stratified bank; DEV size is unchanged")
+    parser.add_argument("--adam-train-batches", type=int, default=2,
+                        help="bank count for legacy Adam; short-window always uses two, MS uses one")
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--window-steps", type=int, default=50)
+    parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--critic-epochs", type=int, default=1)
+    parser.add_argument("--critic-batch-size", type=int, default=1024)
+    parser.add_argument("--critic-dev-relative-tolerance", type=float, default=.002)
+    from response_task import RiskConfig
+    for name, default in asdict(RiskConfig()).items():
+        parser.add_argument("--risk-" + name.replace("_", "-"), type=float, default=default)
+    parser.add_argument("--risk-weight", type=float, default=1.)
+    parser.add_argument("--risk-smoothmax-beta", type=float, default=10.)
+    parser.add_argument("--risk-relative-tolerance", type=float, default=0.)
+    parser.add_argument("--critic-direction-samples", type=int, default=4)
+    parser.add_argument("--critic-direction-epsilon", type=float, default=.02)
+    parser.add_argument("--critic-direction-weight", type=float, default=.1)
+    parser.add_argument("--critic-direction-temperature", type=float, default=.1)
+    parser.add_argument("--critic-direction-min-gap", type=float, default=1.e-6)
     parser.add_argument("--updates", type=int)
     parser.add_argument("--max-seconds", type=float, default=10800)
     parser.add_argument("--minimum-updates", type=int, default=300)
@@ -39,6 +59,10 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--gradient-clip", type=float, default=10)
+    parser.add_argument("--adam-max-loss-ratio", type=float, default=2.0)
+    parser.add_argument("--adam-max-omega-ratio", type=float, default=2.0)
+    parser.add_argument("--adam-max-dev-loss-ratio", type=float, default=2.0)
+    parser.add_argument("--maximum-adam-rejections", type=int, default=3)
     parser.add_argument("--dt", type=float, default=.01)
     parser.add_argument("--memory-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -46,10 +70,18 @@ def parse_args(argv=None):
     parser.add_argument("--integral-limit", type=float, default=.5)
     parser.add_argument("--integral-leak", type=float, default=0)
     for name, default in asdict(TaskLossConfig()).items():
-        parser.add_argument("--" + name.replace("_", "-"), type=int if name == "steady_steps" else float, default=default)
+        parser.add_argument("--" + name.replace("_", "-"), type=int if name == "steady_steps" else float,
+                            default=None if name == "prediction_weight" else default)
     parser.add_argument("--segments", type=int, choices=(2, 4), default=2)
     parser.add_argument("--segment-steps", type=int, default=250)
     parser.add_argument("--damping", type=float, default=100)
+    parser.add_argument("--linear-solver", choices=("petsc-minres", "legacy-cg"), default="petsc-minres")
+    parser.add_argument("--kkt-rtol", type=float, default=1.0e-6)
+    parser.add_argument("--kkt-atol", type=float, default=1.0e-10)
+    parser.add_argument("--kkt-max-iterations", type=int, default=200)
+    parser.add_argument("--kkt-preconditioner", choices=("curvature-diagonal", "block-diagonal"), default="curvature-diagonal")
+    parser.add_argument("--kkt-curvature-probes", type=int, default=8)
+    parser.add_argument("--kkt-monitor", action="store_true")
     parser.add_argument("--cg-iterations", type=int, default=16)
     parser.add_argument("--maximum-ms-rejections", type=int, default=3)
     parser.add_argument("--parameter-radius", type=float, default=.05)
@@ -66,11 +98,35 @@ def parse_args(argv=None):
     parser.add_argument("--consume-final", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.horizon is None:
+        args.horizon = 500 if args.optimizer == "short-window" else 125
+    if args.prediction_weight is None:
+        args.prediction_weight = 0. if args.optimizer == "short-window" else .01
+    if args.optimizer == "short-window":
+        try:
+            critic_configuration(args)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.horizon % args.window_steps or args.horizon < args.window_steps:
+            parser.error("short-window horizon must be divisible by --window-steps")
+        if args.prediction_weight != 0 or args.huber_delta <= 0:
+            parser.error("short-window uses performance + local/future risk with no auxiliary and requires Huber delta > 0")
+    if not (math.isfinite(args.kkt_rtol) and 0 < args.kkt_rtol < 1
+            and math.isfinite(args.kkt_atol) and args.kkt_atol >= 0
+            and args.kkt_max_iterations > 0 and args.kkt_curvature_probes > 0):
+        parser.error("KKT requires 0 < rtol < 1, finite atol >= 0, and positive iterations")
     if args.seed != 7:
         parser.error("this protocol trains only model initialization seed7")
     if min(args.horizon, args.threads, args.minimum_updates, args.development_every,
            args.checkpoint_every, args.patience, args.segment_steps, args.cg_iterations, args.maximum_ms_rejections, args.reset_step) < 1:
         parser.error("counts must be positive")
+    if args.maximum_adam_rejections < 1 or any(
+        not math.isfinite(value) or value < 1
+        for value in (args.adam_max_loss_ratio, args.adam_max_omega_ratio, args.adam_max_dev_loss_ratio)
+    ):
+        parser.error("Adam catastrophe ratios must be finite and >=1; rejection limit must be positive")
+    if args.adam_train_batches < 1:
+        parser.error("--adam-train-batches must be positive")
     if args.scenarios < 16 or args.scenarios % 16:
         parser.error("--scenarios must be a positive multiple of 16")
     if min(args.max_seconds, args.lr, args.gradient_clip, args.damping,
@@ -101,6 +157,14 @@ def main(argv=None):
         result = {"dry_run": True, "mode": args.mode, "optimizer": args.optimizer,
                   "protocol": protocol(policy_config, loss_config, args.scenarios),
                   "horizon": args.horizon, "updates": args.updates,
+                  "training_batches": training_batch_count(args),
+                  "training_scenarios": args.scenarios * training_batch_count(args),
+                  "window_steps": args.window_steps if args.optimizer == "short-window" else None,
+                  "critic_training_only": args.optimizer == "short-window",
+                  "critic": asdict(critic_configuration(args))
+                            if args.optimizer == "short-window" else None,
+                  "linear_solver": args.linear_solver, "kkt_rtol": args.kkt_rtol,
+                  "kkt_max_iterations": args.kkt_max_iterations,
                   "teacher_checkpoint_required": False, "all_policy_parameters_trainable": True}
     elif args.mode == "train":
         result = train(args, policy_config, loss_config)

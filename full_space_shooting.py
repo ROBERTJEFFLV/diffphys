@@ -2,9 +2,9 @@
 
 Unlike :mod:`checkpointed_exact_bptt`, this module keeps every segment endpoint
 as an independent decision variable and computes a joint policy/state KKT
-direction.  The implementation deliberately remains labelled an MVP: nested
-CG is not yet block-preconditioned and the trust step is a backtracked damped
-Gauss--Newton ray rather than a production sparse SQP package.
+direction. The default linear backend is reduced PETSc MINRES with fixed
+SPD preconditioning. Nested CG remains an explicit regression/debug backend;
+the outer trust step is still a backtracked damped Gauss--Newton ray.
 """
 
 from __future__ import annotations
@@ -189,6 +189,13 @@ class JointFullSpaceStep:
     linear_solver_residual_max: float
     accepted: bool
     backtracks: int
+    linear_solver: str = "legacy-cg"
+    linear_solver_reason: int = 0
+    linear_solver_relative_residual: float = 0.0
+    linear_solver_scaled_relative_residual: float = 0.0
+    stationarity_multiplier_kind: str = "accepted-step-refit"
+    linear_solver_preconditioner: str = "none"
+    linear_solver_curvature_probes: int = 0
 
 
 @dataclass(frozen=True)
@@ -555,6 +562,15 @@ def solve_joint_sqp_step(
     *,
     damping: float = 1.0e-3,
     penalty: float = 1.0,
+    linear_solver: str = "petsc-minres",
+    kkt_rtol: float = 1.0e-6,
+    kkt_atol: float = 1.0e-10,
+    kkt_max_iterations: int = 200,
+    kkt_monitor: bool = False,
+    kkt_preconditioner: str = "curvature-diagonal",
+    kkt_curvature_probes: int = 8,
+    boundary_scale: Tensor | None = None,
+    constraint_scale: Tensor | None = None,
     cg_iterations: int = 64,
     cg_tolerance: float = 1.0e-8,
     parameter_radius: float = float("inf"),
@@ -569,14 +585,17 @@ def solve_joint_sqp_step(
     """Take a joint equality-constrained Gauss--Newton/LM SQP step.
 
     The linearized subproblem is ``min ||r + J_r d||`` subject to
-    ``J_c d = -c``.  A Schur complement is solved with nested matrix-free CG:
-    no Jacobian, normal matrix, or KKT matrix is materialized.
+    ``J_c d = -c``. PETSc MINRES solves the reduced full KKT by default.
+    ``legacy-cg`` retains the nested Schur implementation for regression.
+    No Jacobian, normal matrix, or KKT matrix is materialized.
     """
 
     if problem.objective is not None:
         raise ValueError(
             "joint SQP requires objective=None; put differentiable terms in task_residual"
         )
+    if linear_solver not in ("petsc-minres", "legacy-cg"):
+        raise ValueError("linear_solver must be petsc-minres or legacy-cg")
     theta = problem.theta.detach().requires_grad_(True)
     boundaries = problem.boundaries.detach().requires_grad_(True)
     local = FullSpaceProblem(
@@ -586,7 +605,6 @@ def solve_joint_sqp_step(
     merit, defects, task = local.merit(boundaries, theta, penalty)
     c = defects.detach()
     r = task.detach()
-    total_size = theta.numel() + boundaries.numel()
     linear_solves: list[LinearSolveResult] = []
 
     def solve(operator: Callable[[Tensor], Tensor], rhs: Tensor) -> Tensor:
@@ -601,20 +619,37 @@ def solve_joint_sqp_step(
         return _joint_vjp_flat(local, jv, kind="task").detach() + float(damping) * direction
 
     task_grad = _joint_vjp_flat(local, r, kind="task").detach()
-    # First solve H y = -J_r^T r.
-    y = solve(hessian, -task_grad)
+    petsc_result = None
+    linear_certified = True
+    if linear_solver == "petsc-minres":
+        from petsc_kkt_solver import solve_petsc_minres
+        petsc_result = solve_petsc_minres(
+            local, damping=damping, rtol=kkt_rtol, atol=kkt_atol,
+            max_iterations=kkt_max_iterations, parameter_scale=parameter_scale,
+            boundary_scale=boundary_scale, constraint_scale=constraint_scale,
+            monitor=kkt_monitor, preconditioner=kkt_preconditioner,
+            curvature_probes=kkt_curvature_probes,
+        )
+        linear_certified = petsc_result.converged and petsc_result.finite
+        direction = _pack_joint(petsc_result.dtheta, petsc_result.dboundary)
+        if not linear_certified:
+            # Never send an uncertified Krylov direction into the trust step.
+            direction = torch.zeros_like(direction)
+    else:
+        # First solve H y = -J_r^T r.
+        y = solve(hessian, -task_grad)
 
-    def schur(cotangent: Tensor) -> Tensor:
-        lifted = _joint_vjp_flat(local, cotangent.reshape_as(c), kind="constraint")
-        solved = solve(hessian, lifted)
-        return _joint_jvp_flat(local, solved, kind="constraint").detach().reshape(-1)
+        def schur(cotangent: Tensor) -> Tensor:
+            lifted = _joint_vjp_flat(local, cotangent.reshape_as(c), kind="constraint")
+            solved = solve(hessian, lifted)
+            return _joint_jvp_flat(local, solved, kind="constraint").detach().reshape(-1)
 
-    rhs = -c.reshape(-1) - _joint_jvp_flat(local, y, kind="constraint").detach().reshape(-1)
-    # Constraint residual is flattened to make CG independent of batch layout.
-    multipliers = solve(schur, rhs)
-    correction_rhs = _joint_vjp_flat(local, multipliers.reshape_as(c), kind="constraint")
-    correction = solve(hessian, correction_rhs)
-    direction = y + correction
+        rhs = -c.reshape(-1) - _joint_jvp_flat(local, y, kind="constraint").detach().reshape(-1)
+        # Constraint residual is flattened to make CG independent of batch layout.
+        multipliers = solve(schur, rhs)
+        correction_rhs = _joint_vjp_flat(local, multipliers.reshape_as(c), kind="constraint")
+        correction = solve(hessian, correction_rhs)
+        direction = y + correction
     dtheta, dboundary = _unpack_joint(local, direction)
     dtheta = dtheta.detach()
     dboundary = dboundary.detach()
@@ -648,6 +683,8 @@ def solve_joint_sqp_step(
     attempted_action_norm = 0.0
     attempted_action_max = 0.0
     for backtracks in range(max_backtracks + 1):
+        if not linear_certified:
+            break
         scale = 0.5**backtracks
         trial_theta = theta.detach() + scale * dtheta
         trial_boundaries = boundaries.detach() + scale * dboundary
@@ -716,7 +753,14 @@ def solve_joint_sqp_step(
         _joint_vjp_flat(local, linearized_task, kind="task")
         + float(damping) * accepted_direction
     )
-    if accepted:
+    if accepted and petsc_result is not None:
+        # This diagnoses the accepted primal step with the raw full-step
+        # multiplier. Backtracking generally makes it nonstationary; the
+        # independently certified raw KKT residual is reported separately.
+        stationarity = stationarity + _joint_vjp_flat(
+            local, petsc_result.multipliers, kind="constraint"
+        )
+    elif accepted:
         # Backtracking changes the accepted primal step, so the full-step
         # multiplier is no longer its KKT multiplier.  Refit a least-squares
         # multiplier for the accepted scale before reporting stationarity.
@@ -764,16 +808,27 @@ def solve_joint_sqp_step(
         parameter_step_norm=scaled_parameter_norm(candidate_theta - theta.detach()),
         action_step_norm=action_norm,
         action_step_max=action_max,
-        linear_solver_converged=bool(
+        linear_solver_converged=(petsc_result.converged if petsc_result is not None else bool(
             linear_solves and all(result.converged for result in linear_solves)
+        )),
+        linear_solver_breakdown=(
+            (not petsc_result.finite or petsc_result.reason in (-5, -6, -7, -8, -9, -10, -11))
+            if petsc_result is not None else bool(
+                not linear_solves or any(result.breakdown for result in linear_solves)
+            )
         ),
-        linear_solver_breakdown=bool(
-            not linear_solves or any(result.breakdown for result in linear_solves)
-        ),
-        linear_solver_iterations=sum(result.iterations for result in linear_solves),
-        linear_solver_residual_max=max(
+        linear_solver_iterations=(petsc_result.iterations if petsc_result is not None else
+                                  sum(result.iterations for result in linear_solves)),
+        linear_solver_residual_max=(petsc_result.residual_norm if petsc_result is not None else max(
             (result.residual_norm for result in linear_solves), default=float("inf")
-        ),
+        )),
+        linear_solver_preconditioner=petsc_result.preconditioner if petsc_result is not None else "none",
+        linear_solver_curvature_probes=petsc_result.curvature_probes if petsc_result is not None else 0,
+        linear_solver=linear_solver,
+        linear_solver_reason=petsc_result.reason if petsc_result is not None else 0,
+        linear_solver_relative_residual=petsc_result.relative_residual if petsc_result is not None else 0.0,
+        linear_solver_scaled_relative_residual=petsc_result.scaled_relative_residual if petsc_result is not None else 0.0,
+        stationarity_multiplier_kind="raw-full-step" if petsc_result is not None else "accepted-step-refit",
         accepted=accepted,
         backtracks=backtracks,
     )

@@ -1,0 +1,29 @@
+--mode train
+--optimizer full-space-ms
+--linear-solver petsc-minres
+--kkt-preconditioner curvature-diagonal
+--kkt-curvature-probes 8
+--device cuda
+--dtype float64
+--seed 7
+--threads 1
+--scenarios 64
+--segments 2
+--segment-steps 125
+--updates 3
+--minimum-updates 1
+--max-seconds 14400
+--development-every 1
+--checkpoint-every 1
+--maximum-ms-rejections 3
+--damping 100
+--parameter-radius 0.05
+--action-radius 0.01
+--action-max-radius 0.05
+--kkt-rtol 1e-6
+--kkt-atol 1e-10
+--kkt-max-iterations 200
+--kkt-monitor
+--ms-debug
+--initialize-from runs/response_guarded_v1/seed7/best.training.pt
+--work-dir runs/response_petsc_minres_825_v1
