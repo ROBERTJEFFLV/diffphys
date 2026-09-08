@@ -9,14 +9,11 @@
 --window-steps 50
 --critic-return-scale-floor 0.001
 --critic-direction-samples 4
---risk-relative-tolerance 0
---subspace-fd-relative-step 0.0001
+--hard-risk-relative-tolerance 0.002
+--hard-risk-absolute-tolerance 0.00000001
 --subspace-parameter-relative-step 0.0001
---subspace-fd-relative-tolerance 0.1
---subspace-fd-atol 0
---subspace-backtracks 4
 --prediction-weight 0
 --huber-delta 1
 --checkpoint-every 1
 --maximum-proposal-rejections 3
---work-dir runs/response_risk_subspace_v1/seed7
+--work-dir runs/response_rollout_subspace_v1/seed7

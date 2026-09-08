@@ -1,182 +1,141 @@
-# Short-window physics with TRAIN-corrected Actor directions
+# Short-window training with real-rollout candidate selection
 
-`ResponseMotorPolicy` is unchanged: action/response → GRU memory → controller →
-four motor commands. The Critic is training-only: one 256/256 SiLU MLP with four
-Softplus outputs. It sees the complete physical/recurrent state, dynamics truth
-and t/H. No privileged input is added to the deployable Actor.
+The deployable `ResponseMotorPolicy` remains unchanged: action response → GRU
+memory → controller → four motors. The training-only Risk-to-Go Critic is the
+same four-output 256/256 SiLU MLP. Its architecture, fixed physical input scales,
+TRAIN-calibrated output units and supervised remaining-risk labels are unchanged.
 
-## Risk semantics
-
-Position, velocity and angular-velocity errors retain the reference-relative
-softplus barrier `softplus(kappa * (error / limit - 1)) / kappa`. Hover references
-are zero. A future tracking task must supply its references consistently in
-collection, continuation, gradients and acceptance; flips are not implemented.
-
-Saturation now means approaching the command limit:
-
-```
-b_sat = mean_motors(relu((abs(executed_command) - warning) / (1 - warning))**2)
-```
-
-The default warning is 0.95 and the normalized hard command limit is 1. The
-barrier and its gradient are exactly zero below the warning, including ordinary
-hover compensation such as command 0.0741. The per-motor penalty reaches 1 at the
-hard limit. Command effort and action changes remain soft performance costs with
-the existing weights. They are not individually required to decrease by a safety
-gate. Position/velocity/omega limits remain 5 m, 5 m/s and 10 rad/s, respectively;
-these are engineering settings, not certified limits.
-
-Risk labels are the four exact undiscounted suffix sums of real transition
-barriers, including a zero target at Z_H. They are not performance cost-to-go.
-The original physical performance objective retains its weights, Huber physical
-errors, horizon normalization and steady-window weighting.
-
-## Fixed TRAIN supervision units
-
-On the first successful fit, all current TRAIN suffix labels set four scales:
-`scale[j] = max(mean_over_time_and_scenes(R_true[j]), return_scale_floor)`.
-The default floor is 0.001 risk units, including an all-zero component. The scales
-remain fixed across proposals and are saved with the Critic and target. Neither
-DEV nor later TRAIN batches recalibrate them.
-
-The MLP predicts normalized nonnegative risks; its public output is multiplied
-by these scales. Actor terminal values and dR/dZ therefore retain physical risk
-units. Regression uses `mean(Huber((prediction - truth) / scale))`. Ranking uses
-both predicted and true differences divided by the same scales; its temperature
-and minimum non-tie gap are in normalized units. Reports contain both physical MAE
-and MAE/scale per component, and per-component direction accuracy/valid counts.
-Input normalization still uses the fixed `PHYSICAL_SCALES` / `POLICY_SCALES`
-divisors, without running RMS or clipping.
-
-Direction samples are still a few legal +/- motor perturbations followed by
-real no-gradient continuation. Immediately after that motor transition the two
-memories can be identical: their subsequent responses have not yet entered the
-GRU. Accuracy on these fitted pairs is not evidence that all memory gradients
-are correct. No extra memory perturbation scheme is added here.
+The normal `physics-subspace` backend uses short-window gradients to propose a
+small search space. Complete continuous physical rollouts choose the update.
+It does not estimate an H500 Jacobian or require a local descent certificate.
 
 ## One proposal
 
-1. Pool two independent 64-scene TRAIN banks using the existing 4×4
-   thrust-to-weight × roll-authority stratification. Fly a continuous H500 with
-   the current Actor and no autograd. Record every closed-loop state and exact
-   component suffix risk. Fit and retain the Critic using only this TRAIN data
-   and the small current set of reachable motor-direction labels.
-2. Freeze the target Critic parameters while preserving derivatives through its
-   inputs. Re-fly the same numerical trajectory as ten H50 graphs. Detach all
-   physical/recurrent state at boundaries; reset no values and update no Actor
-   parameters during the flight. The last window has no terminal Critic value.
-3. Accumulate five separate parameter gradients, averaged across the windows:
-   local performance and each local-plus-terminal risk component. Each objective
-   freezes its own full-H500 CVaR scene weights; no window chooses a new tail.
-4. Reorthogonalize these gradients to an at-most-five-dimensional parameter
-   subspace. In that subspace measure central finite differences using real
-   continuous H500 **TRAIN** flights from the identical initial conditions.
-   The measured rows are performance, four component risks, and total-risk CVaR,
-   so the extra total-risk gate is not omitted from direction construction.
-5. Project the negative performance gradient onto the cone where all five
-   risk rows satisfy `A_risk @ q <= 0`. Enumerate the at-most-32 active risk
-   subsets to minimize `||q + a_performance||^2 / 2`; equality constraints are
-   valid, so risks may stay unchanged. A nearly zero projection returns
-   `no_feasible_direction` for this proposal. Normalize a usable projection
-   and verify its performance/risk slopes at both finite-difference scales.
-   First-order risk equality still requires the real finite-step trajectory gate.
-6. Apply the checked direction directly, without Adam, momentum or weight decay.
-   Test at most four decreasing step lengths on TRAIN. Only after TRAIN improves
-   and passes every risk gate evaluate the candidate on the two fixed DEV banks.
-   A DEV rejection ends the proposal; DEV does not choose the direction, probe
-   radius or a different step size.
-7. Accept only real continuous TRAIN performance improvement and risk
-   non-deterioration. Each DEV bank must meet the existing performance tolerance
-   (0.2%) and the total/per-component risk gate. All risk rows use real
-   `mean + tail_weight * top-20%-CVaR`, recomputed on each candidate flight.
-   The default relative risk tolerance remains zero.
-8. On Actor rejection or exception, restore Actor and post-fit RNG. Keep every
-   finite completed Critic/target/optimizer fit and its fixed scales. A failed
-   Critic fit restores its own pre-fit state instead.
+1. Hold the current Actor fixed and collect a continuous H500 trajectory without
+   autograd, pooling two independent 64-scene TRAIN banks. Keep the existing 4×4
+   thrust-to-weight / roll-authority stratification and full-trajectory CVaR.
+2. Fit Critic remaining-risk values and the existing small direction sample set.
+   Commit a finite completed fit, target copy, optimizer and RNG progression.
+3. Process the same flight as 10 H50 windows. Preserve all numerical physical
+   state and memory across windows, detach only the graph at each boundary,
+   freeze target Critic parameters while retaining its state derivatives, and
+   accumulate five gradient rows: performance and four risk guidance components.
+   There is no Actor update between windows; the final window has no terminal V.
+4. Orthonormalize those rows into at most five basis vectors. Starting from the
+   original Actor, test each sign of each vector at `rho` and `rho/4`, where
+   `rho = subspace_parameter_relative_step * max(||theta||, 1)`.
+5. Every candidate executes a fresh, complete continuous H500 TRAIN flight from
+   identical initial states and RNG. Filter candidates using the TRAIN gate
+   below, then choose the lowest true performance cost among all valid trials.
+   Do not stop at the first improvement. Full rank requires at most 20 candidate
+   flights. No candidate is passed through Adam or weight decay.
+6. Evaluate the selected candidate on both fixed DEV banks. DEV never ranks
+   candidates and never chooses a fallback after rejecting the TRAIN winner.
+   Accept the selected Actor or restore the old Actor. Completed Critic learning
+   survives either outcome.
 
-The debug backend `--actor-proposal smoothmax-adam` retains scalarized gradient
-proposals. Smooth-max alone does not enforce component-wise non-deterioration;
-it is not the primary proposal backend.
+All four Critic components remain useful guidance. Position/velocity guidance
+and the original soft risk sum are diagnostic/training quantities, not hard
+acceptance constraints.
 
-## Cost, diagnostics and stopping
+## Two acceptance stages
 
-The default probe radius and initial parameter step are each
-`1e-4 * max(||theta||, 1)`. Both full and half-radius probes are required:
-a full-rank correction uses twenty extra H500 TRAIN forwards. Row consistency is
+TRAIN requires strictly lower real performance cost. Both DEV banks require
+performance no worse than the current Actor baseline beyond the existing 0.2%
+DEV tolerance. Performance retains the physical Huber position/velocity/angular
+tracking and control-effort/smoothness terms with their existing weights.
+
+Both TRAIN and DEV additionally require:
+
+- Finite physical/recurrent trajectory and finite metrics.
+- No configured flight-envelope violation or action outside the hard `[-1, 1]`
+  command range.
+- Neither of the two true danger exposure components exceeds its declared
+  budget relative to the current Actor.
+
+The hard exposure components are computed directly from the full trajectory:
 
 ```
-||a_h - a_half|| <= fd_atol + fd_rtol * max(||a_h||, ||a_half||)
+omega warning:     max(||omega - omega_reference|| / omega_limit - 1, 0)^2
+motor warning:     mean_motor(max((|u| - saturation_limit) / (1 - saturation_limit), 0)^2)
 ```
 
-`fd_rtol` remains 0.1. `--subspace-fd-atol` is measured in the normalized slope
-units, independently of the real risk gate tolerance. It defaults to zero until
-a TRAIN-only CUDA numerical probe supplies an appropriate absolute noise scale;
-zero retains conservative near-zero checks and is not a calibrated noise estimate.
-The configured value is bound into the experiment/checkpoint.
+The default hover warning thresholds are 10 rad/s and normalized motor command
+0.95. Both exposures are exactly zero below their warning region. Each is summed
+across the full flight and aggregated with the existing scene mean+CVaR rule.
+There is no position/velocity component gate and no gate on the old total risk.
 
-For the final unit direction q, compute d_h and d_half for every row. Use
-`fd_atol + fd_rtol * max(abs(d_h), abs(d_half))` as the directional sign threshold.
-Performance must be below the negative threshold at both scales. Risk above the
-positive threshold at either scale rejects the proposal as `fd_unreliable`.
-Small, mixed-sign risk slopes are recorded as `unknown_or_near_zero` and allowed
-to reach the true H500 line search. They are not treated as proved non-increase.
+For each hard exposure component, the budget is:
 
-Probe roundoff that distorts the requested parameter direction by more than 5%
-also yields `fd_unreliable`. Parameters and Python/NumPy/Torch/CUDA RNG are
-restored on every probe exit, including failures. No Actor Adam transforms the
-checked direction afterward.
+```
+new <= old * (1 + hard_risk_relative_tolerance) + hard_risk_absolute_tolerance
+```
 
-Logs include separate objective-gradient norms, basis rank, actual probe count,
-per-row finite-difference errors/tolerances, directional slopes at both scales,
-per-risk sign classifications and bounded TRAIN line-search outcomes. `development_evaluated=false` means no candidate DEV
-was run; missing DEV fields are not fabricated results. Baselines are cached
-only for identical Actor weights, physical configuration, horizon, loss/risk
-settings and exact DEV state tensors. A Critic-only update does not invalidate
-this cache; an Actor or scene change does.
+Defaults are 0.002 relative and 1e-8 absolute in accumulated dimensionless risk
+units. These are explicit configurable acceptance budgets, not measured CUDA
+noise tolerances or safety certificates. Equality is allowed. A normal action
+increase below the warning region consumes no saturation-risk budget.
 
-`no_feasible_direction`, `fd_unreliable`, and `line_search_exhausted` reject only
-the current proposal. Restore Actor, retain the completed Critic fit, increment
-`consecutive_proposal_rejections`, and sample the next TRAIN batch. A successful
-Actor update resets the counter to zero. True TRAIN/DEV gate rejections count
-in the same consecutive-rejection budget.
+`--hard-position-bound` optionally sets a physical flight radius in metres;
+`--hard-velocity-bound` optionally sets a speed envelope in m/s. Bounds are
+checked over all scenarios/times, including startup, and are not fitted from
+DEV. No physical envelope was supplied, so these bounds default to disabled.
+The Critic's position/velocity normalization and tracking scales are not used
+as implicit bounds. Future angular tracking tasks must supply an appropriate
+angular reference; the current task is hover with zero reference.
 
-At `--maximum-proposal-rejections` (default 3; the old
-`--maximum-adam-rejections` spelling remains an alias), save and stop normally
-with `status=proposal_plateau` and `exit_class=business_stop`. Exact or automatic
-resume cannot re-enter that plateau. The local supervisor scripts use this
-shared business-stop classification. A non-finite proposal or corrupted state
-stops as an error: the guard rolls back unchecked state, the outer loop saves
-`status=failed` / `exit_class=crash`, and the exception produces a nonzero exit.
+The normal direct-search backend's periodic DEV report selects the best saved
+checkpoint and reports progress; it adds no separate best-history Actor veto.
 
-Business stops do not append an extra DEV flight; unchanged-Actor periodic DEV
-reports are reused. Interrupted runs and explicit time/proposal budgets remain
-separate from both rejection plateaus and errors.
+## Rejection, retention and reproducibility
 
-## New experiments and checkpoints
+`empty_subspace` or `no_acceptable_candidate` rejects one proposal. An unsafe or
+non-finite trial is rejected and the remaining candidate budget is still tested.
+A rejected selected candidate on DEV restores the Actor without trying the
+next-best TRAIN candidate. Every failure retains a completed finite Critic fit.
 
-The objective is `component-risk-v3-warning-saturation-train-scaled`. Old scalar
-or component Critic training states are rejected, including old lossless scalar
-splitting. Reuse an Actor through `--initialize-from <checkpoint>` in a **new**
-work directory. No old Actor Adam history or incompatible Critic state is loaded.
-The direct backend stores no Actor optimizer. Exact resume within the same
-experiment preserves fixed scales, Critic/target/optimizer, completed fits and
-RNG; ordinary source/configuration bindings still apply.
+Each finite proposal rejection increments `consecutive_proposal_rejections`;
+an accepted Actor update resets it. At `--maximum-proposal-rejections` (default
+3), save and stop normally with `proposal_plateau` / `business_stop`. Automatic
+resume cannot re-enter that plateau. An invalid baseline, non-finite gradient,
+corrupted optimizer or unexpected simulator exception remains an error stop.
+A failed Critic fit restores its pre-fit state; completed fits survive Actor
+errors/rejections.
 
-`configs/response_risk_subspace.args` defines the complete H500/H50, 128-TRAIN,
-two-64-scene-DEV CUDA profile. It starts a new run directory and defaults to
-profile mode; training requires an explicit proposal budget and mode override.
-First inspect it without execution:
+Search restores Actor parameters and RNG even on an exception. Candidate
+rollouts never accumulate parameter increments. DEV baselines are cached only
+for identical Actor weights, physical state, horizon, task/risk definition and
+hard-risk configuration. TRAIN rejection skips candidate DEV work.
+
+Logs include all attempted candidates with basis index, sign, radius fraction,
+true performance, hard-risk exposure, bound violations and rejection reason.
+They identify the selected candidate and record the subsequent TRAIN/DEV
+metrics. A `development_evaluated=false` record has no candidate DEV result.
+
+## Historical diagnostics and checkpoints
+
+`response_proposals_debug.py` contains the old two-scale finite differences,
+row/direction reliability checks and cone projection. Normal training does not
+import or invoke that module. Its `FiniteDifferenceConfig` is a diagnostic API;
+FD tolerances and backtracking flags are absent from the primary training CLI.
+`--actor-proposal smoothmax-adam` remains a historical regression backend.
+MS/PETSc is unchanged and remains separate from this training path.
+
+Exact resume binds source, proposal configuration, hard-risk definition and
+supervision scales. Changing the proposal/gate configuration requires a new
+experiment; use `--initialize-from <checkpoint>` to reuse Actor weights in a
+new work directory. Do not edit checkpoint hashes or inherit stale Actor Adam
+history into the direct-search backend.
+
+`configs/response_risk_subspace.args` specifies the full H500/H50, 128-TRAIN,
+two-DEV-bank CUDA profile. Its only subspace search setting is the parameter
+radius; the two radius fractions and maximum 20 trials are fixed.
 
 ```bash
 python3 tools/train_response_control.py \
   $(cat configs/response_risk_subspace.args) --dry-run
 ```
 
-Once a profile is requested, use the same configuration with an optional
-`--initialize-from` Actor checkpoint. Measure time per proposal, forward count,
-finite gradients, samples/s and memory; allocating a fixed fraction of GPU memory
-is not a throughput criterion. This implementation has not rerun the historical
-2000th proposal, demonstrated H500 training improvement, or benchmarked CUDA
-throughput. Tiny deterministic tests establish software/numerical behavior only.
-No FINAL, hidden reset, acrobatic task or full-budget training is part of this
-change.
+Training/profile jobs run only when requested. Unit and numerical correctness
+checks do not establish learned control quality or deployment safety. A Critic
+loss decrease or finite window gradient is not an accepted Actor improvement.

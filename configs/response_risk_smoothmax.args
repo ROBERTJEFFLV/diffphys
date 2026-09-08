@@ -1,5 +1,6 @@
 --mode train
 --optimizer short-window
+--actor-proposal smoothmax-adam
 --device cuda
 --dtype float32
 --seed 7
@@ -36,4 +37,5 @@
 --minimum-updates 1
 --patience 1000
 --risk-smoothmax-beta 10
---risk-relative-tolerance 0
+--hard-risk-relative-tolerance 0
+--hard-risk-absolute-tolerance 0

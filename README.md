@@ -436,16 +436,16 @@ labels. Start with `tools/train_response_control.py`; see
 current H500 / ten-H50 trainer. A training-only nonnegative Risk-to-Go MLP supplies
 terminal risk gradients and learns from exact risk suffixes plus a few reachable
 motor perturbation rankings; the deployed Actor is unchanged. Two independent
-64-scene TRAIN banks determine one proposal. Five separate short-window gradients
-form a small parameter subspace; real H500 TRAIN forwards correct the direction
-before a direct parameter step. Continuous TRAIN gates run before candidate DEV,
-with both DEV banks required for acceptance. Total
-risk and each risk component must not worsen. Completed finite Critic fits persist
-across Actor rejections. Supervision uses fixed TRAIN component scales; saturation
-risk starts only in the actuator warning band. Performance directions are
-projected onto the risk non-increase cone. A failed proposal retains Critic
-learning and continues; consecutive failures stop at a configured
-`proposal_plateau` that cannot auto-resume. MS is an optional debug path. Use `configs/response_risk_subspace.args` for the new CUDA profile setup.
+64-scene TRAIN banks determine one proposal. Short-window gradients define a
+subspace of at most five directions. Complete H500 TRAIN rollouts test both signs
+at two radii and select the best safe performance improvement; the selected
+candidate then faces both DEV banks. Hard gates cover angular danger, motor
+warning exposure and configured physical bounds, without requiring position or
+velocity risk components to improve independently. Completed Critic fits persist
+across Actor rejections. Consecutive failed proposals stop at `proposal_plateau`;
+normal training does not call finite differences or a local descent solver.
+MS and the finite-difference module remain diagnostic paths. Use
+`configs/response_risk_subspace.args` for the complete CUDA profile setup.
 
 `tools/run_structured_pipeline.py` and
 `tools/train_structured_full_space.py` select the new task method by default.
@@ -453,8 +453,9 @@ Their old Q2 migration methods require `--historical-q2-distillation`.
 Historical V4/V5 failures, reports, and validation-consumption records are
 preserved and do not certify this new method.
 
-The short-window trainer has deterministic CPU correctness tests; long-horizon
-learning improvement and CUDA performance remain unverified. It does not establish
-flight safety, near-optimal control, or calibration-free real motor commands.
+The short-window trainer has deterministic CPU correctness tests. Learned
+performance and CUDA throughput require separate experiment evidence; passing
+unit tests does not establish flight safety, near-optimal control, or
+calibration-free real motor commands.
 The current simulator action interface is airframe-normalized around hover.
 The remaining sections below describe the earlier baseline and experiments.

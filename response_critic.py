@@ -14,9 +14,9 @@ from torch import nn
 from response_proposals import SubspaceConfig
 
 from response_task import (
-    ResponseClosedLoopState, RiskConfig, TaskLossConfig, TaskTrajectory, concatenate, initialize,
+    ResponseClosedLoopState, RiskConfig, HardRiskConfig, TaskLossConfig, TaskTrajectory, concatenate, initialize,
     observation, physical_risk_metrics, risk_components, risk_weights, rollout, step_costs,
-    suffix_risks, trajectory_metrics,
+    suffix_risks, trajectory_metrics, hard_risk_metrics,
 )
 
 
@@ -291,7 +291,7 @@ class CriticConfig:
     risk: RiskConfig = RiskConfig()
     risk_weight: float = 1.0
     risk_smoothmax_beta: float = 10.
-    risk_relative_tolerance: float = 0.
+    hard_risk: HardRiskConfig = HardRiskConfig()
     direction_samples: int = 4
     direction_epsilon: float = .02
     direction_weight: float = .1
@@ -317,8 +317,6 @@ class CriticConfig:
             raise ValueError("Critic learning rate must be finite and positive")
         if not math.isfinite(self.dev_relative_tolerance) or not 0 <= self.dev_relative_tolerance < 1:
             raise ValueError("DEV tolerance must lie in [0, 1)")
-        if not math.isfinite(self.risk_relative_tolerance) or not 0 <= self.risk_relative_tolerance < 1:
-            raise ValueError("risk relative tolerance must lie in [0, 1)")
 
 
 def _finite_state(value) -> bool:
@@ -331,27 +329,41 @@ def _finite_state(value) -> bool:
     return not isinstance(value, float) or math.isfinite(value)
 
 
-def risk_deteriorated(before: dict, after: dict, *, relative_tolerance: float = 0.) -> bool:
-    """No physical component may buy improvement by worsening another."""
-    return after["risk_objective"] > before["risk_objective"] * (1 + relative_tolerance) or any(
-        after["risk_components"][name] > value * (1 + relative_tolerance)
-        for name, value in before["risk_components"].items()
+def hard_risk_deteriorated(before: dict, after: dict, config: HardRiskConfig) -> bool:
+    """Only actual danger-zone exposure consumes a hard-risk budget."""
+    return any(
+        after["hard_risk_components"][name] > before["hard_risk_components"][name] * (
+            1 + config.relative_tolerance) + config.absolute_tolerance
+        for name in ("omega", "saturation")
     )
 
 
 def acceptance_rejection(before, after, dev_before, dev_after, *, dev_relative_tolerance,
-                         risk_relative_tolerance=0.):
-    """Use real continuous trajectory measurements only, never Critic outputs."""
+                         hard_risk_config: HardRiskConfig = HardRiskConfig()):
+    """Real performance plus physical danger; soft risk sums do not veto an update."""
+    if len(dev_before) != len(dev_after):
+        raise ValueError("every DEV candidate needs its matching baseline")
+    if not before.get("finite", False) or not _finite_state(before):
+        raise FloatingPointError("nonfinite TRAIN baseline")
+    if not after.get("finite", False) or not _finite_state(after):
+        return "train_nonfinite"
+    if after["hard_risk_bounds_violated"]:
+        return "train_out_of_bounds"
     if after["task_objective"] >= before["task_objective"]:
         return "train_not_improved"
-    if risk_deteriorated(before, after, relative_tolerance=risk_relative_tolerance):
-        return "train_risk_deteriorated"
-    if any(new["task_objective"] > old["task_objective"] * (1 + dev_relative_tolerance)
-           for old, new in zip(dev_before, dev_after)):
-        return "development_deteriorated"
-    if any(risk_deteriorated(old, new, relative_tolerance=risk_relative_tolerance)
-           for old, new in zip(dev_before, dev_after)):
-        return "development_risk_deteriorated"
+    if hard_risk_deteriorated(before, after, hard_risk_config):
+        return "train_hard_risk_deteriorated"
+    for old, new in zip(dev_before, dev_after):
+        if not old.get("finite", False) or not _finite_state(old):
+            raise FloatingPointError("nonfinite DEV baseline")
+        if not new.get("finite", False) or not _finite_state(new):
+            return "development_nonfinite"
+        if new["hard_risk_bounds_violated"]:
+            return "development_out_of_bounds"
+        if new["task_objective"] > old["task_objective"] * (1 + dev_relative_tolerance):
+            return "development_deteriorated"
+        if hard_risk_deteriorated(old, new, hard_risk_config):
+            return "development_hard_risk_deteriorated"
     return None
 
 
@@ -496,7 +508,7 @@ class CriticTrainer:
         from response_training import model_hash
         digest = hashlib.sha256(model_hash(policy).encode())
         digest.update(repr((asdict(policy.config), asdict(simulator.params), horizon,
-                            asdict(loss_config), asdict(self.config.risk))).encode())
+                            asdict(loss_config), asdict(self.config.risk), asdict(self.config.hard_risk))).encode())
         for initial in initials:
             for field in fields(initial):
                 original = getattr(initial, field.name)
@@ -505,10 +517,13 @@ class CriticTrainer:
                 digest.update(value.numpy().tobytes())
         return digest.hexdigest()
 
-    def _metrics(self, trace, loss_config):
+    def _metrics(self, trace, loss_config, *, candidate=False):
         row = {**trajectory_metrics(trace, loss_config),
-               **physical_risk_metrics(trace, self.config.risk, loss_config)}
+               **physical_risk_metrics(trace, self.config.risk, loss_config),
+               **hard_risk_metrics(trace, self.config.risk, loss_config, self.config.hard_risk)}
         if not row["finite"] or not _finite_state(row):
+            if candidate:
+                return {"finite": False}
             raise FloatingPointError("nonfinite continuous trajectory metrics")
         return row
 
@@ -524,32 +539,29 @@ class CriticTrainer:
 
     def _propose_actor(self, policy, optimizer, gradients, train_before, evaluate_train,
                        gradient_clip, evidence):
-        """Bounded TRAIN search; DEV is deliberately unavailable at this layer."""
-        from response_proposals import assign_parameters, correct_direction
+        """Pick the lowest real TRAIN cost among safe candidates; DEV is unavailable."""
+        from response_proposals import assign_parameters, search_candidates
 
-        direct = self.config.proposal == "physics-subspace"
         base = torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone()
-        if direct:
+        def accept_candidate(after):
+            return acceptance_rejection(train_before, after, (), (),
+                dev_relative_tolerance=self.config.dev_relative_tolerance,
+                hard_risk_config=self.config.hard_risk)
+
+        if self.config.proposal == "physics-subspace":
             rows = gradients["objective_gradients"]
-            if not bool(torch.isfinite(rows).all()):
-                raise FloatingPointError("nonfinite Actor objective gradient")
             norm = rows.norm(dtype=torch.float64)
-            if not bool(torch.isfinite(norm)):
-                raise FloatingPointError("nonfinite Actor gradient norm")
+            if not bool(torch.isfinite(rows).all()) or not bool(torch.isfinite(norm)):
+                raise FloatingPointError("nonfinite Actor objective gradient")
             evidence["gradient_norm"] = float(norm)
-            def vector(metrics):
-                # The total CVaR gate is an additional constraint row, even
-                # though the gradient span has at most five directions.
-                return torch.tensor([metrics["task_objective"], *metrics["risk_components"].values(),
-                                     metrics["risk_objective"]], dtype=torch.float64)
-            corrected = correct_direction(policy, rows, lambda: vector(evaluate_train()),
-                                          self.config.subspace, baseline=vector(train_before))
-            evidence["correction"] = corrected.evidence
-            if corrected.direction is None:
-                evidence.update(rejection_reason=corrected.reason)
+            selected = search_candidates(policy, rows, evaluate_train, self.config.subspace,
+                                         baseline=train_before, accept_candidate=accept_candidate)
+            evidence["search"] = selected.evidence
+            if selected.parameters is None:
+                evidence["rejection_reason"] = selected.reason
                 return None
-            step = corrected.evidence["parameter_step"] * corrected.direction
-            attempts = self.config.subspace.backtracks
+            assign_parameters(policy, selected.parameters)
+            after = selected.metrics
         else:
             if optimizer is None:
                 raise ValueError("legacy smooth-max proposals require an Actor optimizer")
@@ -558,29 +570,22 @@ class CriticTrainer:
                 raise FloatingPointError("nonfinite Actor gradient")
             evidence["gradient_norm"] = float(norm)
             optimizer.step()
-            attempts = 1
-        evidence["train_line_search"] = []
-        for index in range(attempts):
-            if direct:
-                assign_parameters(policy, base + (0.5 ** index) * step)
-            if not _finite_state(policy.state_dict()) or (not direct and not _finite_state(optimizer.state_dict())):
+            if not _finite_state(policy.state_dict()) or not _finite_state(optimizer.state_dict()):
                 raise FloatingPointError("nonfinite proposed network or optimizer")
             after = evaluate_train()
-            reason = acceptance_rejection(train_before, after, (), (),
-                dev_relative_tolerance=self.config.dev_relative_tolerance,
-                risk_relative_tolerance=self.config.risk_relative_tolerance)
-            evidence["train_line_search"].append({"fraction": 0.5 ** index, "rejection_reason": reason,
-                "performance": after["task_objective"], "risk_components": after["risk_components"],
-                "risk_objective": after["risk_objective"]})
+        reason = accept_candidate(after)
+        evidence["rejection_reason"] = reason
+        if after.get("finite", False):
             evidence.update(continuous_loss_after=after["task_objective"],
-                            continuous_risk_after=after["risk_objective"],
-                            continuous_risk_components_after=after["risk_components"], rejection_reason=reason)
-            if reason is None:
-                evidence["parameter_step_norm"] = float((torch.nn.utils.parameters_to_vector(policy.parameters()).detach() - base).norm())
-                return after
-        if direct:
-            evidence.update(rejection_reason="line_search_exhausted")
-        return None
+                continuous_risk_after=after["risk_objective"],
+                continuous_risk_components_after=after["risk_components"],
+                continuous_hard_risk_after=after["hard_risk_components"],
+                continuous_bounds_after=after["hard_risk_bounds_violated"])
+        if reason is not None:
+            return None
+        evidence["parameter_step_norm"] = float((
+            torch.nn.utils.parameters_to_vector(policy.parameters()).detach() - base).norm())
+        return after
 
     def guarded_step(
         self, policy, optimizer, simulator, initial, horizon: int,
@@ -608,7 +613,7 @@ class CriticTrainer:
 
         @torch.no_grad()
         def evaluate_train():
-            return self._metrics(rollout(policy, simulator, initial, horizon), loss_config)
+            return self._metrics(rollout(policy, simulator, initial, horizon), loss_config, candidate=True)
 
         try:
             record = collect_trajectory(
@@ -621,6 +626,8 @@ class CriticTrainer:
                 raise FloatingPointError("nonfinite continuous TRAIN baseline")
             evidence.update(task_loss=metrics["task_objective"], continuous_loss_before=metrics["task_objective"],
                 continuous_risk_before=metrics["risk_objective"], continuous_risk_components_before=metrics["risk_components"],
+                continuous_hard_risk_before=metrics["hard_risk_components"],
+                continuous_bounds_before=metrics["hard_risk_bounds_violated"],
                 **{key: metrics[key] for key in ("position_rms", "velocity_rms", "omega_rms",
                                                 "steady_success_rate", "motor_saturation_fraction")})
             evidence.update(self.fit(record))
@@ -646,18 +653,21 @@ class CriticTrainer:
                 finally:
                     policy.load_state_dict(candidate)
                 with torch.no_grad():
-                    dev_after = [self._metrics(rollout(policy, simulator, state, horizon), loss_config)
+                    dev_after = [self._metrics(rollout(policy, simulator, state, horizon), loss_config, candidate=True)
                                  for state in development_initials]
                 evidence.update(development_evaluated=True, development_baseline_cache_hit=hit,
                     development_loss_before=[row["task_objective"] for row in dev_before],
                     development_risk_before=[row["risk_objective"] for row in dev_before],
                     development_risk_components_before=[row["risk_components"] for row in dev_before],
-                    development_loss_after=[row["task_objective"] for row in dev_after],
-                    development_risk_after=[row["risk_objective"] for row in dev_after],
-                    development_risk_components_after=[row["risk_components"] for row in dev_after])
+                    development_loss_after=[row.get("task_objective") for row in dev_after],
+                    development_risk_after=[row.get("risk_objective") for row in dev_after],
+                    development_risk_components_after=[row.get("risk_components") for row in dev_after],
+                    development_hard_risk_before=[row["hard_risk_components"] for row in dev_before],
+                    development_hard_risk_after=[row.get("hard_risk_components") for row in dev_after],
+                    development_bounds_after=[row.get("hard_risk_bounds_violated") for row in dev_after])
                 evidence["rejection_reason"] = acceptance_rejection(
                     metrics, after, dev_before, dev_after, dev_relative_tolerance=self.config.dev_relative_tolerance,
-                    risk_relative_tolerance=self.config.risk_relative_tolerance)
+                    hard_risk_config=self.config.hard_risk)
                 evidence["accepted"] = evidence["rejection_reason"] is None
                 if evidence["accepted"]:
                     self._dev_cache = (self._development_key(policy, simulator, development_initials, horizon, loss_config),

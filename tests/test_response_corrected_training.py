@@ -65,7 +65,8 @@ def test_failed_train_gate_skips_dev_and_retains_completed_fit(monkeypatch):
     assert state.completed_fits == 1 and result['critic_update_retained']
 
 
-def test_checked_increment_is_applied_directly_without_adam_or_weight_decay(monkeypatch):
+@pytest.mark.parametrize('reject_on_dev', [False, True])
+def test_checked_increment_is_applied_directly_without_adam_or_weight_decay(monkeypatch, reject_on_dev):
     import response_proposals as proposals
     assert 'proposal' in critic.CriticConfig.__dataclass_fields__
     policy, sim, initial = fixture()
@@ -76,7 +77,8 @@ def test_checked_increment_is_applied_directly_without_adam_or_weight_decay(monk
                       velocity=initial.velocity.new_tensor([[0.,0.,.2]]).repeat(2,1),
                       omega=torch.zeros_like(initial.omega))
     state = critic.CriticTrainer(policy, task.initialize(policy, initial), 6,
-        critic.CriticConfig(window_steps=2, direction_samples=0, proposal='physics-subspace'))
+        critic.CriticConfig(window_steps=2, direction_samples=0, proposal='physics-subspace',
+                            dev_relative_tolerance=0.))
     optimizer = torch.optim.AdamW(policy.parameters(), lr=10., weight_decay=1.)
     # Seed stale moments deliberately: the checked proposal must ignore all of them.
     for p in policy.parameters():
@@ -93,17 +95,36 @@ def test_checked_increment_is_applied_directly_without_adam_or_weight_decay(monk
     direction = torch.cat([torch.full_like(p, -.5).flatten() if name == 'controller.4.bias'
                            else torch.zeros_like(p).flatten() for name, p in policy.named_parameters()])
     assert direction.norm().item() == 1
-    def checked(*args, **kwargs):
-        return proposals.CorrectedDirection(direction, None, {'parameter_step': .002, 'basis_rank': 1,
-            'probe_rollouts': 4, 'objective_gradient_norms': [1.]*5})
-    monkeypatch.setattr(proposals, 'correct_direction', checked)
+    state.config = replace(state.config, subspace=proposals.SubspaceConfig(
+        parameter_relative_step=.002 / float(before.norm())))
+    accumulate = critic.accumulate_actor_gradients
+    def known_span(*args, **kwargs):
+        result = accumulate(*args, **kwargs)
+        result['objective_gradients'] = direction.view(1, -1)
+        return result
+    monkeypatch.setattr(critic, 'accumulate_actor_gradients', known_span)
     def forbidden(*args, **kwargs):
         raise AssertionError('checked increment passed through Adam')
     optimizer.step = forbidden
+    dev = replace(initial, position=-initial.position, velocity=-initial.velocity) if reject_on_dev else replace(initial)
+    dev_visits = []
+    rollout = critic.rollout
+    def observe_dev(policy, simulator, state, *args, **kwargs):
+        if state is dev:
+            dev_visits.append(torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone())
+        return rollout(policy, simulator, state, *args, **kwargs)
+    monkeypatch.setattr(critic, 'rollout', observe_dev)
     result = state.guarded_step(policy, optimizer, sim, initial, 6, task.TaskLossConfig(),
-                               development_initials=(initial, initial), gradient_clip=10.)
-    assert result['accepted'], result
-    torch.testing.assert_close(torch.nn.utils.parameters_to_vector(policy.parameters()), before + .002*direction)
+                               development_initials=(dev, dev), gradient_clip=10.)
+    assert result['accepted'] is not reject_on_dev, result
+    if reject_on_dev:
+        assert result['rejection_reason'] == 'development_deteriorated'
+        assert result['critic_update_retained'] and state.completed_fits == 1
+    torch.testing.assert_close(torch.nn.utils.parameters_to_vector(policy.parameters()),
+                               before if reject_on_dev else before + .002*direction)
+    assert len(dev_visits) == 4, 'only the baseline and TRAIN winner reach the two DEV banks'
+    for candidate in dev_visits[2:]:
+        torch.testing.assert_close(candidate, before + .002*direction)
     assert_nested_equal(optimizer.state_dict(), saved_optimizer)
 
 
@@ -143,7 +164,7 @@ def test_fullspace_debug_profile_still_runs_its_historical_gradient_probe(tmp_pa
     assert report['horizon'] == 4 and report['production_checkpoint_written'] is False
 
 
-@pytest.mark.parametrize('reason', ['no_feasible_direction', 'fd_unreliable', 'line_search_exhausted'])
+@pytest.mark.parametrize('reason', ['empty_subspace', 'no_acceptable_candidate'])
 def test_rejected_proposals_keep_fitting_until_plateau_and_cannot_auto_resume(tmp_path, monkeypatch, reason):
     import response_training as training
     import response_proposals as proposals
@@ -151,8 +172,8 @@ def test_rejected_proposals_keep_fitting_until_plateau_and_cannot_auto_resume(tm
     from tools.train_response_control import parse_args
     monkeypatch.setattr(training, 'FINAL_CLAIM', tmp_path / 'unused')
     def unavailable(*args, **kwargs):
-        return proposals.CorrectedDirection(None, reason, {'basis_rank': 2, 'probe_rollouts': 8})
-    monkeypatch.setattr(proposals, 'correct_direction', unavailable)
+        return proposals.CandidateSearchResult(None, None, reason, {'basis_rank': 2, 'candidate_rollouts': 8})
+    monkeypatch.setattr(proposals, 'search_candidates', unavailable)
     evaluations = []
     evaluate = training.evaluate
     def observed(*args, **kwargs):
@@ -189,7 +210,7 @@ def test_acceptance_resets_consecutive_proposal_rejections(tmp_path, monkeypatch
     def outcome(self, *args, **kwargs):
         accepted = next(outcomes)
         return {'accepted': accepted, 'proposal_finite': True,
-                'rejection_reason': None if accepted else 'no_feasible_direction'}
+                'rejection_reason': None if accepted else 'no_acceptable_candidate'}
     monkeypatch.setattr(critic.CriticTrainer, 'guarded_step', outcome)
     args = parse_args(['--work-dir', str(tmp_path), '--updates', '4', '--horizon', '4', '--window-steps', '2',
                        '--scenarios', '16', '--maximum-proposal-rejections', '2'])

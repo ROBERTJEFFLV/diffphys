@@ -21,7 +21,7 @@ from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_execution import BUSINESS_STOPS, exit_class, training_summary
 from response_task import (
-    RiskConfig, TaskLossConfig, observation, physical_risk_metrics, prediction_residual, rollout, sample_scenarios,
+    RiskConfig, HardRiskConfig, TaskLossConfig, observation, physical_risk_metrics, hard_risk_metrics, prediction_residual, rollout, sample_scenarios,
     scenario_costs, task_loss, trajectory_metrics, initialize,
 )
 
@@ -152,18 +152,16 @@ def critic_configuration(args):
                         dev_relative_tolerance=args.critic_dev_relative_tolerance,
                         risk=RiskConfig(**{f.name: getattr(args, "risk_" + f.name) for f in fields(RiskConfig)}),
                         risk_weight=args.risk_weight, risk_smoothmax_beta=args.risk_smoothmax_beta,
-                        risk_relative_tolerance=args.risk_relative_tolerance,
+                        hard_risk=HardRiskConfig(relative_tolerance=args.hard_risk_relative_tolerance,
+                            absolute_tolerance=args.hard_risk_absolute_tolerance,
+                            position_bound=args.hard_position_bound, velocity_bound=args.hard_velocity_bound),
                         direction_samples=args.critic_direction_samples,
                         direction_epsilon=args.critic_direction_epsilon,
                         direction_weight=args.critic_direction_weight,
                         direction_temperature=args.critic_direction_temperature,
                         direction_min_gap=args.critic_direction_min_gap,
                         return_scale_floor=args.critic_return_scale_floor, proposal=args.actor_proposal,
-                        subspace=SubspaceConfig(fd_relative_step=args.subspace_fd_relative_step,
-                            parameter_relative_step=args.subspace_parameter_relative_step,
-                            fd_relative_tolerance=args.subspace_fd_relative_tolerance,
-                            fd_absolute_tolerance=args.subspace_fd_absolute_tolerance,
-                            backtracks=args.subspace_backtracks))
+                        subspace=SubspaceConfig(parameter_relative_step=args.subspace_parameter_relative_step))
 
 
 def actor_optimizer(args, policy):
@@ -389,7 +387,7 @@ def _select_trace(trace, mask):
 @torch.no_grad()
 def evaluate(
     policy, loss_config, *, seeds, horizons, scenarios, output=None,
-    q2_checkpoint=None, split="development", save_trajectories=False, risk_config=None,
+    q2_checkpoint=None, split="development", save_trajectories=False, risk_config=None, hard_risk_config=None,
 ):
     device, dtype = next(policy.parameters()).device, next(policy.parameters()).dtype
     simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
@@ -401,8 +399,10 @@ def evaluate(
             metrics = trajectory_metrics(trace, loss_config)
             if risk_config is not None:
                 metrics.update(physical_risk_metrics(trace, risk_config, loss_config))
+                metrics.update(hard_risk_metrics(trace, risk_config, loss_config, hard_risk_config or HardRiskConfig()))
                 metrics["finite"] = metrics["finite"] and all(math.isfinite(x) for x in (
-                    metrics["risk_objective"], *metrics["risk_components"].values()
+                    metrics["risk_objective"], *metrics["risk_components"].values(),
+                    *metrics["hard_risk_components"].values(), *metrics["hard_risk_peaks"].values()
                 ))
             if not metrics["finite"] or not math.isfinite(metrics["task_objective"]):
                 if output is not None:
@@ -455,6 +455,10 @@ def evaluate(
     if risk_config is not None:
         report.update(
             risk_config=asdict(risk_config),
+            hard_risk_config=asdict(hard_risk_config or HardRiskConfig()),
+            hard_risk_components={name: sum(row["policy"]["hard_risk_components"][name] for row in records) / len(records)
+                                  for name in ("omega", "saturation")},
+            hard_risk_bounds_violated=sorted({name for row in records for name in row["policy"]["hard_risk_bounds_violated"]}),
             risk_objective=sum(row["policy"]["risk_objective"] for row in records) / len(records),
             risk_components={
                 name: sum(row["policy"]["risk_components"][name] for row in records) / len(records)
@@ -608,9 +612,10 @@ def train(args, policy_config, loss_config):
                 scenarios=args.scenarios,
                 output=work / "development" / ("%07d.json" % progress["attempts"]),
                 risk_config=None if critic is None else critic.config.risk,
+                hard_risk_config=None if critic is None else critic.config.hard_risk,
             )
         except BaseException:
-            if args.optimizer != "full-space-ms" and progress["best_score"] is not None:
+            if optimizer is not None and progress["best_score"] is not None:
                 restore_best_after_development_failure("development_evaluation_failed")
             raise
         if progress["baseline_score"] is None:
@@ -621,10 +626,12 @@ def train(args, policy_config, loss_config):
         )}
         compact.update(attempt=progress["attempts"], update=progress["updates"], model_sha256=current_model)
         if critic is not None:
-            compact.update({key: report[key] for key in ("risk_objective", "risk_components")})
+            compact.update({key: report[key] for key in ("risk_objective", "risk_components", "hard_risk_components", "hard_risk_bounds_violated")})
         progress["development"].append(compact)
         old_score = progress["best_score"]
-        catastrophic = args.optimizer != "full-space-ms" and old_score is not None and (
+        # Direct candidate search already applied both current-Actor TRAIN/DEV
+        # gates. Periodic reports must not add a third best-history veto.
+        catastrophic = optimizer is not None and old_score is not None and (
             report["score"] > args.adam_max_dev_loss_ratio * max(old_score, 1.0e-6)
             or report["omega_rms"] > args.adam_max_omega_ratio * max(progress["best_omega_rms"], 0.5)
         )
@@ -821,7 +828,7 @@ def profile(args, policy_config, loss_config):
         report = {
             "protocol": PROTOCOL_VERSION, "optimizer": "short-window",
             "initial_model_sha256": initial_model_sha256,
-            "scope": "one Monte Carlo risk/ranking Critic fit and windowed Actor proposal with continuous performance/risk gates",
+            "scope": "one Critic fit, windowed gradient subspace, bounded real TRAIN candidate search and one selected candidate DEV check",
             "critic": asdict(critic.config),
             "guard": guard, "device": str(device), "dtype": args.dtype,
             "scenarios": train_batches * args.scenarios, "scenarios_per_bank": args.scenarios,
@@ -950,6 +957,8 @@ def evaluate_checkpoint(args):
         save_trajectories=True,
         risk_config=RiskConfig(**saved["binding"]["critic"]["risk"])
                     if (saved["binding"].get("critic") or {}).get("risk") else None,
+        hard_risk_config=HardRiskConfig(**saved["binding"]["critic"].get("hard_risk", {}))
+                         if saved["binding"].get("critic") else None,
     )
     report["candidate_frozen"] = final
     report["final_evaluation_complete"] = final

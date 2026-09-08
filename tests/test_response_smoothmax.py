@@ -23,21 +23,22 @@ def test_smoothmax_normalizes_units_detaches_baseline_and_prioritizes_worsening(
     assert torch.isfinite(zero.grad).all()
 
 
-def test_relative_risk_gate_uses_declared_tolerance_for_total_and_each_component():
-    before = {'task_objective':10., 'risk_objective':20.,
-              'risk_components':{'position':10., 'velocity':5., 'omega':4., 'saturation':1.}}
-    after = {**before, 'task_objective':9., 'risk_objective':19.,
-             'risk_components':{**before['risk_components'], 'saturation':1.+5.e-7}}
-    assert 'risk_relative_tolerance' in critic.CriticConfig.__dataclass_fields__, 'gate lacks calibrated tolerance'
+def test_relative_hard_risk_gate_uses_only_the_declared_danger_budget():
+    from response_task import HardRiskConfig
+    before = {'finite':True, 'task_objective':10., 'hard_risk_bounds_violated':[],
+              'hard_risk_components':{'omega':4., 'saturation':1.}}
+    after = {**before, 'task_objective':9.,
+             'hard_risk_components':{**before['hard_risk_components'], 'saturation':1.+5.e-7}}
+    config = HardRiskConfig(relative_tolerance=1.e-6, absolute_tolerance=0.)
     assert critic.acceptance_rejection(before,after,[before],[after],dev_relative_tolerance=.002,
-                                      risk_relative_tolerance=1.e-6) is None
+                                      hard_risk_config=config) is None
     assert critic.acceptance_rejection(before,after,[before],[after],dev_relative_tolerance=.002,
-                                      risk_relative_tolerance=0.) == 'train_risk_deteriorated'
-    after['risk_components']['saturation'] = 1.+2.e-6
-    assert critic.risk_deteriorated(before,after,relative_tolerance=1.e-6)
+                                      hard_risk_config=HardRiskConfig(relative_tolerance=0., absolute_tolerance=0.)) == 'train_hard_risk_deteriorated'
+    after['hard_risk_components']['saturation'] = 1.+2.e-6
+    assert critic.hard_risk_deteriorated(before,after,config)
     for bad in (-1., float('nan'), 1.):
         with pytest.raises(ValueError):
-            critic.CriticConfig(risk_relative_tolerance=bad)
+            HardRiskConfig(relative_tolerance=bad)
 
 
 def test_component_labels_match_real_suffixes_and_critic_has_four_outputs():

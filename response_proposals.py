@@ -1,38 +1,24 @@
-"""TRAIN-only, low-dimensional correction of short-window Actor directions.
-
-The proposed span comes from physics/Critic gradients. Real continuous forward
-flights determine the direction inside that span; no Actor optimizer transforms
-it afterward. Finite differences are diagnostics, not a safety certificate.
-"""
+"""Bounded TRAIN rollout search in a short-window gradient subspace."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
 import math
-
 import torch
 
 
 @dataclass(frozen=True)
 class SubspaceConfig:
-    fd_relative_step: float = 1.e-4
     parameter_relative_step: float = 1.e-4
-    fd_relative_tolerance: float = .1
-    fd_absolute_tolerance: float = 0.
-    backtracks: int = 4
 
     def __post_init__(self):
-        if any(not math.isfinite(x) or x <= 0 for x in (
-            self.fd_relative_step, self.parameter_relative_step, self.fd_relative_tolerance
-        )) or self.backtracks < 1:
-            raise ValueError("subspace radii/tolerance and bounded backtrack count must be positive")
-        if not math.isfinite(self.fd_absolute_tolerance) or self.fd_absolute_tolerance < 0:
-            raise ValueError("FD absolute tolerance must be finite and nonnegative")
+        if not math.isfinite(self.parameter_relative_step) or self.parameter_relative_step <= 0:
+            raise ValueError("candidate parameter radius must be finite and positive")
 
 
 @dataclass(frozen=True)
-class CorrectedDirection:
-    direction: torch.Tensor | None
+class CandidateSearchResult:
+    parameters: torch.Tensor | None
+    metrics: dict | None
     reason: str | None
     evidence: dict
 
@@ -41,6 +27,8 @@ def gradient_basis(gradients: torch.Tensor, *, rank_tolerance: float = 1.e-6) ->
     """Reorthogonalize the at-most-five gradient rows, independent of their units."""
     if gradients.ndim != 2 or not bool(torch.isfinite(gradients).all()):
         raise FloatingPointError("nonfinite or malformed objective gradients")
+    if not 1 <= gradients.shape[0] <= 5:
+        raise ValueError("candidate search supports at most five objective gradients")
     columns = []
     for row in gradients.detach():
         norm = row.norm(dtype=torch.float64)
@@ -58,76 +46,6 @@ def gradient_basis(gradients: torch.Tensor, *, rank_tolerance: float = 1.e-6) ->
     return torch.stack(columns, 1) if columns else gradients.new_empty((gradients.shape[1], 0))
 
 
-def projected_performance_direction(matrix: torch.Tensor, *, flat_tolerance: float = 1.e-10,
-                                    feasibility_tolerance: float = 1.e-10) -> torch.Tensor | None:
-    """Project -performance onto the cone risk @ q <= 0; boundary solutions count.
-
-    Enumerate active subsets of at most five risk constraints. Their projection
-    satisfies q = y - R_active.T @ multipliers, with nonnegative multipliers.
-    Row normalization preserves the risk halfspaces. Normalize y for the small
-    solve, then return the projection in the original performance-gradient units.
-    """
-    if matrix.ndim != 2 or not 1 <= matrix.shape[0] <= 6 or not 1 <= matrix.shape[1] <= 5:
-        raise ValueError("projection needs one to six objective rows and at most five directions")
-    if not bool(torch.isfinite(matrix).all()):
-        raise FloatingPointError("nonfinite measured direction matrix")
-    rows = matrix.detach().to(device="cpu", dtype=torch.float64)
-    perf_norm = rows[0].norm()
-    if not bool(torch.isfinite(perf_norm)):
-        raise FloatingPointError("nonfinite performance-gradient norm")
-    if float(perf_norm) <= flat_tolerance:
-        return None
-    y = -rows[0] / perf_norm
-    risks = rows[1:]
-    norms = risks.norm(dim=1)
-    risks = risks[norms > 0] / norms[norms > 0, None]
-    best, distance = torch.zeros_like(y), float(y.square().sum())
-    for count in range(risks.shape[0] + 1):
-        for indices in combinations(range(risks.shape[0]), count):
-            if count:
-                active = risks[list(indices)]
-                multipliers = torch.linalg.pinv(active @ active.T) @ (active @ y)
-                if bool((multipliers < -feasibility_tolerance).any()):
-                    continue
-                candidate = y - active.T @ multipliers
-            else:
-                candidate = y
-            if bool((risks @ candidate > feasibility_tolerance).any()):
-                continue
-            error = float((candidate - y).square().sum())
-            if error < distance:
-                best, distance = candidate, error
-    if float(best.norm()) <= flat_tolerance or float(y @ best) <= 0:
-        return None
-    return (best * perf_norm).to(matrix)
-
-
-def check_direction_at_scales(full: torch.Tensor, half: torch.Tensor, q: torch.Tensor,
-                              config: SubspaceConfig) -> tuple[bool, dict]:
-    """Check the actual unit direction at both scales; near-zero risk is unknown.
-
-    Directional thresholds use the same normalized slope units as row checks.
-    A small sign change inside atol + rtol * max(|d_h|, |d_half|) is allowed to
-    reach the real trajectory gate. Performance must be clearly negative twice.
-    """
-    slopes = torch.stack((full @ q, half @ q))
-    if not bool(torch.isfinite(slopes).all()):
-        raise FloatingPointError("nonfinite corrected directional slopes")
-    tolerance = config.fd_absolute_tolerance * q.norm() + config.fd_relative_tolerance * slopes.abs().amax(0)
-    perf_ok = bool((slopes[:, 0] < -tolerance[0]).all())
-    increasing = (slopes[:, 1:] > tolerance[1:]).any(0)
-    decreasing = (slopes[:, 1:] < -tolerance[1:]).all(0)
-    labels = ["increasing" if bool(up) else "decreasing" if bool(down) else "unknown_or_near_zero"
-              for up, down in zip(increasing, decreasing)]
-    return perf_ok and not bool(increasing.any()), {
-        "directional_slopes_full_step": slopes[0].tolist(),
-        "directional_slopes_half_step": slopes[1].tolist(),
-        "directional_slope_tolerances": tolerance.tolist(),
-        "direction_performance_clear_descent": perf_ok,
-        "direction_risk_classification": labels,
-    }
-
-
 @torch.no_grad()
 def assign_parameters(policy, vector: torch.Tensor) -> None:
     """Copy a checked vector without replacing Parameter objects or their storage."""
@@ -143,83 +61,66 @@ def assign_parameters(policy, vector: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-def correct_direction(policy, gradients, evaluate_train, config: SubspaceConfig, *, baseline=None):
-    """Measure +/- perturbations from identical Actor, initial states and RNG.
+def search_candidates(policy, gradients, evaluate_train, config: SubspaceConfig, *, baseline,
+                      accept_candidate) -> CandidateSearchResult:
+    """Test +/- each basis vector at rho and rho/4; return the best safe TRAIN point.
 
-    The callback must return the real TRAIN performance first, then risk
-    components and optionally total-risk CVaR. It has no DEV inputs. Restore
-    parameters and RNG on every exit, including a failed forward evaluation.
+    All trials start from the same parameters and RNG. DEV is unavailable here.
+    Restore the original Actor even on success: the caller explicitly applies
+    the selected parameters once before its independent DEV check.
     """
     from response_training import capture_rng, restore_rng
 
     base = torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone()
+    if not bool(torch.isfinite(base).all()):
+        raise FloatingPointError("nonfinite baseline Actor")
     basis = gradient_basis(gradients)
-    evidence = {"basis_rank": basis.shape[1], "probe_rollouts": 0,
+    if basis.shape[0] != base.numel():
+        raise ValueError("objective gradients do not match the Actor")
+    evidence = {"basis_rank": basis.shape[1], "candidate_rollouts": 0, "candidates": [],
                 "objective_gradient_norms": gradients.norm(dim=1, dtype=torch.float64).tolist()}
     if not basis.shape[1]:
-        return CorrectedDirection(None, "no_feasible_direction", evidence)
+        return CandidateSearchResult(None, None, "empty_subspace", evidence)
+    radius = config.parameter_relative_step * max(float(base.norm(dtype=torch.float64)), 1.)
+    evidence.update(parameter_step=radius, step_fractions=[1., .25])
+    best_parameters, best_metrics, best_loss = None, None, float(baseline["task_objective"])
+    if not math.isfinite(best_loss):
+        raise FloatingPointError("nonfinite baseline performance")
     rng = capture_rng()
-    scale = max(float(base.norm(dtype=torch.float64)), 1.)
-    epsilon = config.fd_relative_step * scale
-    evidence.update(fd_parameter_step=epsilon, parameter_step=config.parameter_relative_step * scale)
-
-    def measure():
-        value = evaluate_train().detach().to(device="cpu", dtype=torch.float64)
-        if value.ndim != 1 or not bool(torch.isfinite(value).all()):
-            raise FloatingPointError("nonfinite true TRAIN objective in direction probe")
-        return value
-
     try:
-        baseline = measure() if baseline is None else baseline.detach().to(device="cpu", dtype=torch.float64)
-        if baseline.ndim != 1 or not bool(torch.isfinite(baseline).all()):
-            raise FloatingPointError("nonfinite direction baseline")
-        units = baseline.abs().clamp_min(1.e-6)
-        matrices = []
-        for radius in (epsilon, epsilon / 2):
-            columns = []
-            for direction in basis.T:
-                pair = []
+        for index, direction in enumerate(basis.T):
+            for fraction in (1., .25):
                 for sign in (1, -1):
-                    proposed = base + sign * radius * direction
-                    # Detect a perturbation lost or distorted by parameter dtype.
-                    realized = (proposed - base) / (sign * radius)
-                    if float((realized - direction).norm()) > .05:
-                        evidence["fd_failure"] = "parameter_roundoff"
-                        return CorrectedDirection(None, "fd_unreliable", evidence)
-                    assign_parameters(policy, proposed)
+                    parameters = base + (sign * fraction * radius) * direction
+                    trial = {"basis_index": index, "sign": sign, "fraction": fraction}
+                    if torch.equal(parameters, base):
+                        trial["rejection_reason"] = "unchanged_parameters"
+                        evidence["candidates"].append(trial)
+                        continue
+                    if not bool(torch.isfinite(parameters).all()):
+                        trial["rejection_reason"] = "candidate_nonfinite"
+                        evidence["candidates"].append(trial)
+                        continue
+                    assign_parameters(policy, parameters)
                     restore_rng(rng)
-                    pair.append(measure())
-                    evidence["probe_rollouts"] += 1
-                columns.append((pair[0] - pair[1]) / (2 * radius) / units)
-            matrices.append(torch.stack(columns, 1))
-        measured = matrices[-1]
-        evidence["measured_objective_slopes"] = measured.tolist()
-        evidence["objective_units"] = units.tolist()
-        evidence["flat_objective_rows"] = (measured.norm(dim=1) <= 1.e-10).nonzero().flatten().tolist()
-        if not all(bool(torch.isfinite(matrix).all()) for matrix in matrices):
-            raise FloatingPointError("nonfinite finite-difference slopes")
-        diff = (matrices[0] - measured).norm(dim=1)
-        size = torch.maximum(matrices[0].norm(dim=1), measured.norm(dim=1))
-        tolerance = config.fd_absolute_tolerance + config.fd_relative_tolerance * size
-        evidence["fd_absolute_error_by_objective"] = diff.tolist()
-        evidence["fd_tolerance_by_objective"] = tolerance.tolist()
-        evidence["fd_absolute_tolerance"] = config.fd_absolute_tolerance
-        evidence["fd_relative_tolerance"] = config.fd_relative_tolerance
-        if bool((diff > tolerance).any()):
-            evidence["fd_failure"] = "row_disagreement"
-            return CorrectedDirection(None, "fd_unreliable", evidence)
-        q = projected_performance_direction(measured)
-        if q is None:
-            return CorrectedDirection(None, "no_feasible_direction", evidence)
-        q = q / q.norm()
-        reliable, directional = check_direction_at_scales(matrices[0], measured, q, config)
-        evidence.update(directional)
-        if not reliable:
-            evidence["fd_failure"] = "direction_disagreement"
-            return CorrectedDirection(None, "fd_unreliable", evidence)
-        evidence["corrected_objective_slopes"] = (measured @ q).tolist()
-        direction = basis @ q.to(basis)
-        return CorrectedDirection(direction / direction.norm(), None, evidence)
+                    evidence["candidate_rollouts"] += 1
+                    try:
+                        metrics = evaluate_train()
+                        reason = accept_candidate(metrics)
+                    except FloatingPointError:
+                        metrics, reason = {"finite": False}, "candidate_nonfinite"
+                    trial["rejection_reason"] = reason
+                    if metrics.get("finite", False):
+                        trial.update(performance=metrics["task_objective"],
+                                     hard_risk_components=metrics["hard_risk_components"],
+                                     bounds_violated=metrics["hard_risk_bounds_violated"])
+                    evidence["candidates"].append(trial)
+                    if reason is None and float(metrics["task_objective"]) < best_loss:
+                        best_parameters, best_metrics = parameters.clone(), metrics
+                        best_loss = float(metrics["task_objective"])
+                        evidence["selected_candidate"] = len(evidence["candidates"]) - 1
+        return CandidateSearchResult(best_parameters, best_metrics,
+            None if best_parameters is not None else "no_acceptable_candidate", evidence)
     finally:
         assign_parameters(policy, base)
         restore_rng(rng)

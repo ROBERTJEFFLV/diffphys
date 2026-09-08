@@ -63,6 +63,28 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class HardRiskConfig:
+    """Declared acceptance budgets and optional flight envelope, not FD tolerances.
+
+    Bounds are opt-in physical operating limits. Tracking error scales must not
+    silently become a geofence. Tiny absolute slack is in summed risk units.
+    """
+    relative_tolerance: float = .002
+    absolute_tolerance: float = 1.e-8
+    position_bound: Optional[float] = None
+    velocity_bound: Optional[float] = None
+
+    def __post_init__(self):
+        if not math.isfinite(self.relative_tolerance) or not 0 <= self.relative_tolerance < 1:
+            raise ValueError("hard risk relative tolerance must lie in [0, 1)")
+        if not math.isfinite(self.absolute_tolerance) or self.absolute_tolerance < 0:
+            raise ValueError("hard risk absolute tolerance must be finite and nonnegative")
+        if any(value is not None and (not math.isfinite(value) or value <= 0)
+               for value in (self.position_bound, self.velocity_bound)):
+            raise ValueError("configured flight bounds must be finite and positive")
+
+
+@dataclass(frozen=True)
 class ResponseClosedLoopState:
     physical: L2FState
     policy: ResponsePolicyState
@@ -236,6 +258,37 @@ def physical_risk_metrics(trajectory, config: RiskConfig, loss_config: TaskLossC
 
     return {"risk_objective": aggregate(total),
             "risk_components": {name: aggregate(value) for name, value in components.items()}}
+
+
+def hard_risk_metrics(trajectory, config: RiskConfig, loss_config: TaskLossConfig,
+                      hard_config: HardRiskConfig, *, omega_reference=0.) -> dict:
+    """Real warning-zone exposure only; position/velocity are performance costs.
+
+    Keep the established full-flight mean+CVaR aggregation. Both danger terms
+    are exactly zero below their physical warning limits. Optional envelope
+    violations are checked directly over every scene/time, including startup.
+    """
+    omega = (trajectory.omegas.detach() - omega_reference).norm(dim=-1)
+    components = {
+        "omega": (omega / config.omega_limit - 1).clamp_min(0).square(),
+        "saturation": ((trajectory.actions.detach().abs() - config.saturation_limit)
+                       / (1 - config.saturation_limit)).clamp_min(0).square().mean(-1),
+    }
+    values = {name: value.sum(0) for name, value in components.items()}
+    count = max(1, math.ceil(loss_config.tail_fraction * omega.shape[1]))
+    risks = {name: float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
+             for name, value in values.items()}
+    position = torch.cat((trajectory.observations[:1, ..., :3], trajectory.positions)).detach().norm(dim=-1)
+    velocity = torch.cat((trajectory.observations[:1, ..., 3:6], trajectory.velocities)).detach().norm(dim=-1)
+    violated = [name for name, value, limit in (
+        ("position", position, hard_config.position_bound),
+        ("velocity", velocity, hard_config.velocity_bound),
+    ) if limit is not None and bool((value > limit).any())]
+    if bool((trajectory.actions.detach().abs() > 1.).any()):
+        violated.append("action_limit")
+    return {"hard_risk_components": risks, "hard_risk_bounds_violated": violated,
+            "hard_risk_peaks": {"omega": float(omega.max()), "action_abs": float(trajectory.actions.detach().abs().max()),
+                                "position": float(position.max()), "velocity": float(velocity.max())}}
 
 
 def risk_weights(costs: torch.Tensor, config: TaskLossConfig) -> torch.Tensor:

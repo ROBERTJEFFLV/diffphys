@@ -241,8 +241,8 @@ def test_short_window_checkpoint_exact_resume_includes_critic_target_and_both_op
     assert first["progress"]["attempts"] == second["progress"]["attempts"] == 2
 
 
-@pytest.mark.parametrize("motor,delta", [(2, .001), (3, .01)])
-def test_continuous_risk_gate_restores_performance_improving_real_physics_proposal(motor, delta):
+@pytest.mark.parametrize("motor,delta,reason", [(2, .001, None), (3, .01, "development_deteriorated")])
+def test_real_physics_proposal_uses_hard_risk_and_dev_performance(motor, delta, reason):
     from response_training import capture_rng
     from test_response_guarded_updates import assert_nested_equal
     _, policy, simulator, initial, state, optimizer = trainer_fixture()
@@ -262,12 +262,15 @@ def test_continuous_risk_gate_restores_performance_improving_real_physics_propos
                                 development_initials=(initial, dev), gradient_clip=10.)
     assert len(steps) == 1
     assert report["continuous_loss_after"] < report["continuous_loss_before"]
-    assert not report["accepted"]
-    assert report["rejection_reason"] == "train_risk_deteriorated"
+    assert report["accepted"] == (reason is None)
+    assert report["rejection_reason"] == reason
+    # These real proposals used to be vetoed by small soft-risk tradeoffs.
     assert any(report["continuous_risk_components_after"][key] > value
                for key, value in report["continuous_risk_components_before"].items())
-    assert_nested_equal(saved[0], policy.state_dict())
-    assert_nested_equal(saved[2], optimizer.state_dict())
+    assert report["continuous_hard_risk_after"] == {"omega": 0., "saturation": 0.}
+    if reason is not None:
+        assert_nested_equal(saved[0], policy.state_dict())
+        assert_nested_equal(saved[2], optimizer.state_dict())
     assert_nested_equal(fitted["training"], state.state_dict())
     assert_nested_equal(fitted["rng"], capture_rng())
 
@@ -404,7 +407,8 @@ def test_periodic_dev_rollback_preserves_accumulated_critic_and_rng(tmp_path, mo
         return {"score": 10. if len(evaluations) == 1 else 21., "finite": True,
                 "position_rms": 1., "velocity_rms": 1., "omega_rms": 1.,
                 "steady_success_rate": 0., "motor_saturation_fraction": 0.,
-                "risk_objective": 1., "risk_components": {"position": 1., "velocity": 0., "omega": 0., "saturation": 0.}}
+                "risk_objective": 1., "risk_components": {"position": 1., "velocity": 0., "omega": 0., "saturation": 0.},
+                "hard_risk_components": {"omega": 0., "saturation": 0.}, "hard_risk_bounds_violated": []}
     monkeypatch.setattr(training, "evaluate", development)
     # Exercise the periodic rollback after an Actor change. An unchanged,
     # rejected Actor now correctly reuses its existing development report.

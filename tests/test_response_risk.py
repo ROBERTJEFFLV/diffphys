@@ -140,10 +140,13 @@ def test_true_risk_gate_rejects_component_worsening_despite_better_performance_a
                 "risk_components": {"position": 3., "velocity": 1., "omega": 2., "saturation": 1.}}
     unsafe = {"task_objective": 8., "risk_objective": 6.,
               "risk_components": {"position": 1., "velocity": 1., "omega": 3., "saturation": 1.}}
+    for row in (before, improved, unsafe):
+        row.update(finite=True, hard_risk_bounds_violated=[],
+                   hard_risk_components={name: row['risk_components'][name] for name in ('omega', 'saturation')})
     reason = critic.acceptance_rejection(before, unsafe if bank == "train" else improved,
                                          [before, before], [improved, unsafe] if bank == "dev" else [improved, improved],
                                          dev_relative_tolerance=.002)
-    assert reason == ("train_risk_deteriorated" if bank == "train" else "development_risk_deteriorated")
+    assert reason == ("train_hard_risk_deteriorated" if bank == "train" else "development_hard_risk_deteriorated")
     assert critic.acceptance_rejection(before, improved, [before, before], [improved, improved],
                                       dev_relative_tolerance=.002) is None
 
