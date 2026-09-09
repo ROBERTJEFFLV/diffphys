@@ -12,63 +12,72 @@ import math
 import torch
 from torch import nn
 from response_proposals import SubspaceConfig
+from env_l2f import L2FParams, normalized_capability_target
+from response_phase1 import Phase1ProbeError
 
 from response_task import (
     ResponseClosedLoopState, RiskConfig, HardRiskConfig, TaskLossConfig, TaskTrajectory, concatenate, initialize,
-    observation, physical_risk_metrics, risk_components, risk_weights, rollout, step_costs,
+    observation, physical_risk_metrics, risk_components, risk_weights, rollout, training_step_costs,
     suffix_risks, trajectory_metrics, hard_risk_metrics,
 )
 
 
-# Fixed physical divisors; no batch statistics, clipping, or running RMS.
-# Every truth/history field has an explicit scale so additions fail visibly.
-PHYSICAL_SCALES = {
-    "position": 5., "velocity": 5., "rotation": 1., "omega": 10.,
-    "motor": 1., "previous_action": 1., "external_force": .5, "mass": .05,
-    "thrust_coeff_c0": .1, "thrust_coeff_c1": .1, "thrust_coeff_c2": .1,
-    "thrust_to_weight": 3., "torque_to_inertia": 500., "rotor_distance_factor": 1.,
-    "inertia_factor": 1., "motor_time_rising": .1, "motor_time_falling": .1,
-    "rotor_torque_constant": .01, "cbrt_mass": .4, "force_std": .5,
-    "arm_length": .05, "inertia_x": 1.e-5, "inertia_y": 1.e-5, "inertia_z": 2.e-5,
-    "alpha_roll_max": 500., "alpha_pitch_max": 500., "alpha_yaw_max": 100.,
-    "eta_yaw": .2, "jz_over_jxy": 2., "dt_alpha_roll_max": 5., "dt_alpha_yaw_max": 1.,
-}
-POLICY_SCALES = {
-    "memory": 1., "integral": .5, "previous_velocity": 5., "previous_omega": 10.,
-    "previous_rotation": 1., "last_action": 1., "older_action": 1.,
-}
-RISK_OBJECTIVE = "component-risk-v3-warning-saturation-train-scaled"
+# Fixed task references; dynamics use the simulator's dimensionless capability
+# coordinates. No raw CAD-field dictionary or data-dependent calibration.
+RISK_OBJECTIVE = "component-mean-risk-v5-capability"
 
 
 def critic_features(closed: ResponseClosedLoopState, step: int, horizon: int) -> torch.Tensor:
-    """Complete privileged state normalized by fixed physical divisors, plus t/H."""
+    """Task state, causal response history, six log capabilities and F/(mg).
+
+    This is the registered physical-fit family (linear identical motors, Jx=Jy),
+    not a sufficient representation of arbitrary nonlinear/asymmetric vehicles.
+    Redundant last_action is omitted; previous_action is the actual command.
+    """
     if horizon < 1 or not 0 <= step <= horizon:
         raise ValueError("Critic time must lie in the original positive horizon")
-    batch = closed.physical.position.shape[0]
-    values = [(getattr(closed.physical, f.name) / PHYSICAL_SCALES[f.name]).reshape(batch, -1)
-              for f in fields(closed.physical)]
-    values.extend((getattr(closed.policy, f.name) / (horizon if f.name == "calls"
-                   else POLICY_SCALES[f.name])).reshape(batch, -1) for f in fields(closed.policy))
-    values.append(closed.physical.position.new_full((batch, 1), step / horizon))
+    physical, history = closed.physical, closed.policy
+    batch = physical.position.shape[0]
+    values = (
+        physical.position / 5., physical.velocity / 5., physical.rotation.reshape(batch, 9),
+        physical.omega / 10., physical.motor, physical.previous_action,
+        history.memory, history.integral / .5,
+        history.previous_velocity / 5., history.previous_omega / 10.,
+        history.previous_rotation.reshape(batch, 9), history.older_action,
+        (history.calls > 0).to(physical.position).reshape(batch, 1),
+        normalized_capability_target(physical),
+        physical.external_force / (physical.mass[:, None] * L2FParams().gravity),
+        physical.position.new_full((batch, 1), step / horizon),
+    )
     return torch.cat(values, dim=-1)
 
 
 class RiskToGoCritic(nn.Module):
-    """One 256/256 SiLU MLP with four nonnegative remaining-risk components."""
+    """Predict four signed mean-per-remaining-step risks with a linear head."""
 
     def __init__(self, input_dim: int) -> None:
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, 256), nn.SiLU(),
-            nn.Linear(256, 256), nn.SiLU(), nn.Linear(256, 4), nn.Softplus(),
+            nn.Linear(256, 256), nn.SiLU(), nn.Linear(256, 4),
         )
 
-        # Set once from TRAIN labels. The MLP learns normalized targets while
-        # callers receive physical remaining-risk units, including dR/dZ.
-        self.register_buffer("output_scales", torch.ones(4))
-
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs) * self.output_scales
+        return self.network(inputs)
+
+
+def mean_future_risks(suffix_sums: torch.Tensor) -> torch.Tensor:
+    """Convert exact cumulative labels at Z_0..Z_H to mean risks; Z_H is zero.
+
+    Keep the original sums in the trajectory record for the unchanged full-flight
+    CVaR and detached risk prefix used to construct Actor directions.
+    """
+    if suffix_sums.ndim != 3 or suffix_sums.shape[0] < 2 or suffix_sums.shape[-1] != 4:
+        raise ValueError("risk labels must cover Z_0..Z_H with four components")
+    horizon = suffix_sums.shape[0] - 1
+    remaining = torch.arange(horizon, -1, -1, device=suffix_sums.device, dtype=suffix_sums.dtype)
+    return torch.where(remaining[:, None, None] > 0,
+                       suffix_sums / remaining.clamp_min(1)[:, None, None], torch.zeros_like(suffix_sums))
 
 
 def detach_closed_state(closed: ResponseClosedLoopState) -> ResponseClosedLoopState:
@@ -81,6 +90,7 @@ def detach_closed_state(closed: ResponseClosedLoopState) -> ResponseClosedLoopSt
 
 @dataclass(frozen=True)
 class DirectionSamples:
+    """Reachable paired states with mean risks over their remaining continuations."""
     plus_inputs: torch.Tensor
     minus_inputs: torch.Tensor
     plus_returns: torch.Tensor
@@ -133,7 +143,7 @@ def collect_direction_samples(policy, simulator, boundaries, horizon, risk_confi
             for a, b in ((plus.physical, minus.physical), (plus.policy, minus.policy))
         ))
         future = rollout(policy, simulator, joined, horizon - step - 1)
-        risks = torch.stack(tuple(risk_components(future, risk_config).values()), -1).sum(0)
+        risks = torch.stack(tuple(risk_components(future, risk_config).values()), -1).mean(0)
         count = base.shape[0]
         plus_inputs.append(critic_features(plus, step + 1, horizon))
         minus_inputs.append(critic_features(minus, step + 1, horizon))
@@ -144,17 +154,16 @@ def collect_direction_samples(policy, simulator, boundaries, horizon, risk_confi
         plus_inputs, minus_inputs, plus_returns, minus_returns, perturbations)))
 
 
-def direction_ranking_loss(plus, minus, true_plus, true_minus, *, temperature, min_gap=1.e-6,
-                           scales=None):
-    scales = 1. if scales is None else scales.detach()
-    difference = (true_plus - true_minus).detach() / scales
+def direction_ranking_loss(plus, minus, true_plus, true_minus, *, temperature, min_gap=1.e-6):
+    difference = (true_plus - true_minus).detach()
     valid = difference.abs() > min_gap
-    losses = nn.functional.softplus(-difference.sign() * (plus - minus) / scales / temperature)
+    losses = nn.functional.softplus(-difference.sign() * (plus - minus) / temperature)
     return (losses * valid).sum() / valid.sum().clamp_min(1)
 
 
 @dataclass(frozen=True)
 class MonteCarloTrajectory:
+    """Keep exact suffix sums for Actor CVaR/prefixes; fit converts them to means."""
     trajectory: TaskTrajectory
     inputs: torch.Tensor
     returns: torch.Tensor
@@ -198,7 +207,7 @@ def collect_trajectory(policy, simulator, initial, horizon: int, loss_config: Ta
     returns = suffix_risks(torch.stack(tuple(risk_components(trace, risk_config).values()), -1))
     directions = collect_direction_samples(policy, simulator, boundaries, horizon, risk_config, direction_epsilon)
     return MonteCarloTrajectory(trace, torch.stack(inputs), returns,
-                                risk_weights(step_costs(trace, loss_config).sum(0), loss_config), directions)
+                                risk_weights(training_step_costs(trace, loss_config).sum(0), loss_config), directions)
 
 
 def accumulate_actor_gradients(
@@ -207,6 +216,7 @@ def accumulate_actor_gradients(
     risk_config: RiskConfig = RiskConfig(), risk_weight: float = 1.,
     baseline_returns: torch.Tensor, risk_smoothmax_beta: float = 10.,
     separate_objectives: bool = False,
+    phase1_reference: dict | None = None,
 ) -> dict:
     """Backpropagate each window immediately; update no parameters here.
 
@@ -235,16 +245,25 @@ def accumulate_actor_gradients(
     surrogate = weights.new_zeros(())
     parameters = list(policy.parameters())
     objective_gradients = weights.new_zeros((5, sum(p.numel() for p in parameters))) if separate_objectives else None
+    phase1_windows = []
     for start in range(0, horizon, window_steps):
         trace = rollout(policy, simulator, closed, window_steps)
-        costs = step_costs(trace, loss_config, start=start, horizon=horizon).sum(0)
+        costs = training_step_costs(trace, loss_config, start=start, horizon=horizon).sum(0)
         end = start + window_steps
+        if phase1_reference is not None:
+            from response_phase1 import compare_boundary, terminal_state_gradient
+            window_probe = {"start": start, "end": end,
+                            "boundary": compare_boundary(phase1_reference[end], trace.end, end),
+                            **terminal_state_gradient(target, trace.end, end, horizon)}
+            window_norms = []
         risk = torch.stack(tuple(risk_components(trace, risk_config).values()), -1).sum(0)
         # Include the detached true prefix so every window uses full-flight
         # units. Only the current window and learned suffix carry gradients.
         risk = risk + (baseline_returns[0] - baseline_returns[start])
         if end < horizon:
-            risk = risk + target(critic_features(trace.end, end, horizon))
+            # The network predicts a per-step mean. Restore the full suffix
+            # and its state derivative; Z_H never calls the terminal Critic.
+            risk = risk + (horizon - end) * target(critic_features(trace.end, end, horizon))
         component_totals = (component_weights * risk).sum(0)
         performance = (weights * costs).sum()
         if separate_objectives:
@@ -253,10 +272,21 @@ def accumulate_actor_gradients(
                 raise FloatingPointError("nonfinite short-window objective components")
             for j in range(5):
                 gradients = torch.autograd.grad(objectives[j], parameters, retain_graph=j < 4, allow_unused=True)
-                objective_gradients[j] += torch.cat([
+                flat_gradient = torch.cat([
                     torch.zeros_like(p).flatten() if g is None else g.detach().flatten()
                     for p, g in zip(parameters, gradients)
                 ])
+                objective_gradients[j] += flat_gradient
+                if phase1_reference is not None:
+                    # Report each raw window objective before the 1/windows average.
+                    window_norms.append(float((flat_gradient * windows).norm(dtype=torch.float64)))
+            if phase1_reference is not None:
+                if not all(math.isfinite(value) for value in window_norms):
+                    raise Phase1ProbeError("window_gradient_nonfinite", {"start": start, "end": end})
+                window_probe.update(performance_gradient_norm=window_norms[0],
+                    risk_gradient_norm=math.sqrt(sum(n*n for n in window_norms[1:])),
+                    risk_component_gradient_norms=window_norms[1:])
+                phase1_windows.append(window_probe)
             loss = objectives.detach().sum()
         else:
             risk_objective = normalized_risk_smoothmax(component_totals, baseline, beta=risk_smoothmax_beta)
@@ -269,7 +299,8 @@ def accumulate_actor_gradients(
         closed = detach_closed_state(trace.end)
         del trace, costs, risk, loss
     return {"surrogate_loss": float(surrogate), "windows": windows, "end": closed,
-            "risk_baseline": baseline.tolist(), "objective_gradients": objective_gradients}
+            "risk_baseline": baseline.tolist(), "objective_gradients": objective_gradients,
+            "phase1_windows": phase1_windows}
 
 
 def normalized_risk_smoothmax(risks: torch.Tensor, baseline: torch.Tensor, *,
@@ -283,6 +314,8 @@ def normalized_risk_smoothmax(risks: torch.Tensor, baseline: torch.Tensor, *,
 
 @dataclass(frozen=True)
 class CriticConfig:
+    phase1_probes: bool = False
+    acceptance_mode: str = "train-and-dev"
     window_steps: int = 50
     lr: float = 1.0e-3
     epochs: int = 1
@@ -297,14 +330,19 @@ class CriticConfig:
     direction_weight: float = .1
     direction_temperature: float = .1
     direction_min_gap: float = 1.e-6
-    return_scale_floor: float = 1.e-3
     proposal: str = "physics-subspace"
     subspace: SubspaceConfig = SubspaceConfig()
 
     def __post_init__(self) -> None:
+        if self.acceptance_mode not in ("train-and-dev", "train-objective"):
+            raise ValueError("unknown Actor acceptance mode")
+        if self.acceptance_mode == "train-objective" and self.proposal != "physics-subspace":
+            raise ValueError("TRAIN-only Phase 1 requires physics-subspace search")
+        if self.phase1_probes and self.proposal != "physics-subspace":
+            raise ValueError("Phase 1 probes require the normal physics-subspace backend")
         if self.proposal not in ("physics-subspace", "smoothmax-adam"):
             raise ValueError("unknown short-window proposal backend")
-        positive = (self.risk_weight, self.risk_smoothmax_beta, self.return_scale_floor,
+        positive = (self.risk_weight, self.risk_smoothmax_beta,
                     self.direction_epsilon, self.direction_temperature)
         nonnegative = (self.direction_weight, self.direction_min_gap)
         if any(not math.isfinite(x) or x <= 0 for x in positive) or any(
@@ -380,48 +418,49 @@ class CriticTrainer:
         self.target = copy.deepcopy(self.critic).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.lr)
         self.completed_fits = 0
-        self.scales_calibrated = False
         self._dev_cache = None
 
     def state_dict(self) -> dict:
         return {"objective": RISK_OBJECTIVE, "critic": self.critic.state_dict(), "target": self.target.state_dict(),
                 "optimizer": self.optimizer.state_dict(), "completed_fits": self.completed_fits,
-                "risk_config": asdict(self.config.risk), "scales_calibrated": self.scales_calibrated,
-                "return_scale_floor": self.config.return_scale_floor}
+                "risk_config": asdict(self.config.risk)}
 
     def load_state_dict(self, saved: dict) -> None:
         if saved.get("objective") != RISK_OBJECTIVE:
             raise ValueError("risk objective changed; start a new weights-only Actor experiment")
-        if saved.get("risk_config") != asdict(self.config.risk) or saved.get("return_scale_floor") != self.config.return_scale_floor:
-            raise ValueError("risk definition/scales changed; start a new experiment")
+        if saved.get("risk_config") != asdict(self.config.risk):
+            raise ValueError("risk definition changed; start a new experiment")
+        expected = self.critic.state_dict()
         for name in ("critic", "target"):
-            scales = saved[name]["output_scales"]
-            if scales.shape != (4,) or not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
-                raise ValueError("Critic checkpoint needs four positive finite TRAIN scales")
-        if not torch.equal(saved['critic']['output_scales'], saved['target']['output_scales']):
-            raise ValueError("Critic and target must use identical TRAIN units")
+            values = saved[name]
+            if values.keys() != expected.keys() or any(
+                not isinstance(values[key], torch.Tensor) or values[key].shape != value.shape
+                for key, value in expected.items()
+            ):
+                raise ValueError("Critic checkpoint does not match the mean-risk feature schema")
+        if not _finite_state(saved):
+            raise ValueError("nonfinite Critic training checkpoint")
         self.critic.load_state_dict(saved["critic"])
         self.target.load_state_dict(saved["target"])
         self.optimizer.load_state_dict(saved["optimizer"])
         self.completed_fits = saved["completed_fits"]
-        self.scales_calibrated = saved["scales_calibrated"]
-
-    def initialize_from_scalar(self, saved: dict, proportions: torch.Tensor) -> None:
-        """Reject old risk units; reuse only Actor weights in a new experiment."""
-        raise ValueError("risk definition and supervision changed; start a new weights-only Actor experiment")
 
     def _value_loss(self, prediction, returns, *, reduction="mean"):
-        scales = self.critic.output_scales.detach()
-        return nn.functional.smooth_l1_loss(prediction / scales, returns / scales, reduction=reduction)
+        return nn.functional.smooth_l1_loss(prediction, returns, reduction=reduction)
 
     @torch.no_grad()
     def _component_errors(self, inputs, returns):
         total = returns.new_zeros(4)
         for start in range(0, returns.shape[0], self.config.batch_size):
             end = start + self.config.batch_size
-            total += (self.critic(inputs[start:end]) - returns[start:end]).abs().sum(0)
+            prediction = self.critic(inputs[start:end])
+            if not bool(torch.isfinite(prediction).all()):
+                raise FloatingPointError("nonfinite physical-unit Critic prediction")
+            total += (prediction - returns[start:end]).abs().sum(0)
         mae = total / returns.shape[0]
-        return mae.tolist(), (mae / self.critic.output_scales).tolist()
+        if not bool(torch.isfinite(mae).all()):
+            raise FloatingPointError("nonfinite physical-unit Critic error")
+        return mae.tolist()
 
     @torch.no_grad()
     def _regression_loss(self, inputs, returns) -> float:
@@ -438,16 +477,15 @@ class CriticTrainer:
             self.critic(samples.plus_inputs), self.critic(samples.minus_inputs),
             samples.plus_returns, samples.minus_returns,
             temperature=self.config.direction_temperature, min_gap=self.config.direction_min_gap,
-            scales=self.critic.output_scales,
         )
 
     @torch.no_grad()
     def _direction_metrics(self, samples):
         if samples is None:
             return {"pairs": 0, "valid_pairs": 0, "loss": 0., "accuracy": None}
-        difference = (samples.plus_returns - samples.minus_returns) / self.critic.output_scales
+        difference = samples.plus_returns - samples.minus_returns
         valid = difference.abs() > self.config.direction_min_gap
-        predicted = (self.critic(samples.plus_inputs) - self.critic(samples.minus_inputs)) / self.critic.output_scales
+        predicted = self.critic(samples.plus_inputs) - self.critic(samples.minus_inputs)
         count = int(valid.sum())
         return {"pairs": difference.shape[0], "component_comparisons": difference.numel(), "valid_pairs": count,
                 "loss": float(self._direction_loss(samples)),
@@ -459,21 +497,15 @@ class CriticTrainer:
 
     def fit(self, record: MonteCarloTrajectory) -> dict:
         inputs = record.inputs.detach().reshape(-1, record.inputs.shape[-1])
-        returns = record.returns.detach().reshape(-1, 4)
-        if not _finite_state((inputs, returns)) or (record.directions is not None and not _finite_state(
+        returns = mean_future_risks(record.returns.detach()).reshape(-1, 4)
+        if not _finite_state((inputs, record.returns, returns)) or (record.directions is not None and not _finite_state(
             [getattr(record.directions, f.name) for f in fields(record.directions)]
         )):
             raise FloatingPointError("nonfinite risk supervision")
-        if bool((returns < 0).any()):
+        if bool((record.returns < 0).any()):
             raise ValueError("remaining risk labels must be nonnegative")
-        if not self.scales_calibrated:
-            # Only fit(TRAIN) may set units. Never update them on later fits or DEV.
-            with torch.no_grad():
-                self.critic.output_scales.copy_(returns.mean(0).clamp_min(self.config.return_scale_floor))
-                self.target.output_scales.copy_(self.critic.output_scales)
-            self.scales_calibrated = True
         before = self._regression_loss(inputs, returns)
-        mae_before, normalized_before = self._component_errors(inputs, returns)
+        mae_before = self._component_errors(inputs, returns)
         direction_before = self._direction_metrics(record.directions)
         for _ in range(self.config.epochs):
             order = torch.randperm(returns.shape[0], device=returns.device)
@@ -489,20 +521,25 @@ class CriticTrainer:
                     raise FloatingPointError("nonfinite Critic gradient")
                 self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
-        self.target.load_state_dict(self.critic.state_dict())
         after = self._regression_loss(inputs, returns)
         direction_after = self._direction_metrics(record.directions)
         if not math.isfinite(after) or not _finite_state((self.state_dict(), direction_after)):
             raise FloatingPointError("nonfinite fitted Critic or optimizer")
+        mae_after = self._component_errors(inputs, returns)
+        if record.directions is not None:
+            for sign in ("plus", "minus"):
+                self._component_errors(getattr(record.directions, sign + "_inputs"),
+                                       getattr(record.directions, sign + "_returns"))
+        self.target.load_state_dict(self.critic.state_dict())
         self.completed_fits += 1
-        mae_after, normalized_after = self._component_errors(inputs, returns)
-        return {"critic_loss_before": before, "critic_loss_after": after,
-                "critic_scale_source": "first_train_trajectory",
-                "critic_component_scales": self.critic.output_scales.tolist(),
+        report = {"critic_loss_before": before, "critic_loss_after": after,
+                "critic_regression_coordinates": "mean_per_step_risk",
                 "critic_component_mae_before": mae_before, "critic_component_mae_after": mae_after,
-                "critic_component_normalized_mae_before": normalized_before,
-                "critic_component_normalized_mae_after": normalized_after,
                 "critic_direction_before": direction_before, "critic_direction_after": direction_after}
+        if self.config.phase1_probes:
+            from response_phase1 import critic_ranges
+            report.update(critic_ranges(self.critic, inputs, returns, record.returns, self.config.batch_size))
+        return report
 
     def _development_key(self, policy, simulator, initials, horizon, loss_config):
         from response_training import model_hash
@@ -522,9 +559,16 @@ class CriticTrainer:
                **physical_risk_metrics(trace, self.config.risk, loss_config),
                **hard_risk_metrics(trace, self.config.risk, loss_config, self.config.hard_risk)}
         if not row["finite"] or not _finite_state(row):
+            if self.config.phase1_probes:
+                raise Phase1ProbeError("candidate_nonfinite" if candidate else "baseline_nonfinite", "continuous trajectory metrics")
             if candidate:
                 return {"finite": False}
             raise FloatingPointError("nonfinite continuous trajectory metrics")
+        if self.config.phase1_probes:
+            from response_phase1 import task_loss_components
+            from response_task import training_loss_config
+            row["task_loss_components"] = task_loss_components(trace, loss_config)
+            row["training_loss_components"] = task_loss_components(trace, training_loss_config(loss_config))
         return row
 
     @torch.no_grad()
@@ -539,11 +583,15 @@ class CriticTrainer:
 
     def _propose_actor(self, policy, optimizer, gradients, train_before, evaluate_train,
                        gradient_clip, evidence):
-        """Pick the lowest real TRAIN cost among safe candidates; DEV is unavailable."""
+        """Pick the lowest real TRAIN cost allowed by the configured acceptance mode."""
         from response_proposals import assign_parameters, search_candidates
 
         base = torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone()
         def accept_candidate(after):
+            if self.config.acceptance_mode == "train-objective":
+                if not after.get("finite", False) or not _finite_state(after):
+                    return "train_nonfinite"
+                return None if after["task_objective"] < train_before["task_objective"] else "train_not_improved"
             return acceptance_rejection(train_before, after, (), (),
                 dev_relative_tolerance=self.config.dev_relative_tolerance,
                 hard_risk_config=self.config.hard_risk)
@@ -592,16 +640,19 @@ class CriticTrainer:
         loss_config: TaskLossConfig, *, development_initials: tuple,
         gradient_clip: float,
     ) -> dict:
-        """Fit Critic independently, then accept a true TRAIN/DEV Actor proposal.
+        """Fit Critic independently, then apply configured TRAIN-only or TRAIN/DEV acceptance.
 
         Failed Actor proposals restore Actor/optimizer and the post-fit RNG.
-        Finite completed Critic fits and their calibrated units always survive.
+        Finite completed Critic fits and their learned weights always survive.
         TRAIN rejection skips DEV; DEV never selects a correction or step size.
         """
         from response_training import capture_rng, restore_rng
 
-        if not development_initials:
+        train_only = self.config.acceptance_mode == "train-objective"
+        if not development_initials and not train_only:
             raise ValueError("a fixed independent DEV bank is required")
+        if train_only and development_initials:
+            raise ValueError("TRAIN-only Phase 1 must not receive DEV banks")
         before_actor = copy.deepcopy(policy.state_dict())
         before_optimizer = None if optimizer is None else copy.deepcopy(optimizer.state_dict())
         before_critic = copy.deepcopy(self.state_dict())
@@ -609,7 +660,8 @@ class CriticTrainer:
         critic_committed = False
         evidence = {"accepted": False, "proposal_finite": True, "proposal_backend": self.config.proposal,
                     "rejection_reason": None, "continuous_loss_after": None,
-                    "development_evaluated": False}
+                    "development_evaluated": False, "acceptance_mode": self.config.acceptance_mode}
+        stage = "forward"
 
         @torch.no_grad()
         def evaluate_train():
@@ -630,21 +682,46 @@ class CriticTrainer:
                 continuous_bounds_before=metrics["hard_risk_bounds_violated"],
                 **{key: metrics[key] for key in ("position_rms", "velocity_rms", "omega_rms",
                                                 "steady_success_rate", "motor_saturation_fraction")})
+            reference = None
+            if self.config.phase1_probes:
+                from response_phase1 import boundary_reference
+                evidence["phase1_loss_components"] = {
+                    "evaluation": metrics["task_loss_components"],
+                    "training": metrics["training_loss_components"],
+                }
+                reference = boundary_reference(policy, simulator, initial, horizon, self.config.window_steps)
+            stage = "critic"
             evidence.update(self.fit(record))
             rollback_rng = capture_rng()
             critic_committed = True
             weights, baseline_returns = record.weights, record.returns
             del record
+            stage = "short_window_backward"
             gradients = accumulate_actor_gradients(
                 policy, self.target, simulator, initial, horizon, self.config.window_steps,
                 loss_config, weights, risk_config=self.config.risk, risk_weight=self.config.risk_weight,
                 baseline_returns=baseline_returns, risk_smoothmax_beta=self.config.risk_smoothmax_beta,
                 separate_objectives=self.config.proposal == "physics-subspace",
+                phase1_reference=reference,
             )
             evidence.update({key: gradients[key] for key in ("surrogate_loss", "windows", "risk_baseline")})
+            if self.config.phase1_probes:
+                evidence["phase1_windows"] = gradients["phase1_windows"]
+            stage = "candidate_search"
             after = self._propose_actor(policy, optimizer, gradients, metrics, evaluate_train, gradient_clip, evidence)
             del gradients
-            if after is not None:
+            if train_only:
+                evidence["accepted"] = after is not None
+                retained = after if evidence["accepted"] else metrics
+                evidence["phase1_retained"] = {key: retained[key] for key in (
+                    "task_objective", "position_rms", "velocity_rms", "omega_rms", "steady_success_rate",
+                    "risk_objective", "risk_components", "hard_risk_components", "motor_saturation_fraction",
+                )}
+                if self.config.phase1_probes:
+                    evidence["phase1_retained"].update({key: retained[key] for key in (
+                        "task_loss_components", "training_loss_components")})
+            elif after is not None:
+                stage = "development"
                 candidate = copy.deepcopy(policy.state_dict())
                 # The baseline belongs to the old Actor, never the candidate.
                 policy.load_state_dict(before_actor)
@@ -672,8 +749,11 @@ class CriticTrainer:
                 if evidence["accepted"]:
                     self._dev_cache = (self._development_key(policy, simulator, development_initials, horizon, loss_config),
                                        copy.deepcopy(dev_after))
+        except Phase1ProbeError as error:
+            evidence.update(proposal_finite=False, rejection_reason=str(error),
+                            phase1_failure={"stage": error.stage, "detail": error.detail})
         except FloatingPointError as error:
-            evidence.update(proposal_finite=False, rejection_reason=str(error))
+            evidence.update(proposal_finite=False, rejection_reason=str(error), failure_stage=stage)
         finally:
             if not evidence["accepted"]:
                 policy.load_state_dict(before_actor)
@@ -687,4 +767,7 @@ class CriticTrainer:
         evidence["numerics_finite"] = evidence["proposal_finite"]
         evidence["critic_update_retained"] = critic_committed
         evidence["critic_fits"] = self.completed_fits
+        if self.config.phase1_probes:
+            from response_phase1 import proposal_summary
+            evidence["phase1_proposal"] = proposal_summary(evidence)
         return evidence

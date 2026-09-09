@@ -1,7 +1,7 @@
 """Teacher-free causal rollout, physical task objective, and scenario banks."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import math
 from typing import Mapping, Optional
 
@@ -130,6 +130,7 @@ def rollout(
     *,
     parameters: Optional[Mapping[str, torch.Tensor]] = None,
     memory_enabled: bool = True,
+    boundary_observer=None,
 ) -> TaskTrajectory:
     if steps < 1:
         raise ValueError("rollout must contain physical transitions")
@@ -138,7 +139,7 @@ def rollout(
     closed = initialize(policy, initial) if isinstance(initial, L2FState) else initial
     observations = [observation(closed.physical, closed.policy.integral)]
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
-    for _ in range(steps):
+    for step in range(steps):
         output = policy_step(
             policy, observations[-1], closed.policy, parameters,
             memory_enabled=memory_enabled,
@@ -148,6 +149,8 @@ def rollout(
         # advanced once. No truth reset, detached burn-in, or hidden-state splice.
         physical = simulator.step(before, output.action, grad_decay=1.0)
         closed = ResponseClosedLoopState(physical, output.next_state)
+        if boundary_observer is not None:
+            boundary_observer(step + 1, closed)
         actions.append(output.action)
         positions.append(physical.position)
         velocities.append(physical.velocity)
@@ -215,6 +218,23 @@ def scenario_costs(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.
 def step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
     """Additive [time, scenario] costs, without mean/CVaR scenario weights."""
     return weighted_task_features(trajectory, config, start=start, horizon=horizon).square().sum(-1)
+
+
+def training_loss_config(config: TaskLossConfig) -> TaskLossConfig:
+    """Dense p/v/omega and first action differences, with the existing CVaR.
+
+    Preserve retained weights, Huber curvature, half-range motor scaling and
+    horizon normalization. Evaluation continues to use the original config.
+    """
+    return replace(config, action_weight=0., omega_delta_weight=0., steady_weight=0., prediction_weight=0.)
+
+
+def training_step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
+    return step_costs(trajectory, training_loss_config(config), start=start, horizon=horizon)
+
+
+def training_task_loss(trajectory, config: TaskLossConfig) -> torch.Tensor:
+    return task_loss(trajectory, training_loss_config(config))
 
 
 def risk_components(trajectory, config: RiskConfig, *, position_reference=0.,
@@ -343,11 +363,22 @@ def prediction_residual(policy, observations, actions, *, parameters=None) -> to
 def sample_scenarios(
     count: int, *, seed: int, dt: float = 0.01,
     device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
+    scenario_mode: str = "physical-fit",
 ) -> tuple[L2FState, torch.Tensor]:
-    """Independent 4x4 physical-fit bank, without importing distillation code."""
+    """Independent physical-fit bank or nominal airframe with random kinematics."""
+    if scenario_mode not in ("physical-fit", "fixed-airframe"):
+        raise ValueError("unknown response scenario mode")
     if count < 16 or count % 16:
         raise ValueError("scenario count must be a positive multiple of 16")
     simulator = L2FSimulator(L2FParams(dt=dt))
+    if scenario_mode == "fixed-airframe":
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(int(seed))
+            fixed = simulator.reset(count, device="cpu", dtype=torch.float32,
+                                    sample_dynamics=False, sample_external_force=False)
+        state = L2FState(**{f.name: getattr(fixed, f.name).to(device=device, dtype=dtype)
+                           for f in fields(fixed)})
+        return state, torch.full((count, 2), -1, device=device, dtype=torch.long)
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(int(seed))
         pool = simulator.reset(

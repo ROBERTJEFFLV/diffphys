@@ -7,7 +7,6 @@
 --scenarios 64
 --horizon 500
 --window-steps 50
---critic-return-scale-floor 0.001
 --critic-direction-samples 4
 --hard-risk-relative-tolerance 0.002
 --hard-risk-absolute-tolerance 0.00000001

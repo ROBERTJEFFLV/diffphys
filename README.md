@@ -433,7 +433,7 @@ The primary experiment now jointly learns response memory and direct motor
 control from differentiable physical task rollouts, without Q2 action or JVP
 labels. Start with `tools/train_response_control.py`; see
 [`docs/response_critic_training.md`](docs/response_critic_training.md) for the
-current H500 / ten-H50 trainer. A training-only nonnegative Risk-to-Go MLP supplies
+current H500 / ten-H50 trainer. A training-only Risk-to-Go MLP supplies
 terminal risk gradients and learns from exact risk suffixes plus a few reachable
 motor perturbation rankings; the deployed Actor is unchanged. Two independent
 64-scene TRAIN banks determine one proposal. Short-window gradients define a
@@ -446,6 +446,15 @@ across Actor rejections. Consecutive failed proposals stop at `proposal_plateau`
 normal training does not call finite differences or a local descent solver.
 MS and the finite-difference module remain diagnostic paths. Use
 `configs/response_risk_subspace.args` for the complete CUDA profile setup.
+
+The Critic uses dimensionless task/history state, six log-normalized control
+capabilities and external acceleration divided by gravity. It predicts mean future
+risk directly; Actor terminal terms multiply this by the remaining step count.
+No preliminary calibration or output-coordinate transform is required.
+The training performance loss contains only dense position, velocity, angular
+velocity, first action differences and the existing CVaR. Continuous evaluation
+criteria are unchanged. Every lower DEV cost refreshes `best.training.pt`, while
+`best_success.training.pt` preserves the actual highest-success Actor separately.
 
 `tools/run_structured_pipeline.py` and
 `tools/train_structured_full_space.py` select the new task method by default.

@@ -51,7 +51,7 @@ def test_exact_suffix_risk_has_zero_terminal_and_collection_uses_risk_not_perfor
     assert (record.returns[-1] == 0).all()
 
 
-def test_critic_normalizes_truth_and_histories_with_fixed_scales_and_is_nonnegative():
+def test_critic_keeps_coarse_feature_scales_and_allows_signed_estimation_errors():
     risk_api()
     policy, _, initial = fixture()
     closed = task.initialize(policy, initial)
@@ -66,8 +66,8 @@ def test_critic_normalizes_truth_and_histories_with_fixed_scales_and_is_nonnegat
     with torch.no_grad():
         for p in net.parameters():
             p.zero_()
-        net.network[-2].bias.fill_(-20.)
-    assert (net(original) >= 0).all()
+        net.network[-1].bias.fill_(-2.)
+    torch.testing.assert_close(net(original), torch.full_like(net(original), -2.))
     assert torch.isfinite(net(original)).all()
 
 
@@ -127,7 +127,7 @@ def test_direction_labels_continue_to_original_horizon_without_prefix_risk():
                                    (minus, samples.minus_inputs, samples.minus_returns)):
         torch.testing.assert_close(inputs, critic.critic_features(state, 3, 6))
         future = task.rollout(policy, simulator, state, 3)
-        torch.testing.assert_close(targets, torch.stack(tuple(task.risk_components(future, risk).values()), -1).sum(0))
+        torch.testing.assert_close(targets, torch.stack(tuple(task.risk_components(future, risk).values()), -1).mean(0))
         assert not inputs.requires_grad and not targets.requires_grad
 
 
@@ -165,11 +165,11 @@ def test_actor_local_risk_gradient_and_terminal_risk_match_detached_oracle():
     closed = task.initialize(policy, initial)
     for start in (0, 2, 4):
         trace = task.rollout(policy, simulator, critic.detach_closed_state(closed), 2)
-        value = task.step_costs(trace, loss_config, start=start, horizon=6).sum(0)
+        value = task.training_step_costs(trace, loss_config, start=start, horizon=6).sum(0)
         danger = torch.stack(tuple(task.risk_components(trace, risk).values()), -1).sum(0)
         danger = danger + record.returns[0] - record.returns[start]
         if start < 4:
-            danger = danger + target(critic.critic_features(trace.end, start + 2, 6))
+            danger = danger + (4 - start) * target(critic.critic_features(trace.end, start + 2, 6))
         cw = torch.stack([task.risk_weights(record.returns[0,:,j],loss_config) for j in range(4)],-1)
         ratio = (cw*danger).sum(0)/((cw*record.returns[0]).sum(0)+1.e-12)
         ((record.weights * value).sum()/3 + .7*torch.logsumexp(10*ratio,0)/30).backward()
@@ -285,3 +285,19 @@ def test_risk_at_zero_errors_and_full_motor_command_has_finite_gradients(dtype):
     dp, du = torch.autograd.grad(loss, (p, actions))
     assert torch.isfinite(dp).all() and torch.isfinite(du).all()
     assert (dp == 0).all() and (du > 0).all()
+
+
+def test_normal_motor_compensation_has_no_saturation_risk_or_safety_gradient():
+    policy, sim, initial = fixture()
+    trace = task.rollout(policy, sim, initial, 1)
+    commands = trace.actions.new_tensor([0., .0741, .95, .975]).view(1, 1, 4).requires_grad_()
+    risks = task.risk_components(replace(trace, actions=commands), task.RiskConfig())
+    # Warning at .95, hard limit at 1: .975 is halfway through the warning band.
+    torch.testing.assert_close(risks['saturation'], commands.new_tensor([[.0625]]))
+    derivative = torch.autograd.grad(risks['saturation'].sum(), commands)[0]
+    torch.testing.assert_close(derivative[..., :3], torch.zeros_like(derivative[..., :3]))
+    assert derivative[..., 3].item() > 0
+    for normal in (0., .0741, -.0741):
+        value = task.risk_components(replace(trace, actions=torch.full_like(trace.actions, normal)),
+                                     task.RiskConfig())['saturation']
+        assert torch.equal(value, torch.zeros_like(value))

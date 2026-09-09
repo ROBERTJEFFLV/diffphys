@@ -1,0 +1,26 @@
+--mode train
+--optimizer task-adam
+--scenario-mode fixed-airframe
+--phase1-probes
+--device cuda
+--dtype float32
+--seed 7
+--scenarios 32
+--horizon 500
+--window-steps 50
+--updates 50
+--max-seconds 1800
+--lr 3e-4
+--weight-decay 0
+--gradient-clip 10
+--critic-lr 1e-3
+--critic-epochs 1
+--critic-batch-size 1024
+--value-target-tau 0.6
+--value-gradient-clip 10
+--development-every 5
+--checkpoint-every 1
+--prediction-weight 0
+--huber-delta 1
+--contract-report reports/phase1_task_value_adam/contract.json
+--work-dir runs/phase1_task_value_adam/seed7

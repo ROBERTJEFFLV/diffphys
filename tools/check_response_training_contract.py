@@ -30,7 +30,7 @@ def inspect_calls(function):
             and isinstance(node.func, (ast.Name, ast.Attribute))}
 
 
-def run_contract(*, device="cuda", loss_config=None):
+def run_contract(*, device="cuda", loss_config=None, scenario_mode="physical-fit"):
     torch.set_num_threads(1)
     torch.manual_seed(7)
     if device == "cuda" and not torch.cuda.is_available():
@@ -39,7 +39,8 @@ def run_contract(*, device="cuda", loss_config=None):
     loss_config = TaskLossConfig(prediction_weight=0) if loss_config is None else loss_config
     policy = ResponseMotorPolicy(config).to(device)
     simulator = L2FSimulator(L2FParams(dt=config.dt))
-    initial, _ = sample_scenarios(16, seed=TRAIN_SEED_BASE, dt=config.dt, device=torch.device(device))
+    initial, _ = sample_scenarios(16, seed=TRAIN_SEED_BASE, dt=config.dt, device=torch.device(device),
+                                  scenario_mode=scenario_mode)
     captured = []
     handle = policy.register_forward_hook(lambda module, inputs, output: captured.append(output.action))
     trace = rollout(policy, simulator, initial, 16)
@@ -89,6 +90,7 @@ def run_contract(*, device="cuda", loss_config=None):
         "schema": "minimal-response-training-contract-v1", "source_sha256": source_hash(),
         "policy_config": asdict(config), "loss_config": asdict(loss_config),
         "model_seed": 7, "scenario_seed": TRAIN_SEED_BASE, "horizon": 16,
+        "scenario_mode": scenario_mode,
         "device": device, "optimizer_updates": 0, "checks": checks, "gradient_groups": gradients,
         "passed": all(checks.values()) and bool(torch.isfinite(loss)),
         "cuda_vjp_retested": False,
@@ -102,11 +104,12 @@ def run_contract(*, device="cuda", loss_config=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--scenario-mode", choices=("physical-fit", "fixed-airframe"), default="physical-fit")
     parser.add_argument("--output", type=Path, default=Path("runs/response_guarded_v1/contract.json"))
     parser.add_argument("--prediction-weight", type=float, default=0.)
     parser.add_argument("--huber-delta", type=float, default=1.)
     args = parser.parse_args()
-    report = run_contract(device=args.device, loss_config=TaskLossConfig(
+    report = run_contract(device=args.device, scenario_mode=args.scenario_mode, loss_config=TaskLossConfig(
         prediction_weight=args.prediction_weight, huber_delta=args.huber_delta,
     ))
     atomic_json(args.output, report)

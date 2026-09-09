@@ -23,13 +23,18 @@ from response_training import (
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("train", "profile", "evaluate", "hidden-reset", "freeze", "final"), default="train")
-    parser.add_argument("--optimizer", choices=("short-window", "adam", "full-space-ms"), default="short-window")
+    parser.add_argument("--optimizer", choices=("task-adam", "short-window", "adam", "full-space-ms"), default="short-window")
     parser.add_argument("--work-dir", type=Path, default=Path("runs/response_risk_critic_v1/seed7"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--scenarios", type=int, default=64, help="scenarios per stratified bank; DEV size is unchanged")
+    parser.add_argument("--scenario-mode", choices=("physical-fit", "fixed-airframe"), default="physical-fit")
+    parser.add_argument("--phase1-probes", action="store_true",
+                        help="record continuity/loss/window gradients; fail on continuity or nonfinite")
+    parser.add_argument("--phase1-train-only", action="store_true",
+                        help="nominal airframe: accept finite TRAIN objective improvement; no DEV or risk veto")
     parser.add_argument("--adam-train-batches", type=int, default=2,
                         help="bank count for legacy Adam; short-window always uses two, MS uses one")
     parser.add_argument("--horizon", type=int, default=None)
@@ -37,10 +42,12 @@ def parse_args(argv=None):
     parser.add_argument("--actor-proposal", choices=("physics-subspace", "smoothmax-adam"), default="physics-subspace",
                         help="bounded real TRAIN candidate search; Adam is a regression backend")
     parser.add_argument("--subspace-parameter-relative-step", type=float, default=1.e-4)
-    parser.add_argument("--critic-return-scale-floor", type=float, default=1.e-3)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--critic-epochs", type=int, default=1)
     parser.add_argument("--critic-batch-size", type=int, default=1024)
+    parser.add_argument("--value-target-tau", type=float, default=.6,
+                        help="task-value target update: new critic fraction, old target retains 1-tau")
+    parser.add_argument("--value-gradient-clip", type=float, default=10.)
     parser.add_argument("--critic-dev-relative-tolerance", type=float, default=.002)
     from response_task import RiskConfig
     for name, default in asdict(RiskConfig()).items():
@@ -64,7 +71,7 @@ def parse_args(argv=None):
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--min-relative-improvement", type=float, default=.002)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--gradient-clip", type=float, default=10)
     parser.add_argument("--adam-max-loss-ratio", type=float, default=2.0)
     parser.add_argument("--adam-max-omega-ratio", type=float, default=2.0)
@@ -107,11 +114,24 @@ def parse_args(argv=None):
     parser.add_argument("--consume-final", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.weight_decay is None:
+        args.weight_decay = 0. if args.optimizer == "task-adam" else 1.e-5
+    if args.optimizer == "task-adam" and (args.scenario_mode != "fixed-airframe"
+            or args.mode not in ("train", "profile", "evaluate") or args.phase1_train_only or args.weight_decay != 0):
+        parser.error("task-adam Phase 1 requires fixed-airframe, train/profile/evaluate, no approval flag and zero weight decay")
+    if args.phase1_train_only and (args.scenario_mode != "fixed-airframe" or not args.phase1_probes
+                                  or args.mode not in ("train", "profile")):
+        parser.error("TRAIN-only Phase 1 requires fixed-airframe, phase1-probes and train/profile mode")
+    if (args.phase1_probes or args.scenario_mode == "fixed-airframe") and (
+        args.optimizer not in ("short-window", "task-adam") or (args.optimizer == "short-window" and args.actor_proposal != "physics-subspace")
+        or args.mode not in ("train", "profile", "evaluate")
+    ):
+        parser.error("Phase 1 uses the normal short-window subspace train/profile/evaluate chain")
     if args.horizon is None:
-        args.horizon = 500 if args.optimizer == "short-window" else 125
+        args.horizon = 500 if args.optimizer in ("short-window", "task-adam") else 125
     if args.prediction_weight is None:
-        args.prediction_weight = 0. if args.optimizer == "short-window" else .01
-    if args.optimizer == "short-window":
+        args.prediction_weight = 0. if args.optimizer in ("short-window", "task-adam") else .01
+    if args.optimizer in ("short-window", "task-adam"):
         try:
             critic_configuration(args)
         except ValueError as error:
@@ -164,14 +184,14 @@ def main(argv=None):
     })
     if args.dry_run:
         result = {"dry_run": True, "mode": args.mode, "optimizer": args.optimizer,
-                  "protocol": protocol(policy_config, loss_config, args.scenarios),
+                  "protocol": protocol(policy_config, loss_config, args.scenarios, args.scenario_mode),
                   "horizon": args.horizon, "updates": args.updates,
                   "training_batches": training_batch_count(args),
                   "training_scenarios": args.scenarios * training_batch_count(args),
-                  "window_steps": args.window_steps if args.optimizer == "short-window" else None,
-                  "critic_training_only": args.optimizer == "short-window",
+                  "window_steps": args.window_steps if args.optimizer in ("short-window", "task-adam") else None,
+                  "critic_training_only": args.optimizer in ("short-window", "task-adam"),
                   "critic": asdict(critic_configuration(args))
-                            if args.optimizer == "short-window" else None,
+                            if args.optimizer in ("short-window", "task-adam") else None,
                   "linear_solver": args.linear_solver, "kkt_rtol": args.kkt_rtol,
                   "kkt_max_iterations": args.kkt_max_iterations,
                   "teacher_checkpoint_required": False, "all_policy_parameters_trainable": True}

@@ -54,21 +54,6 @@ def test_component_labels_match_real_suffixes_and_critic_has_four_outputs():
     assert net(record.inputs[0]).shape == (2, 4)
 
 
-def test_scalar_migration_rejects_old_risk_semantics_and_keeps_fresh_state():
-    import copy
-    import response_task as task
-    from test_response_control import fixture
-    from test_response_guarded_updates import assert_nested_equal
-    policy, _, initial = fixture()
-    state = critic.CriticTrainer(policy, task.initialize(policy, initial), 6,
-                                 critic.CriticConfig(window_steps=2))
-    before = copy.deepcopy(state.state_dict())
-    with pytest.raises(ValueError, match="new weights-only Actor experiment"):
-        state.initialize_from_scalar({'objective': 'risk-to-go-v1-fixed-physical-scales'},
-                                     torch.tensor([.5, .3, .199, .001]))
-    assert_nested_equal(state.state_dict(), before)
-
-
 def test_short_window_component_objective_matches_independent_physics_oracle():
     import copy
     import response_task as task
@@ -96,10 +81,10 @@ def test_short_window_component_objective_matches_independent_physics_oracle():
         risks = torch.stack(tuple(task.risk_components(trace,task.RiskConfig()).values()),-1).sum(0)
         risks = risks + returns[0]-returns[start]
         if start < 4:
-            risks = risks + target(critic.critic_features(trace.end,start+2,6))
+            risks = risks + (4 - start) * target(critic.critic_features(trace.end,start+2,6))
         ratios = (cw*risks).sum(0)/(baseline+1.e-12)
         value = torch.logsumexp(8*ratios,0)/8
-        performance = (record.weights*task.step_costs(trace,config,start=start,horizon=6).sum(0)).sum()
+        performance = (record.weights*task.training_step_costs(trace,config,start=start,horizon=6).sum(0)).sum()
         ((performance+value)/3).backward()
         closed = trace.end
     for p, expected in zip(policy.parameters(),actual):

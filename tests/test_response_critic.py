@@ -63,10 +63,10 @@ def test_exact_returns_and_complete_state_teacher_are_detached_and_continuous():
     assert not record.inputs.requires_grad and not record.returns.requires_grad
     torch.testing.assert_close(record.returns[0].sum(-1), task.step_risks(direct, task.RiskConfig()).sum(0))
     assert bool((record.returns[-1] == 0).all())
-    # Motor truth, recurrent history and mass each change Critic input only.
+    # Motor truth, recurrent history and capabilities each change Critic input only.
     closed = task.initialize(policy, initial)
     original = critic.critic_features(closed, 0, 6)
-    for field in ("mass", "motor", "inertia_x", "external_force"):
+    for field in ("thrust_to_weight", "motor", "alpha_roll_max", "external_force"):
         changed = replace(closed, physical=replace(initial, **{field: getattr(initial, field) + .01}))
         assert not torch.equal(original, critic.critic_features(changed, 0, 6))
     changed = replace(closed, policy=replace(closed.policy, older_action=closed.policy.older_action + .1))
@@ -109,11 +109,11 @@ def test_window_gradients_match_explicit_detached_oracle_without_actor_update():
     for start in (0, 2, 4):
         closed = critic.detach_closed_state(closed)
         trace = task.rollout(policy, simulator, closed, 2)
-        local = task.step_costs(trace, config, start=start, horizon=6).sum(0)
+        local = task.training_step_costs(trace, config, start=start, horizon=6).sum(0)
         risk = torch.stack(tuple(task.risk_components(trace, task.RiskConfig()).values()), -1).sum(0)
         risk = risk + record.returns[0] - record.returns[start]
         if start < 4:
-            risk = risk + target(critic.critic_features(trace.end, start + 2, 6))
+            risk = risk + (4 - start) * target(critic.critic_features(trace.end, start + 2, 6))
         cw = torch.stack([task.risk_weights(record.returns[0,:,j],config) for j in range(4)],-1)
         ratio = (cw*risk).sum(0)/((cw*record.returns[0]).sum(0)+1.e-12)
         ((record.weights * local).sum()/3 + torch.logsumexp(10*ratio,0)/30).backward()

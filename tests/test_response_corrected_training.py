@@ -29,8 +29,8 @@ def test_separate_window_gradients_match_detached_physics_and_keep_actor_continu
         trace = task.rollout(policy, sim, critic.detach_closed_state(closed), 2)
         risks = torch.stack(tuple(task.risk_components(trace, task.RiskConfig()).values()), -1).sum(0)
         if start != 4:
-            risks = risks + target(critic.critic_features(trace.end, start+2, 6))
-        performance = (record.weights * task.step_costs(trace, config, start=start, horizon=6).sum(0)).sum()
+            risks = risks + (4 - start) * target(critic.critic_features(trace.end, start+2, 6))
+        performance = (record.weights * task.training_step_costs(trace, config, start=start, horizon=6).sum(0)).sum()
         totals.append(torch.cat((performance.view(1), (weights * risks).sum(0))) / 3)
         closed = trace.end
     objectives = torch.stack(totals).sum(0)
@@ -136,7 +136,8 @@ def test_dev_cache_survives_critic_fit_and_invalidates_on_actor_states_and_objec
     assert hasattr(state, 'development_baseline'), 'missing keyed DEV baseline cache'
     first, hit = state.development_baseline(policy, sim, (initial,), 4, config)
     assert not hit
-    state.fit(critic.collect_trajectory(policy, sim, initial, 4, config))
+    record = critic.collect_trajectory(policy, sim, initial, 4, config)
+    state.fit(record)
     second, hit = state.development_baseline(policy, sim, (initial,), 4, config)
     assert hit and first == second
     with torch.no_grad():

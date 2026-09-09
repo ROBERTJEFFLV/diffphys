@@ -1,20 +1,87 @@
 # Short-window training with real-rollout candidate selection
 
 The deployable `ResponseMotorPolicy` remains unchanged: action response → GRU
-memory → controller → four motors. The training-only Risk-to-Go Critic is the
-same four-output 256/256 SiLU MLP. Its architecture, fixed physical input scales,
-TRAIN-calibrated output units and supervised remaining-risk labels are unchanged.
+memory → controller → four motors. The training-only Risk-to-Go Critic keeps
+the four-output 256/256 SiLU MLP, with a linear head predicting average future
+risk. Physical risk barriers, sampling and acceptance definitions are unchanged.
 
 The normal `physics-subspace` backend uses short-window gradients to propose a
 small search space. Complete continuous physical rollouts choose the update.
 It does not estimate an H500 Jacobian or require a local descent certificate.
+
+## Capability state and mean future risk
+
+`critic_features` contains task position/velocity/rotation/angular velocity,
+actual motor state and previous command, GRU memory, integral, the response
+history used on the next Actor call, and a startup-history flag. Position and
+velocity use fixed references of 5 m and 5 m/s, angular velocity 10 rad/s,
+and integral 0.5 m s. Rotation, memory and motor commands retain their natural
+coordinates. Unused duplicate `last_action` and a second continuously increasing
+call counter are omitted; normalized task time `t/H` remains.
+
+Privileged dynamics are exactly the existing six `normalized_capability_target`
+coordinates: thrust-to-weight, roll authority, yaw/roll authority ratio,
+Jz/Jxy, tau-rise and tau-fall. Log-bound midpoints map to zero and endpoints to
++/-1, without clipping normalized values. Disturbance is `external_force/(mass*g)`.
+Raw mass, principal moments, thrust polynomial coefficients, arm length and their
+redundant derived fields no longer enter the MLP separately. With memory width
+64 the input has 123 features. This representation is for the current physical-fit
+family with identical linear motors and Jx=Jy; it is not a sufficient description
+of every nonlinear or asymmetric vehicle.
+
+The network directly predicts the four mean future risks:
+
+```
+mean_risk_target[t] = true_suffix_sum[t] / (H - t),  t < H
+mean_risk_target[H] = 0
+```
+
+Value fitting uses ordinary Smooth-L1 on these means. Reachable motor-pair
+continuations use mean-risk labels as well; ranking temperature and minimum gap
+are in mean-per-step risk units. Logging reports MAE in these units. Predictions
+are allowed to be negative and pass through no Softplus, clamp or inverse
+transform. Exact suffix sums remain in rollout records only for the unchanged
+full-flight CVaR and detached prefixes used in candidate-direction construction.
+
+At a window boundary the Actor uses `(H - t) * critic(features)` so the terminal
+term and its state derivative are in total future-risk units. The final window
+has no terminal call. Nonfinite supervision, fitting, state or gradients follow
+the existing transaction rollback; finite completed Critic fits survive Actor
+rejection.
+
+There is no preliminary calibration rollout, TRAIN mean/std, output-scale buffer,
+or compressed-coordinate path. TRAIN and profile start with their normal scenario
+banks. Averaging removes the deterministic remaining-length multiplier; it does
+not bound large single-step risk or establish direction accuracy. Label semantics
+are consistent across horizons, but a model trained at H500 is not thereby
+validated at H1000: `t/H` alone does not encode absolute remaining duration.
+
+## Minimal training performance objective
+
+The normal response training performance gradient contains only dense per-step
+position, velocity, angular velocity and first-order action difference terms,
+plus the existing full-flight scenario CVaR. Their weights remain 1, 0.3, 0.1
+and 0.01. Huber curvature, the existing `0.5 * delta_action` convention, and
+normalization by the complete horizon are preserved. There is no final-window
+bonus, action magnitude cost, omega-difference cost or auxiliary prediction loss
+in this gradient. CLF, outward velocity, omega decay and second action differences
+are not part of the normal response chain; historical Q2 code is unchanged.
+
+The Risk Critic supplies four separate search directions; these are not added
+to the performance gradient in the normal `physics-subspace` backend. CVaR
+weights for the performance gradient are selected once from the complete
+trajectory's minimal cost and stay fixed across all windows. The CVaR fraction
+and coefficient are unchanged. Continuous candidate selection, TRAIN/DEV scores,
+physical gates and success criteria keep their original definitions, including
+the original evaluation cost. Thus training cost and evaluation cost are reported
+as separate concepts; removed training weights are retained in evaluation config.
 
 ## One proposal
 
 1. Hold the current Actor fixed and collect a continuous H500 trajectory without
    autograd, pooling two independent 64-scene TRAIN banks. Keep the existing 4×4
    thrust-to-weight / roll-authority stratification and full-trajectory CVaR.
-2. Fit Critic remaining-risk values and the existing small direction sample set.
+2. Fit Critic mean remaining-risk values and the existing small direction sample set.
    Commit a finite completed fit, target copy, optimizer and RNG progression.
 3. Process the same flight as 10 H50 windows. Preserve all numerical physical
    state and memory across windows, detach only the graph at each boundary,
@@ -34,7 +101,7 @@ It does not estimate an H500 Jacobian or require a local descent certificate.
    Accept the selected Actor or restore the old Actor. Completed Critic learning
    survives either outcome.
 
-All four Critic components remain useful guidance. Position/velocity guidance
+All four Critic components remain available as guidance. Position/velocity guidance
 and the original soft risk sum are diagnostic/training quantities, not hard
 acceptance constraints.
 
@@ -84,8 +151,13 @@ The Critic's position/velocity normalization and tracking scales are not used
 as implicit bounds. Future angular tracking tasks must supply an appropriate
 angular reference; the current task is hover with zero reference.
 
-The normal direct-search backend's periodic DEV report selects the best saved
-checkpoint and reports progress; it adds no separate best-history Actor veto.
+The normal direct-search backend's periodic DEV report adds no separate
+best-history Actor veto. Every strictly lower evaluated cost refreshes
+`best.training.pt`. The relative improvement threshold controls only patience:
+a separate saved `significant_score` lets several small improvements accumulate.
+`best_success.training.pt` separately stores the actual highest-success Actor
+(lower cost breaks success ties), with its corresponding DEV report. It does
+not reconstruct weights missing from earlier experiments.
 
 ## Rejection, retention and reproducibility
 
@@ -121,8 +193,10 @@ FD tolerances and backtracking flags are absent from the primary training CLI.
 `--actor-proposal smoothmax-adam` remains a historical regression backend.
 MS/PETSc is unchanged and remains separate from this training path.
 
+Critic objective `component-mean-risk-v5-capability` rejects old cumulative-risk
+and compressed-coordinate Critic states.
 Exact resume binds source, proposal configuration, hard-risk definition and
-supervision scales. Changing the proposal/gate configuration requires a new
+the Critic feature/target schema. Changing the proposal/gate configuration requires a new
 experiment; use `--initialize-from <checkpoint>` to reuse Actor weights in a
 new work directory. Do not edit checkpoint hashes or inherit stale Actor Adam
 history into the direct-search backend.
