@@ -35,7 +35,7 @@ def test_mc_labels_are_exact_task_suffixes_and_share_full_flight_cvar():
     assert not record.inputs.requires_grad and not record.returns.requires_grad
     assert record.returns.shape == (7, initial.position.shape[0])
     assert (record.weights * record.returns[0]).sum() == pytest.approx(float(task.task_loss(record.trajectory, config)))
-    assert set(record.boundaries) == {2, 4, 6}
+    assert set(record.boundaries) == {0, 2, 4, 6}
     # At identical kinematics, last-two-step costs are 7 times normal steps:
     # (1/6 + 2/2) / (1/6) = 7. Windows must not restart the tail clock.
     frozen = replace(record.trajectory,
@@ -124,7 +124,7 @@ def test_update_uses_persistent_adam_without_candidate_replay(monkeypatch):
     policy, sim, initial = fixture()
     config = task.TaskLossConfig(prediction_weight=0)
     trainer = value.TaskValueTrainer(policy, task.initialize(policy, initial), 6,
-        value.TaskValueConfig(window_steps=2, batch_size=16))
+        value.TaskValueConfig(window_steps=2, batch_size=16, terminal_mode='oracle_full_state'))
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     def forbidden(*args, **kwargs):
         raise AssertionError('candidate search must not run')
@@ -148,7 +148,7 @@ def test_nonfinite_backward_does_not_submit_adam_and_keeps_completed_fit(monkeyp
     value = value_module()
     policy, sim, initial = fixture()
     trainer = value.TaskValueTrainer(policy, task.initialize(policy, initial), 6,
-        value.TaskValueConfig(window_steps=2))
+        value.TaskValueConfig(window_steps=2, terminal_mode='oracle_full_state'))
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     before = copy.deepcopy(policy.state_dict())
     # Inject at the actual parameter-gradient boundary, after supervised fit.

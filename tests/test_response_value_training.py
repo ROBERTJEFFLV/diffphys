@@ -15,7 +15,7 @@ from tools.train_response_control import parse_args
 
 def arguments(work, updates=2):
     return parse_args(['--optimizer', 'task-adam', '--scenario-mode', 'fixed-airframe',
-        '--phase1-probes', '--updates', str(updates), '--horizon', '4', '--window-steps', '2',
+        '--phase1-probes', '--value-terminal-mode', 'oracle_full_state', '--updates', str(updates), '--horizon', '4', '--window-steps', '2',
         '--scenarios', '16', '--memory-dim', '4', '--hidden-dim', '8',
         '--development-every', '1', '--checkpoint-every', '1', '--work-dir', str(work)])
 

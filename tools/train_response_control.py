@@ -48,14 +48,20 @@ def parse_args(argv=None):
     parser.add_argument("--value-target-tau", type=float, default=.6,
                         help="task-value target update: new critic fraction, old target retains 1-tau")
     parser.add_argument("--value-gradient-clip", type=float, default=10.)
-    from response_value import DERIVATIVE_STATE_SCALES
-    parser.add_argument('--value-derivative-state-group', choices=tuple(DERIVATIVE_STATE_SCALES), default='policy.memory')
+    from response_adjoints import STATE_SCALES
+    parser.add_argument('--value-derivative-state-groups', choices=tuple(STATE_SCALES), nargs='+', default=tuple(STATE_SCALES))
     parser.add_argument('--value-derivative-boundaries', type=int, nargs='+', default=(),
-                        help='default: first/middle/last nonterminal H50 boundary')
-    parser.add_argument('--value-derivative-samples', type=int, default=32)
-    parser.add_argument('--value-derivative-holdout-samples', type=int, default=16)
+                        help='default: every nonterminal window boundary')
+    parser.add_argument('--value-derivative-holdout-scenes', type=int, default=16)
     parser.add_argument('--value-derivative-batch-size', type=int, default=32)
     parser.add_argument('--value-derivative-epsilon', type=float, default=1.e-8)
+    parser.add_argument('--value-derivative-balance-mode', choices=('minibatch','fixed'), default='minibatch')
+    parser.add_argument('--value-terminal-mode', choices=('critic','oracle_full_state','none'), default='critic')
+    parser.add_argument('--value-critic-only', action='store_true', help='bounded frozen Actor fit/readiness; never step Actor')
+    parser.add_argument('--value-warmup-max-fits', type=int, default=8)
+    parser.add_argument('--value-warmup-max-seconds', type=float, default=120.)
+    parser.add_argument('--value-ready-min-cosine', type=float, default=.9)
+    parser.add_argument('--value-ready-max-relative-error', type=float, default=.5)
     parser.add_argument("--critic-dev-relative-tolerance", type=float, default=.002)
     from response_task import RiskConfig
     for name, default in asdict(RiskConfig()).items():
@@ -122,6 +128,8 @@ def parse_args(argv=None):
     parser.add_argument("--consume-final", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.value_critic_only and args.optimizer != 'task-adam':
+        parser.error('value-critic-only requires task-adam')
     if args.weight_decay is None:
         args.weight_decay = 0. if args.optimizer == "task-adam" else 1.e-5
     if args.optimizer == "task-adam" and (args.scenario_mode != "fixed-airframe"

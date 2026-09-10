@@ -53,3 +53,6 @@ matlab_l2f/validation_results.json
 matlab_l2f/numerical_validation.txt
 matlab_l2f/syntax_validation.txt
 matlab_l2f/SHA256SUMS.txt
+
+# Local user-provided audit evidence.
+/审计包/

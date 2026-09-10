@@ -100,12 +100,30 @@ def derivative_gradient_metrics(predicted, true, epsilon=1.e-8):
     pn, tn = predicted.norm(dim=-1), true.norm(dim=-1)
     valid = tn > epsilon
     count = int(valid.sum())
+    cosine = torch.nn.functional.cosine_similarity(predicted[valid], true[valid], dim=-1, eps=epsilon)
+    ratio = pn[valid]/tn[valid]
     return {'samples': len(tn), 'direction_samples': count, 'zero_true_samples': int((~valid).sum()),
-            'gradient_cosine': float(torch.nn.functional.cosine_similarity(predicted[valid], true[valid],
-                dim=-1, eps=epsilon).mean()) if count else None,
-            'norm_ratio': float((pn[valid]/tn[valid]).mean()) if count else None,
+            'gradient_cosine': float(cosine.mean()) if count else None,
+            'negative_cosine_fraction': float((cosine < 0).double().mean()) if count else None,
+            'norm_ratio': float(ratio.mean()) if count else None,
+            'norm_ratio_median': float(torch.quantile(ratio, .5)) if count else None,
+            'norm_ratio_p90': float(torch.quantile(ratio, .9)) if count else None,
             'lognorm_error': float((torch.log(pn[valid]+epsilon)-torch.log(tn[valid]+epsilon)).abs().mean()) if count else None,
             'predicted_norm_mean': float(pn.mean()), 'true_norm_mean': float(tn.mean())}
+
+
+@torch.no_grad()
+def parameter_gradient_metrics(predicted, reference):
+    """Compare like-for-like window-averaged parameter covectors in float64."""
+    a, b = predicted.double().flatten(), reference.double().flatten()
+    if not bool(torch.isfinite(a).all() & torch.isfinite(b).all()):
+        raise Phase1ProbeError('actor_gradient_nonfinite', 'parameter oracle comparison')
+    an, bn = float(a.norm()), float(b.norm())
+    return {'finite': True, 'predicted_norm': an, 'oracle_norm': bn,
+            'cosine': float(torch.dot(a/an, b/bn)) if an and bn else None,
+            'relative_error': float((a-b).norm())/bn if bn else None,
+            'norm_ratio': an/bn if bn else None,
+            'normalization': 'both gradients averaged over H/window windows'}
 
 
 def terminal_state_gradient(target, closed, step: int, horizon: int, *, mean_risk: bool = True,

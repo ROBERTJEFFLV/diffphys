@@ -29,6 +29,7 @@ def task_binding(args, policy_config, loss_config):
             'training_sampling': {'batches': 2, 'scenarios': 2 * args.scenarios, 'pooled_cvar': True},
             'evaluation_every': args.development_every, 'evaluation_seeds': list(common.DEVELOPMENT_SEEDS),
             'evaluation_role': 'observation_and_best_checkpoint_only', 'phase1_probes': args.phase1_probes,
+            'critic_only': args.value_critic_only,
             'contract_sha256': None if args.contract_report is None else common.file_hash(args.contract_report)}
 
 
@@ -103,8 +104,8 @@ def train_task_value(args, policy_config, loss_config):
         trainer.load_state_dict(saved['critic_training'])
         progress, initial_model = saved['progress'], saved['initial_model']
         common.restore_rng(saved['rng'])
-        if progress['status'] == 'failed':
-            raise RuntimeError('failed task-Adam run must be diagnosed, not automatically resumed')
+        if progress['status'] in ('failed', 'critic_not_ready', 'critic_only_ready'):
+            raise RuntimeError('stopped task-value experiment must be diagnosed, not automatically resumed')
     work.mkdir(parents=True, exist_ok=True)
     common.atomic_json(work/'configuration.json', {'binding': run_binding,
         'execution': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}})
@@ -158,11 +159,13 @@ def train_task_value(args, policy_config, loss_config):
                 torch.cuda.reset_peak_memory_stats()
             clock = time.monotonic()
             row = trainer.update(policy, optimizer, simulator, current_initial, args.horizon, loss_config,
-                                 gradient_clip=args.gradient_clip, probes=args.phase1_probes)
+                                 gradient_clip=args.gradient_clip, probes=args.phase1_probes,
+                                 critic_only=args.value_critic_only)
             _synchronize(policy)
             row['update_seconds'] = time.monotonic() - clock
             row['peak_allocated_bytes'] = torch.cuda.max_memory_allocated() if next(policy.parameters()).is_cuda else None
-            progress['attempts'] += 1; progress['updates'] += 1
+            progress['attempts'] += 1
+            progress['updates'] += int(row['updated'])
             progress['training_seeds'].extend(seeds)
             row.update(attempt=progress['attempts'], update=progress['updates'], scenario_seeds=seeds,
                        training_scenarios=2 * args.scenarios, model_sha256=common.model_hash(policy))
@@ -170,6 +173,10 @@ def train_task_value(args, policy_config, loss_config):
             row['train_before'].pop('scenarios', None)
             progress['history'].append(row)
             print(json.dumps(row, allow_nan=False), flush=True)
+            if not row['updated']:
+                progress['status'] = row['status']
+                save()
+                break
             if progress['updates'] % args.development_every == 0:
                 evaluate()
             if progress['updates'] % args.checkpoint_every == 0:
@@ -207,9 +214,10 @@ def profile_task_value(args, policy_config, loss_config):
         torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     row = trainer.update(policy, optimizer, simulator, initial, args.horizon, loss_config,
-                         gradient_clip=args.gradient_clip, probes=args.phase1_probes)
+                         gradient_clip=args.gradient_clip, probes=args.phase1_probes,
+                         critic_only=args.value_critic_only)
     _synchronize(policy)
-    report = {'scope': 'one fresh task-value fit and short-window Adam update; no EVAL or candidate replay',
+    report = {'scope': 'one fixed-data task-value attempt with bounded readiness; Actor step only if permitted',
               'seconds': time.monotonic() - started, 'source_sha256': common.source_hash(),
               'device': args.device, 'dtype': args.dtype, 'scenarios': 2 * args.scenarios,
               'horizon': args.horizon, 'scenario_seeds': seeds,

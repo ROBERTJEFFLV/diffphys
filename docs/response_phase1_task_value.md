@@ -1,141 +1,180 @@
-# Phase 1: unified task-value Actor–Critic
+# Phase 1: task value and complete boundary feedback
 
-The default Phase 1 configuration is `configs/response_phase1_single_airframe.args`.
-It uses the current ResponseMotorPolicy, fixed nominal L2F dynamics, zero external
-force, and fresh random position, velocity, attitude and omega on each episode.
-Two banks of 32 initial states are pooled before computing any task/CVaR weights.
+The deployable `ResponseMotorPolicy`, physics, nominal dynamics sampling, loss
+weights, H500/H50 timing and evaluation criteria are unchanged. The task-value
+schema is `task-value-v3-full-boundary-adjoints`. This revision establishes a full
+feedback reference and bounded Critic readiness checks; it does not claim that
+the learned Critic now provides accurate feedback or that the Actor can hover.
 
-## One objective
+## One task and one continuous episode
 
-`response_task.step_costs()` supplies both supervision and Actor window costs.
-It retains all existing evaluation weights, Huber residuals, the full-flight mean
-and the final steady interval. A window calls it with `start=b, horizon=H`; it
-never restarts the final interval at the local window boundary. Risk metrics are
-observations only. `training_step_costs()` and risk scalarization are not used.
+`response_task.step_costs()` supplies both value labels and Actor costs, including
+its existing full-flight and final steady-interval weights. Each window passes
+absolute `start=b, horizon=H`. `training_step_costs()` and risk scalarization are
+not used. Risk remains an observation, not an Actor veto.
 
-The Critic has the existing dimensionless closed-loop/capability inputs, two
-256-wide SiLU hidden layers, and one signed linear output. It predicts cumulative
-remaining **task** cost directly, without Softplus, asinh, output calibration, or
-an extra remaining-time multiplier. The deployable Actor receives no new inputs.
+Two banks of 32 nominal initial states are pooled. A fixed Actor generates one
+continuous H500 trajectory and per-scene remaining task costs. Full-flight
+mean+CVaR weights are selected once and reused in every window. The scalar
+256/256 SiLU Critic still predicts cumulative task cost, with a signed linear
+output and the existing dimensionless state/capability features. It predicts
+neither batch CVaR nor optimal-policy cost. No running normalization, output
+transformation, additional observations or remaining-time multiplier is added.
 
-For a fixed Actor, one no-gradient H500 rollout produces costs c[t] and labels
-G[t] = sum(c[t:]); G[H] = 0. Huber value regression and the continuation derivative
-supervision below update only the Critic. No TD, replay buffer, optimal-policy
-labels, or risk supervision are used.
-After fitting, target = (1-tau)*target + tau*critic. Target parameters are frozen;
-its input derivatives remain enabled during the Actor pass.
+Actor weights stay fixed throughout sampling and all ten windows. Physical state,
+GRU memory, integral and action history remain numerically continuous; only the
+computation graph is detached at each H50 boundary. Ten parameter gradients are
+averaged before clipping and, when ready, one persistent Adam update. Evaluation
+is periodic observation/best-checkpoint selection; it never rolls back an update.
+No candidate search, FD, MS, PETSc or per-update EVAL approval enters this path.
 
-For each H50 window, the objective is the same task cost over that absolute time
-slice plus V_target(Z_end, end), with zero terminal value at H. Full-flight
-mean+CVaR scenario weights are selected once from sum(c) and reused for all ten
-windows. The Critic predicts per-scenario value, never batch CVaR. The ten window
-gradients are averaged; physical state, memory, integral and history remain
-numerically continuous and only the computation graph is detached at boundaries.
-One gradient clip and one persistent Actor Adam step follow the complete episode.
+## Exact full-state reference
 
-## Continuation derivative supervision
-
-The task-value objective is now `task-value-v2-memory-cosine-lognorm`. The MLP,
-value labels, Actor objective, and optimizer hyperparameters are unchanged.
-Default supervision selects **only `policy.memory`**. At t=50,250,450 of the
-current H500 trajectory, a small set of states continues to H500 with Actor
-parameters frozen but the selected state field differentiable. The suffix cost
-uses `step_costs(..., start=t, horizon=H)`. Labels are detached per-scene gradients
-of that remaining task cost; they exclude batch CVaR, like the scalar value.
-
-Both true and predicted raw-state gradients are multiplied by the same fixed
-state scale: for x_hat=x/s, dV/dx_hat=s*dV/dx. Memory uses s=1. The selectable
-single-field interface also supports the explicit fixed-scale fields listed in
-`DERIVATIVE_STATE_SCALES`; it never enables all-state supervision implicitly.
-The Critic prediction uses the canonical `critic_features` mapping and absolute
-t/H. No running normalization or learned state units are added.
-
-Each value minibatch (1024 by default) draws 32 derivative samples with
-replacement from a fresh 32-sample pool. It minimizes:
+`response_adjoints.collect_boundary_adjoints()` recomputes the ten windows in
+reverse order with frozen Actor parameters. At each start, all dynamic state
+fields become independent leaves. With lambda[H]=0, differentiate
 
 ```
-L = L_value + 0.5 * wd * (1 - cosine(g_pred, g_true))
-            + wm * SmoothL1(log(norm(g_pred)+eps) - log(norm(g_true)+eps))
+Q = sum(step_costs(window, start, horizon)) + lambda[end] dot Z_end
 ```
 
-Cosine and log norms are computed per sample in float64 for stable reductions.
-Zero true gradients have no direction; they contribute only the magnitude loss.
-`create_graph=True` lets these losses update Critic parameters through its state
-gradient. On the first derivative minibatch, BEFORE clipping, fix:
-`wd=norm(grad L_value)/norm(grad L_dir)` and
-`wm=norm(grad L_value)/norm(grad L_mag)`. The 0.5 direction factor is applied after
-this measurement. A denominator floor of eps=1e-8 handles a zero gradient norm;
-the original measured norms and floor are logged. This is a one-time gradient
-balance, not the adaptive GradNorm algorithm. No weights are recalibrated later.
+with respect to those start leaves. The linear terminal injection preserves the
+recorded numerical remaining value while providing exactly the specified
+covector. Labels are per-scene and **unweighted by CVaR**. They include physical
+and recurrent history aliases; they are bound to Actor hash, initial-state hash,
+loss and time configuration. Boundary mismatch or nonfinite values stop the run.
 
-Critic clipping remains 10 and target EMA remains 0.6. The checkpoint stores
-fixed weights, initial gradient norms, selected state field, boundary steps,
-sample counts/scene IDs and sampler configuration. Failed Critic transactions
-restore the weights and sampling metadata with the Critic/target/optimizer.
-Completed fits still survive a subsequent Actor failure.
+Only one H50 graph lives at a time. The propagated adjoint is nevertheless
+mathematically the full long-horizon derivative, so it can exhibit real exploding
+gradients. This oracle is a diagnostic/short-baseline facility, not a claim that
+truncation has eliminated long-horizon conditioning.
 
-An additional 16 derivative samples use disjoint TRAIN scene IDs, across every
-selected boundary. They are excluded from derivative optimization and weight
-calibration. `response_phase1.py` records target cosine, norm ratio, and absolute
-log-norm error before/after fitting, plus post-fit online-Critic metrics. These
-are **held-out derivative labels within TRAIN**: ordinary value regression uses
-all trajectory scenes. They are not independent EVAL/generalization evidence.
-None of these metrics creates a new Actor gate.
+`accumulate_task_gradients()` supports explicit terminal modes:
 
-For small test horizons the default boundaries are the first/middle/last distinct
-nonterminal window boundaries. A single terminal window has no bootstrap
-derivative pool. Explicit boundary indices must be nonterminal window boundaries.
+- `critic` (default): local cost plus target value, after readiness below.
+- `oracle_full_state`: local cost plus the complete true boundary covector;
+  explicit diagnostic, no learned-Critic readiness requirement.
+- `none`: local-only diagnostic, no terminal value.
 
-## Execution and evaluation
+For H500/H50, **10 times** the oracle's averaged Actor gradient must match full
+H500 BPTT under the same fixed pooled CVaR weights. Neither oracle nor Critic
+feedback detaches any physical branch to hide untrained derivatives.
 
-`response_value.py` owns collection, scalar value learning and window gradients.
-`response_value_training.py` owns persistent optimizers, checkpoints and periodic
-EVAL. The existing entry point dispatches `--optimizer task-adam` to this path.
-No candidate search, H500 backtracking, risk veto or EVAL rollback runs here.
-Ordinary finite cost increases do not stop training or restore Adam moments.
+## Supervision coverage and coordinates
 
-EVAL uses a fixed pooled 2x32 nominal-state bank at updates 0,5,...,50. It reports
-the same objective, CVaR, loss decomposition and original success criteria. It
-only records trends and saves `best.training.pt` / `best_success.training.pt`.
-`latest.training.pt` always follows the ongoing Adam trajectory. EVAL preserves
-RNG, so reporting does not alter training sampling or Critic minibatches.
+The default derivative pool now covers all nine nonterminal boundaries and all
+64 TRAIN scenes. A single scene split holds out 16 scenes at every boundary:
+432 training states and 144 derivative-held-out states. Value regression still
+uses all scenes, so this is derivative holdout within TRAIN, not independent
+EVAL/generalization evidence. Each 1024-value minibatch draws 32 derivative states
+with replacement. Labels are reused within the bounded frozen-Actor fit.
 
-Checkpoints bind the task-value schema, loss, source, hyperparameters and dtype.
-They preserve Actor Adam, Critic Adam, target, RNG and sampling position. Old v1
-task-value and Risk Critic states cannot be resumed into this objective. An explicitly
-requested weights-only Actor initialization starts both optimizers and Critic anew.
-Nonfinite gradients do not reach the Actor step; numerical failure saves its
-stage and inputs in `failure.pt`, saves training state, and stops. Boundary
-continuity failure also stops. No performance plateau gate is active.
+All twelve differentiable state groups used by `critic_features()` are supervised:
+position, velocity, rotation, omega, motor, previous action, memory, integral,
+previous velocity, previous omega, previous rotation and older action. The full
+oracle additionally retains `policy.last_action` and `policy.calls`; they are
+absent or differentially inactive in the Critic mapping. Their omission from
+regression does not omit them from the oracle.
 
-## Reproduce the trial
+For Euclidean x/s, both true and predicted gradients use s*dV/dx. The fixed scales
+are recorded in `response_adjoints.STATE_SCALES`; no statistics are estimated.
+Rotations use tangent perturbations R exp(skew(delta)), in radians, not a loss on
+nine independent rotation entries. The oracle retains ambient covectors for
+exact Actor VJPs. Tangent supervision is checked against the actual Actor gradient
+below, rather than assumed to constrain every ambient neural-network direction.
 
-First generate a fresh nominal training contract using the existing
-`tools/check_response_training_contract.py` CLI. Then:
+Direction and magnitude losses are computed per state group and then averaged:
+
+```
+L = Huber(value, remaining_task_cost)
+  + 0.5 * wd * mean_group(1 - cosine(g_pred, g_true))
+  + wm * mean_group(Huber(log(norm(g_pred)+eps) - log(norm(g_true)+eps)))
+```
+
+Zero true gradients contribute only magnitude loss. Float64 reductions stabilize
+cosine/lognorm computation; `create_graph=True` carries state-derivative losses
+back into Critic parameters. The three parameter-gradient norms are remeasured
+before every minibatch update. Ratios to the value gradient set wd and wm; a
+near-zero denominator disables that term and is logged, rather than magnifying
+it with an epsilon denominator. `fixed` remains an explicit ablation option.
+This norm-ratio heuristic is **not** the full GradNorm algorithm and does not
+establish that the losses can be jointly learned.
+
+Critic clip=10 and target EMA tau=0.6 are unchanged. Checkpoints record the schema,
+state groups, boundaries, scene IDs, scales, balance mode and current weights.
+Every minibatch logs raw and weighted parameter-gradient contributions. Online
+and target derivatives are reported separately, per group and per boundary,
+including cosine, negative-cosine fraction, norm-ratio median/p90 and log error.
+
+## Bounded readiness and checkpoint transactions
+
+On fixed Actor/data, each fit is followed by actual Actor-gradient comparisons:
+
+```
+g_critic = average_window_gradient(local cost + target terminal)
+g_oracle = average_window_gradient(local cost + full true terminal)
+```
+
+The log records their cosine and relative vector error for all TRAIN scenes and
+the derivative-held-out scenes; online-Critic/all-scene results are separate.
+Held-out checks retain the **original forward batch size** and mask the original
+CVaR weights without renormalizing. Slicing a CUDA batch can change the numerical
+trajectory and make a long-horizon gradient comparison misleading.
+
+Default readiness requires both target comparisons to reach cosine >=0.9 and
+relative error <=0.5 within 8 fits/120 seconds. These are explicit, configurable
+**engineering criteria**, not experimentally established convergence or deployment
+thresholds. The time budget starts at trajectory collection and is checked at
+fit boundaries; a fit plus its audits completes atomically and may exceed the
+wall-clock limit. A successful readiness check does not certify an Adam step or
+finite-step task improvement. The actual parameter step and unaveraged
+`g_oracle dot delta_theta` are logged for learned-Critic updates.
+
+If not ready, the result is `critic_not_ready`: retain completed Critic/target/
+Critic-Adam work, keep Actor/Actor-Adam unchanged, checkpoint and stop normally.
+The runner refuses automatic resume of this business stop. `--value-critic-only`
+never commits an Actor update, including when ready (`critic_only_ready`).
+Numerical failures instead save their stage/inputs and stop as failures. Failed
+Critic fit transactions roll back only that fit, not previously completed fits.
+
+Old v1/v2 or risk-Critic training state is incompatible and cannot be silently
+resumed. `--initialize-from` explicitly loads **Actor weights only** into a new
+experiment and creates fresh Actor/Critic optimizers. It does not claim resetting
+Actor moments is better. The separate shadow diagnostic preserves saved Actor
+Adam moments to compare identical optimizer transformations. Exact new-schema
+resume otherwise preserves optimizer states and RNG.
+
+## Bounded diagnostic commands
+
+Frozen-Actor readiness, one attempt, no online training:
 
 ```bash
-python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args) --mode profile
-python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
+python3 tools/train_response_control.py $(cat configs/response_phase1_critic_only.args)
 ```
 
-Profile is a fresh isolated update; it does not initialize the subsequent run.
-The derivative-supervised configuration writes to a new experiment directory,
-`runs/phase1_task_value_derivatives/seed7`, and requires a newly generated contract
-at `reports/phase1_task_value_derivatives/contract.json`; previous runs are kept.
-The seed-7 trial uses 50 updates, CUDA float32, Actor Adam lr=3e-4, Critic Adam
-lr=1e-3, clips=10, one full-data Critic epoch, minibatch=1024, target tau=0.6,
-and an 1800-second limit. The configuration contains no weight decay objective.
-Diagnostics include complete boundary states, window local/total parameter
-gradients, terminal dV/dZ, Critic target/error ranges and synchronized update time.
+Use `--initialize-from PATH` for explicit Actor-only initialization and a fresh
+`--work-dir`. The independent config uses CUDA float32, seed 7, H500/H50 and 64
+pooled TRAIN scenes. A fixed EVAL baseline is recorded; it does not approve fits.
 
-The prior TRAIN-only search is still available through
-`configs/response_phase1_search.args`; it is a separate diagnostic experiment.
-Neither trial is a deployment or generalization certificate.
+Saved-checkpoint oracle and shadow checks (no Actor update is retained):
 
-## Reference and deliberate differences
+```bash
+python3 tools/check_response_boundary_adjoints.py \
+  --snapshots reports/phase1_derivative_profile_20m/snapshots \
+  --fits 1 6 --device cuda --chunk-size 64 --shadow-steps \
+  --max-seconds 180 --output reports/phase1_boundary_check
+```
 
-[Official NVIDIA SHAC implementation](https://github.com/NVlabs/DiffRL/blob/main/algorithms/shac.py)
-uses Actor/Critic Adam, clipping and a smoothed target. This adaptation uses exact
-Monte Carlo labels from a full episode, no discount, the repository's task/CVaR,
-and one recurrent Actor update after all ten windows. It does not reproduce the
-original TD-based SHAC algorithm or claim its published results.
+`--frozen-fits N` additionally compares memory-only and full-state supervision on
+the first saved Actor, with the same expanded pool, initial scalar MLP weights,
+minibatch RNG and fresh Critic Adam. Historical Critic weights are read for this
+explicit diagnostic; incompatible optimizer/schema state is not resumed.
+Use the original batch size for the full BPTT reference when memory permits.
+Smaller chunks are a memory fallback, **not** a guarantee of the same CUDA
+numerics; the tool records scene-cost discrepancy and stops on oracle error.
+
+The existing `response_phase1_single_airframe.args` remains the opt-in online
+configuration, now subject to bounded readiness. Long training still requires
+explicit authorization and a fresh source-bound training contract. Numerical
+correctness, Critic feedback quality, learned control and deployment safety are
+separate claims.

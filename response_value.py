@@ -1,12 +1,11 @@
 """Unified task-value Monte Carlo supervision and short-window Actor Adam.
 
 Task costs always come from response_task.step_costs, including absolute time
-weights. This path has no risk scalarization, candidate search or approval gate.
+weights. Critic readiness uses full feedback; there is no risk or EVAL veto.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
-from contextlib import contextmanager
 import copy
 import math
 import time
@@ -16,21 +15,15 @@ from torch import nn
 
 from response_critic import critic_features, detach_closed_state, _finite_state
 from response_phase1 import (compare_boundary, task_loss_components, terminal_state_gradient,
-                            derivative_gradient_metrics)
+                            derivative_gradient_metrics, dynamic_closed_state)
+from response_adjoints import (collect_boundary_adjoints, linearized_terminal,
+                               STATE_SCALES, gradient_coordinates, frozen_parameters)
 from response_task import (
     HardRiskConfig, RiskConfig, TaskLossConfig, TaskTrajectory, ResponseClosedLoopState, initialize,
     hard_risk_metrics, physical_risk_metrics, risk_weights, rollout, step_costs, trajectory_metrics,
 )
 
-TASK_VALUE_OBJECTIVE = "task-value-v2-memory-cosine-lognorm"
-
-# x_hat=x/s in critic_features: dV/dx_hat=s*dV/dx. Select one field,
-# never silently enable unvalidated full-state supervision.
-DERIVATIVE_STATE_SCALES = {
-    'policy.memory': 1., 'policy.integral': .5,
-    'physical.position': 5., 'physical.velocity': 5., 'physical.omega': 10.,
-    'policy.previous_velocity': 5., 'policy.previous_omega': 10.,
-}
+TASK_VALUE_OBJECTIVE = "task-value-v3-full-boundary-adjoints"
 
 
 class TaskValueCritic(nn.Module):
@@ -53,13 +46,18 @@ class TaskValueConfig:
     batch_size: int = 1024
     target_tau: float = .6  # new critic fraction; old target retains 1-tau
     gradient_clip: float = 10.
-    derivative_state_group: str = 'policy.memory'
-    derivative_boundaries: tuple[int, ...] = ()  # first/middle/last nonterminal window
-    derivative_samples: int = 32
-    derivative_holdout_samples: int = 16
+    derivative_state_groups: tuple[str, ...] = tuple(STATE_SCALES)
+    derivative_boundaries: tuple[int, ...] = ()  # every nonterminal window
+    derivative_holdout_scenes: int = 16
     derivative_batch_size: int = 32
     derivative_epsilon: float = 1.e-8
     derivative_direction_factor: float = .5
+    derivative_balance_mode: str = 'minibatch'  # fixed is an explicit ablation
+    terminal_mode: str = 'critic'
+    warmup_max_fits: int = 8
+    warmup_max_seconds: float = 120.
+    ready_min_cosine: float = .9
+    ready_max_relative_error: float = .5
 
     def __post_init__(self):
         if min(self.window_steps, self.epochs, self.batch_size) < 1:
@@ -68,10 +66,21 @@ class TaskValueConfig:
             raise ValueError("task-value learning rate and gradient clip must be positive and finite")
         if not math.isfinite(self.target_tau) or not 0 < self.target_tau <= 1:
             raise ValueError("target_tau must be in (0, 1]")
-        if self.derivative_state_group not in DERIVATIVE_STATE_SCALES:
-            raise ValueError('unsupported derivative state group')
-        if min(self.derivative_samples, self.derivative_holdout_samples, self.derivative_batch_size) < 1:
+        if (not self.derivative_state_groups or len(set(self.derivative_state_groups)) != len(self.derivative_state_groups)
+                or any(n not in STATE_SCALES for n in self.derivative_state_groups)):
+            raise ValueError('unsupported or repeated derivative state groups')
+        if min(self.derivative_holdout_scenes, self.derivative_batch_size) < 1:
             raise ValueError('derivative sample counts must be positive')
+        if self.derivative_balance_mode not in ('minibatch', 'fixed'):
+            raise ValueError('derivative balance mode must be minibatch or fixed')
+        if self.terminal_mode not in ('critic', 'oracle_full_state', 'none'):
+            raise ValueError('unsupported terminal mode')
+        if self.warmup_max_fits < 1 or not math.isfinite(self.warmup_max_seconds) or self.warmup_max_seconds <= 0:
+            raise ValueError('warmup budgets must be positive and finite')
+        if not math.isfinite(self.ready_min_cosine) or not -1 <= self.ready_min_cosine <= 1:
+            raise ValueError('readiness cosine must be in [-1,1]')
+        if not math.isfinite(self.ready_max_relative_error) or self.ready_max_relative_error < 0:
+            raise ValueError('readiness relative error must be nonnegative and finite')
         if not math.isfinite(self.derivative_epsilon) or self.derivative_epsilon <= 0:
             raise ValueError('derivative epsilon must be positive and finite')
         if not math.isfinite(self.derivative_direction_factor) or self.derivative_direction_factor < 0:
@@ -85,8 +94,7 @@ class TaskValueConfig:
             if max(self.derivative_boundaries) >= horizon:
                 raise ValueError('derivative boundaries must be before the horizon')
             return self.derivative_boundaries
-        available = list(range(self.window_steps, horizon, self.window_steps))
-        return tuple(sorted({available[0], available[len(available)//2], available[-1]})) if available else ()
+        return tuple(range(self.window_steps, horizon, self.window_steps))
 
 
 @dataclass(frozen=True)
@@ -103,7 +111,7 @@ def collect_task_trajectory(policy, simulator, initial, horizon, window_steps, c
     if horizon < 1 or window_steps < 1 or horizon % window_steps:
         raise ValueError("horizon must be a positive multiple of window_steps")
     inputs = [critic_features(initialize(policy, initial), 0, horizon)]
-    boundaries = {}
+    boundaries = {0: detach_closed_state(initialize(policy, initial))}
     def observe(step, closed):
         inputs.append(critic_features(closed, step, horizon))
         if step % window_steps == 0:
@@ -122,9 +130,10 @@ class DerivativeSamples:
     closed: ResponseClosedLoopState
     steps: torch.Tensor
     scene_ids: torch.Tensor
-    gradients: torch.Tensor  # per-scene d(remaining task cost)/d(x/s), detached
+    gradients: dict  # dimensionless covectors, rotation tangent covectors
     horizon: int
-    state_group: str
+    state_groups: tuple
+    metadata: dict
 
 
 def _select_closed(closed, indices):
@@ -134,90 +143,62 @@ def _select_closed(closed, indices):
 
 def select_derivative_samples(samples, indices):
     return replace(samples, closed=_select_closed(samples.closed, indices), steps=samples.steps[indices],
-                   scene_ids=samples.scene_ids[indices], gradients=samples.gradients[indices])
+                   scene_ids=samples.scene_ids[indices],
+                   gradients={n:g[indices] for n,g in samples.gradients.items()})
 
 
-def _state_leaf(closed, state_group):
-    parent, field = state_group.split('.')
-    leaf = getattr(getattr(closed, parent), field).detach().requires_grad_(True)
-    return replace(closed, **{parent: replace(getattr(closed, parent), **{field: leaf})}), leaf
-
-
-@contextmanager
-def _frozen_actor(policy):
-    parameters = list(policy.parameters())
-    flags = [p.requires_grad for p in parameters]
-    try:
-        for p in parameters:
-            p.requires_grad_(False)
-        yield
-    finally:
-        for p, flag in zip(parameters, flags):
-            p.requires_grad_(flag)
-
-
-def collect_derivative_samples(policy, simulator, record, horizon, loss_config, config):
-    """Small fresh TRAIN pools; held-out scenes never supply derivative loss.
-
-    A per-scene value does not include batch CVaR weights. Actor applies those
-    weights to terminal values later. No replay buffer or DEV calibration.
-    """
+def collect_derivative_samples(policy, simulator, record, horizon, loss_config, config, *, adjoints=None):
+    """Every selected scene at every boundary; only derivative labels are held out."""
     boundaries = config.sampling_boundaries(horizon)
     if not boundaries:
-        return None, None  # a single terminal window has no bootstrap boundary
+        return None, None
+    if adjoints is None:
+        adjoints = collect_boundary_adjoints(policy, simulator, record, horizon, config.window_steps, loss_config)
+    adjoints.validate(policy, horizon, config.window_steps, loss_config, record)
     batch = record.inputs.shape[1]
     if batch < 2:
         raise ValueError('derivative holdout requires at least two TRAIN scenes')
-    scene_order = torch.randperm(batch, device=record.inputs.device)
-    holdout_count = min(batch//2, max(1, math.ceil(config.derivative_holdout_samples/len(boundaries))))
+    order = torch.randperm(batch, device=record.inputs.device)
+    holdout_count = min(config.derivative_holdout_scenes, max(1, batch//2))
+    metadata = {'actor_sha256': adjoints.actor_sha256, 'objective': TASK_VALUE_OBJECTIVE,
+        'adjoint_objective': adjoints.objective, 'horizon': horizon, 'loss_config': adjoints.loss_config,
+        'initial_sha256': adjoints.initial_sha256,
+        'state_scales': {n:STATE_SCALES[n] for n in config.derivative_state_groups},
+        'rotation_coordinates': 'R exp(skew(delta)); radians; ambient adjoints retained for Actor VJP',
+        'aliases': 'independent dynamic leaves; last_action and calls retained by oracle but absent/differentially inactive in critic_features'}
 
-    def collect(scene_ids, count):
-        # Interleave independently shuffled scenes across boundaries, then cap
-        # the pool. This covers all selected boundaries when count permits.
-        scene_grid = torch.stack([scene_ids[torch.randperm(len(scene_ids), device=scene_ids.device)]
-                                  for _ in boundaries], dim=1).flatten()[:count]
-        step_grid = torch.tensor(boundaries, device=scene_ids.device).repeat(len(scene_ids))[:count]
-        states, labels, steps, ids = [], [], [], []
-        for step in boundaries:
-            selected = scene_grid[step_grid == step]
-            if not len(selected):
-                continue
-            closed = _select_closed(record.boundaries[step], selected)
-            differentiable, leaf = _state_leaf(closed, config.derivative_state_group)
-            continuation = rollout(policy, simulator, differentiable, horizon-step)
-            costs = step_costs(continuation, loss_config, start=step, horizon=horizon).sum(0)
-            gradient = torch.autograd.grad(costs.sum(), leaf)[0].flatten(1)
-            gradient = gradient.detach() * DERIVATIVE_STATE_SCALES[config.derivative_state_group]
-            if not _finite_state((costs, gradient)):
-                raise FloatingPointError('nonfinite continuation derivative labels')
-            states.append(closed); labels.append(gradient)
-            steps.append(step_grid.new_full((len(selected),), step)); ids.append(selected)
-            del continuation, costs, gradient, differentiable, leaf
+    def collect(ids):
+        states = [_select_closed(record.boundaries[t], ids) for t in boundaries]
         combined = type(states[0])(*(type(getattr(states[0], group))(**{
             f.name: torch.cat([getattr(getattr(s, group), f.name) for s in states])
             for f in fields(getattr(states[0], group))}) for group in ('physical', 'policy')))
-        return DerivativeSamples(combined, torch.cat(steps), torch.cat(ids), torch.cat(labels),
-                                 horizon, config.derivative_state_group)
-
-    with _frozen_actor(policy), torch.enable_grad():
-        return (collect(scene_order[holdout_count:], config.derivative_samples),
-                collect(scene_order[:holdout_count], config.derivative_holdout_samples))
+        gradients = {n:torch.cat([gradient_coordinates(n, adjoints.gradients[t][n][ids], state)
+                                 for t,state in zip(boundaries, states)]).detach()
+                     for n in config.derivative_state_groups}
+        return DerivativeSamples(combined, torch.cat([ids.new_full((len(ids),), t) for t in boundaries]),
+            ids.repeat(len(boundaries)), gradients, horizon, config.derivative_state_groups, metadata)
+    return collect(order[holdout_count:]), collect(order[:holdout_count])
 
 
 def predict_derivatives(critic, samples, *, create_graph=False):
-    """Differentiate the same critic_features mapping used by terminal Actor V."""
+    """Same complete state mapping as Actor terminal V; rotations use tangent coordinates."""
     with torch.enable_grad():
-        closed, leaf = _state_leaf(samples.closed, samples.state_group)
+        closed, leaves, names = dynamic_closed_state(samples.closed)
         features = critic_features(closed, 0, samples.horizon)
-        # critic_features' final column is t/H; this minibatch mixes boundaries.
         features = torch.cat((features[:, :-1], samples.steps.to(features)[:, None]/samples.horizon), dim=-1)
         predicted = critic(features).sum()
-        gradient = torch.autograd.grad(predicted, leaf, create_graph=create_graph)[0].flatten(1)
-        return gradient * DERIVATIVE_STATE_SCALES[samples.state_group]
+        raw = torch.autograd.grad(predicted, leaves, create_graph=create_graph, allow_unused=True)
+        return {n:gradient_coordinates(n, torch.zeros_like(z) if g is None else g, closed)
+                for n,z,g in zip(names, leaves, raw) if n in samples.state_groups}
 
 
 def derivative_losses(predicted, true, *, epsilon=1.e-8):
-    """Per-sample direction and log magnitude; zero truth has no direction."""
+    """Equal state-group losses, not one norm dominated by the largest field."""
+    if isinstance(predicted, dict):
+        if set(predicted) != set(true):
+            raise ValueError('derivative prediction/label groups differ')
+        losses = [derivative_losses(predicted[n], true[n], epsilon=epsilon) for n in predicted]
+        return tuple(torch.stack([row[i] for row in losses]).mean() for i in (0,1))
     predicted, true = predicted.double(), true.detach().double()
     pn, tn = predicted.norm(dim=-1), true.norm(dim=-1)
     valid = tn > epsilon
@@ -233,15 +214,34 @@ def _flat(gradients, parameters):
 
 
 def accumulate_task_gradients(policy, target, simulator, initial, horizon, window_steps,
-                              config, record, *, probes=True):
+                              config, record, *, probes=True, terminal_mode='critic', adjoints=None,
+                              scene_indices=None):
     """Average ten task gradients; only the caller performs an optimizer step."""
     if horizon < 1 or window_steps < 1 or horizon % window_steps:
         raise ValueError("horizon must be a positive multiple of window_steps")
-    if any(p.requires_grad for p in target.parameters()):
+    if terminal_mode not in ('critic', 'oracle_full_state', 'none'):
+        raise ValueError('unknown terminal mode')
+    if terminal_mode == 'critic' and any(p.requires_grad for p in target.parameters()):
         raise ValueError("target parameters must be frozen, with input gradients enabled")
+    if terminal_mode == 'oracle_full_state':
+        if adjoints is None:
+            raise ValueError('oracle terminal requires boundary adjoints')
+        adjoints.validate(policy, horizon, window_steps, config, record)
     weights = record.weights.detach()
+    weighted_scenarios = len(weights)
+    if scene_indices is not None:
+        ids = torch.as_tensor(scene_indices, device=weights.device, dtype=torch.long)
+        if (ids.ndim != 1 or not ids.numel() or ids.unique().numel() != ids.numel()
+                or bool((ids < 0).any()) or bool((ids >= len(weights)).any())):
+            raise ValueError('scene_indices must be distinct valid scene IDs')
+        # Keep the original CUDA forward batch: changing GEMM batch size can
+        # perturb long-horizon gradients. Select held-out scenes by weights only.
+        mask = torch.zeros_like(weights)
+        mask[ids] = 1
+        weights = weights * mask
+        weighted_scenarios = ids.numel()
     policy.zero_grad(set_to_none=True)
-    closed = detach_closed_state(initialize(policy, initial))
+    closed = initialize(policy, initial)
     parameters = list(policy.parameters())
     count = horizon // window_steps
     windows, surrogate = [], 0.
@@ -251,18 +251,22 @@ def accumulate_task_gradients(policy, target, simulator, initial, horizon, windo
         boundary = compare_boundary(record.boundaries[end], trace.end, end)
         local = (weights * step_costs(trace, config, start=start, horizon=horizon).sum(0)).sum()
         terminal = local.new_zeros(())
-        if end < horizon:
+        if end < horizon and terminal_mode == 'critic':
             # Network output ALREADY has cumulative task units. Do not multiply
             # by H-end, normalize it as risk, or detach the terminal state.
             terminal = (weights * target(critic_features(trace.end, end, horizon)).squeeze(-1)).sum()
+        elif end < horizon and terminal_mode == 'oracle_full_state':
+            terminal = (weights * linearized_terminal(trace.end,
+                adjoints.gradients[end], record.returns[end])).sum()
         objective = local + terminal
         if not bool(torch.isfinite(objective)):
             raise FloatingPointError("nonfinite window task surrogate")
         row = {"start": start, "end": end, "boundary": boundary,
                "local_task": float(local.detach()), "terminal_value": float(terminal.detach())}
-        if probes:
+        if probes and terminal_mode == 'critic':
             row.update(terminal_state_gradient(target, trace.end, end, horizon, mean_risk=False,
                                                weights=weights))
+        if probes:
             local_grads = torch.autograd.grad(local, parameters, retain_graph=True, allow_unused=True)
             row['local_task_gradient_norm'] = float(_flat(local_grads, parameters).norm(dtype=torch.float64))
         grads = torch.autograd.grad(objective, parameters, allow_unused=True)
@@ -279,7 +283,35 @@ def accumulate_task_gradients(policy, target, simulator, initial, horizon, windo
         windows.append(row)
         closed = detach_closed_state(trace.end)
         del trace, local, terminal, objective, grads
-    return {"surrogate_loss": surrogate, "windows": windows}
+    return {"surrogate_loss": surrogate, "windows": windows, 'terminal_mode': terminal_mode,
+            'forward_scenarios': len(weights), 'weighted_scenarios': weighted_scenarios}
+
+
+def task_gradient_vector(policy, target, simulator, initial, horizon, window_steps,
+                         config, record, *, terminal_mode, adjoints=None, scene_indices=None):
+    """Read-only parameter-gradient probe, preserving the caller's .grad slots."""
+    parameters = list(policy.parameters())
+    saved = [p.grad for p in parameters]
+    try:
+        accumulate_task_gradients(policy, target, simulator, initial, horizon, window_steps,
+            config, record, probes=False, terminal_mode=terminal_mode,
+            adjoints=adjoints, scene_indices=scene_indices)
+        return _flat([p.grad for p in parameters], parameters)
+    finally:
+        for p, grad in zip(parameters, saved):
+            p.grad = grad
+
+
+def audit_actor_gradient(policy, target, simulator, initial, horizon, window_steps,
+                         config, record, adjoints, *, scene_indices=None, reference=None):
+    from response_phase1 import parameter_gradient_metrics
+    if reference is None:
+        reference = task_gradient_vector(policy, target, simulator, initial, horizon, window_steps,
+            config, record, terminal_mode='oracle_full_state', adjoints=adjoints, scene_indices=scene_indices)
+    with frozen_parameters(target):
+        candidate = task_gradient_vector(policy, target, simulator, initial, horizon, window_steps,
+            config, record, terminal_mode='critic', scene_indices=scene_indices)
+    return parameter_gradient_metrics(candidate, reference), reference
 
 
 @torch.no_grad()
@@ -306,6 +338,7 @@ class TaskValueTrainer:
         self.optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.lr)
         self.completed_fits = 0
         self.derivative_balance = None
+        self.balance_updates = 0
         self.derivative_sampling = None
         self.stage = 'idle'
 
@@ -314,6 +347,7 @@ class TaskValueTrainer:
                 'critic': self.critic.state_dict(), 'target': self.target.state_dict(),
                 'optimizer': self.optimizer.state_dict(), 'completed_fits': self.completed_fits,
                 'derivative_balance': copy.deepcopy(self.derivative_balance),
+                'balance_updates': self.balance_updates,
                 'derivative_sampling': copy.deepcopy(self.derivative_sampling)}
 
     def load_state_dict(self, saved):
@@ -326,6 +360,7 @@ class TaskValueTrainer:
         self.optimizer.load_state_dict(saved['optimizer'])
         self.completed_fits = saved['completed_fits']
         self.derivative_balance = copy.deepcopy(saved['derivative_balance'])
+        self.balance_updates = saved['balance_updates']
         self.derivative_sampling = copy.deepcopy(saved['derivative_sampling'])
 
     @torch.no_grad()
@@ -341,29 +376,36 @@ class TaskValueTrainer:
                 'prediction_range': [float(predicted.min()), float(predicted.max())]}
 
     def _balance_derivative_losses(self, value_loss, direction_loss, magnitude_loss):
-        """One-time parameter-gradient ratios, BEFORE clipping and the 0.5 factor."""
+        """Measure every minibatch; fixed mode is only a registered ablation."""
         losses = {'value': value_loss, 'direction': direction_loss, 'magnitude': magnitude_loss}
         parameters = list(self.critic.parameters())
         norms = {name: float(_flat(torch.autograd.grad(loss, parameters, retain_graph=True,
-                    allow_unused=True), parameters).norm(dtype=torch.float64)) for name, loss in losses.items()}
+                    allow_unused=True), parameters).norm(dtype=torch.float64)) if loss.requires_grad else 0.
+                 for name, loss in losses.items()}
         epsilon = self.config.derivative_epsilon
-        self.derivative_balance = {
-            'direction': norms['value']/max(norms['direction'], epsilon),
-            'magnitude': norms['value']/max(norms['magnitude'], epsilon),
-            'direction_factor': self.config.derivative_direction_factor, 'initial_gradient_norms': norms,
-            'denominator_floor': epsilon, 'calibrated_at_fit': self.completed_fits+1}
+        if self.derivative_balance is None or self.config.derivative_balance_mode == 'minibatch':
+            self.balance_updates += 1
+            self.derivative_balance = {n:norms['value']/norms[n] if norms[n] > epsilon else 0.
+                                       for n in ('direction', 'magnitude')}
         if not _finite_state(self.derivative_balance):
             raise FloatingPointError('nonfinite derivative loss balance')
+        weights = {n:self.derivative_balance[n] if norms[n] > epsilon else 0.
+                   for n in ('direction', 'magnitude')}
+        return {'raw_norms': norms, 'weights': weights, 'inactive': [n for n in weights if norms[n] <= epsilon],
+                'weighted_norms': {'value': norms['value'],
+                    'direction': norms['direction']*weights['direction']*self.config.derivative_direction_factor,
+                    'magnitude': norms['magnitude']*weights['magnitude']}}
 
     def _derivative_metrics(self, network, samples):
         if samples is None:
             return None
-        predicted = predict_derivatives(network, samples).detach()
-        result = derivative_gradient_metrics(predicted, samples.gradients, self.config.derivative_epsilon)
-        result['boundaries'] = {str(step): derivative_gradient_metrics(predicted[samples.steps == step],
-            samples.gradients[samples.steps == step], self.config.derivative_epsilon)
-            for step in sorted(set(samples.steps.tolist()))}
-        return result
+        predicted = predict_derivatives(network, samples)
+        def metrics(mask):
+            return {n:derivative_gradient_metrics(predicted[n][mask], samples.gradients[n][mask],
+                        self.config.derivative_epsilon) for n in samples.state_groups}
+        return {'samples': len(samples.steps), 'state_groups': metrics(slice(None)),
+                'boundaries': {str(step):metrics(samples.steps == step)
+                               for step in sorted(set(samples.steps.tolist()))}}
 
     def fit(self, record, derivatives=None, heldout=None):
         inputs = record.inputs.detach().flatten(0, 1)
@@ -372,14 +414,14 @@ class TaskValueTrainer:
         snapshot = copy.deepcopy(self.state_dict())
         gradient_norms = []
         derivative_losses_log = []
+        contributions = []
         try:
             target_before = self._derivative_metrics(self.target, heldout)
             if derivatives is not None:
                 if heldout is None or not set(derivatives.scene_ids.tolist()).isdisjoint(heldout.scene_ids.tolist()):
                     raise ValueError('derivative holdout must use disjoint TRAIN scenes')
                 self.derivative_sampling = {
-                    'state_group': derivatives.state_group, 'horizon': derivatives.horizon,
-                    'state_scale': DERIVATIVE_STATE_SCALES[derivatives.state_group],
+                    **derivatives.metadata, 'state_groups': derivatives.state_groups,
                     'boundary_steps': sorted(set(derivatives.steps.tolist())),
                     'train_scene_ids': derivatives.scene_ids.tolist(), 'train_steps': derivatives.steps.tolist(),
                     'heldout_scene_ids': heldout.scene_ids.tolist(), 'heldout_steps': heldout.steps.tolist(),
@@ -396,10 +438,11 @@ class TaskValueTrainer:
                         predicted = predict_derivatives(self.critic, samples, create_graph=True)
                         direction, magnitude = derivative_losses(predicted, samples.gradients,
                                                                   epsilon=self.config.derivative_epsilon)
-                        if self.derivative_balance is None:
-                            self._balance_derivative_losses(value_loss, direction, magnitude)
-                        loss = (value_loss + self.config.derivative_direction_factor*self.derivative_balance['direction']*direction
-                                + self.derivative_balance['magnitude']*magnitude)
+                        contribution = self._balance_derivative_losses(value_loss, direction, magnitude)
+                        contributions.append(contribution)
+                        weights = contribution['weights']
+                        loss = (value_loss + self.config.derivative_direction_factor*weights['direction']*direction
+                                + weights['magnitude']*magnitude)
                         derivative_losses_log.append((float(direction.detach()), float(magnitude.detach())))
                     if not bool(torch.isfinite(loss)):
                         raise FloatingPointError("nonfinite task-value fit loss")
@@ -431,25 +474,83 @@ class TaskValueTrainer:
                 'derivative_magnitude_loss': (sum(r[1] for r in derivative_losses_log)/len(derivative_losses_log)
                                               if derivative_losses_log else None),
                 'derivative_balance': copy.deepcopy(self.derivative_balance),
+                'derivative_gradient_contributions': contributions,
                 'derivative_sampling': copy.deepcopy(self.derivative_sampling),
                 'target_derivative_heldout_before': target_before,
                 'target_derivative_heldout_after': target_after, 'critic_derivative_heldout_after': critic_after}
 
-    def update(self, policy, optimizer, simulator, initial, horizon, loss_config, *, gradient_clip, probes=True):
+    def warmup(self, policy, simulator, initial, horizon, loss_config, record, adjoints,
+               derivatives, heldout, *, deadline):
+        """Fixed Actor/data; stop at the registered fit/time budget, never alter Adam."""
+        held_ids = heldout.scene_ids.unique() if heldout is not None else None
+        references = {name:task_gradient_vector(policy, self.target, simulator, initial, horizon,
+            self.config.window_steps, loss_config, record, terminal_mode='oracle_full_state',
+            adjoints=adjoints, scene_indices=ids) for name,ids in (('all',None),('heldout',held_ids))}
+        rounds, fitted = [], {}
+        ready = False
+        for _ in range(self.config.warmup_max_fits):
+            if time.monotonic() >= deadline:
+                break
+            self.stage = 'critic'
+            fitted = self.fit(record, derivatives, heldout)
+            self.stage = 'critic_readiness'
+            audit = {}
+            for name, ids in (('all',None),('heldout',held_ids)):
+                audit['target_'+name], _ = audit_actor_gradient(policy, self.target, simulator, initial,
+                    horizon, self.config.window_steps, loss_config, record, adjoints,
+                    scene_indices=ids, reference=references[name])
+            audit['online_all'], _ = audit_actor_gradient(policy, self.critic, simulator, initial,
+                horizon, self.config.window_steps, loss_config, record, adjoints, reference=references['all'])
+            ready = all(audit[n]['cosine'] is not None and audit[n]['relative_error'] is not None
+                and audit[n]['cosine'] >= self.config.ready_min_cosine
+                and audit[n]['relative_error'] <= self.config.ready_max_relative_error
+                for n in ('target_all','target_heldout'))
+            rounds.append({'fit': self.completed_fits, 'audit': audit, 'ready': ready,
+                           'value_loss': fitted['critic_loss_after'], 'critic_fit': fitted})
+            if ready:
+                break
+        status = {'ready': ready, 'fits': len(rounds), 'rounds': rounds,
+                  'last_audit': rounds[-1]['audit'] if rounds else None,
+                  'stop_reason': 'ready' if ready else 'time_budget' if time.monotonic() >= deadline else 'fit_budget',
+                  'min_cosine': self.config.ready_min_cosine,
+                  'max_relative_error': self.config.ready_max_relative_error,
+                  'scope': 'fixed TRAIN Actor/data; derivative holdout still participates in value regression'}
+        return fitted, status, references['all']
+
+    def update(self, policy, optimizer, simulator, initial, horizon, loss_config, *,
+               gradient_clip, probes=True, critic_only=False):
         clock = time.monotonic()
         self.stage = 'forward'
         record = collect_task_trajectory(policy, simulator, initial, horizon, self.config.window_steps, loss_config)
         metrics = task_metrics(record.trajectory, loss_config)
         forward_seconds = time.monotonic() - clock
-        self.stage = 'continuation_derivatives'
-        derivatives, heldout = collect_derivative_samples(policy, simulator, record, horizon, loss_config, self.config)
+        self.stage = 'boundary_adjoints'
+        adjoints = collect_boundary_adjoints(policy, simulator, record, horizon, self.config.window_steps, loss_config)
+        derivatives, heldout = collect_derivative_samples(policy, simulator, record, horizon,
+            loss_config, self.config, adjoints=adjoints)
         derivative_seconds = time.monotonic() - clock - forward_seconds
         self.stage = 'critic'
-        fitted = self.fit(record, derivatives, heldout)
+        reference = None
+        if self.config.terminal_mode == 'critic' or critic_only:
+            fitted, readiness, reference = self.warmup(policy, simulator, initial, horizon, loss_config,
+                record, adjoints, derivatives, heldout, deadline=clock+self.config.warmup_max_seconds)
+        else:
+            fitted = self.fit(record, derivatives, heldout)
+            readiness = {'ready': None, 'fits': 1, 'stop_reason': 'explicit_diagnostic_terminal'}
         fit_seconds = time.monotonic() - clock - forward_seconds - derivative_seconds
+        base = {'train_before': metrics, **fitted, 'readiness': readiness,
+                'boundary_continuity': adjoints.continuity,
+                'forward_seconds': forward_seconds, 'boundary_adjoint_seconds': derivative_seconds,
+                'critic_and_readiness_seconds': fit_seconds, 'finite': True}
+        if critic_only or readiness['ready'] is False:
+            self.stage = 'idle'
+            return {**base, 'updated': False,
+                    'status': 'critic_only_ready' if readiness['ready'] else 'critic_not_ready',
+                    'windows': [], 'update_seconds': time.monotonic()-clock}
         self.stage = 'short_window_backward'
         actor = accumulate_task_gradients(policy, self.target, simulator, initial, horizon,
-            self.config.window_steps, loss_config, record, probes=probes)
+            self.config.window_steps, loss_config, record, probes=probes,
+            terminal_mode=self.config.terminal_mode, adjoints=adjoints)
         norm = nn.utils.clip_grad_norm_(policy.parameters(), gradient_clip, error_if_nonfinite=True)
         after_clip = float(torch.cat([p.grad.flatten() for p in policy.parameters() if p.grad is not None]).norm(dtype=torch.float64))
         backward_seconds = time.monotonic() - clock - forward_seconds - derivative_seconds - fit_seconds
@@ -464,11 +565,12 @@ class TaskValueTrainer:
             policy.load_state_dict(old_model)
             optimizer.load_state_dict(old_optimizer)
             raise
-        step_norm = float((nn.utils.parameters_to_vector(policy.parameters()).detach() - before).norm(dtype=torch.float64))
+        delta = nn.utils.parameters_to_vector(policy.parameters()).detach() - before
+        step_norm = float(delta.norm(dtype=torch.float64))
+        dot = None if reference is None else float(torch.dot(reference.double(), delta.double())
+                                                  * (horizon//self.config.window_steps))
         self.stage = 'idle'
-        return {'updated': True, 'finite': True, 'train_before': metrics, **fitted, **actor,
+        return {**base, **actor, 'updated': True, 'status': 'updated',
                 'gradient_norm_before_clip': float(norm), 'gradient_norm_after_clip': after_clip,
-                'parameter_step_norm': step_norm, 'forward_seconds': forward_seconds,
-                'critic_seconds': fit_seconds, 'continuation_derivative_seconds': derivative_seconds,
-                'backward_seconds': backward_seconds,
-                'update_seconds': time.monotonic() - clock}
+                'parameter_step_norm': step_norm, 'oracle_gradient_dot_step': dot,
+                'backward_seconds': backward_seconds, 'update_seconds': time.monotonic() - clock}

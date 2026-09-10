@@ -111,7 +111,7 @@ def diagnose_update(before, after, reference, output, *, chunk_size=64):
     import response_training as common
     from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
     from response_task import TaskLossConfig, initialize, sample_scenarios
-    from response_value import (TaskValueTrainer, TaskValueConfig, collect_task_trajectory,
+    from response_value import (TaskValueCritic, collect_task_trajectory,
                                 accumulate_task_gradients, task_metrics)
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -131,12 +131,14 @@ def diagnose_update(before, after, reference, output, *, chunk_size=64):
     eval_initial = type(initial)(**{f.name: torch.cat([getattr(b, f.name) for b in banks]) for f in fields(initial)})
     from env_l2f import L2FSimulator, L2FParams
     simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
-    value_config = dict(binding['critic']); value_config.pop('objective')
-    trainer = TaskValueTrainer(policy, initialize(policy, initial), horizon, TaskValueConfig(**value_config))
-    trainer.load_state_dict(after['critic_training'])
-    record = collect_task_trajectory(policy, simulator, initial, horizon, trainer.config.window_steps, config)
-    short_report = accumulate_task_gradients(policy, trainer.target, simulator, initial, horizon,
-        trainer.config.window_steps, config, record, probes=True)
+    window_steps = binding['critic']['window_steps']
+    record = collect_task_trajectory(policy, simulator, initial, horizon, window_steps, config)
+    # Historical diagnostic: read scalar MLP weights, never resume an old
+    # Critic optimizer or translate its incompatible supervision schema.
+    target = TaskValueCritic(record.inputs.shape[-1]).to(next(policy.parameters())).requires_grad_(False)
+    target.load_state_dict(after['critic_training']['target'])
+    short_report = accumulate_task_gradients(policy, target, simulator, initial, horizon,
+        window_steps, config, record, probes=True)
     short = parameter_gradient(policy).clone()
     clip_norm = torch.nn.utils.clip_grad_norm_(parameters, binding['gradient_clip'], error_if_nonfinite=True)
     clipped = parameter_gradient(policy).clone()
@@ -161,7 +163,7 @@ def diagnose_update(before, after, reference, output, *, chunk_size=64):
     result = {'update': after['update'], 'before_update': before['update'], 'seeds': seeds,
               'adam_replay_exact': adam_exact, 'exact': exact_evidence,
               'short_vs_exact': compare_vectors(short, exact),
-              'ten_short_vs_exact': compare_vectors(short * (horizon // trainer.config.window_steps), exact),
+              'ten_short_vs_exact': compare_vectors(short * (horizon // window_steps), exact),
               'clip_norm': float(clip_norm), 'clip_vs_raw': compare_vectors(clipped, short),
               'adam_vs_negative_short': compare_vectors(delta, -short),
               'adam_vs_negative_exact': compare_vectors(delta, -exact),
@@ -177,9 +179,9 @@ def diagnose_update(before, after, reference, output, *, chunk_size=64):
     # A bad approximate gradient warrants the requested decomposition. Also
     # record the same boundaries for the preceding reference update.
     for end in (50, 250, 450):
-        start = end - trainer.config.window_steps
+        start = end - window_steps
         state = initialize(policy, initial) if start == 0 else record.boundaries[start]
-        report, tensors = boundary_comparison(policy, trainer.target, simulator, state,
+        report, tensors = boundary_comparison(policy, target, simulator, state,
             start, end, horizon, config, record.weights)
         torch.save({k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in tensors.items()},
                    output/('boundary_%03d.pt' % end))

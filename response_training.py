@@ -39,7 +39,7 @@ SOURCE_FILES = (
     "env_l2f.py", "full_space_shooting.py", "petsc_kkt_solver.py",
     "tools/check_response_training_contract.py", "tools/check_response_preflight.py",
     "response_critic.py", "response_proposals.py", "response_execution.py", "response_phase1.py",
-    "response_value.py", "response_value_training.py",
+    "response_value.py", "response_value_training.py", "response_adjoints.py",
 )
 
 
@@ -153,12 +153,15 @@ def critic_configuration(args):
         return TaskValueConfig(window_steps=args.window_steps, lr=args.critic_lr,
             epochs=args.critic_epochs, batch_size=args.critic_batch_size,
             target_tau=args.value_target_tau, gradient_clip=args.value_gradient_clip,
-            derivative_state_group=args.value_derivative_state_group,
+            derivative_state_groups=tuple(args.value_derivative_state_groups),
             derivative_boundaries=tuple(args.value_derivative_boundaries),
-            derivative_samples=args.value_derivative_samples,
-            derivative_holdout_samples=args.value_derivative_holdout_samples,
+            derivative_holdout_scenes=args.value_derivative_holdout_scenes,
             derivative_batch_size=args.value_derivative_batch_size,
-            derivative_epsilon=args.value_derivative_epsilon)
+            derivative_epsilon=args.value_derivative_epsilon,
+            derivative_balance_mode=args.value_derivative_balance_mode,
+            terminal_mode=args.value_terminal_mode,
+            warmup_max_fits=args.value_warmup_max_fits, warmup_max_seconds=args.value_warmup_max_seconds,
+            ready_min_cosine=args.value_ready_min_cosine, ready_max_relative_error=args.value_ready_max_relative_error)
     from response_critic import CriticConfig
     from response_proposals import SubspaceConfig
     return CriticConfig(phase1_probes=args.phase1_probes,
