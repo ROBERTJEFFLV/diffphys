@@ -19,8 +19,9 @@ remaining **task** cost directly, without Softplus, asinh, output calibration, o
 an extra remaining-time multiplier. The deployable Actor receives no new inputs.
 
 For a fixed Actor, one no-gradient H500 rollout produces costs c[t] and labels
-G[t] = sum(c[t:]); G[H] = 0. Huber regression updates only the Critic. No TD,
-ranking directions, replay, optimal-policy labels, or risk supervision are used.
+G[t] = sum(c[t:]); G[H] = 0. Huber value regression and the continuation derivative
+supervision below update only the Critic. No TD, replay buffer, optimal-policy
+labels, or risk supervision are used.
 After fitting, target = (1-tau)*target + tau*critic. Target parameters are frozen;
 its input derivatives remain enabled during the Actor pass.
 
@@ -31,6 +32,59 @@ windows. The Critic predicts per-scenario value, never batch CVaR. The ten windo
 gradients are averaged; physical state, memory, integral and history remain
 numerically continuous and only the computation graph is detached at boundaries.
 One gradient clip and one persistent Actor Adam step follow the complete episode.
+
+## Continuation derivative supervision
+
+The task-value objective is now `task-value-v2-memory-cosine-lognorm`. The MLP,
+value labels, Actor objective, and optimizer hyperparameters are unchanged.
+Default supervision selects **only `policy.memory`**. At t=50,250,450 of the
+current H500 trajectory, a small set of states continues to H500 with Actor
+parameters frozen but the selected state field differentiable. The suffix cost
+uses `step_costs(..., start=t, horizon=H)`. Labels are detached per-scene gradients
+of that remaining task cost; they exclude batch CVaR, like the scalar value.
+
+Both true and predicted raw-state gradients are multiplied by the same fixed
+state scale: for x_hat=x/s, dV/dx_hat=s*dV/dx. Memory uses s=1. The selectable
+single-field interface also supports the explicit fixed-scale fields listed in
+`DERIVATIVE_STATE_SCALES`; it never enables all-state supervision implicitly.
+The Critic prediction uses the canonical `critic_features` mapping and absolute
+t/H. No running normalization or learned state units are added.
+
+Each value minibatch (1024 by default) draws 32 derivative samples with
+replacement from a fresh 32-sample pool. It minimizes:
+
+```
+L = L_value + 0.5 * wd * (1 - cosine(g_pred, g_true))
+            + wm * SmoothL1(log(norm(g_pred)+eps) - log(norm(g_true)+eps))
+```
+
+Cosine and log norms are computed per sample in float64 for stable reductions.
+Zero true gradients have no direction; they contribute only the magnitude loss.
+`create_graph=True` lets these losses update Critic parameters through its state
+gradient. On the first derivative minibatch, BEFORE clipping, fix:
+`wd=norm(grad L_value)/norm(grad L_dir)` and
+`wm=norm(grad L_value)/norm(grad L_mag)`. The 0.5 direction factor is applied after
+this measurement. A denominator floor of eps=1e-8 handles a zero gradient norm;
+the original measured norms and floor are logged. This is a one-time gradient
+balance, not the adaptive GradNorm algorithm. No weights are recalibrated later.
+
+Critic clipping remains 10 and target EMA remains 0.6. The checkpoint stores
+fixed weights, initial gradient norms, selected state field, boundary steps,
+sample counts/scene IDs and sampler configuration. Failed Critic transactions
+restore the weights and sampling metadata with the Critic/target/optimizer.
+Completed fits still survive a subsequent Actor failure.
+
+An additional 16 derivative samples use disjoint TRAIN scene IDs, across every
+selected boundary. They are excluded from derivative optimization and weight
+calibration. `response_phase1.py` records target cosine, norm ratio, and absolute
+log-norm error before/after fitting, plus post-fit online-Critic metrics. These
+are **held-out derivative labels within TRAIN**: ordinary value regression uses
+all trajectory scenes. They are not independent EVAL/generalization evidence.
+None of these metrics creates a new Actor gate.
+
+For small test horizons the default boundaries are the first/middle/last distinct
+nonterminal window boundaries. A single terminal window has no bootstrap
+derivative pool. Explicit boundary indices must be nonterminal window boundaries.
 
 ## Execution and evaluation
 
@@ -47,8 +101,8 @@ only records trends and saves `best.training.pt` / `best_success.training.pt`.
 RNG, so reporting does not alter training sampling or Critic minibatches.
 
 Checkpoints bind the task-value schema, loss, source, hyperparameters and dtype.
-They preserve Actor Adam, Critic Adam, target, RNG and sampling position. Old Risk
-Critic or optimizer states cannot be resumed into this objective. An explicitly
+They preserve Actor Adam, Critic Adam, target, RNG and sampling position. Old v1
+task-value and Risk Critic states cannot be resumed into this objective. An explicitly
 requested weights-only Actor initialization starts both optimizers and Critic anew.
 Nonfinite gradients do not reach the Actor step; numerical failure saves its
 stage and inputs in `failure.pt`, saves training state, and stops. Boundary
@@ -65,6 +119,9 @@ python3 tools/train_response_control.py $(cat configs/response_phase1_single_air
 ```
 
 Profile is a fresh isolated update; it does not initialize the subsequent run.
+The derivative-supervised configuration writes to a new experiment directory,
+`runs/phase1_task_value_derivatives/seed7`, and requires a newly generated contract
+at `reports/phase1_task_value_derivatives/contract.json`; previous runs are kept.
 The seed-7 trial uses 50 updates, CUDA float32, Actor Adam lr=3e-4, Critic Adam
 lr=1e-3, clips=10, one full-data Critic epoch, minibatch=1024, target tau=0.6,
 and an 1800-second limit. The configuration contains no weight decay objective.

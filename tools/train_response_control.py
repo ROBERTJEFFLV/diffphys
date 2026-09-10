@@ -48,6 +48,14 @@ def parse_args(argv=None):
     parser.add_argument("--value-target-tau", type=float, default=.6,
                         help="task-value target update: new critic fraction, old target retains 1-tau")
     parser.add_argument("--value-gradient-clip", type=float, default=10.)
+    from response_value import DERIVATIVE_STATE_SCALES
+    parser.add_argument('--value-derivative-state-group', choices=tuple(DERIVATIVE_STATE_SCALES), default='policy.memory')
+    parser.add_argument('--value-derivative-boundaries', type=int, nargs='+', default=(),
+                        help='default: first/middle/last nonterminal H50 boundary')
+    parser.add_argument('--value-derivative-samples', type=int, default=32)
+    parser.add_argument('--value-derivative-holdout-samples', type=int, default=16)
+    parser.add_argument('--value-derivative-batch-size', type=int, default=32)
+    parser.add_argument('--value-derivative-epsilon', type=float, default=1.e-8)
     parser.add_argument("--critic-dev-relative-tolerance", type=float, default=.002)
     from response_task import RiskConfig
     for name, default in asdict(RiskConfig()).items():

@@ -136,7 +136,10 @@ def test_update_uses_persistent_adam_without_candidate_replay(monkeypatch):
     for _ in range(2):
         result = trainer.update(policy, optimizer, sim, initial, 6, config, gradient_clip=10)
         assert result['updated'] and result['finite']
-    assert calls == [6, 2, 2, 2] * 2  # one full sampling flight, no post-step replay
+        assert result['derivative_train_samples'] > 0 and result['derivative_minibatches'] > 0
+    # Continuation labels add short suffix flights. There is still exactly one
+    # full initial-state episode per update, with no candidate replay.
+    assert calls.count(6) == 2 and all(0 < n <= 6 for n in calls)
     assert all(float(s['step']) == 2 for s in optimizer.state.values())
     assert trainer.completed_fits == 2
 

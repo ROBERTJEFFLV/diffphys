@@ -18,9 +18,14 @@
 --critic-batch-size 1024
 --value-target-tau 0.6
 --value-gradient-clip 10
+--value-derivative-state-group policy.memory
+--value-derivative-boundaries 50 250 450
+--value-derivative-samples 32
+--value-derivative-holdout-samples 16
+--value-derivative-batch-size 32
 --development-every 5
 --checkpoint-every 1
 --prediction-weight 0
 --huber-delta 1
---contract-report reports/phase1_task_value_adam/contract.json
---work-dir runs/phase1_task_value_adam/seed7
+--contract-report reports/phase1_task_value_derivatives/contract.json
+--work-dir runs/phase1_task_value_derivatives/seed7

@@ -69,18 +69,10 @@ def task_loss_components(trace, config) -> dict:
     return result
 
 
-def terminal_state_gradient(target, closed, step: int, horizon: int, *, mean_risk: bool = True) -> dict:
-    """Frobenius norm of d(mean_scene cumulative risk_j)/d(dynamic closed state).
-
-    Separate detached leaves avoid counting upstream graph paths twice. Truth
-    parameters stay constants. This diagnostic does not touch Actor gradients.
-    mean_risk=False accepts scalar cumulative task value with no H-t scaling.
-    """
-    if step == horizon:
-        return {"terminal_state_gradient_norm": 0., "terminal_component_state_gradient_norms": [0.] * (4 if mean_risk else 1)}
-    from response_critic import critic_features
+def dynamic_closed_state(closed):
+    """Independent dynamic leaves; simulator truth remains constant."""
     dynamic = {'position', 'velocity', 'rotation', 'omega', 'motor', 'previous_action'}
-    leaves, states = [], []
+    leaves, states, names = [], [], []
     for group, state in (('physical', closed.physical), ('policy', closed.policy)):
         values = {}
         for f in fields(state):
@@ -89,10 +81,53 @@ def terminal_state_gradient(target, closed, step: int, horizon: int, *, mean_ris
                 if value.is_floating_point():
                     value = value.requires_grad_(True)
                     leaves.append(value)
+                    names.append(group + '.' + f.name)
             values[f.name] = value
         states.append(type(state)(**values))
+    return ResponseClosedLoopState(*states), leaves, names
+
+
+@torch.no_grad()
+def derivative_gradient_metrics(predicted, true, epsilon=1.e-8):
+    """Per-sample metrics in the SAME dimensionless field coordinates.
+
+    Zero true gradients have no defined direction/ratio: report their count,
+    without crediting them as perfect directional predictions.
+    """
+    predicted, true = predicted.detach().double(), true.detach().double()
+    if not bool(torch.isfinite(predicted).all() & torch.isfinite(true).all()):
+        raise Phase1ProbeError('derivative_metric_nonfinite', 'Critic or continuation gradient')
+    pn, tn = predicted.norm(dim=-1), true.norm(dim=-1)
+    valid = tn > epsilon
+    count = int(valid.sum())
+    return {'samples': len(tn), 'direction_samples': count, 'zero_true_samples': int((~valid).sum()),
+            'gradient_cosine': float(torch.nn.functional.cosine_similarity(predicted[valid], true[valid],
+                dim=-1, eps=epsilon).mean()) if count else None,
+            'norm_ratio': float((pn[valid]/tn[valid]).mean()) if count else None,
+            'lognorm_error': float((torch.log(pn[valid]+epsilon)-torch.log(tn[valid]+epsilon)).abs().mean()) if count else None,
+            'predicted_norm_mean': float(pn.mean()), 'true_norm_mean': float(tn.mean())}
+
+
+def terminal_state_gradient(target, closed, step: int, horizon: int, *, mean_risk: bool = True,
+                            weights=None) -> dict:
+    """d(weighted cumulative value)/dZ on independent dynamic leaves.
+
+    Pass the Actor's detached pooled CVaR weights unchanged (sum need not be
+    one). Omitted weights retain the historical scene-mean risk diagnostic.
+    mean_risk=False uses cumulative task units, with no H-t scaling.
+    """
+    if step == horizon:
+        return {"terminal_state_gradient_norm": 0., "terminal_component_state_gradient_norms": [0.] * (4 if mean_risk else 1)}
+    from response_critic import critic_features
+    state, leaves, _ = dynamic_closed_state(closed)
     scale = horizon - step if mean_risk else 1.
-    values = scale * target(critic_features(ResponseClosedLoopState(*states), step, horizon)).mean(0)
+    predicted = target(critic_features(state, step, horizon))
+    if weights is None:
+        values = scale * predicted.mean(0)
+    else:
+        if weights.shape != predicted.shape[:1]:
+            raise ValueError('terminal weights must have one entry per scene')
+        values = scale * (weights.detach()[:, None] * predicted).sum(0)
     norms = []
     for j in range(values.numel()):
         grads = torch.autograd.grad(values[j], leaves, retain_graph=j < values.numel() - 1, allow_unused=True)

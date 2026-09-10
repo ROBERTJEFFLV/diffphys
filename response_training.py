@@ -152,7 +152,13 @@ def critic_configuration(args):
         from response_value import TaskValueConfig
         return TaskValueConfig(window_steps=args.window_steps, lr=args.critic_lr,
             epochs=args.critic_epochs, batch_size=args.critic_batch_size,
-            target_tau=args.value_target_tau, gradient_clip=args.value_gradient_clip)
+            target_tau=args.value_target_tau, gradient_clip=args.value_gradient_clip,
+            derivative_state_group=args.value_derivative_state_group,
+            derivative_boundaries=tuple(args.value_derivative_boundaries),
+            derivative_samples=args.value_derivative_samples,
+            derivative_holdout_samples=args.value_derivative_holdout_samples,
+            derivative_batch_size=args.value_derivative_batch_size,
+            derivative_epsilon=args.value_derivative_epsilon)
     from response_critic import CriticConfig
     from response_proposals import SubspaceConfig
     return CriticConfig(phase1_probes=args.phase1_probes,
