@@ -140,31 +140,3 @@ def test_certified_petsc_sqp_step_uses_no_cg_and_keeps_fixed_clock(monkeypatch):
     assert step.stationarity_multiplier_kind == "raw-full-step"
     torch.testing.assert_close(step.boundaries[problem.fixed_boundary_mask],
                                 problem.boundaries[problem.fixed_boundary_mask], rtol=0, atol=0)
-
-
-def test_nonfinite_solve_rejects_response_proposal_and_preserves_json_evidence(monkeypatch):
-    pytest.importorskip("petsc4py")
-    from env_l2f import L2FParams, L2FSimulator
-    from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-    from response_shooting import task_shooting_step
-    from response_task import TaskLossConfig
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=2, hidden_dim=4)).double()
-    simulator = L2FSimulator(L2FParams())
-    initial = simulator.reset(2, device=torch.device("cpu"), dtype=torch.float64)
-    original = {name: value.clone() for name, value in policy.state_dict().items()}
-    def failed(problem, **kwargs):
-        return backend.PetscKKTResult(
-            torch.full_like(problem.theta, float("nan")),
-            torch.full_like(problem.boundaries, float("nan")),
-            torch.full_like(problem.boundaries, float("nan")),
-            False, 4, float("nan"), float("nan"), float("nan"), -9, False,
-        )
-    monkeypatch.setattr(backend, "solve_petsc_minres", failed)
-    evidence, _ = task_shooting_step(policy, simulator, initial, initial,
-                                     TaskLossConfig(prediction_weight=0),
-                                     segment_steps=2, segments=2, debug_solver=True)
-    assert not evidence["accepted"]
-    assert evidence["linear_solver_relative_residual"] is None
-    assert evidence["solver_debug"]["linear_solver_breakdown"]
-    json.dumps(evidence, allow_nan=False)
-    assert all(torch.equal(original[name], value) for name, value in policy.state_dict().items())

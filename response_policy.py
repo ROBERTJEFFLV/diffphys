@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-ARCHITECTURE = "response-conditioned-motor-policy-v1"
+ARCHITECTURE = "response-conditioned-motor-policy-v2-actor-only"
 OBSERVATION_DIM = 25
 
 
@@ -48,20 +48,11 @@ class ResponsePolicyState:
 class ResponsePolicyOutput:
     action: torch.Tensor
     next_state: ResponsePolicyState
-    response_prediction: torch.Tensor
     memory: torch.Tensor
 
 
 def body_vector(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
     return (rotation.transpose(-1, -2) @ vector.unsqueeze(-1)).squeeze(-1)
-
-
-def measured_response(before: torch.Tensor, after: torch.Tensor, dt: float) -> torch.Tensor:
-    """Aligned measured response to the command executed between two rows."""
-    rotation = before[:, 6:15].reshape(-1, 3, 3)
-    linear = body_vector(rotation, after[:, 3:6] - before[:, 3:6]) / (dt * 9.80665)
-    angular = (after[:, 15:18] - before[:, 15:18]) / (dt * 1000.0)
-    return torch.cat((linear, angular), -1)
 
 
 class ResponseMotorPolicy(nn.Module):
@@ -90,10 +81,6 @@ class ResponseMotorPolicy(nn.Module):
         # memory. There is no zero authorization multiplier on learned control.
         nn.init.xavier_uniform_(self.controller[-1].weight, gain=0.1)
         nn.init.zeros_(self.controller[-1].bias)
-        self.response_predictor = nn.Sequential(
-            nn.Linear(config.memory_dim + 19 + 4, config.hidden_dim),
-            nn.SiLU(), nn.Linear(config.hidden_dim, 6),
-        )
 
     def initial_state(self, observation: torch.Tensor) -> ResponsePolicyState:
         self._check_observation(observation)
@@ -173,7 +160,6 @@ class ResponseMotorPolicy(nn.Module):
             not bool(torch.isfinite(executed).all()) or bool((executed.abs() > 1).any())
         ):
             raise ValueError("executed actions must be finite and in [-1,1]")
-        prediction = self.response_predictor(torch.cat((memory, features, executed), -1))
         integral = (
             max(0.0, 1.0 - self.config.integral_leak * self.config.dt) * state.integral
             + self.config.dt * observation[:, :3]
@@ -182,7 +168,4 @@ class ResponseMotorPolicy(nn.Module):
             memory, integral, observation[:, 3:6], observation[:, 15:18], rotation,
             executed, executed_previous, state.calls + 1.0,
         )
-        return ResponsePolicyOutput(action, next_state, prediction, memory)
-
-    def forward_with_aux(self, observation, state=None, **kwargs) -> ResponsePolicyOutput:
-        return self.forward(observation, state, **kwargs)
+        return ResponsePolicyOutput(action, next_state, memory)

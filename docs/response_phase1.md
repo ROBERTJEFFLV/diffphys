@@ -1,5 +1,9 @@
 # Historical Phase 1 diagnostic: nominal airframe, candidate search
 
+> Historical experiment at `e6559deb`; its trainer/configuration has been retired.
+> The only current production response path is documented in
+> [response_control_v1.md](response_control_v1.md). Commands below require the historical revision.
+
 The current Phase 1 baseline is [task-value Actor–Critic with Adam](response_phase1_task_value.md).
 This document describes the preserved candidate-search experiment only.
 

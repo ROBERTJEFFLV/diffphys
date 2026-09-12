@@ -1,5 +1,14 @@
 # L2F-in-seconds
 
+## Current production response path
+
+`tools/train_response_control.py` trains `ResponseMotorPolicy` using exact H500
+backpropagation with H50 reverse-window rematerialization and one Adam update.
+There is no Critic, auxiliary prediction head or per-update candidate search.
+Use `configs/response_phase1_single_airframe.args`; see
+[the training and checkpoint contract](docs/response_control_v1.md).
+The baseline architectures and earlier experiments below are historical context.
+
 This folder contains a compact CUDA-tensor training chain derived from the current
 DiffPhys L2F CUDA work and reshaped to match the `diffphysDrone` recurrent control
 flow.
@@ -427,44 +436,3 @@ The Simulink scaffold can be generated from MATLAB with:
 addpath('matlab_l2f');
 build_l2f_simulink_model;
 ```
-# Primary method: response-conditioned task learning
-
-The primary experiment now jointly learns response memory and direct motor
-control from differentiable physical task rollouts, without Q2 action or JVP
-labels. Start with `tools/train_response_control.py`; see
-[`docs/response_critic_training.md`](docs/response_critic_training.md) for the
-current H500 / ten-H50 trainer. A training-only Risk-to-Go MLP supplies
-terminal risk gradients and learns from exact risk suffixes plus a few reachable
-motor perturbation rankings; the deployed Actor is unchanged. Two independent
-64-scene TRAIN banks determine one proposal. Short-window gradients define a
-subspace of at most five directions. Complete H500 TRAIN rollouts test both signs
-at two radii and select the best safe performance improvement; the selected
-candidate then faces both DEV banks. Hard gates cover angular danger, motor
-warning exposure and configured physical bounds, without requiring position or
-velocity risk components to improve independently. Completed Critic fits persist
-across Actor rejections. Consecutive failed proposals stop at `proposal_plateau`;
-normal training does not call finite differences or a local descent solver.
-MS and the finite-difference module remain diagnostic paths. Use
-`configs/response_risk_subspace.args` for the complete CUDA profile setup.
-
-The Critic uses dimensionless task/history state, six log-normalized control
-capabilities and external acceleration divided by gravity. It predicts mean future
-risk directly; Actor terminal terms multiply this by the remaining step count.
-No preliminary calibration or output-coordinate transform is required.
-The training performance loss contains only dense position, velocity, angular
-velocity, first action differences and the existing CVaR. Continuous evaluation
-criteria are unchanged. Every lower DEV cost refreshes `best.training.pt`, while
-`best_success.training.pt` preserves the actual highest-success Actor separately.
-
-`tools/run_structured_pipeline.py` and
-`tools/train_structured_full_space.py` select the new task method by default.
-Their old Q2 migration methods require `--historical-q2-distillation`.
-Historical V4/V5 failures, reports, and validation-consumption records are
-preserved and do not certify this new method.
-
-The short-window trainer has deterministic CPU correctness tests. Learned
-performance and CUDA throughput require separate experiment evidence; passing
-unit tests does not establish flight safety, near-optimal control, or
-calibration-free real motor commands.
-The current simulator action interface is airframe-normalized around hover.
-The remaining sections below describe the earlier baseline and experiments.

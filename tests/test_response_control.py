@@ -6,11 +6,29 @@ import torch
 from env_l2f import L2FParams, L2FSimulator
 from full_space_shooting import BoundaryLayout, FullSpaceProblem, solve_joint_sqp_step, so3_exp
 from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_shooting import PolicyVector, make_problem
 from response_task import (
-    TaskLossConfig, concatenate, initialize, observation, prediction_residual,
+    TaskLossConfig, concatenate, initialize, observation,
     rollout, sample_scenarios, task_loss,
 )
+
+
+class PolicyVector:
+    """Test-only functional parameter packing; no training solver dependency."""
+    def __init__(self, policy):
+        self.items = [(name, p.shape, p.numel()) for name, p in policy.named_parameters()]
+
+    def flatten(self, policy):
+        return torch.nn.utils.parameters_to_vector(policy.parameters())
+
+    def mapping(self, vector):
+        result, start = {}, 0
+        for name, shape, count in self.items:
+            result[name] = vector[start:start+count].reshape(shape)
+            start += count
+        return result
+
+    def install(self, policy, vector):
+        torch.nn.utils.vector_to_parameters(vector, policy.parameters())
 
 
 def fixture(dtype=torch.float64):
@@ -31,7 +49,7 @@ def fixture(dtype=torch.float64):
 def test_task_loss_updates_memory_and_controller_without_teacher():
     policy, simulator, physical = fixture()
     trace = rollout(policy, simulator, physical, 8)
-    loss = task_loss(trace, TaskLossConfig(prediction_weight=0))
+    loss = task_loss(trace, TaskLossConfig())
     loss.backward()
     for prefix in ("response_encoder.", "response_memory.", "controller."):
         values = [p.grad for name, p in policy.named_parameters() if name.startswith(prefix)]
@@ -45,7 +63,7 @@ def test_short_rollout_task_directional_gradient_matches_finite_difference():
     theta = vector.flatten(policy).detach().requires_grad_(True)
     direction = torch.linspace(-1, 1, theta.numel(), dtype=theta.dtype)
     direction = direction / direction.norm()
-    config = TaskLossConfig(prediction_weight=0)
+    config = TaskLossConfig()
     def value(parameters):
         return task_loss(rollout(policy, simulator, physical, 5,
                                  parameters=vector.mapping(parameters)), config)
@@ -69,17 +87,6 @@ def test_early_executed_action_affects_later_response_memory_and_task():
     assert float(memory_gradient.abs().max()) > 1.0e-12
     assert float(terminal_gradient.abs().max()) > 1.0e-12
     assert float(trace.end.policy.calls.min()) == 6
-
-
-def test_auxiliary_prediction_does_not_train_actor_to_make_targets_easy():
-    policy, simulator, physical = fixture()
-    trace = rollout(policy, simulator, physical, 6)
-    auxiliary = prediction_residual(policy, trace.observations, trace.actions).square().sum()
-    actor = list(policy.controller.parameters())
-    gradients = torch.autograd.grad(auxiliary, actor, allow_unused=True, retain_graph=True)
-    assert all(value is None or not bool(value.any()) for value in gradients)
-    memory = torch.autograd.grad(auxiliary, list(policy.response_memory.parameters()), allow_unused=True)
-    assert any(value is not None and float(value.abs().max()) > 0 for value in memory)
 
 
 def test_actual_action_advance_uses_same_input_and_consumes_one_call():
@@ -106,7 +113,7 @@ def test_deployment_step_loop_and_training_rollout_are_identical():
     actions = []
     for _ in range(8):
         obs = observation(closed.physical, closed.policy.integral)
-        output = policy.forward_with_aux(obs, closed.policy)
+        output = policy(obs, closed.policy)
         physical_next = simulator.step(closed.physical, output.action, grad_decay=1.)
         closed = type(closed)(physical_next, output.next_state)
         actions.append(output.action)
@@ -171,25 +178,6 @@ def test_sampling_is_stratified_and_does_not_change_model_rng():
     _, cells = sample_scenarios(16, seed=31_000_007)
     assert torch.equal(before, torch.get_rng_state())
     assert len(set(map(tuple, cells.tolist()))) == 16
-
-
-def test_ms_includes_startup_all_parameters_and_dynamic_action_history():
-    policy, simulator, physical = fixture()
-    problem, codec, vector = make_problem(
-        policy, simulator, physical, TaskLossConfig(prediction_weight=0),
-        segment_steps=2, segments=2,
-    )
-    assert float(problem.initial[:, codec.clock_index].max()) == 0
-    assert set(vector.names) == {name for name, _ in policy.named_parameters()}
-    assert bool(problem.fixed_boundary_mask[..., codec.clock_index].all())
-    assert int(problem.fixed_boundary_mask[0, 0].sum()) == 1
-    assert not bool(problem.fixed_boundary_mask[..., 16:20].any())
-    assert not bool(problem.fixed_boundary_mask[..., 32+policy.config.memory_dim:36+policy.config.memory_dim].any())
-    assert float(problem.defects().abs().max()) < 1e-7
-    gradient = torch.autograd.grad(problem.task_values().square().sum(), problem.theta)[0]
-    mapped = vector.mapping(gradient)
-    assert any(float(value.abs().max()) > 0 for name, value in mapped.items()
-               if name.startswith("response_memory."))
 
 
 def test_joint_solver_keeps_fixed_clock_in_its_internal_problem():

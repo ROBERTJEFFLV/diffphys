@@ -10,7 +10,7 @@ from torch.nn.utils.stateless import functional_call
 
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import (
-    ResponseMotorPolicy, ResponsePolicyState, body_vector, measured_response,
+    ResponseMotorPolicy, ResponsePolicyState, body_vector,
 )
 
 
@@ -26,7 +26,6 @@ class TaskLossConfig:
     steady_steps: int = 100
     tail_weight: float = 0.5
     tail_fraction: float = 0.2
-    prediction_weight: float = 0.01
     huber_delta: float = 1.0
 
     def __post_init__(self) -> None:
@@ -39,49 +38,6 @@ class TaskLossConfig:
             raise ValueError("invalid steady window or CVaR tail fraction")
         if not math.isfinite(self.huber_delta) or self.huber_delta < 0:
             raise ValueError("Huber delta must be finite and non-negative (0 selects historical squares)")
-
-
-@dataclass(frozen=True)
-class RiskConfig:
-    """Fixed hover operating limits, independent of task precision weights.
-
-    These are configurable engineering starting points, not certified limits.
-    Risk is an undiscounted sum of per-transition dimensionless barriers.
-    """
-    position_limit: float = 5.0
-    velocity_limit: float = 5.0
-    omega_limit: float = 10.0
-    saturation_limit: float = 0.95
-    sharpness: float = 10.0
-
-    def __post_init__(self) -> None:
-        if any(not math.isfinite(getattr(self, f.name)) or getattr(self, f.name) <= 0
-               for f in fields(self)):
-            raise ValueError("risk limits and sharpness must be finite and positive")
-        if self.saturation_limit >= 1:
-            raise ValueError("risk saturation warning must be below normalized hard command limit 1")
-
-
-@dataclass(frozen=True)
-class HardRiskConfig:
-    """Declared acceptance budgets and optional flight envelope, not FD tolerances.
-
-    Bounds are opt-in physical operating limits. Tracking error scales must not
-    silently become a geofence. Tiny absolute slack is in summed risk units.
-    """
-    relative_tolerance: float = .002
-    absolute_tolerance: float = 1.e-8
-    position_bound: Optional[float] = None
-    velocity_bound: Optional[float] = None
-
-    def __post_init__(self):
-        if not math.isfinite(self.relative_tolerance) or not 0 <= self.relative_tolerance < 1:
-            raise ValueError("hard risk relative tolerance must lie in [0, 1)")
-        if not math.isfinite(self.absolute_tolerance) or self.absolute_tolerance < 0:
-            raise ValueError("hard risk absolute tolerance must be finite and nonnegative")
-        if any(value is not None and (not math.isfinite(value) or value <= 0)
-               for value in (self.position_bound, self.velocity_bound)):
-            raise ValueError("configured flight bounds must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -220,94 +176,25 @@ def step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
     return weighted_task_features(trajectory, config, start=start, horizon=horizon).square().sum(-1)
 
 
-def training_loss_config(config: TaskLossConfig) -> TaskLossConfig:
-    """Dense p/v/omega and first action differences, with the existing CVaR.
-
-    Preserve retained weights, Huber curvature, half-range motor scaling and
-    horizon normalization. Evaluation continues to use the original config.
-    """
-    return replace(config, action_weight=0., omega_delta_weight=0., steady_weight=0., prediction_weight=0.)
-
-
-def training_step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
-    return step_costs(trajectory, training_loss_config(config), start=start, horizon=horizon)
-
-
-def training_task_loss(trajectory, config: TaskLossConfig) -> torch.Tensor:
-    return task_loss(trajectory, training_loss_config(config))
-
-
-def risk_components(trajectory, config: RiskConfig, *, position_reference=0.,
-                    velocity_reference=0., omega_reference=0.) -> dict[str, torch.Tensor]:
-    """[time, scene] barriers on task errors and normalized command saturation.
-
-    Hover references are zero. A future tracking task must supply its references
-    consistently in collection, continuation, Actor loss and acceptance.
-    """
-    def barrier(magnitude, limit):
-        return torch.nn.functional.softplus(config.sharpness * (magnitude / limit - 1)) / config.sharpness
-
+def warning_risk_steps(trajectory) -> dict[str, torch.Tensor]:
+    """Unchanged hover warning exposure, used only as a physical observation."""
     return {
-        "position": barrier((trajectory.positions - position_reference).norm(dim=-1), config.position_limit),
-        "velocity": barrier((trajectory.velocities - velocity_reference).norm(dim=-1), config.velocity_limit),
-        "omega": barrier((trajectory.omegas - omega_reference).norm(dim=-1), config.omega_limit),
-        # Normal control effort remains a soft task cost. Safety risk starts
-        # only in the warning band, and reaches one at the hard command limit.
-        "saturation": ((trajectory.actions.abs() - config.saturation_limit)
-                       / (1 - config.saturation_limit)).clamp_min(0).square().mean(-1),
+        "omega": (trajectory.omegas.detach().norm(dim=-1) / 10.0 - 1).clamp_min(0).square(),
+        "saturation": ((trajectory.actions.detach().abs() - .95) / (1.0 - .95))
+                      .clamp_min(0).square().mean(-1),
     }
 
 
-def step_risks(trajectory, config: RiskConfig, **references) -> torch.Tensor:
-    return torch.stack(tuple(risk_components(trajectory, config, **references).values())).sum(0)
-
-
-def suffix_risks(risks: torch.Tensor) -> torch.Tensor:
-    """Exact remaining risk at Z_0 ... Z_H; b_t belongs to Z_t -> Z_{t+1}."""
-    return torch.cat((risks.flip(0).cumsum(0).flip(0), torch.zeros_like(risks[:1])))
-
-
-def physical_risk_metrics(trajectory, config: RiskConfig, loss_config: TaskLossConfig) -> dict:
-    """Real flight risk, with independent full-flight mean+CVaR per component."""
-    components = {name: value.detach().sum(0) for name, value in risk_components(trajectory, config).items()}
-    total = torch.stack(tuple(components.values())).sum(0)
-
-    def aggregate(value):
-        count = max(1, math.ceil(loss_config.tail_fraction * value.numel()))
-        return float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
-
-    return {"risk_objective": aggregate(total),
-            "risk_components": {name: aggregate(value) for name, value in components.items()}}
-
-
-def hard_risk_metrics(trajectory, config: RiskConfig, loss_config: TaskLossConfig,
-                      hard_config: HardRiskConfig, *, omega_reference=0.) -> dict:
-    """Real warning-zone exposure only; position/velocity are performance costs.
-
-    Keep the established full-flight mean+CVaR aggregation. Both danger terms
-    are exactly zero below their physical warning limits. Optional envelope
-    violations are checked directly over every scene/time, including startup.
-    """
-    omega = (trajectory.omegas.detach() - omega_reference).norm(dim=-1)
-    components = {
-        "omega": (omega / config.omega_limit - 1).clamp_min(0).square(),
-        "saturation": ((trajectory.actions.detach().abs() - config.saturation_limit)
-                       / (1 - config.saturation_limit)).clamp_min(0).square().mean(-1),
-    }
-    values = {name: value.sum(0) for name, value in components.items()}
-    count = max(1, math.ceil(loss_config.tail_fraction * omega.shape[1]))
+def hard_risk_metrics(trajectory, loss_config: TaskLossConfig) -> dict:
+    risks = {name: value.sum(0) for name, value in warning_risk_steps(trajectory).items()}
+    count = max(1, math.ceil(loss_config.tail_fraction * trajectory.actions.shape[1]))
     risks = {name: float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
-             for name, value in values.items()}
+             for name, value in risks.items()}
     position = torch.cat((trajectory.observations[:1, ..., :3], trajectory.positions)).detach().norm(dim=-1)
     velocity = torch.cat((trajectory.observations[:1, ..., 3:6], trajectory.velocities)).detach().norm(dim=-1)
-    violated = [name for name, value, limit in (
-        ("position", position, hard_config.position_bound),
-        ("velocity", velocity, hard_config.velocity_bound),
-    ) if limit is not None and bool((value > limit).any())]
-    if bool((trajectory.actions.detach().abs() > 1.).any()):
-        violated.append("action_limit")
-    return {"hard_risk_components": risks, "hard_risk_bounds_violated": violated,
-            "hard_risk_peaks": {"omega": float(omega.max()), "action_abs": float(trajectory.actions.detach().abs().max()),
+    return {"hard_risk_components": risks,
+            "hard_risk_peaks": {"omega": float(trajectory.omegas.detach().norm(dim=-1).max()),
+                                "action_abs": float(trajectory.actions.detach().abs().max()),
                                 "position": float(position.max()), "velocity": float(velocity.max())}}
 
 
@@ -335,29 +222,6 @@ def task_residual(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.T
 
 def task_loss(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
     return 0.5 * task_residual(trajectory, config).square().sum()
-
-
-def prediction_residual(policy, observations, actions, *, parameters=None) -> torch.Tensor:
-    """Fixed self-collected response supervision, with NO actor-label target.
-
-    Detaching observations/actions here prevents the actor making the prediction
-    problem artificially easy. Memory remains differentiable through the record.
-    The separate task rollout keeps the complete action/physics/memory gradient.
-    """
-    observations, actions = observations.detach(), actions.detach()
-    if observations.shape[0] != actions.shape[0] + 1:
-        raise ValueError("H executed actions require H+1 observation rows")
-    state = policy.initial_state(observations[0])
-    errors = []
-    for step in range(actions.shape[0]):
-        output = policy_step(
-            policy, observations[step], state, parameters,
-            applied_action=actions[step],
-        )
-        target = measured_response(observations[step], observations[step + 1], policy.config.dt)
-        errors.append(output.response_prediction - target)
-        state = output.next_state
-    return torch.stack(errors).reshape(-1) / math.sqrt(actions.shape[0] * actions.shape[1] * 6)
 
 
 def sample_scenarios(
@@ -443,3 +307,57 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
         "finite": bool(finite.all()), "success_count": sum(r["success"] for r in rows),
         "scenario_count": len(rows), "scenarios": rows,
     }
+
+
+def task_loss_components(trajectory, config, *, start=0, horizon=None, weights=None):
+    """Additive attribution of the existing task objective, including its CVaR."""
+    features = weighted_task_features(trajectory, config, start=start, horizon=horizon).square()
+    if weights is None:
+        weights = risk_weights(features.sum(dim=(0, 2)), config)
+    return {name: float((weights * features[:, :, section].sum(dim=(0, 2))).sum().detach())
+            for name, section in (('position', slice(0, 3)), ('velocity', slice(3, 6)),
+                                  ('omega', slice(6, 9)), ('regularization', slice(9, None)))}
+
+
+class FlightStatistics:
+    """Streaming observations; no trajectory, labels or training gates retained."""
+
+    def __init__(self, initial, horizon, config):
+        self.horizon, self.config = horizon, config
+        self.squares = initial.position.new_zeros(3, initial.position.shape[0])
+        self.saturation = self.squares[0].clone()
+        self.success = torch.ones_like(self.saturation, dtype=torch.bool)
+        self.components = initial.position.new_zeros(4, initial.position.shape[0])
+        self.risks = initial.position.new_zeros(2, initial.position.shape[0])
+
+    @torch.no_grad()
+    def add(self, trace, start):
+        magnitudes = torch.stack([x.norm(dim=-1) for x in
+                                  (trace.positions, trace.velocities, trace.omegas)])
+        values = [magnitudes, trace.actions]
+        values += [getattr(s, f.name) for s in (trace.end.physical, trace.end.policy) for f in fields(s)]
+        if not all(bool(torch.isfinite(x).all()) for x in values):
+            raise FloatingPointError('nonfinite continuous closed-loop state')
+        self.squares.add_(magnitudes.square().sum(1))
+        self.saturation.add_((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2).sum(0))
+        tail_start = max(0, self.horizon-min(self.config.steady_steps, self.horizon)-start)
+        p, v, w = magnitudes[:, tail_start:]
+        self.success &= ((p < .05) & (v < .1) & (w < .5)).all(0)
+        features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
+        for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9), slice(9, None))):
+            self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))
+        for i, value in enumerate(warning_risk_steps(trace).values()):
+            self.risks[i].add_(value.sum(0))
+
+    def finish(self, costs, weights):
+        result = {name: float((self.squares[i].mean()/self.horizon).sqrt())
+                  for i, name in enumerate(('position_rms', 'velocity_rms', 'omega_rms'))}
+        result.update(task_objective=float((costs*weights).sum()), finite=True,
+                      steady_success_rate=float(self.success.float().mean()),
+                      success_count=int(self.success.sum()), scenario_count=costs.numel(),
+                      motor_saturation_fraction=float(self.saturation.mean()/self.horizon),
+                      task_components={name: float((self.components[i]*weights).sum())
+                                       for i, name in enumerate(('position','velocity','omega','regularization'))},
+                      omega_risk=float((self.risks[0]*risk_weights(self.risks[0], self.config)).sum()),
+                      saturation_risk=float((self.risks[1]*risk_weights(self.risks[1], self.config)).sum()))
+        return result

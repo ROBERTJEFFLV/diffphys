@@ -1,4 +1,4 @@
-"""A/B dense-oracle validation of the reduced PETSc backend; no training."""
+"""Artificial dense-oracle validation of the historical PETSc backend; no response training."""
 from __future__ import annotations
 
 import argparse
@@ -14,12 +14,8 @@ if str(ROOT) not in sys.path:
 
 import torch
 
-from env_l2f import L2FParams, L2FSimulator
 from full_space_shooting import BoundaryLayout, FullSpaceProblem
 from petsc_kkt_solver import ReducedKKTLayout, TorchKKTContext, require_petsc, solve_petsc_minres
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_shooting import make_problem
-from response_task import TaskLossConfig
 
 
 def artificial_problem(device="cpu"):
@@ -41,30 +37,6 @@ def artificial_problem(device="cpu"):
     fixed[..., -1] = True
     return FullSpaceProblem(initial, boundaries, theta, segment, BoundaryLayout(13),
                             task_residual=task, fixed_boundary_mask=fixed)
-
-
-def tiny_response_problem(device="cpu"):
-    torch.manual_seed(7)
-    simulator = L2FSimulator(L2FParams())
-    initial = simulator.reset(2, device=torch.device(device), dtype=torch.float64)
-    initial = replace(initial,
-        position=initial.position.new_tensor(((.3, -.2, .4), (-.4, .1, .2))),
-        velocity=initial.velocity.new_tensor(((.1, .2, -.1), (-.2, .1, .2))),
-        rotation=torch.eye(3, device=device, dtype=torch.float64).repeat(2, 1, 1),
-        omega=initial.omega.new_tensor(((.2, -.1, .3), (-.1, .2, -.2))),
-        motor=torch.zeros_like(initial.motor), previous_action=torch.zeros_like(initial.previous_action),
-    )
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=2, hidden_dim=4)).to(
-        device=device, dtype=torch.float64
-    )
-    problem, codec, _ = make_problem(policy, simulator, initial, TaskLossConfig(steady_steps=4),
-                                     segment_steps=2, segments=2)
-    # Nonzero dynamic defects test the constraint RHS and multiplier sign.
-    perturbation = torch.linspace(-1., 1., problem.boundaries.numel(), device=device,
-                                  dtype=torch.float64).reshape_as(problem.boundaries) * 1.0e-4
-    perturbation[problem.fixed_boundary_mask] = 0
-    problem = replace(problem, boundaries=problem.boundaries.detach() + perturbation)
-    return problem, codec.characteristic_scales()
 
 
 def dense_oracle(problem, damping):
@@ -137,14 +109,9 @@ def main(argv=None):
     results = []
     results.append(check_problem(artificial_problem(args.device), label="A"))
     print(json.dumps(results[-1]), flush=True)
-    if results[-1]["passed"]:
-        problem, scale = tiny_response_problem(args.device)
-        results.append(check_problem(problem, damping=1., boundary_scale=scale, label="B"))
-        print(json.dumps(results[-1]), flush=True)
-    from response_training import source_hash
     report = {"petsc_version": petsc.Sys.getVersion(), "torch_version": str(torch.__version__),
-              "source_sha256": source_hash(), "results": results,
-              "passed": len(results) == 2 and all(row["passed"] for row in results),
+              "results": results,
+              "passed": len(results) == 1 and all(row["passed"] for row in results),
               "training_executed": False}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")

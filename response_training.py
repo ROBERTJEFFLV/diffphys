@@ -1,12 +1,14 @@
-"""Versioned teacher-free research training, evaluation, and resumable state."""
+"""One production path: exact rematerialized H500 BPTT and persistent Adam."""
+
 from __future__ import annotations
 
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, fields
 import copy
 import hashlib
 import json
 import math
 import os
+import pickle
 from pathlib import Path
 import random
 import signal
@@ -19,59 +21,62 @@ import torch
 
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
-from response_execution import BUSINESS_STOPS, exit_class, training_summary
 from response_task import (
-    RiskConfig, HardRiskConfig, TaskLossConfig, observation, physical_risk_metrics, hard_risk_metrics, prediction_residual, rollout, sample_scenarios,
-    scenario_costs, task_loss, trajectory_metrics, initialize, training_task_loss, training_loss_config,
+    TaskLossConfig,
+    sample_scenarios,
+    rollout,
+    trajectory_metrics,
+    task_loss_components,
+    hard_risk_metrics,
 )
+from response_adjoints import collect_boundary_rollout, backward_actor
+from response_execution import exit_class
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL_VERSION = "response-control-task-v1"
+PROTOCOL_VERSION = "response-actor-only-exact-v2"
 TRAIN_SEED_BASE = 31_000_007
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
-MS_ACCEPTANCE_SEED = 33_000_007
 FINAL_SEEDS = (34_000_007, 34_010_007)
-FINAL_HORIZONS = (125, 500, 1000)
-FINAL_CLAIM = ROOT / "reports" / "response_control_v1_final_claim.json"
 SOURCE_FILES = (
-    "response_policy.py", "response_task.py", "response_shooting.py",
-    "response_training.py", "tools/train_response_control.py",
-    "env_l2f.py", "full_space_shooting.py", "petsc_kkt_solver.py",
-    "tools/check_response_training_contract.py", "tools/check_response_preflight.py",
-    "response_critic.py", "response_proposals.py", "response_execution.py", "response_phase1.py",
-    "response_value.py", "response_value_training.py", "response_adjoints.py",
+    "response_policy.py",
+    "response_task.py",
+    "response_adjoints.py",
+    "response_training.py",
+    "response_execution.py",
+    "env_l2f.py",
+    "tools/train_response_control.py",
 )
 
 
-def file_hash(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def file_hash(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def model_hash(policy) -> str:
-    digest = hashlib.sha256()
-    for name, value in sorted(policy.state_dict().items()):
-        value = value.detach().cpu().contiguous()
-        digest.update(name.encode("ascii"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.numpy().tobytes())
-    return digest.hexdigest()
-
-
-def source_hash() -> str:
+def source_hash():
     digest = hashlib.sha256()
     for name in SOURCE_FILES:
-        digest.update(name.encode("ascii"))
+        digest.update(name.encode())
         digest.update((ROOT / name).read_bytes())
     return digest.hexdigest()
 
 
-def atomic_torch(path: Path, value) -> None:
+def model_hash(policy):
+    digest = hashlib.sha256()
+    for name, value in sorted(policy.state_dict().items()):
+        value = value.detach().cpu().contiguous()
+        for metadata in (name, str(value.dtype), str(tuple(value.shape))):
+            digest.update(metadata.encode())
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _atomic(path, write):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     try:
         with os.fdopen(fd, "wb") as stream:
-            torch.save(value, stream)
+            write(stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -80,1044 +85,561 @@ def atomic_torch(path: Path, value) -> None:
             os.unlink(temporary)
 
 
-def atomic_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+def atomic_torch(path, value):
+    _atomic(path, lambda stream: torch.save(value, stream))
 
 
-def capture_rng() -> dict:
+def atomic_json(path, value):
+    data = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    _atomic(path, lambda stream: stream.write(data.encode()))
+
+
+def capture_rng():
+    name, keys, pos, gaussian, cached = np.random.get_state()
     return {
-        "python": random.getstate(), "numpy": np.random.get_state(),
+        "python": random.getstate(),
+        "numpy": [name, keys.tolist(), pos, gaussian, cached],
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
 
 
-def restore_rng(state: dict) -> None:
+def restore_rng(state):
     random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
+    name, keys, pos, gaussian, cached = state["numpy"]
+    np.random.set_state((name, np.asarray(keys, dtype=np.uint32), pos, gaussian, cached))
     torch.set_rng_state(state["torch"].cpu())
     if state["cuda"]:
         if not torch.cuda.is_available():
-            raise RuntimeError("this exact RNG resume requires CUDA")
-        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+            raise RuntimeError("exact resume of CUDA RNG requires CUDA")
+        torch.cuda.set_rng_state_all([x.cpu() for x in state["cuda"]])
 
 
-def protocol(policy_config, loss_config, scenarios, scenario_mode="physical-fit") -> dict:
-    return {
-        "version": PROTOCOL_VERSION, "architecture": ARCHITECTURE,
-        "model_training_seed": 7, "train_scenario_seed_base": TRAIN_SEED_BASE,
-        "development_seeds": list(DEVELOPMENT_SEEDS),
-        "ms_acceptance_seed": MS_ACCEPTANCE_SEED,
-        "final_seeds": list(FINAL_SEEDS), "final_horizons": list(FINAL_HORIZONS),
-        "scenarios_per_bank": scenarios, "scenario_mode": scenario_mode,
-        "stratification": "4x4 TW/log-roll-authority" if scenario_mode == "physical-fit" else "none; random initial kinematics",
-        "policy": asdict(policy_config), "loss": asdict(loss_config),
-        "observation": "world-p/world-v/R/body-omega/body-integral/executed-previous-action",
-        "action_mapping": "normalized_per-airframe_hover_relative; zero is hover without external force",
-        "action_mapping_requires_airframe_calibration_for_real_actuators": True,
-        "startup": "memory updates from the first completed transition; no capability publication gate",
-        "success": {"position": 0.05, "velocity": 0.10, "full_omega": 0.50,
-                    "consecutive_steps": loss_config.steady_steps},
-        "parameter_family": ("registered physical-fit simulator, fixed dynamics per episode"
-                             if scenario_mode == "physical-fit" else "nominal L2F fixed dynamics, zero external force"),
-        "no_absolute_yaw_or_horizontal_attitude_objective": True,
-        "formal_v5_freeze_not_a_prerequisite_or_certificate": True,
-        "deployment_authorized": False,
+def migrate_actor_weights(policy, state):
+    """Drop only the known unused head; all effective weights remain strict."""
+    expected = policy.state_dict()
+    extra = set(state) - set(expected)
+    h, m = policy.config.hidden_dim, policy.config.memory_dim
+    head_shapes = {
+        "response_predictor.0.weight": (h, m + 23),
+        "response_predictor.0.bias": (h,),
+        "response_predictor.2.weight": (6, h),
+        "response_predictor.2.bias": (6,),
     }
+    if set(expected) - set(state) or (extra and extra != set(head_shapes)):
+        raise ValueError("unknown or missing Actor keys; only response_predictor may be removed")
+    for name in extra:
+        if tuple(state[name].shape) != head_shapes[name]:
+            raise ValueError("unexpected legacy prediction head shape")
+    if any(
+        state[n].shape != v.shape or not bool(torch.isfinite(state[n]).all())
+        for n, v in expected.items()
+    ):
+        raise ValueError("Actor tensor shape mismatch or nonfinite weights")
+    policy.load_state_dict({n: state[n] for n in expected}, strict=True)
 
 
-def training_batch_count(args) -> int:
-    """Short-window proposals pool exactly two independent stratified banks."""
-    if args.optimizer in ("short-window", "task-adam"):
-        return 2
-    count = getattr(args, "adam_train_batches", 2) if args.optimizer == "adam" else 1
-    if count < 1:
-        raise ValueError("training batches must be positive")
-    return count
+def load_legacy_checkpoint(path):
+    """Explicit trusted local import; map only NumPy's known private rename."""
+    class NumpyCompatibleUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == 'numpy._core.multiarray' and name in ('_reconstruct', 'scalar'):
+                return getattr(np.core.multiarray, name)
+            return super().find_class(module, name)
+
+    compatibility = SimpleNamespace(__name__='legacy_numpy_pickle',
+                                    Unpickler=NumpyCompatibleUnpickler, load=pickle.load)
+    return torch.load(path, map_location='cpu', weights_only=False, pickle_module=compatibility)
 
 
-def critic_configuration(args):
-    if args.optimizer == "task-adam":
-        from response_value import TaskValueConfig
-        return TaskValueConfig(window_steps=args.window_steps, lr=args.critic_lr,
-            epochs=args.critic_epochs, batch_size=args.critic_batch_size,
-            target_tau=args.value_target_tau, gradient_clip=args.value_gradient_clip,
-            derivative_state_groups=tuple(args.value_derivative_state_groups),
-            derivative_boundaries=tuple(args.value_derivative_boundaries),
-            derivative_holdout_scenes=args.value_derivative_holdout_scenes,
-            derivative_batch_size=args.value_derivative_batch_size,
-            derivative_epsilon=args.value_derivative_epsilon,
-            derivative_balance_mode=args.value_derivative_balance_mode,
-            terminal_mode=args.value_terminal_mode,
-            warmup_max_fits=args.value_warmup_max_fits, warmup_max_seconds=args.value_warmup_max_seconds,
-            ready_min_cosine=args.value_ready_min_cosine, ready_max_relative_error=args.value_ready_max_relative_error)
-    from response_critic import CriticConfig
-    from response_proposals import SubspaceConfig
-    return CriticConfig(phase1_probes=args.phase1_probes,
-                        acceptance_mode="train-objective" if args.phase1_train_only else "train-and-dev",
-                        window_steps=args.window_steps, lr=args.critic_lr,
-                        epochs=args.critic_epochs, batch_size=args.critic_batch_size,
-                        dev_relative_tolerance=args.critic_dev_relative_tolerance,
-                        risk=RiskConfig(**{f.name: getattr(args, "risk_" + f.name) for f in fields(RiskConfig)}),
-                        risk_weight=args.risk_weight, risk_smoothmax_beta=args.risk_smoothmax_beta,
-                        hard_risk=HardRiskConfig(relative_tolerance=args.hard_risk_relative_tolerance,
-                            absolute_tolerance=args.hard_risk_absolute_tolerance,
-                            position_bound=args.hard_position_bound, velocity_bound=args.hard_velocity_bound),
-                        direction_samples=args.critic_direction_samples,
-                        direction_epsilon=args.critic_direction_epsilon,
-                        direction_weight=args.critic_direction_weight,
-                        direction_temperature=args.critic_direction_temperature,
-                        direction_min_gap=args.critic_direction_min_gap,
-                        proposal=args.actor_proposal,
-                        subspace=SubspaceConfig(parameter_relative_step=args.subspace_parameter_relative_step))
+def optimizer_parameter_names(policy, optimizer):
+    names = {id(p): n for n, p in policy.named_parameters()}
+    return [[names[id(p)] for p in group["params"]] for group in optimizer.param_groups]
 
 
-def record_development_selection(progress, report, min_relative_improvement):
-    """Separate exact checkpoint selection from accumulated patience progress."""
-    score, success = report["score"], report["steady_success_rate"]
-    cost_best = progress.get("best_score") is None or score < progress["best_score"]
-    success_best = progress.get("best_success_rate") is None or success > progress["best_success_rate"] or (
-        success == progress["best_success_rate"] and score < progress["best_success_score"])
-    reference = progress.get("significant_score")
-    if reference is None or score < reference * (1 - min_relative_improvement):
-        progress.update(significant_score=score, bad_checks=0)
-    else:
-        progress["bad_checks"] += 1
-    if cost_best:
-        progress.update(best_score=score, best_update=progress["updates"], best_omega_rms=report["omega_rms"])
-    if success_best:
-        progress.update(best_success_rate=success, best_success_score=score, best_success_update=progress["updates"])
-    return {"cost": cost_best, "success": success_best}
-
-
-def actor_optimizer(args, policy):
-    if args.optimizer == "task-adam":
-        return torch.optim.Adam(policy.parameters(), lr=args.lr)
-    if args.optimizer == "full-space-ms" or (args.optimizer == "short-window" and args.actor_proposal == "physics-subspace"):
-        return None
-    return torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-
-def sample_training_scenarios(
-    scenarios: int, attempt_index: int, *, batches: int, dt: float,
-    device: torch.device, dtype: torch.dtype, scenario_mode: str = "physical-fit",
-) -> tuple[L2FState, list[int]]:
-    """Pool independent, stratified TRAIN banks before any policy update.
-
-    Concatenating physical initial states preserves per-episode recurrent
-    initialization. The existing task loss then selects its CVaR tail over
-    the entire pooled rollout, not independently within each bank.
-    """
-    if attempt_index < 0 or batches < 1:
-        raise ValueError("invalid TRAIN attempt index or bank count")
-    seeds = [TRAIN_SEED_BASE + batches * attempt_index + bank for bank in range(batches)]
-    reserved_start = min((*DEVELOPMENT_SEEDS, MS_ACCEPTANCE_SEED, *FINAL_SEEDS))
-    if seeds[-1] >= reserved_start:
-        raise ValueError("TRAIN sampling budget would enter the reserved DEV/FINAL seed range")
-    states = [
-        sample_scenarios(scenarios, seed=seed, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode)[0]
-        for seed in seeds
-    ]
-    if len(states) == 1:
-        return states[0], seeds
-    pooled = L2FState(**{
-        field.name: torch.cat([getattr(state, field.name) for state in states], dim=0)
-        for field in fields(states[0])
-    })
-    return pooled, seeds
-
-
-def binding(args, policy_config, loss_config) -> dict:
-    batches = training_batch_count(args)
-    return {
-        "source_sha256": source_hash(), "protocol": protocol(policy_config, loss_config, args.scenarios, args.scenario_mode),
-        "training_loss": asdict(training_loss_config(loss_config)) if args.optimizer != "full-space-ms" else asdict(loss_config),
-        "optimizer": args.optimizer, "horizon": args.horizon, "segments": args.segments,
-        "critic": asdict(critic_configuration(args)) if args.optimizer == "short-window" else None,
-        "training_sampling": {
-            "batches_per_proposal": batches,
-            "scenarios_per_bank": args.scenarios,
-            "scenarios_per_proposal": batches * args.scenarios,
-            "seed_rule": "TRAIN_SEED_BASE + batches_per_proposal * zero_based_attempt + bank_index",
-            "risk_aggregation": "mean_and_CVaR_over_all_proposal_scenarios",
-        },
-        "segment_steps": args.segment_steps, "lr": args.lr,
-        "weight_decay": args.weight_decay, "gradient_clip": args.gradient_clip,
-        "device": args.device, "dtype": args.dtype, "torch_version": str(torch.__version__),
-        "linear_solver": args.linear_solver, "kkt_rtol": args.kkt_rtol,
-        "kkt_atol": args.kkt_atol, "kkt_max_iterations": args.kkt_max_iterations,
-        "kkt_preconditioner": args.kkt_preconditioner, "kkt_curvature_probes": args.kkt_curvature_probes,
-        "cg_iterations": args.cg_iterations, "parameter_radius": args.parameter_radius,
-        "action_radius": args.action_radius, "action_max_radius": args.action_max_radius,
-        "development_every": args.development_every,
-        "adam_guard": {
-            "max_loss_ratio": args.adam_max_loss_ratio,
-            "max_omega_ratio": args.adam_max_omega_ratio,
-            "max_dev_loss_ratio": args.adam_max_dev_loss_ratio,
-            "maximum_consecutive_rejections": args.maximum_adam_rejections,
-        },
-        "gradient_norm_kind": ("separate_window_performance_and_risk_components_no_Adam"
-                               if args.optimizer == "short-window" and args.actor_proposal == "physics-subspace"
-                               else "mean_window_performance_plus_local_and_terminal_risk_before_clipping"
-                               if args.optimizer == "short-window" else "combined_task_plus_weighted_auxiliary_before_clipping"),
-        "contract_sha256": None if args.contract_report is None else file_hash(args.contract_report),
-    }
-
-
-def save_training(path, policy, optimizer, progress, solver, run_binding, initial_model, *, critic=None):
-    atomic_torch(path, {
-        "schema": PROTOCOL_VERSION, "architecture": ARCHITECTURE,
-        "model": policy.state_dict(), "model_sha256": model_hash(policy),
-        "policy_config": asdict(policy.config), "binding": run_binding,
-        "optimizer": None if optimizer is None else optimizer.state_dict(),
-        "critic_training": None if critic is None else critic.state_dict(),
-        "rng": capture_rng(), "progress": copy.deepcopy(progress), "solver": solver,
-        "initial_model": initial_model, "deployment_authorized": False,
-        "formal_eligible": False,
-    })
+def migrate_named_adam(optimizer, policy, saved, saved_names):
+    """Explicit name metadata is mandatory; never infer old parameter IDs."""
+    if not saved_names or len(saved_names) != len(saved["param_groups"]) or len(saved_names) != 1:
+        raise ValueError("named single-group Adam metadata required for migration")
+    old_group = saved["param_groups"][0]
+    names = saved_names[0]
+    if len(names) != len(old_group["params"]) or len(set(names)) != len(names):
+        raise ValueError("invalid optimizer name order")
+    lookup = dict(zip(names, old_group["params"]))
+    new = optimizer.state_dict()
+    current = optimizer_parameter_names(policy, optimizer)[0]
+    if not set(current).issubset(lookup) or any(
+        not n.startswith("response_predictor.") for n in set(names) - set(current)
+    ):
+        raise ValueError("optimizer parameter names do not match effective Actor")
+    parameters = dict(policy.named_parameters())
+    for n, new_id in zip(current, new["param_groups"][0]["params"]):
+        state = copy.deepcopy(saved["state"].get(lookup[n], {}))
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                if key != "step" and value.shape != parameters[n].shape:
+                    raise ValueError("Adam moment shape mismatch for " + n)
+                if not bool(torch.isfinite(value).all()):
+                    raise ValueError("nonfinite Adam state")
+        if state:
+            new["state"][new_id] = state
+    new["param_groups"][0].update({k: v for k, v in old_group.items() if k != "params"})
+    optimizer.load_state_dict(new)
 
 
 def load_policy_checkpoint(path, device, dtype):
-    value = torch.load(path, map_location="cpu")
+    value = torch.load(path, map_location="cpu", weights_only=True)
     if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("not a response-task checkpoint; Q2/distillation weights are not accepted")
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(**value["policy_config"])).to(device=device, dtype=dtype)
-    policy.load_state_dict(value["model"])
-    # Float64/float32 conversion is allowed only for explicit weights-only
-    # initialization; evaluation/resume validate the stored dtype separately.
+        raise ValueError("not a current Actor-only checkpoint; use explicit weights initialization")
+    policy = ResponseMotorPolicy(ResponsePolicyConfig(**value["policy_config"])).to(
+        device=device, dtype=dtype
+    )
+    migrate_actor_weights(policy, value["model"])
     return policy, value
 
 
-def task_gradient_norms(loss, policy):
-    named = [(name, p) for name, p in policy.named_parameters() if not name.startswith("response_predictor.")]
-    gradients = torch.autograd.grad(loss, [p for _, p in named], retain_graph=True, allow_unused=True)
-    squared = {"memory": 0.0, "controller": 0.0}
-    for (name, _), gradient in zip(named, gradients):
-        key = "controller" if name.startswith("controller.") else "memory"
-        if gradient is not None:
-            squared[key] += float(gradient.detach().double().square().sum())
-    return {"task_" + name + "_gradient_norm": math.sqrt(value) for name, value in squared.items()}
-
-
-def guarded_adam_step(
-    policy, optimizer, simulator, initial, horizon, loss_config, before_metrics,
-    *, max_loss_ratio, max_omega_ratio, rejection_path=None, context=None,
+def sample_training_scenarios(
+    scenarios,
+    attempt_index,
+    *,
+    batches=2,
+    dt=0.01,
+    device=torch.device("cpu"),
+    dtype=torch.float32,
+    scenario_mode="fixed-airframe",
 ):
-    """Accept finite proposals only after a fresh continuous physical rollout.
-
-    Gradients have already been computed/clipped by the caller. This no-grad
-    acceptance replay is separate from the fully differentiated training rollout.
-    Rejection restores Adam moments and RNG, not just model weights.
-    """
-    before_model = copy.deepcopy(policy.state_dict())
-    before_optimizer = copy.deepcopy(optimizer.state_dict())
-    before_rng = capture_rng()
-    accepted = False
-    after = None
-    candidate = None
-    try:
-        optimizer.step()
-        finite = all(bool(torch.isfinite(value).all()) for value in policy.state_dict().values())
-        finite = finite and all(
-            bool(torch.isfinite(value).all())
-            for state in optimizer.state.values() for value in state.values()
-            if isinstance(value, torch.Tensor)
-        )
-        reason = None
-        if not finite:
-            reason = "nonfinite_model_or_optimizer"
-        else:
-            with torch.no_grad():
-                candidate = rollout(policy, simulator, initial, horizon)
-                after = trajectory_metrics(candidate, loss_config)
-            finite = after["finite"] and math.isfinite(after["task_objective"]) and math.isfinite(after["omega_rms"])
-            if not finite:
-                reason = "nonfinite_continuous_rollout"
-            elif after["task_objective"] > max_loss_ratio * max(before_metrics["task_objective"], 1.0e-6):
-                reason = "continuous_task_loss_catastrophe"
-            elif after["omega_rms"] > max_omega_ratio * max(before_metrics["omega_rms"], 0.5):
-                reason = "continuous_omega_catastrophe"
-            else:
-                accepted = True
-        evidence = {
-            "accepted": accepted, "rejection_reason": reason,
-            "proposal_finite": finite,
-            "continuous_loss_before": before_metrics["task_objective"],
-            "continuous_loss_after": None if after is None or not math.isfinite(after["task_objective"]) else after["task_objective"],
-            "continuous_omega_before": before_metrics["omega_rms"],
-            "continuous_omega_after": None if after is None or not math.isfinite(after["omega_rms"]) else after["omega_rms"],
-        }
-        if not accepted and rejection_path is not None:
-            atomic_torch(rejection_path, {
-                "kind": "rejected-adam-proposal", "context": context,
-                "before_model": before_model, "before_optimizer": before_optimizer,
-                "before_rng": before_rng,
-                "candidate_model": policy.state_dict(),
-                "candidate_optimizer": optimizer.state_dict(),
-                "initial_state": {f.name: getattr(initial, f.name).detach().cpu() for f in fields(initial)},
-                "candidate_trajectory": None if candidate is None else {
-                    name: getattr(candidate, name).detach().cpu()
-                    for name in ("observations", "actions", "positions", "velocities", "omegas")
-                },
-                "guard": evidence, "deployment_authorized": False,
-            })
-        return evidence
-    finally:
-        # This also handles exceptions during the proposal, replay or artifact
-        # write: the outer failure checkpoint must never contain unchecked weights.
-        if not accepted:
-            policy.load_state_dict(before_model)
-            optimizer.load_state_dict(before_optimizer)
-            restore_rng(before_rng)
+    if attempt_index < 0 or batches < 1:
+        raise ValueError("invalid sampling index")
+    seeds = [TRAIN_SEED_BASE + batches * attempt_index + i for i in range(batches)]
+    if seeds[-1] >= min(DEVELOPMENT_SEEDS):
+        raise ValueError("TRAIN seed range would enter reserved EVAL")
+    states = [
+        sample_scenarios(
+            scenarios, seed=s, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode
+        )[0]
+        for s in seeds
+    ]
+    return pool_states(states), seeds
 
 
-def _reference_rollout(checkpoint, simulator, initial, horizon):
-    # This import and checkpoint load exist ONLY in explicitly requested
-    # evaluation. No training/profile/MS objective calls this function.
-    from diagnostics.formal_rollout import load_q2_policy
-    from policy_observation import build_policy_observation, initial_observation_state, update_position_integral
-    reference, _ = load_q2_policy(checkpoint, device=initial.position.device, dtype=initial.position.dtype)
-    reference.eval()
-    settings = dict(mode="integral25", integral_input_frame="body", integral_input_multiplier=1.0,
-                    noise_max=0.0, integral_limit=0.5, integral_leak=0.0, integral_clamp_mode="box")
-    settings.update(getattr(reference, "q2_observation_settings", {}))
-    options = {key: settings[key] for key in ("mode", "integral_input_frame", "integral_input_multiplier", "noise_max")}
-    obs_state = initial_observation_state(initial.position.shape[0], device=initial.position.device,
-                                          dtype=initial.position.dtype)
-    hidden = reference.initial_hidden(initial.position.shape[0], device=initial.position.device,
-                                      dtype=initial.position.dtype)
-    state = initial
-    arrays = {name: [] for name in ("positions", "velocities", "omegas", "actions", "action_deltas", "omega_deltas")}
-    for _ in range(horizon):
-        obs, observed_p = build_policy_observation(state, obs_state, **options)
-        action, hidden = reference(obs, hidden)
-        obs_state = update_position_integral(
-            obs_state, observed_p, dt=simulator.params.dt, integral_limit=settings["integral_limit"],
-            integral_leak=settings["integral_leak"], integral_clamp_mode=settings["integral_clamp_mode"],
-        )
-        after = simulator.step(state, action, grad_decay=1.0)
-        for name, tensor in (
-            ("positions", after.position), ("velocities", after.velocity), ("omegas", after.omega),
-            ("actions", action), ("action_deltas", action - state.previous_action),
-            ("omega_deltas", after.omega - state.omega),
-        ):
-            arrays[name].append(tensor)
-        state = after
-    return SimpleNamespace(**{name: torch.stack(values) for name, values in arrays.items()})
-
-
-def _select_trace(trace, mask):
-    return SimpleNamespace(**{
-        name: getattr(trace, name)[:, mask]
-        for name in ("positions", "velocities", "omegas", "actions", "action_deltas", "omega_deltas")
-    })
+def pool_states(states):
+    return L2FState(
+        **{f.name: torch.cat([getattr(s, f.name) for s in states]) for f in fields(states[0])}
+    )
 
 
 @torch.no_grad()
-def evaluate(
-    policy, loss_config, *, seeds, horizons, scenarios, output=None,
-    q2_checkpoint=None, split="development", save_trajectories=False, risk_config=None, hard_risk_config=None,
-    scenario_mode="physical-fit", phase1_probes=False,
-):
-    device, dtype = next(policy.parameters()).device, next(policy.parameters()).dtype
-    simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
-    records, tensor_records = [], []
-    for seed in seeds:
-        initial, cells = sample_scenarios(scenarios, seed=seed, dt=policy.config.dt, device=device, dtype=dtype, scenario_mode=scenario_mode)
-        for horizon in horizons:
-            trace = rollout(policy, simulator, initial, horizon)
-            metrics = trajectory_metrics(trace, loss_config)
-            if phase1_probes:
-                from response_phase1 import task_loss_components
-                metrics["task_loss_components"] = task_loss_components(trace, loss_config)
-                metrics["training_loss_components"] = task_loss_components(trace, training_loss_config(loss_config))
-            if risk_config is not None:
-                metrics.update(physical_risk_metrics(trace, risk_config, loss_config))
-                metrics.update(hard_risk_metrics(trace, risk_config, loss_config, hard_risk_config or HardRiskConfig()))
-                metrics["finite"] = metrics["finite"] and all(math.isfinite(x) for x in (
-                    metrics["risk_objective"], *metrics["risk_components"].values(),
-                    *metrics["hard_risk_components"].values(), *metrics["hard_risk_peaks"].values()
-                ))
-            if not metrics["finite"] or not math.isfinite(metrics["task_objective"]):
-                if output is not None:
-                    atomic_torch(output.with_suffix(".nonfinite.pt"), {
-                        "seed": seed, "horizon": horizon, "observations": trace.observations.cpu(),
-                        "actions": trace.actions.cpu(), "deployment_authorized": False,
-                    })
-                raise RuntimeError("non-finite continuous evaluation; failing trajectory preserved")
-            row = {"seed": seed, "horizon": horizon, "policy": metrics}
-            for metric, cell in zip(metrics["scenarios"], cells.tolist()):
-                metric["tw_bin"], metric["log_alpha_bin"] = cell
-            if q2_checkpoint is not None:
-                reference = _reference_rollout(q2_checkpoint, simulator, initial, horizon)
-                row["q2"] = trajectory_metrics(reference, loss_config)
-                # Pair every scene, not just aggregate means. These comparisons
-                # are research metrics, not a replacement for the historical 5% gate.
-                for candidate, baseline in zip(metrics["scenarios"], row["q2"]["scenarios"]):
-                    candidate["q2_cost"] = baseline["task_cost"]
-                    candidate["q2_success"] = baseline["success"]
-            records.append(row)
-            if save_trajectories:
-                tensor_records.append({
-                    "seed": seed, "horizon": horizon, "cells": cells.cpu(),
-                    "initial_state": {f.name: getattr(initial, f.name).cpu() for f in fields(initial)},
-                    "observations": trace.observations.cpu(), "actions": trace.actions.cpu(),
-                    "positions": trace.positions.cpu(), "velocities": trace.velocities.cpu(),
-                    "omegas": trace.omegas.cpu(),
-                })
-    report = {
-        "protocol": PROTOCOL_VERSION, "split": split, "model_sha256": model_hash(policy),
-        "source_sha256": source_hash(), "records": records,
-        "score": sum(row["policy"]["task_objective"] for row in records) / len(records),
-        "finite": all(row["policy"]["finite"] for row in records),
-        "success_count": sum(row["policy"]["success_count"] for row in records),
-        **{
-            key: math.sqrt(sum(row["policy"][key] ** 2 for row in records) / len(records))
-            for key in ("position_rms", "velocity_rms", "omega_rms")
+def gradient_norm(parameters):
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        raise FloatingPointError("Actor has no task gradients")
+    norm = torch.stack([g.double().square().sum() for g in grads]).sum().sqrt()
+    value = float(norm)
+    if not math.isfinite(value):
+        raise FloatingPointError("nonfinite Actor gradient norm")
+    return value
+
+
+@torch.no_grad()
+def safe_global_clip(parameters, limit):
+    parameters = list(parameters)
+    value = gradient_norm(parameters)
+    if limit <= 0 or not math.isfinite(limit):
+        raise ValueError("gradient clip must be finite and positive")
+    scale = min(1.0, limit / (value + 1e-6))
+    for p in parameters:
+        if p.grad is not None:
+            p.grad.mul_(scale)
+    return value
+
+
+@torch.no_grad()
+def adaptive_clip(parameters, limit):
+    if limit == 0:
+        return
+    for p in parameters:
+        if p.grad is None:
+            continue
+        axes = tuple(range(1, p.ndim)) if p.ndim > 1 else None
+        pn = p.double().norm(dim=axes, keepdim=True).clamp_min(0.001)
+        gn = p.grad.double().norm(dim=axes, keepdim=True).clamp_min(1e-6)
+        p.grad.mul_((limit * pn / gn).clamp_max(1).to(p.grad.dtype))
+
+
+def binding(args, policy_config, loss_config):
+    return {
+        "source_sha256": source_hash(),
+        "algorithm": "exact-boundary-bptt-adam",
+        "protocol": {
+            "version": PROTOCOL_VERSION,
+            "architecture": ARCHITECTURE,
+            "policy": asdict(policy_config),
+            "loss": asdict(loss_config),
+            "scenarios_per_bank": args.scenarios,
+            "scenario_mode": args.scenario_mode,
+            "development_seeds": list(DEVELOPMENT_SEEDS),
+            "deployment_authorized": False,
         },
         **{
-            key: sum(row["policy"][key] for row in records) / len(records)
-            for key in ("steady_success_rate", "motor_saturation_fraction")
+            n: getattr(args, n)
+            for n in (
+                "seed",
+                "device",
+                "dtype",
+                "horizon",
+                "window_steps",
+                "lr",
+                "gradient_clip",
+                "gradient_scale",
+                "agc",
+                "threads",
+            )
         },
-        "q2_checkpoint_sha256": None if q2_checkpoint is None else file_hash(q2_checkpoint),
-        "all_scenarios_retained": True, "fresh_continuous_rollout_from_initial_state": True,
-        "scenario_mode": scenario_mode,
-        "unseen_parameter_draws_within_registered_family": scenario_mode == "physical-fit",
-        "out_of_family_generalization_tested": False,
-        "best_known_per_airframe_optimality_reference_available": False,
-        "formal_eligible": False, "deployment_authorized": False,
+        "training_banks": 2,
+        "torch_version": str(torch.__version__),
     }
-    if risk_config is not None:
-        report.update(
-            risk_config=asdict(risk_config),
-            hard_risk_config=asdict(hard_risk_config or HardRiskConfig()),
-            hard_risk_components={name: sum(row["policy"]["hard_risk_components"][name] for row in records) / len(records)
-                                  for name in ("omega", "saturation")},
-            hard_risk_bounds_violated=sorted({name for row in records for name in row["policy"]["hard_risk_bounds_violated"]}),
-            risk_objective=sum(row["policy"]["risk_objective"] for row in records) / len(records),
-            risk_components={
-                name: sum(row["policy"]["risk_components"][name] for row in records) / len(records)
-                for name in records[0]["policy"]["risk_components"]
-            },
-        )
-    if output is not None:
-        atomic_json(output, report)
-        if save_trajectories:
-            atomic_torch(output.with_suffix(".trajectories.pt"), {
-                "split": split, "model_sha256": report["model_sha256"],
-                "records": tensor_records, "deployment_authorized": False,
-            })
+
+
+def _checkpoint(policy, optimizer, progress, run_binding):
+    return {
+        "schema": PROTOCOL_VERSION,
+        "architecture": ARCHITECTURE,
+        "policy_config": asdict(policy.config),
+        "model": policy.state_dict(),
+        "model_sha256": model_hash(policy),
+        "optimizer": optimizer.state_dict(),
+        "optimizer_parameter_names": optimizer_parameter_names(policy, optimizer),
+        "rng": capture_rng(),
+        "next_update": progress["updates"],
+        "progress": copy.deepcopy(progress),
+        "binding": run_binding,
+        "deployment_authorized": False,
+    }
+
+
+def _recover_log(path, committed_update):
+    """Crash after append but before checkpoint must not duplicate update IDs."""
+    if not path.exists():
+        return
+    lines = []
+    for raw in path.read_text().splitlines():
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            break
+        if row["update"] > committed_update:
+            break
+        lines.append(raw + "\n")
+    _atomic(path, lambda stream: stream.write("".join(lines).encode()))
+
+
+def _append(path, row):
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, allow_nan=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+@torch.no_grad()
+def evaluate(policy, simulator, initial, horizon, loss_config):
+    trace = rollout(policy, simulator, initial, horizon)
+    report = trajectory_metrics(trace, loss_config)
+    if not report["finite"]:
+        raise FloatingPointError("nonfinite fixed EVAL")
+    report.pop("scenarios")
+    report["task_components"] = task_loss_components(trace, loss_config)
+    risk = hard_risk_metrics(trace, loss_config)
+    report["risk"] = risk
     return report
+
+
+def _sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def train(args, policy_config, loss_config):
-    if args.optimizer == "task-adam":
-        from response_value_training import train_task_value
-        return train_task_value(args, policy_config, loss_config)
-    if args.initialize_from is not None and (args.work_dir / "latest.training.pt").exists():
-        raise ValueError("weights-only initialization requires a new work directory; do not inherit old training state")
-    if args.updates is None or not 1 <= args.updates < 1_000_000:
-        raise ValueError("set an explicit --updates budget below 1000000 after profiling")
-    if args.seed != 7:
-        raise ValueError("this mechanism-screening protocol trains only initialization seed7")
-    train_batches = training_batch_count(args)
-    reserved_start = min((*DEVELOPMENT_SEEDS, MS_ACCEPTANCE_SEED, *FINAL_SEEDS))
-    if args.updates * train_batches > reserved_start - TRAIN_SEED_BASE:
-        raise ValueError("proposal budget exceeds the independent TRAIN seed range")
-    if args.q2_checkpoint is not None:
-        raise ValueError("Q2 is an optional evaluation reference, not a training input")
-    if FINAL_CLAIM.exists():
-        raise RuntimeError("this protocol final set has been consumed; register a new independent protocol before further candidate development")
-    if args.updates > 5:
-        validate_training_contract(args.contract_report, policy_config, loss_config)
-    if args.optimizer == "full-space-ms" and args.initialize_from is None and args.resume is None and not (args.work_dir / "latest.training.pt").exists():
-        raise ValueError("MS requires a learned task checkpoint; do not start it from a random controller")
-    torch.set_num_threads(args.threads)
-    device = torch.device(args.device)
+    """A finite loss increase never vetoes an update; numerical failures abort."""
+    device = torch.device(
+        "cuda"
+        if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto" else args.device
+    )
+    args.device = str(device)
     dtype = getattr(torch, args.dtype)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable")
-    random.seed(7); np.random.seed(7); torch.manual_seed(7)
+    torch.set_num_threads(args.threads)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(7)
+        torch.cuda.init()
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
-    if args.optimizer == "full-space-ms" and args.linear_solver == "petsc-minres":
-        from petsc_kkt_solver import require_petsc
-        require_petsc(next(policy.parameters()))
-    if args.initialize_from is not None:
-        initialized, source = load_policy_checkpoint(args.initialize_from, device, dtype)
-        if initialized.config != policy.config:
-            raise ValueError("weights-only initialization requires the same policy configuration")
-        policy.load_state_dict(initialized.state_dict())
-    optimizer = actor_optimizer(args, policy)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
-    critic = None
-    train_only = args.phase1_train_only
-    development_initials = ()
-    if args.optimizer == "short-window":
-        from response_critic import CriticTrainer
-        if loss_config.prediction_weight != 0 or loss_config.huber_delta <= 0:
-            raise ValueError("short-window training requires Huber task cost and no prediction auxiliary")
-        if train_only:
-            example, _ = sample_scenarios(args.scenarios, seed=TRAIN_SEED_BASE, dt=policy_config.dt,
-                                         device=device, dtype=dtype, scenario_mode=args.scenario_mode)
-        else:
-            development_initials = tuple(sample_scenarios(
-                args.scenarios, seed=seed, dt=policy_config.dt, device=device, dtype=dtype, scenario_mode=args.scenario_mode
-            )[0] for seed in DEVELOPMENT_SEEDS)
-            example = development_initials[0]
-        critic = CriticTrainer(policy, initialize(policy, example), args.horizon, critic_configuration(args))
     run_binding = binding(args, policy_config, loss_config)
-    work = args.work_dir
-    latest = work / "latest.training.pt"
-    resume = args.resume if args.resume is not None else (latest if latest.exists() else None)
-    initial_model = copy.deepcopy(policy.state_dict())
-    progress = {
-        "attempts": 0, "updates": 0, "elapsed_seconds": 0.0,
-        "best_score": None, "best_update": None, "best_omega_rms": None, "bad_checks": 0,
-        "significant_score": None, "best_success_rate": None,
-        "best_success_score": None, "best_success_update": None,
-        "history": [], "development": [], "training_seeds": [],
-        "baseline_score": None, "status": "training",
-        "initialization_checkpoint_sha256": None if args.initialize_from is None else file_hash(args.initialize_from),
-    }
-    solver = {"damping": args.damping}
-    if resume is not None:
-        saved = torch.load(resume, map_location="cpu")
-        if saved.get("schema") != PROTOCOL_VERSION or saved.get("binding") != run_binding:
-            raise ValueError("resume binding changed; use an explicit new weights-only experiment, not hash editing")
-        policy.load_state_dict(saved["model"])
-        if optimizer is not None:
-            optimizer.load_state_dict(saved["optimizer"])
-        if critic is not None:
-            critic.load_state_dict(saved["critic_training"])
-        progress, solver, initial_model = saved["progress"], saved["solver"], saved["initial_model"]
-        restore_rng(saved["rng"])
-        if progress["status"] in BUSINESS_STOPS:
-            # A supervisor must not turn a business stop into another proposal.
-            return {**training_summary(progress, PROTOCOL_VERSION), "resume_blocked": True}
+    work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
-    atomic_json(work / "configuration.json", {
-        "binding": run_binding,
-        "execution": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-        "resume": None if resume is None else str(resume),
-        "deployment_authorized": False,
-    })
-    started, previous_seconds = time.monotonic(), progress["elapsed_seconds"]
-    stop = {"requested": False}
-    old_handlers = {}
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        old_handlers[signum] = signal.signal(signum, lambda signum, frame: stop.update(requested=True))
-
-    def save(path=latest):
-        progress["elapsed_seconds"] = previous_seconds + time.monotonic() - started
-        progress["exit_class"] = exit_class(progress["status"])
-        save_training(path, policy, optimizer, progress, solver, run_binding, initial_model, critic=critic)
-
-
-    def restore_best_after_development_failure(reason):
-        candidate_update = progress["updates"]
-        rejected_path = work / "rejected_development" / ("%07d.training.pt" % progress["attempts"])
-        save(rejected_path)
-        stable = torch.load(work / "best.training.pt", map_location="cpu")
-        policy.load_state_dict(stable["model"])
-        if optimizer is not None:
-            optimizer.load_state_dict(stable["optimizer"])
-        # Completed supervised Critic fits survive an Actor DEV rollback too.
-        # Their RNG progression must remain consistent with the retained fits.
-        if critic is None:
-            restore_rng(stable["rng"])
-        solver.clear()
-        solver.update(stable["solver"])
-        stable_attempt = stable["progress"]["attempts"]
-        for row in progress["history"]:
-            if row["attempt"] > stable_attempt and row["accepted"]:
-                row["provisionally_accepted"] = True
-                row["accepted"] = False
-                row["rolled_back"] = True
-                row["rejection_reason"] = "development_catastrophe"
-        # Attempts and sampled seeds are not rewound or hidden. Only the number
-        # of retained updates is restored to the accepted checkpoint's progress.
-        progress["updates"] = stable["progress"]["updates"]
-        progress["status"] = "adam_development_rollback"
-        progress["rollback"] = {
-            "reason": reason, "candidate_update": candidate_update,
-            "restored_update": progress["updates"],
-            "restored_attempt": stable_attempt,
-            "rejected_checkpoint": str(rejected_path),
-        }
-
-    def development():
-        current_model = model_hash(policy)
-        if progress["development"] and progress["development"][-1].get("model_sha256") == current_model:
-            return True
-        try:
-            report = evaluate(
-                policy, loss_config, seeds=DEVELOPMENT_SEEDS, horizons=(args.horizon,),
-                scenarios=args.scenarios, scenario_mode=args.scenario_mode, phase1_probes=args.phase1_probes,
-                output=work / "development" / ("%07d.json" % progress["attempts"]),
-                risk_config=None if critic is None else critic.config.risk,
-                hard_risk_config=None if critic is None else critic.config.hard_risk,
+    if not args.resume and any(
+        (work / name).exists() for name in ("latest.pt", "history.jsonl", "evaluation.jsonl")
+    ):
+        raise ValueError("work directory already contains a run; choose resume or a new directory")
+    progress = {
+        "updates": 0,
+        "status": "training",
+        "elapsed_seconds": 0.0,
+        "best_score": None,
+        "best_success_rate": None,
+        "best_success_score": None,
+    }
+    if args.resume:
+        saved = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if saved.get("schema") != PROTOCOL_VERSION or saved["binding"] != run_binding:
+            raise ValueError(
+                "resume requires identical Actor-only objective, source and optimizer configuration"
             )
-        except BaseException:
-            if optimizer is not None and progress["best_score"] is not None:
-                restore_best_after_development_failure("development_evaluation_failed")
-            raise
-        if progress["baseline_score"] is None:
-            progress["baseline_score"] = report["score"]
-        compact = {key: report[key] for key in (
-            "score", "finite", "position_rms", "velocity_rms", "omega_rms",
-            "steady_success_rate", "motor_saturation_fraction",
-        )}
-        compact.update(attempt=progress["attempts"], update=progress["updates"], model_sha256=current_model)
-        if critic is not None:
-            compact.update({key: report[key] for key in ("risk_objective", "risk_components", "hard_risk_components", "hard_risk_bounds_violated")})
-        progress["development"].append(compact)
-        old_score = progress["best_score"]
-        # Direct candidate search already applied both current-Actor TRAIN/DEV
-        # gates. Periodic reports must not add a third best-history veto.
-        catastrophic = optimizer is not None and old_score is not None and (
-            report["score"] > args.adam_max_dev_loss_ratio * max(old_score, 1.0e-6)
-            or report["omega_rms"] > args.adam_max_omega_ratio * max(progress["best_omega_rms"], 0.5)
+        migrate_actor_weights(policy, saved["model"])
+        if saved.get("model_sha256") != model_hash(policy):
+            raise ValueError("checkpoint model digest mismatch")
+        migrate_named_adam(
+            optimizer, policy, saved["optimizer"], saved["optimizer_parameter_names"]
         )
-        if catastrophic:
-            compact["accepted"] = False
-            restore_best_after_development_failure("finite_development_catastrophe")
-            print(json.dumps({"development": compact, "rollback": progress["rollback"]}), flush=True)
-            return False
-        selected = record_development_selection(progress, report, args.min_relative_improvement)
-        if selected["cost"]:
-            save(work / "best.training.pt")
-            atomic_json(work / "best.development.json", report)
-        if selected["success"]:
-            save(work / "best_success.training.pt")
-            atomic_json(work / "best_success.development.json", report)
-        print(json.dumps({"development": compact}), flush=True)
-        return True
+        progress = copy.deepcopy(saved["progress"])
+        if saved["next_update"] != progress["updates"]:
+            raise ValueError("inconsistent checkpoint sampling index")
+        restore_rng(saved["rng"])
+    elif args.init_checkpoint or args.migrate_checkpoint:
+        path = args.init_checkpoint or args.migrate_checkpoint
+        # Explicit local legacy migration may contain old NumPy RNG tuples.
+        saved = load_legacy_checkpoint(path)
+        if saved.get("policy_config") != asdict(policy_config) and not (
+            args.migrate_checkpoint and "policy_config" not in saved
+        ):
+            raise ValueError("initialization policy configuration mismatch")
+        migrate_actor_weights(policy, saved["model"])
+        progress["initialization"] = {
+            "file_sha256": file_hash(path),
+            "weights_only": bool(args.init_checkpoint),
+        }
+        if args.migrate_checkpoint:
+            metadata = json.loads(Path(args.migration_metadata).read_text())
+            if (
+                metadata.get("checkpoint_sha256") != file_hash(path)
+                or metadata.get("algorithm") != "actor-only-exact-bptt"
+            ):
+                raise ValueError("migration metadata must certify this exact Actor-only checkpoint")
+            if metadata.get("binding") != {
+                k: v for k, v in run_binding.items() if k != "source_sha256"
+            }:
+                raise ValueError("explicit legacy migration training semantics mismatch")
+            migrate_named_adam(
+                optimizer, policy, saved["optimizer"], metadata["optimizer_parameter_names"]
+            )
+            progress.update(updates=int(metadata["next_update"]))
+            restore_rng(saved["rng"])
+    for name in ("history.jsonl", "evaluation.jsonl"):
+        _recover_log(work / name, progress["updates"])
+    elapsed_before = progress["elapsed_seconds"]
+    stop = []
+    old_handlers = {}
+
+    def interrupted(signum, frame):
+        stop.append(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[signum] = signal.signal(signum, interrupted)
+    eval_initial = pool_states(
+        [
+            sample_scenarios(
+                args.scenarios,
+                seed=s,
+                dt=policy_config.dt,
+                device=device,
+                dtype=dtype,
+                scenario_mode=args.scenario_mode,
+            )[0]
+            for s in DEVELOPMENT_SEEDS
+        ]
+    )
+
+    def save(name="latest.pt"):
+        atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
+
+    def evaluation():
+        rng = capture_rng()
+        try:
+            report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config)
+        finally:
+            restore_rng(rng)
+        _append(work / "evaluation.jsonl", {"update": progress["updates"], **report})
+        score, success = report["task_objective"], report["steady_success_rate"]
+        cost_best = progress["best_score"] is None or score < progress["best_score"]
+        success_best = (
+            progress["best_success_rate"] is None
+            or success > progress["best_success_rate"]
+            or (success == progress["best_success_rate"] and score < progress["best_success_score"])
+        )
+        if cost_best:
+            progress.update(best_score=score, best_update=progress["updates"])
+        if success_best:
+            progress.update(
+                best_success_rate=success,
+                best_success_score=score,
+                best_success_update=progress["updates"],
+            )
+        progress["last_evaluated_update"] = progress["updates"]
+        if cost_best:
+            save("best.pt")
+        if success_best:
+            save("best_success.pt")
 
     try:
-        if args.optimizer != "full-space-ms" and progress["best_score"] is not None and not (work / "best.training.pt").exists():
-            if progress["updates"] != progress["best_update"]:
-                raise ValueError("guarded resume needs the best checkpoint in the original work directory")
-            save(work / "best.training.pt")
-        if not progress["development"] and not train_only:
-            development()
-            save()
-        progress["status"] = "training"
-        while progress["attempts"] < args.updates:
-            elapsed = previous_seconds + time.monotonic() - started
-            if stop["requested"] or elapsed >= args.max_seconds:
-                progress["status"] = "interrupted" if stop["requested"] else "time_budget"
+        if (
+            progress.get("last_evaluated_update") != progress["updates"]
+            and progress["updates"] == 0
+        ):
+            evaluation()
+        save()
+        while progress["updates"] < args.updates:
+            if stop:
+                progress["status"] = "interrupted"
                 break
-            index = progress["attempts"]
-            initial, scenario_seeds = sample_training_scenarios(
-                args.scenarios, index, batches=train_batches,
-                dt=policy_config.dt, device=device, dtype=dtype, scenario_mode=args.scenario_mode,
+            if time.monotonic() - started >= args.max_seconds:
+                progress["status"] = "time_budget"
+                break
+            progress["status"] = "training"
+            before = (
+                copy.deepcopy(policy.state_dict()),
+                copy.deepcopy(optimizer.state_dict()),
+                capture_rng(),
             )
-            scenario_seed = scenario_seeds[0]
-            if args.optimizer == "full-space-ms":
-                from response_shooting import task_shooting_step
-                development_initial, _ = sample_scenarios(
-                    args.scenarios, seed=MS_ACCEPTANCE_SEED, dt=policy_config.dt, device=device, dtype=dtype
+            _sync(device)
+            update_start = time.monotonic()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            try:
+                initial, seeds = sample_training_scenarios(
+                    args.scenarios,
+                    progress["updates"],
+                    dt=policy_config.dt,
+                    device=device,
+                    dtype=dtype,
+                    scenario_mode=args.scenario_mode,
                 )
-                previous_rejections = solver.get("consecutive_rejections", 0)
-                record, solver = task_shooting_step(
-                    policy, simulator, initial, development_initial, loss_config,
-                    segment_steps=args.segment_steps, segments=args.segments,
-                    damping=solver["damping"], cg_iterations=args.cg_iterations,
-                    linear_solver=args.linear_solver, kkt_rtol=args.kkt_rtol,
-                    kkt_atol=args.kkt_atol, kkt_max_iterations=args.kkt_max_iterations,
-                    kkt_monitor=args.kkt_monitor, kkt_preconditioner=args.kkt_preconditioner,
-                    kkt_curvature_probes=args.kkt_curvature_probes,
-                    parameter_radius=args.parameter_radius, action_radius=args.action_radius,
-                    action_max_radius=args.action_max_radius, debug_solver=args.ms_debug,
-                )
-                accepted = record["accepted"]
-                solver["consecutive_rejections"] = 0 if accepted else previous_rejections + 1
-            elif critic is not None:
-                if args.phase1_probes and device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    torch.cuda.reset_peak_memory_stats(device)
-                proposal_started = time.monotonic()
-                record = critic.guarded_step(
-                    policy, optimizer, simulator, initial, args.horizon, loss_config,
-                    development_initials=development_initials, gradient_clip=args.gradient_clip,
-                )
-                if args.phase1_probes:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                    record.update(proposal_seconds=time.monotonic() - proposal_started,
-                        peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
-                        peak_reserved_bytes=torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None)
-                accepted = record["accepted"]
-                solver["consecutive_proposal_rejections"] = 0 if accepted else solver.get("consecutive_proposal_rejections", 0) + 1
-                record["consecutive_proposal_rejections"] = solver["consecutive_proposal_rejections"]
-            else:
-                # Every bank uses the same pre-update parameters. Keep one
-                # pooled task loss, one backward, one clip and one Adam step.
-                # task_loss selects CVaR globally across all pooled scenarios.
-                trace = rollout(policy, simulator, initial, args.horizon)
-                control = training_task_loss(trace, loss_config)
-                with torch.no_grad():
-                    metrics = trajectory_metrics(trace, loss_config)
-                if not metrics["finite"]:
-                    raise RuntimeError("non-finite physical or recurrent state")
-                loss = control
-                if not bool(torch.isfinite(loss)):
-                    raise RuntimeError("non-finite physical task loss")
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                gradient_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.gradient_clip)
-                if not bool(torch.isfinite(gradient_norm)):
-                    raise RuntimeError("non-finite combined-loss gradient before clipping")
-                record = {
-                    "task_loss": float(control.detach()),
-                    "total_loss": float(loss.detach()),
-                    **{key: metrics[key] for key in (
-                        "position_rms", "velocity_rms", "omega_rms",
-                        "steady_success_rate", "motor_saturation_fraction",
-                    )},
-                    "gradient_norm": float(gradient_norm),
-                }
-                del trace, control, loss
-                proposal = guarded_adam_step(
-                    policy, optimizer, simulator, initial, args.horizon, loss_config, metrics,
-                    max_loss_ratio=args.adam_max_loss_ratio,
-                    max_omega_ratio=args.adam_max_omega_ratio,
-                    rejection_path=work / "rejected_adam" / ("%07d.pt" % (progress["attempts"] + 1)),
-                    context={
-                        "binding": run_binding, "attempt": progress["attempts"] + 1,
-                        "scenario_seed": scenario_seed, "scenario_seeds": scenario_seeds,
-                        "scenarios_per_bank": args.scenarios,
-                        "training_scenarios": train_batches * args.scenarios,
-                    },
+                record = collect_boundary_rollout(
+                    policy,
+                    simulator,
+                    initial,
+                    loss_config,
+                    horizon=args.horizon,
+                    window_steps=args.window_steps,
                 )
-                record.update(proposal, numerics_finite=proposal["proposal_finite"])
-                accepted = proposal["accepted"]
-                solver["consecutive_adam_rejections"] = 0 if accepted else solver.get("consecutive_adam_rejections", 0) + 1
-            progress["attempts"] += 1
-            progress["updates"] += int(accepted)
-            progress["training_seeds"].extend(scenario_seeds)
-            record.update(
-                attempt=progress["attempts"], update=progress["updates"],
-                scenario_seed=scenario_seed, scenario_seeds=scenario_seeds,
-                training_batches=train_batches,
-                training_scenarios=train_batches * args.scenarios,
-            )
-            progress["history"].append(record)
-            if progress["attempts"] % args.checkpoint_every == 0:
+                _sync(device)
+                forward_done = time.monotonic()
+                backward = backward_actor(
+                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
+                )
+                raw_norm = gradient_norm(policy.parameters()) if args.agc else None
+                adaptive_clip(policy.parameters(), args.agc)
+                pre_clip = safe_global_clip(policy.parameters(), args.gradient_clip)
+                if raw_norm is None:
+                    raw_norm = pre_clip
+                optimizer.step()
+                tensors = list(policy.parameters()) + [
+                    v for s in optimizer.state.values() for v in s.values() if torch.is_tensor(v)
+                ]
+                if not all(bool(torch.isfinite(x).all()) for x in tensors):
+                    raise FloatingPointError("nonfinite Adam parameters or moments")
+            except Exception:
+                policy.load_state_dict(before[0])
+                optimizer.load_state_dict(before[1])
+                restore_rng(before[2])
+                optimizer.zero_grad(set_to_none=True)
+                raise
+            _sync(device)
+            progress["updates"] += 1
+            progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
+            row = {
+                "update": progress["updates"],
+                "train_seeds": seeds,
+                **record.metrics,
+                "raw_gradient_norm": raw_norm,
+                "pre_global_clip_norm": pre_clip,
+                "gradient_scale": args.gradient_scale,
+                "boundary_exact": all(r["exact"] for r in backward["boundaries"]),
+                "boundary_max_error": max(r["max_error"] for r in backward["boundaries"]),
+                "forward_seconds": forward_done - update_start,
+                "update_seconds": time.monotonic() - update_start,
+                "cuda_peak_bytes": (
+                    torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+                ),
+            }
+            _append(work / "history.jsonl", row)
+            print(json.dumps(row, allow_nan=False), flush=True)
+            del record, backward, before
+            if progress["updates"] % args.development_every == 0:
+                evaluation()
+            if progress["updates"] % args.checkpoint_every == 0:
                 save()
-                print(json.dumps(record), flush=True)
-            if args.optimizer != "full-space-ms" and not record["proposal_finite"]:
-                # The guard has restored unchecked Actor state and retained only
-                # completed Critic fits. Surface corruption as an error, not a plateau.
-                raise FloatingPointError(record["rejection_reason"])
-            rejection_key = "consecutive_proposal_rejections" if critic is not None else "consecutive_adam_rejections"
-            if args.optimizer != "full-space-ms" and solver.get(rejection_key, 0) >= args.maximum_adam_rejections:
-                progress["status"] = "proposal_plateau" if critic is not None else "adam_rejections"
-                save()
-                break
-            if args.optimizer == "full-space-ms" and solver.get("consecutive_rejections", 0) >= args.maximum_ms_rejections:
-                progress["status"] = "solver_rejections"
-                break
-            if not train_only and progress["attempts"] % args.development_every == 0:
-                if not development():
-                    save()
-                    break
-                save()
-                if progress["updates"] >= args.minimum_updates and progress["bad_checks"] >= args.patience:
-                    progress["status"] = "development_plateau"
-                    break
-        if progress["status"] == "training":
+        else:
             progress["status"] = "update_budget"
-        if not train_only and progress["status"] not in BUSINESS_STOPS and progress["development"][-1]["attempt"] != progress["attempts"]:
-            development()
-        save()
-    except BaseException as error:
-        progress["status"] = "failed"
-        progress["error"] = repr(error)
-        save()
+    except Exception as error:
+        progress.update(status="failed", error=type(error).__name__ + ": " + str(error))
+        save("failure.pt")
         raise
     finally:
+        progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
-    summary = training_summary(progress, PROTOCOL_VERSION)
-    if train_only:
-        summary.update(acceptance_mode="train-objective", development_evaluations=0,
-                       last_retained_train_metrics=progress["history"][-1].get("phase1_retained") if progress["history"] else None)
-    atomic_json(work / "training_report.json", summary)
-    return summary
-
-
-def profile(args, policy_config, loss_config):
-    if args.optimizer == "task-adam":
-        from response_value_training import profile_task_value
-        return profile_task_value(args, policy_config, loss_config)
-    torch.set_num_threads(args.threads)
-    torch.manual_seed(7)
-    device, dtype = torch.device(args.device), getattr(torch, args.dtype)
-    policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
-    if args.initialize_from is not None:
-        initialized, _ = load_policy_checkpoint(args.initialize_from, device, dtype)
-        if initialized.config != policy.config:
-            raise ValueError("weights-only initialization requires the same policy configuration")
-        policy.load_state_dict(initialized.state_dict())
-    initial_model_sha256 = model_hash(policy)
-    train_batches = training_batch_count(args)
-    initial, scenario_seeds = sample_training_scenarios(
-        args.scenarios, 0, batches=train_batches, dt=policy_config.dt,
-        device=device, dtype=dtype, scenario_mode=args.scenario_mode,
-    )
-    simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
-    optimizer = (actor_optimizer(args, policy) if args.optimizer == "short-window" else
-                 torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay))
-    if args.optimizer == "short-window":
-        from response_critic import CriticTrainer
-        critic = CriticTrainer(policy, initialize(policy, initial), args.horizon, critic_configuration(args))
-        dev = () if args.phase1_train_only else tuple(sample_scenarios(args.scenarios, seed=seed, dt=policy_config.dt,
-                                     device=device, dtype=dtype, scenario_mode=args.scenario_mode)[0] for seed in DEVELOPMENT_SEEDS)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-        started = time.monotonic()
-        guard = critic.guarded_step(policy, optimizer, simulator, initial, args.horizon, loss_config,
-                                    development_initials=dev, gradient_clip=args.gradient_clip)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        report = {
-            "protocol": PROTOCOL_VERSION, "optimizer": "short-window",
-            "initial_model_sha256": initial_model_sha256,
-            "scope": ("one Critic fit, windowed gradients and pooled TRAIN objective-only search"
-                      if args.phase1_train_only else "one Critic fit, windowed gradient subspace, bounded real TRAIN candidate search and one selected candidate DEV check"),
-            "critic": asdict(critic.config),
-            "guard": guard, "device": str(device), "dtype": args.dtype,
-            "scenarios": train_batches * args.scenarios, "scenarios_per_bank": args.scenarios,
-            "training_batches": train_batches, "scenario_seeds": scenario_seeds,
-            "horizon": args.horizon, "window_steps": args.window_steps,
-            "proposal_seconds": time.monotonic() - started,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
-            "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
-            "production_checkpoint_written": False, "deployment_authorized": False,
-        }
-        atomic_json(args.work_dir / "profile.json", report)
-        return report
-    if device.type == "cuda":
-        torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
-    start = time.monotonic()
-    trace = rollout(policy, simulator, initial, args.horizon)
-    loss = task_loss(trace, loss_config)
-    with torch.no_grad():
-        before_metrics = trajectory_metrics(trace, loss_config)
-    if loss_config.prediction_weight:
-        loss = loss + loss_config.prediction_weight * prediction_residual(
-            policy, trace.observations, trace.actions
-        ).square().sum()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    forward = time.monotonic() - start
-    start = time.monotonic()
-    loss.backward()
-    gradient_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.gradient_clip)
-    if not bool(torch.isfinite(gradient_norm)):
-        raise RuntimeError("non-finite combined-loss gradient in guarded profile")
-    del loss, trace
-    guard = guarded_adam_step(
-        policy, optimizer, simulator, initial, args.horizon, loss_config, before_metrics,
-        max_loss_ratio=args.adam_max_loss_ratio, max_omega_ratio=args.adam_max_omega_ratio,
-    )
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    report = {
-        "protocol": PROTOCOL_VERSION, "scope": "one guarded AdamW proposal including acceptance replay; excludes periodic DEV and MS",
-        "guard": guard,
-        "device": str(device), "dtype": args.dtype,
-        "scenarios": train_batches * args.scenarios, "scenarios_per_bank": args.scenarios,
-        "training_batches": train_batches, "scenario_seeds": scenario_seeds,
-        "horizon": args.horizon, "forward_seconds": forward,
-        "backward_update_seconds": time.monotonic() - start,
-        "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
-        "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
-        "production_checkpoint_written": False, "deployment_authorized": False,
-    }
-    atomic_json(args.work_dir / "profile.json", report)
-    return report
-
-
-def freeze_candidate(args):
-    source = args.checkpoint or args.work_dir / "best.training.pt"
-    saved = torch.load(source, map_location="cpu")
-    if saved.get("schema") != PROTOCOL_VERSION or saved["binding"]["source_sha256"] != source_hash():
-        raise ValueError("candidate checkpoint source/protocol is stale")
-    progress = saved["progress"]
-    if progress["updates"] < args.minimum_updates:
-        raise ValueError("candidate has not completed the requested minimum training budget")
-    development = progress["development"][-1]
-    if not development["finite"] or not development["score"] < progress["baseline_score"]:
-        raise ValueError("candidate has not improved its continuous development task score")
-    if development["update"] != progress["updates"]:
-        raise ValueError("development evidence does not belong to the candidate update")
-    target = args.work_dir / "candidate.pt"
-    if target.exists() or (args.work_dir / "candidate.json").exists():
-        raise FileExistsError("candidate already frozen; preserve it and use a new experiment directory")
-    dtype = getattr(torch, saved["binding"]["dtype"])
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(**saved["policy_config"])).to(dtype=dtype)
-    policy.load_state_dict(saved["model"])
-    if model_hash(policy) != saved["model_sha256"]:
-        raise ValueError("candidate model digest mismatch")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("xb") as stream:
-        torch.save(saved, stream)
-        stream.flush(); os.fsync(stream.fileno())
-    record = {
-        "protocol": PROTOCOL_VERSION, "candidate_sha256": file_hash(target),
-        "source_checkpoint_sha256": file_hash(source), "source_sha256": source_hash(),
-        "model_sha256": saved["model_sha256"], "update": progress["updates"],
-        "final_seeds": list(FINAL_SEEDS), "final_horizons": list(FINAL_HORIZONS),
-        "binding": saved["binding"], "deployment_authorized": False,
-    }
-    atomic_json(args.work_dir / "candidate.json", record)
-    return record
+        if progress["status"] != "failed":
+            save()
+        atomic_json(
+            work / "summary.json",
+            {
+                **progress,
+                "exit_class": exit_class(progress["status"]),
+                "final_seeds_consumed": [],
+                "deployment_authorized": False,
+            },
+        )
+    return progress
 
 
 def evaluate_checkpoint(args):
-    final = args.mode == "final"
-    path = (args.work_dir / "candidate.pt") if final else (
-        args.checkpoint or args.work_dir / "best.training.pt"
+    saved = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    if saved["binding"]["source_sha256"] != source_hash():
+        raise ValueError("checkpoint source mismatch")
+    device = torch.device(
+        "cuda"
+        if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto" else args.device
     )
-    saved = torch.load(path, map_location="cpu")
-    if saved.get("schema") != PROTOCOL_VERSION or saved["binding"]["source_sha256"] != source_hash():
-        raise ValueError("checkpoint source/protocol is stale")
-    policy, _ = load_policy_checkpoint(path, torch.device(args.device), getattr(torch, saved["binding"]["dtype"]))
-    if model_hash(policy) != saved["model_sha256"]:
-        raise ValueError("checkpoint model digest mismatch")
-    loss_config = TaskLossConfig(**{"huber_delta": 0., **saved["binding"]["protocol"]["loss"]})
-    scenarios = saved["binding"]["protocol"]["scenarios_per_bank"]
-    if final:
-        if not args.consume_final:
-            raise ValueError("final evaluation requires explicit --consume-final")
-        record = json.loads((args.work_dir / "candidate.json").read_text())
-        if (record["candidate_sha256"] != file_hash(path)
-            or record["binding"] != saved["binding"]
-            or record["source_sha256"] != source_hash()
-            or record["final_seeds"] != list(FINAL_SEEDS)
-            or record["final_horizons"] != list(FINAL_HORIZONS)):
-            raise ValueError("frozen candidate record mismatch")
-        FINAL_CLAIM.parent.mkdir(parents=True, exist_ok=True)
-        # Stable protocol-wide location: changing a work directory or model
-        # hash does not grant another independent use of these final seeds.
-        with FINAL_CLAIM.open("x", encoding="utf-8") as stream:
-            json.dump({"status": "claimed", "candidate_sha256": record["candidate_sha256"],
-                       "seeds": list(FINAL_SEEDS), "source_sha256": source_hash()}, stream, indent=2)
-            stream.flush(); os.fsync(stream.fileno())
+    dtype = getattr(torch, saved["binding"]["dtype"])
+    policy, _ = load_policy_checkpoint(args.checkpoint, device, dtype)
+    cfg = saved["binding"]["protocol"]
+    initial = pool_states(
+        [
+            sample_scenarios(
+                cfg["scenarios_per_bank"],
+                seed=s,
+                dt=policy.config.dt,
+                device=device,
+                dtype=dtype,
+                scenario_mode=cfg["scenario_mode"],
+            )[0]
+            for s in DEVELOPMENT_SEEDS
+        ]
+    )
     report = evaluate(
-        policy, loss_config, seeds=FINAL_SEEDS if final else DEVELOPMENT_SEEDS,
-        horizons=FINAL_HORIZONS if final else (args.horizon,), scenarios=scenarios,
-        output=args.work_dir / ("final_evaluation.json" if final else "evaluation.json"),
-        q2_checkpoint=args.q2_checkpoint, split="final" if final else "development",
-        save_trajectories=True,
-        scenario_mode=saved["binding"]["protocol"].get("scenario_mode", "physical-fit"),
-        phase1_probes=(saved["binding"].get("critic") or {}).get("phase1_probes", False),
-        risk_config=RiskConfig(**saved["binding"]["critic"]["risk"])
-                    if (saved["binding"].get("critic") or {}).get("risk") else None,
-        hard_risk_config=HardRiskConfig(**saved["binding"]["critic"].get("hard_risk", {}))
-                         if saved["binding"].get("critic") else None,
+        policy,
+        L2FSimulator(L2FParams(dt=policy.config.dt)),
+        initial,
+        saved["binding"]["horizon"],
+        TaskLossConfig(**cfg["loss"]),
     )
-    report["candidate_frozen"] = final
-    report["final_evaluation_complete"] = final
-    output = args.work_dir / ("final_evaluation.json" if final else "evaluation.json")
-    atomic_json(output, report)
-    if final:
-        atomic_json(FINAL_CLAIM, {
-            "status": "completed", "candidate_sha256": file_hash(path),
-            "report_sha256": file_hash(output), "seeds": list(FINAL_SEEDS),
-            "source_sha256": source_hash(), "deployment_authorized": False,
-        })
-    return report
-
-
-def validate_training_contract(path, policy_config, loss_config):
-    if path is None:
-        raise ValueError("more than five updates require --contract-report from the one-time training contract check")
-    record = json.loads(Path(path).read_text())
-    digest = record.pop("evidence_sha256", None)
-    expected = hashlib.sha256(json.dumps(record, sort_keys=True).encode("utf-8")).hexdigest()
-    if digest != expected or record.get("source_sha256") != source_hash():
-        raise ValueError("training contract evidence is stale or changed")
-    if record.get("policy_config") != asdict(policy_config) or record.get("loss_config") != asdict(loss_config):
-        raise ValueError("training contract belongs to a different policy/objective")
-    required = {"no_q2_targets", "response_recurrent_gradient", "control_head_gradient",
-                "no_privileged_actor_input", "auxiliary_target_stop_gradient", "startup_connected"}
-    if not record.get("passed") or set(record.get("checks", {})) != required or not all(record["checks"].values()):
-        raise ValueError("training contract failed")
-    for group in ("response_recurrent", "control_head"):
-        value = record.get("gradient_groups", {}).get(group, {})
-        if not value.get("finite") or not math.isfinite(value.get("norm", float("nan"))) or value["norm"] <= 0:
-            raise ValueError("missing finite, nonzero task gradient for " + group)
-    return record
-
-
-@torch.no_grad()
-def evaluate_hidden_reset(args):
-    """One DEV counterfactual: change only recurrent memory at a fixed time."""
-    source = args.checkpoint or args.work_dir / "best.training.pt"
-    saved = torch.load(source, map_location="cpu")
-    if saved.get("schema") != PROTOCOL_VERSION or saved["binding"]["source_sha256"] != source_hash():
-        raise ValueError("checkpoint source/protocol is stale")
-    policy, _ = load_policy_checkpoint(
-        source, torch.device(args.device), getattr(torch, saved["binding"]["dtype"])
-    )
-    if model_hash(policy) != saved["model_sha256"]:
-        raise ValueError("checkpoint model digest mismatch")
-    output = args.work_dir / "hidden_reset.json"
-    if output.exists():
-        raise FileExistsError("preserve the existing hidden-reset experiment rather than overwrite it")
-    config = TaskLossConfig(**{"huber_delta": 0., **saved["binding"]["protocol"]["loss"]})
-    count = saved["binding"]["protocol"]["scenarios_per_bank"]
-    simulator = L2FSimulator(L2FParams(dt=policy.config.dt))
-    rows, trajectories = [], []
-    for seed in DEVELOPMENT_SEEDS:
-        initial, cells = sample_scenarios(
-            count, seed=seed, dt=policy.config.dt,
-            device=next(policy.parameters()).device, dtype=next(policy.parameters()).dtype,
-        )
-        prefix = rollout(policy, simulator, initial, args.reset_step)
-        normal_state = prefix.end
-        reset_state = replace(normal_state, policy=replace(
-            normal_state.policy, memory=torch.zeros_like(normal_state.policy.memory)
-        ))
-        normal = rollout(policy, simulator, normal_state, args.reset_horizon)
-        reset = rollout(policy, simulator, reset_state, args.reset_horizon)
-        normal_metrics, reset_metrics = trajectory_metrics(normal, config), trajectory_metrics(reset, config)
-        rows.append({
-            "seed": seed, "normal": normal_metrics, "hidden_reset": reset_metrics,
-            "same_physical_state_and_nonmemory_recurrent_fields": True,
-        })
-        trajectories.append({
-            "seed": seed, "cells": cells.cpu(),
-            "prefix_observations": prefix.observations.cpu(), "prefix_actions": prefix.actions.cpu(),
-            "normal_observations": normal.observations.cpu(), "normal_actions": normal.actions.cpu(),
-            "reset_observations": reset.observations.cpu(), "reset_actions": reset.actions.cpu(),
-        })
-    report = {
-        "protocol": PROTOCOL_VERSION, "split": "development-mechanism-check",
-        "checkpoint_sha256": file_hash(source), "model_sha256": model_hash(policy),
-        "reset_after_physical_transitions": args.reset_step,
-        "subsequent_horizon": args.reset_horizon, "records": rows,
-        "intervention": "zero memory once, then allow normal online updates; do not change integral/action history/physical state",
-        "interpretation": "paired effect sizes, not a claim of optimality or an independent FINAL result",
-        "final_seeds_consumed": [], "formal_eligible": False, "deployment_authorized": False,
-    }
-    atomic_json(output, report)
-    atomic_torch(output.with_suffix(".trajectories.pt"), trajectories)
+    atomic_json(Path(args.work_dir) / "evaluation.json", report)
     return report

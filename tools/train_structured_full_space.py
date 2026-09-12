@@ -656,7 +656,7 @@ if __name__ == "__main__":
     )
     if not historical:
         from tools.train_response_control import main as response_task_main
-        raise SystemExit(response_task_main(["--optimizer", "full-space-ms", *sys.argv[1:]]))
+        raise SystemExit(response_task_main(sys.argv[1:]))
     if "--historical-q2-distillation" in sys.argv:
         sys.argv.remove("--historical-q2-distillation")
     main()

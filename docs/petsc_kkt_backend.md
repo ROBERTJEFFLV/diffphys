@@ -1,5 +1,10 @@
 # PETSc KKT backend
 
+> Historical response MS experiment at `e6559deb`. The current response entry
+> uses exact Actor-only BPTT and does not import this backend. Generic KKT kernels
+> and their artificial oracle remain available; response-specific commands below
+> require that historical revision.
+
 Response full-space MS defaults to `--linear-solver petsc-minres`. Physics,
 policy, task residuals, autograd, trust radii, backtracking, continuous TRAIN
 improvement and acceptance DEV non-deterioration remain in PyTorch. The

@@ -1,5 +1,9 @@
 # Phase 1: task value and complete boundary feedback
 
+> Historical experiment at `e6559deb`; its trainer/configuration has been retired.
+> The only current production response path is documented in
+> [response_control_v1.md](response_control_v1.md). Commands below require the historical revision.
+
 The deployable `ResponseMotorPolicy`, physics, nominal dynamics sampling, loss
 weights, H500/H50 timing and evaluation criteria are unchanged. The task-value
 schema is `task-value-v3-full-boundary-adjoints`. This revision establishes a full

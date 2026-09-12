@@ -1,5 +1,9 @@
 # Short-window training with real-rollout candidate selection
 
+> Historical experiment at `e6559deb`; its trainer/configuration has been retired.
+> The only current production response path is documented in
+> [response_control_v1.md](response_control_v1.md). Commands below require the historical revision.
+
 The deployable `ResponseMotorPolicy` remains unchanged: action response → GRU
 memory → controller → four motors. The training-only Risk-to-Go Critic keeps
 the four-output 256/256 SiLU MLP, with a linear head predicting average future
