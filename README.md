@@ -49,13 +49,17 @@ python3 tools/train_response_control.py $(cat configs/response_phase1_single_air
 
 Use a fresh work directory for a new experiment. `--mode profile` performs at
 most one update of the same trainer. `--resume PATH` requires matching source
-and configuration. `--mode evaluate --checkpoint PATH` evaluates fixed development
-states. See [the task, state and checkpoint contract](docs/response_control_v1.md)
+and configuration. `--mode evaluate --checkpoint PATH` rescores compatible older
+Actor checkpoints on fixed development states and reports checkpoint/evaluator
+source hashes and whether they match. See [the task, state and checkpoint contract](docs/response_control_v1.md)
 for commands and explicit migration requirements.
 
 Runtime recomputation consistency in windowed mode, finite checks, failure recovery, atomic saving,
 RNG restoration and fixed development evaluation are part of production.
-Development scores select best checkpoints; finite loss increases do not veto
+Only the lowest evaluated task objective selects `best.pt`. EVAL additionally
+reports L2F/RAPTOR reference episode lengths and termination shares, plus L2F
+200 mm settling. These are computed offline from the complete flight and do not
+terminate or modify training. Finite loss increases do not veto
 individual updates. Reports, model files and local audit evidence are not code
 and must not be deleted or published as part of source cleanup.
 

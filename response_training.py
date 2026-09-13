@@ -26,6 +26,7 @@ from response_task import (
     sample_scenarios,
     rollout,
     trajectory_metrics,
+    reference_episode_metrics,
     task_loss_components,
     hard_risk_metrics,
     tensors_finite,
@@ -349,6 +350,7 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     report = trajectory_metrics(trace, loss_config)
     if not report["finite"]:
         raise FloatingPointError("nonfinite fixed EVAL")
+    report.update(reference_episode_metrics(trace))
     report["task_components"] = task_loss_components(trace, loss_config)
     risk = hard_risk_metrics(trace, loss_config)
     report["risk"] = risk
@@ -394,8 +396,6 @@ def train(args, policy_config, loss_config):
         "status": "training",
         "elapsed_seconds": 0.0,
         "best_score": None,
-        "best_success_rate": None,
-        "best_success_score": None,
     }
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=True)
@@ -477,26 +477,13 @@ def train(args, policy_config, loss_config):
         finally:
             restore_rng(rng)
         _append(work / "evaluation.jsonl", {"update": progress["updates"], **report})
-        score, success = report["task_objective"], report["steady_success_rate"]
+        score = report["task_objective"]
         cost_best = progress["best_score"] is None or score < progress["best_score"]
-        success_best = (
-            progress["best_success_rate"] is None
-            or success > progress["best_success_rate"]
-            or (success == progress["best_success_rate"] and score < progress["best_success_score"])
-        )
         if cost_best:
             progress.update(best_score=score, best_update=progress["updates"])
-        if success_best:
-            progress.update(
-                best_success_rate=success,
-                best_success_score=score,
-                best_success_update=progress["updates"],
-            )
         progress["last_evaluated_update"] = progress["updates"]
         if cost_best:
             save("best.pt")
-        if success_best:
-            save("best_success.pt")
 
     try:
         if (
@@ -620,9 +607,10 @@ def train(args, policy_config, loss_config):
 
 
 def evaluate_checkpoint(args):
+    """Rescore compatible Actor weights with current metrics; never relax resume."""
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if saved["binding"]["source_sha256"] != source_hash():
-        raise ValueError("checkpoint source mismatch")
+    checkpoint_source = saved["binding"]["source_sha256"]
+    evaluator_source = source_hash()
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
@@ -650,6 +638,11 @@ def evaluate_checkpoint(args):
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),
+    )
+    report.update(
+        checkpoint_source_sha256=checkpoint_source,
+        evaluator_source_sha256=evaluator_source,
+        source_match=checkpoint_source == evaluator_source,
     )
     atomic_json(Path(args.work_dir) / "evaluation.json", report)
     return report

@@ -57,9 +57,41 @@ mean cost plus the existing CVaR coefficient. Banks and windows never select
 their own independent tail.
 
 Logs attribute the objective to position, velocity, omega and regularization.
-They also report full-flight RMS, steady success, saturation and warning-zone
-omega/saturation risk. These are observations, not update vetoes. Success retains
-the last-100-step p<0.05 m, v<0.10 m/s and omega<0.50 rad/s rule.
+They also report full-flight RMS, saturation and warning-zone omega/saturation
+risk. These are observations, not update vetoes. The former last-100-step strict
+success score is removed from both TRAIN statistics and EVAL.
+
+### Offline EVAL reference metrics
+
+`reference_episode_metrics()` runs only after a complete EVAL rollout has passed
+the existing finite checks. It uses these explicitly configured reference profiles:
+
+| Profile | Per-axis position limit | Per-axis velocity limit | Per-axis omega limit |
+| --- | --- | --- | --- |
+| L2F reference | 0.6 m | 1000 m/s | 1000 rad/s |
+| RAPTOR reference | 1.0 m | 2.0 m/s | 35 rad/s |
+
+These profiles do not change simulator or training settings. In particular, the
+archived L2F `fast_learning` configuration contains different default thresholds;
+the table above defines this evaluator's requested limits explicitly.
+
+For each scene, find the first post-transition state with any absolute axis value
+strictly exceeding its limit. Count the terminating transition: lengths are
+1..H500; a scene with no crossing has length 500. Initial state Z0 is not a
+completed transition. Return `l2f_episode_length_mean`, `l2f_episode_length_std`,
+`l2f_share_terminated` and the analogous `raptor_*` fields. Standard deviations
+use the population denominator N; a single scene has zero std. A crossing on
+step 500 still counts in share_terminated, with episode length 500.
+
+`l2f_settling_fraction_200mm` reproduces the L2F condition: episode length equals
+the full horizon and final position norm is strictly below 0.20 m. Earlier
+crossings remain disqualifying even if the flight later recovers. It imposes no
+last-100-step condition or additional final velocity/omega test; a first
+velocity/omega crossing exactly at H still has full episode length.
+
+All flights still run to H500. Task objective, RMS, saturation and risk continue
+to use the complete trajectory, including samples after a reference crossing.
+The new fields never enter loss, CVaR weights, gradients or checkpoint selection.
 
 The Phase 1 config uses seed7, nominal L2F dynamics, no external force, new
 random position/velocity/attitude/omega for each episode, 4×128=512 pooled TRAIN states,
@@ -98,11 +130,11 @@ budget is the total target index, including resumed updates.
 
 ## Checkpoint contract
 
-`latest.pt`, `best.pt`, and `best_success.pt` contain actual Actor weights,
+`latest.pt` and `best.pt` contain actual Actor weights,
 Adam, explicit parameter names, primitive/tensor RNG metadata, next update index,
 source/config bindings and a small progress record. History resides in JSONL,
-not in every checkpoint. Every strictly lower evaluated objective refreshes best;
-best-success is independent, with cost breaking success ties. No plateau gate.
+not in every checkpoint. Every strictly lower evaluated task objective refreshes
+`best.pt`. No success-selected checkpoint or plateau gate is used.
 
 `--resume` requires the exact current algorithm/source/config and preserves Adam,
 sampling index and RNG. On recovery, log records beyond the saved update and a
@@ -130,9 +162,15 @@ On numerical failure, the failed update's Actor/Adam/RNG are restored and
 Source binding covers only production dependencies, including physics. Editing
 an archived Critic or solver does not invalidate an Actor-only checkpoint.
 
-Source cleanup changes this binding even when numerical behavior is equivalent.
-An earlier checkpoint therefore cannot use `--resume` or standalone evaluation
-under the new source. Preserve its source and checkpoint together. After an
+Source edits change this binding even when numerical behavior is equivalent.
+An earlier checkpoint therefore cannot use `--resume` under the new source.
+Standalone `--mode evaluate` can rescore compatible Actor-only checkpoints with
+the current evaluator, retaining the checkpoint's loss, horizon, scenario mode,
+batch size, dtype and policy configuration. Its output records
+`checkpoint_source_sha256`, `evaluator_source_sha256` and `source_match`.
+This exception loads weights for evaluation only; it never rewrites checkpoint
+hashes or restores Adam for continuation. Preserve the old source and checkpoint
+together when reproducing historical execution. After an
 explicit equivalence audit, `--migrate-checkpoint` can carry named Adam moments,
 RNG and the update index into a new run with matching semantics. Do not rewrite
 the old checkpoint's hash or disable source checks. Weights-only initialization

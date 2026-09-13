@@ -250,7 +250,6 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
     p, v, w = [x.detach().norm(dim=-1) for x in (
         trajectory.positions, trajectory.velocities, trajectory.omegas
     )]
-    tail = min(config.steady_steps, p.shape[0])
     finite = torch.stack([
         torch.isfinite(x).flatten(2).all(-1)
         for x in (trajectory.positions, trajectory.velocities, trajectory.omegas, trajectory.actions)
@@ -260,18 +259,47 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
             value = getattr(trajectory.end.physical, field.name)
             finite = finite & torch.isfinite(value).reshape(value.shape[0], -1).all(-1)
         finite = finite & torch.isfinite(trajectory.end.policy.memory).all(-1)
-    success = ((p[-tail:] < 0.05) & (v[-tail:] < 0.10) & (w[-tail:] < 0.50)).all(0)
     saturation = (trajectory.actions.detach().abs() >= 1.0 - 1.0e-6).to(p.dtype).mean(dim=(0, 2))
     return {
         "task_objective": float(task_loss(trajectory, config).detach()),
         "position_rms": float(p.square().mean().sqrt()),
         "velocity_rms": float(v.square().mean().sqrt()),
         "omega_rms": float(w.square().mean().sqrt()),
-        "steady_success_rate": float((success & finite).to(p.dtype).mean()),
         "motor_saturation_fraction": float(saturation.mean()),
-        "finite": bool(finite.all()), "success_count": int((success & finite).sum()),
+        "finite": bool(finite.all()),
         "scenario_count": costs.numel(),
     }
+
+
+@torch.no_grad()
+def reference_episode_metrics(trajectory: TaskTrajectory) -> dict[str, float]:
+    """Offline reference scoring of a complete, finite EVAL trajectory.
+
+    Check post-transition states (steps 1..H), never truncate the real rollout.
+    Limits are per axis, with strict > comparisons; std is population std.
+    L2F settling follows its episode_length == H and final-distance test,
+    including a first termination on the final transition itself.
+    """
+    horizon = trajectory.positions.shape[0]
+    position, velocity, omega = [value.abs().amax(dim=-1) for value in (
+        trajectory.positions, trajectory.velocities, trajectory.omegas
+    )]
+    steps = torch.arange(1, horizon + 1, device=position.device)[:, None]
+    result = {}
+    for name, p_limit, v_limit, w_limit in (
+        ("l2f", 0.6, 1000.0, 1000.0),
+        ("raptor", 1.0, 2.0, 35.0),
+    ):
+        terminated = (position > p_limit) | (velocity > v_limit) | (omega > w_limit)
+        lengths = torch.where(terminated, steps, horizon).amin(dim=0)
+        lengths_float = lengths.to(torch.float64)
+        result[name + "_episode_length_mean"] = float(lengths_float.mean())
+        result[name + "_episode_length_std"] = float(lengths_float.std(unbiased=False))
+        result[name + "_share_terminated"] = float(terminated.any(dim=0).double().mean())
+        if name == "l2f":
+            settled = (lengths == horizon) & (trajectory.positions[-1].norm(dim=-1) < 0.20)
+            result["l2f_settling_fraction_200mm"] = float(settled.double().mean())
+    return result
 
 
 def task_loss_components(trajectory, config, *, start=0, horizon=None, weights=None):
@@ -300,7 +328,6 @@ class FlightStatistics:
         self.horizon, self.config = horizon, config
         self.squares = initial.position.new_zeros(3, initial.position.shape[0])
         self.saturation = self.squares[0].clone()
-        self.success = torch.ones_like(self.saturation, dtype=torch.bool)
         self.components = initial.position.new_zeros(4, initial.position.shape[0])
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
@@ -314,9 +341,6 @@ class FlightStatistics:
             raise FloatingPointError('nonfinite continuous closed-loop state')
         self.squares.add_(magnitudes.square().sum(1))
         self.saturation.add_((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2).sum(0))
-        tail_start = max(0, self.horizon-min(self.config.steady_steps, self.horizon)-start)
-        p, v, w = magnitudes[:, tail_start:]
-        self.success &= ((p < .05) & (v < .1) & (w < .5)).all(0)
         features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
         for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9), slice(9, None))):
             self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))
@@ -327,8 +351,7 @@ class FlightStatistics:
         result = {name: float((self.squares[i].mean()/self.horizon).sqrt())
                   for i, name in enumerate(('position_rms', 'velocity_rms', 'omega_rms'))}
         result.update(task_objective=float((costs*weights).sum()), finite=True,
-                      steady_success_rate=float(self.success.float().mean()),
-                      success_count=int(self.success.sum()), scenario_count=costs.numel(),
+                      scenario_count=costs.numel(),
                       motor_saturation_fraction=float(self.saturation.mean()/self.horizon),
                       task_components={name: float((self.components[i]*weights).sum())
                                        for i, name in enumerate(('position','velocity','omega','regularization'))},
