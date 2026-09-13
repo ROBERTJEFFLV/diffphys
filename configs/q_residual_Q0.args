@@ -1,2 +1,0 @@
-# Fixed P4b control: world-frame integral, no residual branch, no decay.
-@configs/q_residual_common.args

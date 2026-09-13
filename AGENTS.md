@@ -31,41 +31,46 @@ The existing rule still applies: run training/validation only when explicitly re
 
 ## Project Structure & Module Organization
 
-This repository contains a compact PyTorch/CUDA training chain for an L2F-style quadrotor motor policy. Main Python modules live at the repository root:
+The production response chain contains seven Python files:
 
-- `tools/train_response_control.py`: primary response-conditioned task-learning entry point.
-- `response_policy.py`: deployable response memory and conditioned motor controller.
-- `response_task.py`: teacher-free physical rollouts and task/CVaR objectives.
-- `response_training.py` and `response_shooting.py`: resumable task training and joint MS.
-- `train.py`: earlier direct-training baseline and CLI argument parser.
-- `main_cuda.py`: compatibility wrapper that calls `train.main()`.
-- `model.py`: `MotorGRUPolicy`, the state/error/previous-action GRU controller.
-- `env_l2f.py`: differentiable Euler quadrotor simulator and loss terms.
-- `env_cuda.py`: simulator compatibility export.
+- `tools/train_response_control.py`: train/profile/evaluate CLI.
+- `response_policy.py`: deployable response encoder, GRU and motor controller.
+- `response_task.py`: fixed-airframe/physical-fit sampling, rollout, task/CVaR loss and metrics.
+- `response_adjoints.py`: exact full-graph Actor backpropagation with optional reverse-window recomputation.
+- `response_training.py`: Adam, fixed development evaluation, checkpoints and resume.
+- `response_execution.py`: exit classification.
+- `env_l2f.py`: motor response and rigid-body physics, including implicit angular integration.
 
-Use `configs/*.args` for reusable training configurations. Training logs go to `runs/`, and model checkpoints go to `checkpoints/`. Reference implementations are under `reference/`; treat them as source context unless a task explicitly asks to modify them.
+The only training config is `configs/response_phase1_single_airframe.args`.
+Generated runs/checkpoints, audit evidence, physics provenance, applicable source
+and license notices, and local agent configuration are not disposable source.
+Historical code and standalone tests/checks are available at Git revision
+`76b3a02857e122fbfdef5ece5d0ae7dbf98a870b`, with a pre-cleanup local source snapshot.
+Do not reintroduce archived trainers into the production import chain.
 
-## Build, Test, and Development Commands
+## Build and Development Commands
 
-Run a short validation pass:
+There is no build step. Use Python with PyTorch and NumPy; CUDA requires a
+compatible PyTorch CUDA installation, not a repository native extension.
 
-```bash
-python3 train.py $(cat configs/smoke.args)
-```
-
-Run the H500 CUDA configuration:
-
-```bash
-python3 train.py $(cat configs/direct_h500.args)
-```
-
-Use CLI overrides for local experiments:
+Run only when training is explicitly requested with a budget:
 
 ```bash
-python3 train.py --device cpu --steps 2 --horizon 8 --batch-size 4
+python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
 ```
 
-There is no build step; the project runs directly with Python and PyTorch. CUDA is used with `--device cuda` or when `--device auto` detects a GPU.
+An explicitly requested small CPU smoke can use:
+
+```bash
+python3 tools/train_response_control.py --device cpu --horizon 8 --window-steps 4 \
+  --scenarios 16 --updates 2 --work-dir runs/response_smoke
+```
+
+`--scenarios` is per bank; TRAIN pools four banks (default 4×128=512).
+Fixed EVAL pools two banks; EVAL and periodic checkpoint defaults are both 50 updates.
+`profile` uses the same trainer
+with at most one update. `--resume` requires matching source/config; do not modify
+checkpoint source hashes to bypass checks after cleanup.
 
 ## Coding Style & Naming Conventions
 
@@ -73,7 +78,16 @@ Use Python 3 type hints, `from __future__ import annotations`, and four-space in
 
 ## Testing Guidelines
 
-Tests live under `tests/`. New response-control checks are in `test_response_control.py` and `test_response_training.py`. Keep fixtures small enough to run without a GPU. Run validation and training only when requested; distinguish code correctness, learned performance, and deployment safety. See `docs/response_control_v1.md` for the new protocol. The Q2 migration pipeline is historical and requires `--historical-q2-distillation`.
+Keep deterministic verification outside the production tree when requested to
+maintain the seven-file source layout. Historical tests require their matching
+source; removed experimental APIs are not production requirements.
+For physics, sampling or adjoint changes, compare against preserved source:
+complete sampled states and RNG, full rollouts, losses/CVaR weights, gradients,
+Adam updates, finite failure recovery and save/resume behavior. Preserve runtime
+boundary and gradient checks, fixed development evaluation and checkpoint guards.
+Use small deterministic checks by default; do not launch long training as a test.
+See `docs/response_control_v1.md` for the current protocol. Distinguish code and
+gradient correctness from learned performance and deployment safety.
 
 ## Commit & Pull Request Guidelines
 

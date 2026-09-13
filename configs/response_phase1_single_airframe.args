@@ -3,8 +3,9 @@
 --device cuda
 --dtype float32
 --seed 7
---scenarios 32
+--scenarios 128
 --horizon 500
+--backprop-mode full
 --window-steps 50
 --gradient-scale 0.1
 --updates 50
@@ -12,7 +13,7 @@
 --lr 3e-4
 --gradient-clip 10
 --agc 0
---development-every 5
---checkpoint-every 1
+--development-every 50
+--checkpoint-every 50
 --huber-delta 1
 --work-dir runs/response_actor_only/seed7

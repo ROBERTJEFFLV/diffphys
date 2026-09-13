@@ -1,4 +1,4 @@
-"""Exact Actor BPTT: one reverse state+parameter VJP per rematerialized window."""
+"""Exact Actor BPTT with a retained full graph or reverse-window recomputation."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from response_task import (
     rollout,
     step_costs,
     risk_weights,
+    tensors_finite,
 )
 
 PHYSICAL_DYNAMIC = ("position", "velocity", "rotation", "omega", "motor", "previous_action")
@@ -93,30 +94,36 @@ class BoundaryRecord:
     window_steps: int
     loss_config: TaskLossConfig
     metrics: dict
+    backprop_mode: str = "windowed"
 
 
-@torch.no_grad()
-def collect_boundary_rollout(policy, simulator, initial, config, *, horizon=500, window_steps=50):
+def collect_boundary_rollout(
+    policy, simulator, initial, config, *, horizon=500, window_steps=50, backprop_mode="windowed"
+):
     if horizon < 1 or window_steps < 1 or horizon % window_steps:
         raise ValueError("horizon must be divisible by window_steps")
-    closed = initialize(policy, initial)
-    boundaries = {0: snapshot(closed)}
-    statistics = FlightStatistics(initial, horizon, config)
-    cost_chunks = []
-    for start in range(0, horizon, window_steps):
-        trace = rollout(policy, simulator, closed, window_steps)
-        # One full time reduction preserves the CVaR input and learning trajectory.
-        cost_chunks.append(step_costs(trace, config, start=start, horizon=horizon))
-        statistics.add(trace, start)
-        closed = trace.end
-        boundaries[start + window_steps] = snapshot(closed)
-        del trace
-    costs = torch.cat(cost_chunks).sum(0)
-    if not bool(torch.isfinite(costs).all()):
-        raise FloatingPointError("nonfinite continuous task costs")
-    weights = risk_weights(costs, config)
+    if backprop_mode not in ("full", "windowed"):
+        raise ValueError("unknown backprop mode")
+    with torch.set_grad_enabled(backprop_mode == "full"):
+        closed = initialize(policy, initial)
+        boundaries = {0: snapshot(closed)}
+        statistics = FlightStatistics(initial, horizon, config)
+        cost_chunks = []
+        for start in range(0, horizon, window_steps):
+            trace = rollout(policy, simulator, closed, window_steps)
+            # No detach between windows: full mode retains the entire H500 graph.
+            cost_chunks.append(step_costs(trace, config, start=start, horizon=horizon))
+            statistics.add(trace, start)
+            closed = trace.end
+            boundaries[start + window_steps] = snapshot(closed)
+            del trace
+        costs = torch.cat(cost_chunks).sum(0)
+        if not bool(torch.isfinite(costs).all()):
+            raise FloatingPointError("nonfinite continuous task costs")
+        weights = risk_weights(costs, config)
     return BoundaryRecord(
-        boundaries, costs, weights, horizon, window_steps, config, statistics.finish(costs, weights)
+        boundaries, costs, weights, horizon, window_steps, config,
+        statistics.finish(costs.detach(), weights), backprop_mode
     )
 
 
@@ -127,8 +134,19 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
     if not math.isfinite(gradient_scale) or gradient_scale <= 0:
         raise ValueError("gradient_scale must be positive and finite")
     parameters = [p for p in policy.parameters() if p.requires_grad]
+    if record.backprop_mode == "full":
+        objective = gradient_scale * (record.weights * record.costs).sum()
+        if not bool(torch.isfinite(objective)):
+            raise FloatingPointError("nonfinite full-horizon objective")
+        gradients = torch.autograd.grad(objective, parameters, allow_unused=True)
+        if not tensors_finite(gradients):
+            raise FloatingPointError("nonfinite full-horizon Actor gradient")
+        for p, g in zip(parameters, gradients):
+            p.grad = g
+        # No re-computation took place; callers must not report a boundary match.
+        return {"boundaries": []}
     accumulated = [None] * len(parameters)
-    adjoint, rows, starts = {}, [], []
+    adjoint, rows = {}, []
     for start in reversed(range(0, record.horizon, record.window_steps)):
         end = start + record.window_steps
         state, leaves, names = dynamic_closed_state(record.boundaries[start])
@@ -143,7 +161,7 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
         if not bool(torch.isfinite(objective)):
             raise FloatingPointError("nonfinite reverse objective at %d" % start)
         gradients = torch.autograd.grad(objective, leaves + parameters, allow_unused=True)
-        if not all(bool(torch.isfinite(g).all()) for g in gradients if g is not None):
+        if not tensors_finite(gradients):
             raise FloatingPointError("nonfinite full-horizon gradient at %d" % start)
         # Covectors already contain scene weights; no decay or boundary clipping.
         adjoint = {
@@ -156,16 +174,11 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
                     accumulated[i] = g.detach().clone().mul_(gradient_scale)
                 else:
                     accumulated[i].add_(g.detach(), alpha=gradient_scale)
-        starts.append(start)
         del trace, state, leaves, gradients, objective
-    if not all(bool(torch.isfinite(g).all()) for g in accumulated if g is not None):
+    if not tensors_finite(accumulated):
         raise FloatingPointError("nonfinite accumulated Actor gradient")
     for p, g in zip(parameters, accumulated):
         p.grad = g
     return {
-        "reverse_starts": starts,
         "boundaries": rows,
-        "gradient_scale": gradient_scale,
-        "active_state_groups": len(adjoint),
-        "finite": True,
     }

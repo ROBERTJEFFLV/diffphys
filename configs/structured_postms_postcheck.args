@@ -1,8 +1,0 @@
-# Re-run frozen calibration/equilibrium/JVP/allocator evidence after MS.
---checkpoint {work}/postms_calibrated.pt
---source-checkpoint {root}/reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
---output {work}/postms_postcalibration_evidence.pt
---report {work}/postms_postcheck_report.json
---device {device}
---seed 7
---scenario-seed-offset 710000

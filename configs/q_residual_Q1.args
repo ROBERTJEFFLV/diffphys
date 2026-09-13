@@ -1,4 +1,0 @@
-# Q0 + body-frame integral + zero-initialized explicit integral residual.
-@configs/q_residual_common.args
---integral-input-frame body
---enable-integral-residual

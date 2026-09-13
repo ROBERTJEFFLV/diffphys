@@ -1,6 +1,0 @@
-@configs/temporal_decay_short_common.args
---gradient-decay-mode nmi
---state-grad-alpha 0.25
---hidden-grad-alpha 0.25
---log-path reports/temporal_decay_minimal/short_train/D_alpha0p25/train.csv
---checkpoint-path reports/temporal_decay_minimal/short_train/D_alpha0p25/model.pt

@@ -48,7 +48,6 @@ class ResponsePolicyState:
 class ResponsePolicyOutput:
     action: torch.Tensor
     next_state: ResponsePolicyState
-    memory: torch.Tensor
 
 
 def body_vector(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
@@ -114,9 +113,6 @@ class ResponseMotorPolicy(nn.Module):
         self,
         observation: torch.Tensor,
         state: Optional[ResponsePolicyState] = None,
-        *,
-        applied_action: Optional[torch.Tensor] = None,
-        memory_enabled: bool = True,
     ) -> ResponsePolicyOutput:
         self._check_observation(observation)
         state = self.initial_state(observation) if state is None else state
@@ -145,27 +141,18 @@ class ResponseMotorPolicy(nn.Module):
         # At call0 no physical response exists yet; at call1 the first executed
         # action/response pair is available. No startup segment is detached.
         memory = torch.where(state.calls > 0, proposed_memory, state.memory)
-        if not memory_enabled:
-            memory = torch.zeros_like(memory)
         features = self.control_features(observation)
         proposed = torch.tanh(self.controller(torch.cat((features, memory), -1)))
         radius = self.config.action_rate * self.config.dt
         lower = (executed_previous - radius).clamp(-1.0, 1.0)
         upper = (executed_previous + radius).clamp(-1.0, 1.0)
         action = torch.maximum(lower, torch.minimum(upper, proposed))
-        executed = action if applied_action is None else applied_action
-        if executed.shape != action.shape:
-            raise ValueError("executed action must have shape [batch,4]")
-        if applied_action is not None and (
-            not bool(torch.isfinite(executed).all()) or bool((executed.abs() > 1).any())
-        ):
-            raise ValueError("executed actions must be finite and in [-1,1]")
         integral = (
             max(0.0, 1.0 - self.config.integral_leak * self.config.dt) * state.integral
             + self.config.dt * observation[:, :3]
         ).clamp(-self.config.integral_limit, self.config.integral_limit)
         next_state = ResponsePolicyState(
             memory, integral, observation[:, 3:6], observation[:, 15:18], rotation,
-            executed, executed_previous, state.calls + 1.0,
+            action, executed_previous, state.calls + 1.0,
         )
-        return ResponsePolicyOutput(action, next_state, memory)
+        return ResponsePolicyOutput(action, next_state)

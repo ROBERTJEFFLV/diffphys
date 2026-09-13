@@ -1,3 +1,0 @@
-# Strictly 128 unique scenes; retain IDs are globally non-repeating.
-@configs/multiple_shooting_diverse_128x8_screen.args
---output-dir reports/multiple_shooting_diverse_128x8_unique_screen

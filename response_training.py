@@ -1,4 +1,4 @@
-"""One production path: exact rematerialized H500 BPTT and persistent Adam."""
+"""One production path: exact H500 BPTT and persistent Adam."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from response_task import (
     trajectory_metrics,
     task_loss_components,
     hard_risk_metrics,
+    tensors_finite,
 )
 from response_adjoints import collect_boundary_rollout, backward_actor
 from response_execution import exit_class
@@ -35,8 +36,8 @@ from response_execution import exit_class
 ROOT = Path(__file__).resolve().parent
 PROTOCOL_VERSION = "response-actor-only-exact-v2"
 TRAIN_SEED_BASE = 31_000_007
+TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
-FINAL_SEEDS = (34_000_007, 34_010_007)
 SOURCE_FILES = (
     "response_policy.py",
     "response_task.py",
@@ -202,7 +203,7 @@ def sample_training_scenarios(
     scenarios,
     attempt_index,
     *,
-    batches=2,
+    batches=TRAINING_BANKS,
     dt=0.01,
     device=torch.device("cpu"),
     dtype=torch.float32,
@@ -216,7 +217,7 @@ def sample_training_scenarios(
     states = [
         sample_scenarios(
             scenarios, seed=s, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode
-        )[0]
+        )
         for s in seeds
     ]
     return pool_states(states), seeds
@@ -269,7 +270,7 @@ def adaptive_clip(parameters, limit):
 def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
-        "algorithm": "exact-boundary-bptt-adam",
+        "algorithm": "exact-horizon-bptt-adam",
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -287,6 +288,7 @@ def binding(args, policy_config, loss_config):
                 "device",
                 "dtype",
                 "horizon",
+                "backprop_mode",
                 "window_steps",
                 "lr",
                 "gradient_clip",
@@ -295,7 +297,7 @@ def binding(args, policy_config, loss_config):
                 "threads",
             )
         },
-        "training_banks": 2,
+        "training_banks": TRAINING_BANKS,
         "torch_version": str(torch.__version__),
     }
 
@@ -342,11 +344,11 @@ def _append(path, row):
 
 @torch.no_grad()
 def evaluate(policy, simulator, initial, horizon, loss_config):
-    trace = rollout(policy, simulator, initial, horizon)
+    with simulator.defer_solve_errors():
+        trace = rollout(policy, simulator, initial, horizon)
     report = trajectory_metrics(trace, loss_config)
     if not report["finite"]:
         raise FloatingPointError("nonfinite fixed EVAL")
-    report.pop("scenarios")
     report["task_components"] = task_loss_components(trace, loss_config)
     risk = hard_risk_metrics(trace, loss_config)
     report["risk"] = risk
@@ -460,7 +462,7 @@ def train(args, policy_config, loss_config):
                 device=device,
                 dtype=dtype,
                 scenario_mode=args.scenario_mode,
-            )[0]
+            )
             for s in DEVELOPMENT_SEEDS
         ]
     )
@@ -530,19 +532,21 @@ def train(args, policy_config, loss_config):
                     scenario_mode=args.scenario_mode,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                record = collect_boundary_rollout(
-                    policy,
-                    simulator,
-                    initial,
-                    loss_config,
-                    horizon=args.horizon,
-                    window_steps=args.window_steps,
-                )
-                _sync(device)
-                forward_done = time.monotonic()
-                backward = backward_actor(
-                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
-                )
+                with simulator.defer_solve_errors():
+                    record = collect_boundary_rollout(
+                        policy,
+                        simulator,
+                        initial,
+                        loss_config,
+                        horizon=args.horizon,
+                        window_steps=args.window_steps,
+                        backprop_mode=args.backprop_mode,
+                    )
+                    _sync(device)
+                    forward_done = time.monotonic()
+                    backward = backward_actor(
+                        policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
+                    )
                 raw_norm = gradient_norm(policy.parameters()) if args.agc else None
                 adaptive_clip(policy.parameters(), args.agc)
                 pre_clip = safe_global_clip(policy.parameters(), args.gradient_clip)
@@ -552,7 +556,7 @@ def train(args, policy_config, loss_config):
                 tensors = list(policy.parameters()) + [
                     v for s in optimizer.state.values() for v in s.values() if torch.is_tensor(v)
                 ]
-                if not all(bool(torch.isfinite(x).all()) for x in tensors):
+                if not tensors_finite(tensors):
                     raise FloatingPointError("nonfinite Adam parameters or moments")
             except Exception:
                 policy.load_state_dict(before[0])
@@ -570,8 +574,14 @@ def train(args, policy_config, loss_config):
                 "raw_gradient_norm": raw_norm,
                 "pre_global_clip_norm": pre_clip,
                 "gradient_scale": args.gradient_scale,
-                "boundary_exact": all(r["exact"] for r in backward["boundaries"]),
-                "boundary_max_error": max(r["max_error"] for r in backward["boundaries"]),
+                "backprop_mode": args.backprop_mode,
+                "boundary_checks": len(backward["boundaries"]),
+                "boundary_exact": (
+                    all(r["exact"] for r in backward["boundaries"]) if backward["boundaries"] else None
+                ),
+                "boundary_max_error": max(
+                    (r["max_error"] for r in backward["boundaries"]), default=None
+                ),
                 "forward_seconds": forward_done - update_start,
                 "update_seconds": time.monotonic() - update_start,
                 "cuda_peak_bytes": (
@@ -630,7 +640,7 @@ def evaluate_checkpoint(args):
                 device=device,
                 dtype=dtype,
                 scenario_mode=cfg["scenario_mode"],
-            )[0]
+            )
             for s in DEVELOPMENT_SEEDS
         ]
     )

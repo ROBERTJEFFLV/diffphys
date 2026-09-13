@@ -1,4 +1,0 @@
-@configs/time_horizon_q2_common.args
---integral-input-multiplier 1.0
---episode-horizon-schedule mixed-h500-h1000-h2000
-

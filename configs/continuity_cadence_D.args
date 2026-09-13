@@ -1,9 +1,0 @@
-# Arm D: same compressed reset sequence and H1000 optimizer cadence as B,
-# while independent position/omega CVaR events remain on complete H500 blocks.
-# Gradients from both H500 blocks accumulate into one H1000 commit. This is a
-# default-off probe for CVaR event density and total event mass at fixed commit
-# count, not a pure cadence intervention or a promoted policy.
-@configs/continuity_cadence_common.args
---episode-horizon-schedule compressed-t2-10pct
---optimization-block-horizon 0
---tail-supervision-block-horizon 500

@@ -1,12 +1,11 @@
 """Teacher-free causal rollout, physical task objective, and scenario banks."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 import math
-from typing import Mapping, Optional
+from typing import Optional
 
 import torch
-from torch.nn.utils.stateless import functional_call
 
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import (
@@ -72,21 +71,11 @@ def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClose
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
 
-def policy_step(policy, obs, state, parameters=None, **kwargs):
-    if parameters is None:
-        return policy(obs, state, **kwargs)
-    return functional_call(policy, parameters, (obs, state), kwargs)
-
-
 def rollout(
     policy: ResponseMotorPolicy,
     simulator: L2FSimulator,
     initial: L2FState | ResponseClosedLoopState,
     steps: int,
-    *,
-    parameters: Optional[Mapping[str, torch.Tensor]] = None,
-    memory_enabled: bool = True,
-    boundary_observer=None,
 ) -> TaskTrajectory:
     if steps < 1:
         raise ValueError("rollout must contain physical transitions")
@@ -96,17 +85,12 @@ def rollout(
     observations = [observation(closed.physical, closed.policy.integral)]
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     for step in range(steps):
-        output = policy_step(
-            policy, observations[-1], closed.policy, parameters,
-            memory_enabled=memory_enabled,
-        )
+        output = policy(observations[-1], closed.policy)
         before = closed.physical
         # The same action is executed and recorded, and the policy state is
         # advanced once. No truth reset, detached burn-in, or hidden-state splice.
-        physical = simulator.step(before, output.action, grad_decay=1.0)
+        physical = simulator.step(before, output.action)
         closed = ResponseClosedLoopState(physical, output.next_state)
-        if boundary_observer is not None:
-            boundary_observer(step + 1, closed)
         actions.append(output.action)
         positions.append(physical.position)
         velocities.append(physical.velocity)
@@ -119,15 +103,6 @@ def rollout(
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
         torch.stack(omega_deltas),
     )
-
-
-def concatenate(parts: list[TaskTrajectory]) -> TaskTrajectory:
-    if not parts:
-        raise ValueError("empty trajectory list")
-    names = ("actions", "positions", "velocities", "omegas", "action_deltas", "omega_deltas")
-    values = {name: torch.cat([getattr(p, name) for p in parts]) for name in names}
-    observations = torch.cat([parts[0].observations] + [p.observations[1:] for p in parts[1:]])
-    return TaskTrajectory(parts[-1].end, observations=observations, **values)
 
 
 def weighted_task_features(
@@ -228,7 +203,7 @@ def sample_scenarios(
     count: int, *, seed: int, dt: float = 0.01,
     device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
     scenario_mode: str = "physical-fit",
-) -> tuple[L2FState, torch.Tensor]:
+) -> L2FState:
     """Independent physical-fit bank or nominal airframe with random kinematics."""
     if scenario_mode not in ("physical-fit", "fixed-airframe"):
         raise ValueError("unknown response scenario mode")
@@ -242,37 +217,35 @@ def sample_scenarios(
                                     sample_dynamics=False, sample_external_force=False)
         state = L2FState(**{f.name: getattr(fixed, f.name).to(device=device, dtype=dtype)
                            for f in fields(fixed)})
-        return state, torch.full((count, 2), -1, device=device, dtype=torch.long)
+        return state
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(int(seed))
         pool = simulator.reset(
             max(4096, count * 128), device=torch.device("cpu"), dtype=torch.float32,
-            sample_dynamics=True, sampled_dynamics_level="broad",
-            broad_sampler="physical-fit", balanced_dynamics_sampling=False,
+            sample_dynamics=True,
             sample_external_force=True,
         )
     tw_edges = torch.linspace(1.45, 5.50, 5)
     alpha_edges = torch.logspace(math.log10(35.0), math.log10(2200.0), 5)
     tw = torch.bucketize(pool.thrust_to_weight, tw_edges[1:-1])
     alpha = torch.bucketize(pool.alpha_roll_max, alpha_edges[1:-1])
-    selections, cells = [], []
+    selections = []
     for i in range(4):
         for j in range(4):
             choices = torch.nonzero((tw == i) & (alpha == j), as_tuple=False).flatten()
             if choices.numel() < count // 16:
                 raise RuntimeError("physical-fit sampler did not fill the registered strata")
             selections.append(choices[:count // 16])
-            cells.extend([(i, j)] * (count // 16))
     indices = torch.cat(selections)
     state = L2FState(**{
         field.name: getattr(pool, field.name).index_select(0, indices).to(device=device, dtype=dtype)
         for field in fields(pool)
     })
-    return state, torch.tensor(cells, dtype=torch.long, device=device)
+    return state
 
 
 def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> dict:
-    """Minimal control metrics; keep every scene, not a tail/JVP audit suite."""
+    """Aggregate control metrics over every scene, with the original finite mask."""
     costs = scenario_costs(trajectory, config).detach()
     p, v, w = [x.detach().norm(dim=-1) for x in (
         trajectory.positions, trajectory.velocities, trajectory.omegas
@@ -289,14 +262,6 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
         finite = finite & torch.isfinite(trajectory.end.policy.memory).all(-1)
     success = ((p[-tail:] < 0.05) & (v[-tail:] < 0.10) & (w[-tail:] < 0.50)).all(0)
     saturation = (trajectory.actions.detach().abs() >= 1.0 - 1.0e-6).to(p.dtype).mean(dim=(0, 2))
-    rows = [{
-        "scenario": i, "task_cost": float(costs[i]), "finite": bool(finite[i]),
-        "success": bool(success[i] and finite[i]),
-        "position_rms": float(p[:, i].square().mean().sqrt()),
-        "velocity_rms": float(v[:, i].square().mean().sqrt()),
-        "omega_rms": float(w[:, i].square().mean().sqrt()),
-        "motor_saturation_fraction": float(saturation[i]),
-    } for i in range(costs.numel())]
     return {
         "task_objective": float(task_loss(trajectory, config).detach()),
         "position_rms": float(p.square().mean().sqrt()),
@@ -304,8 +269,8 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
         "omega_rms": float(w.square().mean().sqrt()),
         "steady_success_rate": float((success & finite).to(p.dtype).mean()),
         "motor_saturation_fraction": float(saturation.mean()),
-        "finite": bool(finite.all()), "success_count": sum(r["success"] for r in rows),
-        "scenario_count": len(rows), "scenarios": rows,
+        "finite": bool(finite.all()), "success_count": int((success & finite).sum()),
+        "scenario_count": costs.numel(),
     }
 
 
@@ -317,6 +282,15 @@ def task_loss_components(trajectory, config, *, start=0, horizon=None, weights=N
     return {name: float((weights * features[:, :, section].sum(dim=(0, 2))).sum().detach())
             for name, section in (('position', slice(0, 3)), ('velocity', slice(3, 6)),
                                   ('omega', slice(6, 9)), ('regularization', slice(9, None)))}
+
+
+def tensors_finite(values):
+    """Reduce on each device before reading; Adam step counters may live on CPU."""
+    checks = {}
+    for value in values:
+        if value is not None:
+            checks.setdefault(value.device, []).append(torch.isfinite(value).all())
+    return all(bool(torch.stack(flags).all()) for flags in checks.values())
 
 
 class FlightStatistics:
@@ -336,7 +310,7 @@ class FlightStatistics:
                                   (trace.positions, trace.velocities, trace.omegas)])
         values = [magnitudes, trace.actions]
         values += [getattr(s, f.name) for s in (trace.end.physical, trace.end.policy) for f in fields(s)]
-        if not all(bool(torch.isfinite(x).all()) for x in values):
+        if not tensors_finite(values):
             raise FloatingPointError('nonfinite continuous closed-loop state')
         self.squares.add_(magnitudes.square().sum(1))
         self.saturation.add_((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2).sum(0))

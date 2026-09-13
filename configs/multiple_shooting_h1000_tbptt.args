@@ -1,3 +1,0 @@
-@configs/multiple_shooting_h1000_common.args
---mode tbptt
---output-dir reports/multiple_shooting_h1000_minimal/tbptt

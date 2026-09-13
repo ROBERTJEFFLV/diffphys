@@ -1,4 +1,0 @@
-# Q1 + deployable rate damping residual + privileged future-state decay loss.
-@configs/q_residual_Q1.args
---enable-rate-damping-residual
---w-omega-decay 0.001

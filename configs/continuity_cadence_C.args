@@ -1,6 +1,0 @@
-# Arm C: the exact same reset sequence as B, but update/CVaR every H500.
-# Physical state, GRU hidden state, and integral state cross the midpoint of
-# every H1000 reset episode.
-@configs/continuity_cadence_common.args
---episode-horizon-schedule compressed-t2-10pct
---optimization-block-horizon 500

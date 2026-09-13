@@ -1,9 +1,0 @@
-# Re-run the complete paired Torch migration gate after MS evidence refresh.
---teacher-checkpoint {root}/reports/q_residual_h500_u2000_gpu2/seed_7/group_Q2/checkpoints/model_update_2000.pt
---student-checkpoint {work}/postms_postcalibration_evidence.pt
---output-checkpoint {work}/postms_migrated.pt
---csv-output {work}/postms_migration.csv
---json-output {work}/postms_migration_report.json
---device {device}
---seed 7
---scenario-seed-offset 720000

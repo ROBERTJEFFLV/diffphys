@@ -1,4 +1,0 @@
-@configs/position_hold_common.args
---lambda-motor-aux 0.0
---lambda-capability-aux 0.0
---lambda-response-aux 0.0

@@ -1,3 +1,0 @@
-# P2 with an additional independently selected H250 tail.
-@configs/compact_cvar_P2.args
---early-tail-weight 0.25

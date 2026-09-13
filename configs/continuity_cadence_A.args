@@ -1,5 +1,0 @@
-# Arm A: 75 independent H500 reset episodes and 75 H500 optimizer blocks.
-@configs/continuity_cadence_common.args
---episode-horizon-schedule fixed-h500
---optimization-block-horizon 0
-

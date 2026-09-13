@@ -28,9 +28,13 @@ def parse_args(argv=None):
         "--scenario-mode", choices=("fixed-airframe", "physical-fit"), default="fixed-airframe"
     )
     parser.add_argument(
-        "--scenarios", type=int, default=32, help="initial states per bank; TRAIN pools two banks"
+        "--scenarios", type=int, default=128, help="initial states per bank; TRAIN pools four banks"
     )
     parser.add_argument("--horizon", type=int, default=500)
+    parser.add_argument(
+        "--backprop-mode", choices=("full", "windowed"), default="full",
+        help="full retains the entire graph; windowed recomputes to save memory",
+    )
     parser.add_argument("--window-steps", type=int, default=50)
     parser.add_argument(
         "--updates",
@@ -58,8 +62,8 @@ def parse_args(argv=None):
         default=0.0,
         help="optional unitwise adaptive clipping (e.g. .01); 0 disables",
     )
-    parser.add_argument("--development-every", type=int, default=5)
-    parser.add_argument("--checkpoint-every", type=int, default=1)
+    parser.add_argument("--development-every", type=int, default=50)
+    parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--work-dir", type=Path, default=Path("runs/response_actor_only/seed7"))
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)

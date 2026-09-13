@@ -1,3 +1,0 @@
-# P3 with compact observation plus the deployable 3D position integral.
-@configs/compact_cvar_P3.args
---observation-mode integral25

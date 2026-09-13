@@ -1,3 +1,0 @@
-# P1 with full-weight episode events after segment gradient averaging.
-@configs/compact_cvar_P1.args
---correct-episode-boundary-weighting
