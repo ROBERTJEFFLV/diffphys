@@ -55,15 +55,26 @@ class TaskTrajectory:
     omegas: torch.Tensor
     action_deltas: torch.Tensor
     omega_deltas: torch.Tensor
+    initial: L2FState
 
 
 def observation(physical: L2FState, integral: torch.Tensor) -> torch.Tensor:
-    """World p/v, full R, body omega/integral, executed previous action."""
-    return torch.cat((
-        physical.position, physical.velocity, physical.rotation.flatten(1),
-        physical.omega, body_vector(physical.rotation, integral),
-        physical.previous_action,
-    ), -1)
+    """Noisy deployable state only; one fixed noise sample per physical time step.
+
+    Re-observing a window boundary MUST NOT draw a second noise realization.
+    The simulator's true orientation is never changed by observation noise.
+    """
+    clean = torch.cat((physical.position, physical.velocity,
+                       physical.rotation.flatten(1), physical.omega), -1)
+    if physical.noise_tape.shape[1] == 1:
+        noise = physical.noise_tape[:, 0]
+    else:
+        rows = torch.arange(clean.shape[0], device=clean.device)
+        noise = physical.noise_tape[rows, physical.step_index]
+    measured = clean + noise
+    rotation_measured = measured[:, 6:15].reshape(-1, 3, 3)
+    return torch.cat((measured, body_vector(rotation_measured, integral),
+                      physical.previous_action), -1)
 
 
 def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClosedLoopState:
@@ -82,6 +93,13 @@ def rollout(
     if abs(simulator.params.dt - policy.config.dt) > 1.0e-12:
         raise ValueError("training and deployment dt must agree")
     closed = initialize(policy, initial) if isinstance(initial, L2FState) else initial
+    expected_code = int(simulator.params.protocol == "raptor")
+    if not bool((closed.physical.profile_code == expected_code).all()):
+        raise ValueError("sampler and simulator reference protocols disagree")
+    if (closed.physical.noise_tape.shape[1] > 1
+            and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
+        raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
+    initial_physical = closed.physical
     observations = [observation(closed.physical, closed.policy.integral)]
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     for step in range(steps):
@@ -101,7 +119,7 @@ def rollout(
     return TaskTrajectory(
         closed, torch.stack(observations), torch.stack(actions), torch.stack(positions),
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
-        torch.stack(omega_deltas),
+        torch.stack(omega_deltas), initial_physical,
     )
 
 
@@ -165,8 +183,8 @@ def hard_risk_metrics(trajectory, loss_config: TaskLossConfig) -> dict:
     count = max(1, math.ceil(loss_config.tail_fraction * trajectory.actions.shape[1]))
     risks = {name: float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
              for name, value in risks.items()}
-    position = torch.cat((trajectory.observations[:1, ..., :3], trajectory.positions)).detach().norm(dim=-1)
-    velocity = torch.cat((trajectory.observations[:1, ..., 3:6], trajectory.velocities)).detach().norm(dim=-1)
+    position = torch.cat((trajectory.initial.position[None], trajectory.positions)).detach().norm(dim=-1)
+    velocity = torch.cat((trajectory.initial.velocity[None], trajectory.velocities)).detach().norm(dim=-1)
     return {"hard_risk_components": risks,
             "hard_risk_peaks": {"omega": float(trajectory.omegas.detach().norm(dim=-1).max()),
                                 "action_abs": float(trajectory.actions.detach().abs().max()),
@@ -202,46 +220,15 @@ def task_loss(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tenso
 def sample_scenarios(
     count: int, *, seed: int, dt: float = 0.01,
     device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
-    scenario_mode: str = "physical-fit",
+    scenario_mode: str = "raptor", horizon: int = 500,
 ) -> L2FState:
-    """Independent physical-fit bank or nominal airframe with random kinematics."""
-    if scenario_mode not in ("physical-fit", "fixed-airframe"):
-        raise ValueError("unknown response scenario mode")
-    if count < 16 or count % 16:
-        raise ValueError("scenario count must be a positive multiple of 16")
-    simulator = L2FSimulator(L2FParams(dt=dt))
-    if scenario_mode == "fixed-airframe":
-        with torch.random.fork_rng(devices=[]):
-            torch.random.default_generator.manual_seed(int(seed))
-            fixed = simulator.reset(count, device="cpu", dtype=torch.float32,
-                                    sample_dynamics=False, sample_external_force=False)
-        state = L2FState(**{f.name: getattr(fixed, f.name).to(device=device, dtype=dtype)
-                           for f in fields(fixed)})
-        return state
-    with torch.random.fork_rng(devices=[]):
-        torch.random.default_generator.manual_seed(int(seed))
-        pool = simulator.reset(
-            max(4096, count * 128), device=torch.device("cpu"), dtype=torch.float32,
-            sample_dynamics=True,
-            sample_external_force=True,
-        )
-    tw_edges = torch.linspace(1.45, 5.50, 5)
-    alpha_edges = torch.logspace(math.log10(35.0), math.log10(2200.0), 5)
-    tw = torch.bucketize(pool.thrust_to_weight, tw_edges[1:-1])
-    alpha = torch.bucketize(pool.alpha_roll_max, alpha_edges[1:-1])
-    selections = []
-    for i in range(4):
-        for j in range(4):
-            choices = torch.nonzero((tw == i) & (alpha == j), as_tuple=False).flatten()
-            if choices.numel() < count // 16:
-                raise RuntimeError("physical-fit sampler did not fill the registered strata")
-            selections.append(choices[:count // 16])
-    indices = torch.cat(selections)
-    state = L2FState(**{
-        field.name: getattr(pool, field.name).index_select(0, indices).to(device=device, dtype=dtype)
-        for field in fields(pool)
-    })
-    return state
+    """Source-defined airframes, paper-first initial conditions and fixed noise.
+
+    A fresh episode sample uses an independent local seed. There is no 4x4
+    authority reweighting and no environment-default fallback in this path.
+    """
+    simulator = L2FSimulator(L2FParams(dt=dt, protocol=scenario_mode))
+    return simulator.reset(count, seed=seed, horizon=horizon, device=device, dtype=dtype)
 
 
 def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> dict:
@@ -272,33 +259,37 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
 
 
 @torch.no_grad()
-def reference_episode_metrics(trajectory: TaskTrajectory) -> dict[str, float]:
-    """Offline reference scoring of a complete, finite EVAL trajectory.
+def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
+    """Score first termination with each airframe's own reference boundaries.
 
-    Check post-transition states (steps 1..H), never truncate the real rollout.
-    Limits are per axis, with strict > comparisons; std is population std.
-    L2F settling follows its episode_length == H and final-distance test,
-    including a first termination on the final transition itself.
+    Only publish the matching profile, never apply a L2F box to RAPTOR scenes.
+    Physical trajectories remain continuous for exact BPTT; reference metrics
+    stop logically at the first violation, regardless of any later recovery.
     """
+    state = trajectory.initial
+    code = int(state.profile_code[0])
+    if not bool((state.profile_code == code).all()):
+        raise ValueError("a reference evaluation bank cannot mix protocols")
+    if bool(L2FSimulator.terminated(state).any()):
+        raise ValueError("reference evaluation starts outside its termination set")
+    name = "raptor" if code == 1 else "l2f"
     horizon = trajectory.positions.shape[0]
-    position, velocity, omega = [value.abs().amax(dim=-1) for value in (
-        trajectory.positions, trajectory.velocities, trajectory.omegas
-    )]
-    steps = torch.arange(1, horizon + 1, device=position.device)[:, None]
-    result = {}
-    for name, p_limit, v_limit, w_limit in (
-        ("l2f", 0.6, 1000.0, 1000.0),
-        ("raptor", 1.0, 2.0, 35.0),
-    ):
-        terminated = (position > p_limit) | (velocity > v_limit) | (omega > w_limit)
-        lengths = torch.where(terminated, steps, horizon).amin(dim=0)
-        lengths_float = lengths.to(torch.float64)
-        result[name + "_episode_length_mean"] = float(lengths_float.mean())
-        result[name + "_episode_length_std"] = float(lengths_float.std(unbiased=False))
-        result[name + "_share_terminated"] = float(terminated.any(dim=0).double().mean())
-        if name == "l2f":
-            settled = (lengths == horizon) & (trajectory.positions[-1].norm(dim=-1) < 0.20)
-            result["l2f_settling_fraction_200mm"] = float(settled.double().mean())
+    terminated = ((trajectory.positions.abs() > state.position_limit[None, :, None]).any(-1)
+                  | (trajectory.velocities.abs() > state.velocity_limit[None, :, None]).any(-1)
+                  | (trajectory.omegas.abs() > state.omega_limit[None, :, None]).any(-1))
+    steps = torch.arange(1, horizon+1, device=terminated.device)[:, None]
+    lengths = torch.where(terminated, steps, horizon).amin(dim=0)
+    result = {
+        "reference_protocol": name,
+        name + "_episode_length_mean": float(lengths.double().mean()),
+        name + "_episode_length_std": float(lengths.double().std(unbiased=False)),
+        name + "_share_terminated": float(terminated.any(0).double().mean()),
+        "reference_position_limit_min_m": float(state.position_limit.min()),
+        "reference_position_limit_max_m": float(state.position_limit.max()),
+    }
+    if name == "l2f":
+        settled = (lengths == horizon) & (trajectory.positions[-1].norm(dim=-1) < 0.20)
+        result["l2f_settling_fraction_200mm"] = float(settled.double().mean())
     return result
 
 

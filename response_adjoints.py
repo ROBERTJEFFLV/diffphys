@@ -17,7 +17,7 @@ from response_task import (
     tensors_finite,
 )
 
-PHYSICAL_DYNAMIC = ("position", "velocity", "rotation", "omega", "motor", "previous_action")
+PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action")
 POLICY_DYNAMIC = (
     "memory",
     "integral",
@@ -32,7 +32,9 @@ POLICY_NONDIFFERENTIABLE = ("calls", "last_action")
 def snapshot(closed: ResponseClosedLoopState) -> ResponseClosedLoopState:
     return type(closed)(
         *(
-            type(state)(**{f.name: getattr(state, f.name).detach().clone() for f in fields(state)})
+            type(state)(**{f.name: (getattr(state, f.name).detach() if f.name == "noise_tape"
+                                  else getattr(state, f.name).detach().clone())
+                          for f in fields(state)})
             for state in (closed.physical, closed.policy)
         )
     )
@@ -69,6 +71,8 @@ def compare_boundary(expected, actual, step):
                 getattr(getattr(expected, group), f.name),
                 getattr(getattr(actual, group), f.name).detach(),
             )
+            if f.name == "noise_tape" and a.data_ptr() == b.data_ptr() and a.shape == b.shape:
+                continue  # Immutable tape is shared, not recomputed or modified.
             errors.append((a - b).abs().max())
             passed.append(
                 (

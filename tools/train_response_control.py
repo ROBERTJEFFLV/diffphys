@@ -25,11 +25,12 @@ def parse_args(argv=None):
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
-        "--scenario-mode", choices=("fixed-airframe", "physical-fit"), default="fixed-airframe"
+        "--scenario-mode", choices=("l2f", "raptor"), default="raptor"
     )
     parser.add_argument(
         "--scenarios", type=int, default=128, help="initial states per bank; TRAIN pools four banks"
     )
+    parser.add_argument("--eval-scenarios", type=int, default=128, help="fixed EVAL states per bank, independent of TRAIN batch")
     parser.add_argument("--horizon", type=int, default=500)
     parser.add_argument(
         "--backprop-mode", choices=("full", "windowed"), default="full",
@@ -64,21 +65,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--development-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=50)
-    parser.add_argument("--work-dir", type=Path, default=Path("runs/response_actor_only/seed7"))
+    parser.add_argument("--work-dir", type=Path, default=Path("runs/raptor_reference/seed7"))
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)
     initialize.add_argument(
         "--init-checkpoint",
         type=Path,
         help="explicit weights-only initialization; fresh Adam and sampling",
-    )
-    initialize.add_argument(
-        "--migrate-checkpoint", type=Path, help="explicit legacy Actor-only Adam/RNG migration"
-    )
-    parser.add_argument(
-        "--migration-metadata",
-        type=Path,
-        help="audited JSON with checkpoint hash, semantics, parameter names and next_update",
     )
     parser.add_argument(
         "--checkpoint", type=Path, help="checkpoint for fixed development evaluation"
@@ -93,6 +86,7 @@ def parse_args(argv=None):
     for name in (
         "threads",
         "scenarios",
+        "eval_scenarios",
         "horizon",
         "window_steps",
         "development_every",
@@ -100,8 +94,8 @@ def parse_args(argv=None):
     ):
         if getattr(args, name) < 1:
             parser.error(name + " must be positive")
-    if args.scenarios % 16 or args.horizon % args.window_steps:
-        parser.error("scenarios must be divisible by 16 and horizon by window-steps")
+    if args.horizon % args.window_steps:
+        parser.error("horizon must be divisible by window-steps")
     if args.updates < 0:
         parser.error("updates must be nonnegative")
     for name in ("max_seconds", "lr", "gradient_clip", "gradient_scale"):
@@ -109,8 +103,6 @@ def parse_args(argv=None):
             parser.error(name + " must be finite and positive")
     if not math.isfinite(args.agc) or args.agc < 0:
         parser.error("agc must be finite and nonnegative")
-    if args.migrate_checkpoint and not args.migration_metadata:
-        parser.error("migration requires explicit metadata")
     if args.mode == "evaluate" and not args.checkpoint:
         parser.error("evaluate requires --checkpoint")
     return args

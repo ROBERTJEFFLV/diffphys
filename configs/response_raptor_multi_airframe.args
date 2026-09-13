@@ -1,5 +1,5 @@
 --mode train
---scenario-mode l2f
+--scenario-mode raptor
 --device cuda
 --dtype float32
 --seed 7
@@ -18,4 +18,4 @@
 --development-every 50
 --checkpoint-every 50
 --huber-delta 1
---work-dir runs/l2f_reference/seed7
+--work-dir runs/raptor_reference/seed7

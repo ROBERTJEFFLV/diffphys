@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-ARCHITECTURE = "response-conditioned-motor-policy-v2-actor-only"
+ARCHITECTURE = "response-conditioned-absolute-motor-policy-v3"
 OBSERVATION_DIM = 25
 
 
@@ -17,7 +17,7 @@ class ResponsePolicyConfig:
     memory_dim: int = 64
     hidden_dim: int = 64
     dt: float = 0.01
-    action_rate: float = 50.0
+    action_rate: float = 0.0  # 0: native absolute motor commands, no slew projection
     integral_limit: float = 0.5
     integral_leak: float = 0.0
 
@@ -28,7 +28,7 @@ class ResponsePolicyConfig:
             self.dt, self.action_rate, self.integral_limit, self.integral_leak
         )):
             raise ValueError("policy constants must be finite")
-        if min(self.dt, self.action_rate, self.integral_limit) <= 0 or self.integral_leak < 0:
+        if min(self.dt, self.integral_limit) <= 0 or min(self.integral_leak, self.action_rate) < 0:
             raise ValueError("invalid policy integration or actuator constraints")
 
 
@@ -143,10 +143,12 @@ class ResponseMotorPolicy(nn.Module):
         memory = torch.where(state.calls > 0, proposed_memory, state.memory)
         features = self.control_features(observation)
         proposed = torch.tanh(self.controller(torch.cat((features, memory), -1)))
-        radius = self.config.action_rate * self.config.dt
-        lower = (executed_previous - radius).clamp(-1.0, 1.0)
-        upper = (executed_previous + radius).clamp(-1.0, 1.0)
-        action = torch.maximum(lower, torch.minimum(upper, proposed))
+        action = proposed
+        if self.config.action_rate > 0:  # Explicit non-reference experiment only.
+            radius = self.config.action_rate * self.config.dt
+            lower = (executed_previous - radius).clamp(-1.0, 1.0)
+            upper = (executed_previous + radius).clamp(-1.0, 1.0)
+            action = torch.maximum(lower, torch.minimum(upper, proposed))
         integral = (
             max(0.0, 1.0 - self.config.integral_leak * self.config.dt) * state.integral
             + self.config.dt * observation[:, :3]

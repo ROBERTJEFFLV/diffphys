@@ -1,82 +1,95 @@
 # DiffPhys response motor control
 
 A response encoder, GRU memory and motor controller learn from differentiable
-quadrotor flight. The deployable Actor consumes a 25-element observation and
-outputs four motor commands. Simulator dynamics and motor truth do not enter
-its observation.
+quadrotor flight. The Actor consumes 25 deployable observation entries and outputs
+four **absolute normalized motor commands** in [-1,1]. No mass, inertia, motor
+state or external-force truth is given to the Actor.
 
-## Production files
+## Reference environment v3
 
-| File | Responsibility |
+The production path now uses two explicit reference protocols:
+
+| `--scenario-mode` | Environment and initialization |
 | --- | --- |
-| `env_l2f.py` | PyTorch rigid-body physics, motor response and scenario dynamics |
-| `response_policy.py` | Response encoder, GRU and motor controller |
-| `response_task.py` | Initial states, continuous rollout, task/CVaR loss and metrics |
-| `response_adjoints.py` | Exact full-flight gradients with retained graph or window recomputation |
-| `response_training.py` | Adam, fixed development evaluation, checkpoints and resume |
-| `response_execution.py` | Exit status classification |
-| `tools/train_response_control.py` | Train, profile and evaluate CLI |
-| `configs/response_phase1_single_airframe.args` | Nominal-airframe H500/W50 configuration |
+| `l2f` | 2024 L2F Crazyflie, original quadratic RPM thrust curve, 150 ms motor response, source observation noise/force/torque, position +/-0.2 m inside +/-0.6 m boundaries |
+| `raptor` (default) | RAPTOR source joint dynamics distribution, **paper-first** 90-degree initialization, per-axis position +/-10 rotor radii and termination +/-20 radii, speed/omega initialization +/-1, source force/noise settings |
 
-The default `--backprop-mode full` flies H500 once with its entire computation
-graph, selects pooled CVaR weights once and differentiates the same objective.
-H50 chunks preserve absolute time and continuous physical/recurrent state; they
-do not detach the graph or replay the flight. `--backprop-mode windowed` retains
-the exact reverse-window implementation for limited memory and numerical
-comparisons. Both modes apply finite checks, optional AGC, global clipping and
-one persistent Adam update. All implicit-solve statuses from forward and backward
-are checked together before Adam; physical integration is unchanged.
+Both use FLU X geometry, motor order **front-right, back-right, back-left,
+front-left**, 100 Hz and joint RK4 dynamics. Motor zero is no longer a universal
+hover point. A command maps by `u = min + (action+1)/2*(max-min)`; motor lag acts
+on `u` and the original thrust polynomial acts on that delayed state. The
+RAPTOR profile samples rising/falling delays independently. The default Actor
+has no extra slew-rate projection (`--action-rate 0`).
 
-The current defaults use seed 7, four pooled banks of 128 states (512 concurrent
-TRAIN trajectories), H500/W50,
-`gradient-scale=0.1`, Adam `lr=3e-4`, clip 10 and AGC disabled. Nominal dynamics
-and zero external force are fixed; position, velocity, attitude and omega vary.
-The CLI also supports `--scenario-mode physical-fit`, retaining outer 4x4
-thrust-to-weight / roll-authority sampling and its existing disturbances.
-Fixed EVAL pools two banks of 128 states (256 trajectories). Periodic EVAL and
-checkpoint saving both run every 50 updates. Initial and final/interrupted
-checkpoints still protect the run independently of that periodic schedule.
+**Breaking change:** v2 and older hover-centered / plus-layout checkpoints cannot
+be resumed, used for weight initialization or evaluated under v3. Retrain in a
+new work directory. Editing checkpoint hashes is not a migration. Removed
+`fixed-airframe` / `physical-fit` CLI names fail explicitly instead of silently
+changing the meaning of old commands.
+
+The definitive numerical settings, source pins, initialization discrepancies and
+limits of this comparison are in [the reference protocol](docs/raptor_reference.md).
+`docs/response_control_v1.md` describes the **pre-v3** environment and its migration
+path; it is historical, not the current motor/scene contract.
+
+## Production path
+
+The seven production files remain `env_l2f.py`, `response_policy.py`,
+`response_task.py`, `response_adjoints.py`, `response_training.py`,
+`response_execution.py` and `tools/train_response_control.py`.
+
+`full` BPTT retains the entire H500 graph. H50 windows do not detach the graph.
+`windowed` recomputes windows in reverse with exact boundary covectors. Each
+scene's observation noise is pre-sampled once, held fixed for that rollout and
+reused during recomputation. Immutable noise tapes are shared across snapshots.
+Both modes keep finite checks, optional AGC, global clipping, atomic checkpoints,
+RNG restoration and persistent Adam. The old implicit angular solver is replaced
+by reference RK4; there are no implicit-solve status checks to defer.
+
+`--scenarios` is per TRAIN bank (four banks); `--eval-scenarios` is per fixed EVAL
+bank (two banks) and is independent of TRAIN batch size. Defaults are 512 TRAIN
+and 256 EVAL trajectories, seed 7, H500, lr=3e-4, gradient scale 0.1 and clip 10.
+Periodic evaluation/checkpoint cadence remains 50 updates. Checkpoints bind the
+protocol, environment source hash, action convention and sampling configuration.
+Only compatible v3 checkpoints can be rescored with newer metric code.
 
 ## Run
 
-Python, PyTorch and NumPy are required. CUDA training uses the installed PyTorch
-CUDA runtime; no project native extension is required. Run training only with
-an explicit budget:
+Python, PyTorch and NumPy are required; no native extension is needed. Launch
+training only with an explicit time/update budget:
 
 ```bash
+# Multi-airframe, paper-first initialization
+python3 tools/train_response_control.py $(cat configs/response_raptor_multi_airframe.args)
+
+# Single-airframe L2F baseline
 python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
 ```
 
-Use a fresh work directory for a new experiment. `--mode profile` performs at
-most one update of the same trainer. `--resume PATH` requires matching source
-and configuration. `--mode evaluate --checkpoint PATH` rescores compatible older
-Actor checkpoints on fixed development states and reports checkpoint/evaluator
-source hashes and whether they match. See [the task, state and checkpoint contract](docs/response_control_v1.md)
-for commands and explicit migration requirements.
+`--mode profile` executes at most one update. Use `--mode evaluate --checkpoint
+PATH --work-dir NEW_DIR` to evaluate a v3 checkpoint; it uses the checkpoint's
+protocol, horizon and fixed EVAL count, not unrelated CLI defaults.
 
-Runtime recomputation consistency in windowed mode, finite checks, failure recovery, atomic saving,
-RNG restoration and fixed development evaluation are part of production.
-Only the lowest evaluated task objective selects `best.pt`. EVAL additionally
-reports L2F/RAPTOR reference episode lengths and termination shares, plus L2F
-200 mm settling. These are computed offline from the complete flight and do not
-terminate or modify training. Finite loss increases do not veto
-individual updates. Reports, model files and local audit evidence are not code
-and must not be deleted or published as part of source cleanup.
+Bounded verification (no long training or external downloads):
 
-## Source history and limits
+```bash
+OMP_NUM_THREADS=1 python3 -m pytest tests -q
+```
 
-This project derives from the DiffPhys L2F / RLtools CUDA simulator work and the
-`diffphysDrone` recurrent-control flow. The original reference source and its
-notices, older baselines, optional CUDA extensions and standalone test
-and diagnostic tools remain available at commit
-`76b3a02857e122fbfdef5ece5d0ae7dbf98a870b`. Source/provenance notices and the local
-`物理配置/` calibration history are retained. No new license is asserted here.
+## Scope and provenance
 
-Removed APIs and historical pickled module objects require their matching old
-source. Source cleanup invalidates strict checkpoint source bindings; do not
-edit hashes to bypass this. Explicitly audited migration must retain named Adam
-state, RNG and the update index to qualify as optimizer continuation.
+This changes the requested scene, sensor/disturbance and motor semantics, not the
+learning algorithm. The Actor-only response/GRU architecture and existing
+Huber/CVaR objective remain. Training trajectories are still continuous H500;
+reference episode metrics end logically at the **first** failure and only publish
+the matching profile. We do not reproduce RAPTOR's teachers, distillation, reward,
+Langevin trajectory curriculum or seven-airframe published evaluation set. Fresh
+TRAIN episodes sample the same source distribution, not a byte-identical copy of
+the original 1000-airframe archive. Therefore these are reference-environment
+changes, not a claim of reproducing the full RAPTOR experiment or its performance.
 
-Exact gradients can still explode over long horizons. Numerical equivalence
-and reproducible saving do not demonstrate reliable hover, cross-airframe
-performance or real-flight safety. This code does not authorize deployment.
+Historical source/provenance and `物理配置/` remain available. Earlier baselines
+and diagnostic code remain at `76b3a02857e122fbfdef5ece5d0ae7dbf98a870b`.
+See [third-party notices](THIRD_PARTY_NOTICES.md). No new license is asserted for
+the whole repository. Exact gradients can still explode over long horizons.
+Passing numerical tests does not prove hover/adaptation or authorize real flight.

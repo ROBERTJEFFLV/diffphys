@@ -8,18 +8,16 @@ import hashlib
 import json
 import math
 import os
-import pickle
 from pathlib import Path
 import random
 import signal
 import tempfile
 import time
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from env_l2f import L2FParams, L2FSimulator, L2FState
+from env_l2f import L2FParams, L2FSimulator, L2FState, environment_contract
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import (
     TaskLossConfig,
@@ -35,7 +33,7 @@ from response_adjoints import collect_boundary_rollout, backward_actor
 from response_execution import exit_class
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL_VERSION = "response-actor-only-exact-v2"
+PROTOCOL_VERSION = "response-actor-only-reference-v3"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
@@ -141,17 +139,18 @@ def migrate_actor_weights(policy, state):
     policy.load_state_dict({n: state[n] for n in expected}, strict=True)
 
 
-def load_legacy_checkpoint(path):
-    """Explicit trusted local import; map only NumPy's known private rename."""
-    class NumpyCompatibleUnpickler(pickle.Unpickler):
-        def find_class(self, module, name):
-            if module == 'numpy._core.multiarray' and name in ('_reconstruct', 'scalar'):
-                return getattr(np.core.multiarray, name)
-            return super().find_class(module, name)
-
-    compatibility = SimpleNamespace(__name__='legacy_numpy_pickle',
-                                    Unpickler=NumpyCompatibleUnpickler, load=pickle.load)
-    return torch.load(path, map_location='cpu', weights_only=False, pickle_module=compatibility)
+def require_reference_checkpoint(value):
+    """A shape match cannot certify old hover-centered or plus-frame semantics."""
+    if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
+        raise ValueError("incompatible motor semantics: pre-v3 checkpoints cannot be resumed, initialized or evaluated; retrain")
+    cfg = value["binding"]["protocol"]
+    params = L2FParams(**cfg["environment_params"])
+    if (cfg.get("environment") != environment_contract(params)
+            or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_l2f.py")):
+        raise ValueError("checkpoint environment/action contract mismatch")
+    if cfg["scenario_mode"] != params.protocol or value["policy_config"]["dt"] != params.dt:
+        raise ValueError("checkpoint sampler, policy and environment disagree")
+    return params
 
 
 def optimizer_parameter_names(policy, optimizer):
@@ -191,13 +190,14 @@ def migrate_named_adam(optimizer, policy, saved, saved_names):
 
 def load_policy_checkpoint(path, device, dtype):
     value = torch.load(path, map_location="cpu", weights_only=True)
-    if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("not a current Actor-only checkpoint; use explicit weights initialization")
+    require_reference_checkpoint(value)
     policy = ResponseMotorPolicy(ResponsePolicyConfig(**value["policy_config"])).to(
-        device=device, dtype=dtype
+        dtype=getattr(torch, value["binding"]["dtype"])
     )
     migrate_actor_weights(policy, value["model"])
-    return policy, value
+    if value.get("model_sha256") != model_hash(policy):
+        raise ValueError("checkpoint model digest mismatch")
+    return policy.to(device=device, dtype=dtype), value
 
 
 def sample_training_scenarios(
@@ -208,7 +208,8 @@ def sample_training_scenarios(
     dt=0.01,
     device=torch.device("cpu"),
     dtype=torch.float32,
-    scenario_mode="fixed-airframe",
+    scenario_mode="raptor",
+    horizon=500,
 ):
     if attempt_index < 0 or batches < 1:
         raise ValueError("invalid sampling index")
@@ -217,7 +218,7 @@ def sample_training_scenarios(
         raise ValueError("TRAIN seed range would enter reserved EVAL")
     states = [
         sample_scenarios(
-            scenarios, seed=s, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode
+            scenarios, seed=s, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode, horizon=horizon
         )
         for s in seeds
     ]
@@ -279,6 +280,10 @@ def binding(args, policy_config, loss_config):
             "loss": asdict(loss_config),
             "scenarios_per_bank": args.scenarios,
             "scenario_mode": args.scenario_mode,
+            "eval_scenarios_per_bank": args.eval_scenarios,
+            "environment_source_sha256": file_hash(ROOT / "env_l2f.py"),
+            "environment_params": asdict(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode)),
+            "environment": environment_contract(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode)),
             "development_seeds": list(DEVELOPMENT_SEEDS),
             "deployment_authorized": False,
         },
@@ -345,8 +350,7 @@ def _append(path, row):
 
 @torch.no_grad()
 def evaluate(policy, simulator, initial, horizon, loss_config):
-    with simulator.defer_solve_errors():
-        trace = rollout(policy, simulator, initial, horizon)
+    trace = rollout(policy, simulator, initial, horizon)
     report = trajectory_metrics(trace, loss_config)
     if not report["finite"]:
         raise FloatingPointError("nonfinite fixed EVAL")
@@ -383,7 +387,7 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = L2FSimulator(L2FParams(dt=policy_config.dt))
+    simulator = L2FSimulator(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode))
     run_binding = binding(args, policy_config, loss_config)
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -399,6 +403,7 @@ def train(args, policy_config, loss_config):
     }
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=True)
+        require_reference_checkpoint(saved)
         if saved.get("schema") != PROTOCOL_VERSION or saved["binding"] != run_binding:
             raise ValueError(
                 "resume requires identical Actor-only objective, source and optimizer configuration"
@@ -413,35 +418,15 @@ def train(args, policy_config, loss_config):
         if saved["next_update"] != progress["updates"]:
             raise ValueError("inconsistent checkpoint sampling index")
         restore_rng(saved["rng"])
-    elif args.init_checkpoint or args.migrate_checkpoint:
-        path = args.init_checkpoint or args.migrate_checkpoint
-        # Explicit local legacy migration may contain old NumPy RNG tuples.
-        saved = load_legacy_checkpoint(path)
-        if saved.get("policy_config") != asdict(policy_config) and not (
-            args.migrate_checkpoint and "policy_config" not in saved
-        ):
-            raise ValueError("initialization policy configuration mismatch")
+    elif args.init_checkpoint:
+        saved = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+        params = require_reference_checkpoint(saved)
+        if params != simulator.params or saved.get("policy_config") != asdict(policy_config):
+            raise ValueError("initialization policy/environment configuration mismatch")
         migrate_actor_weights(policy, saved["model"])
-        progress["initialization"] = {
-            "file_sha256": file_hash(path),
-            "weights_only": bool(args.init_checkpoint),
-        }
-        if args.migrate_checkpoint:
-            metadata = json.loads(Path(args.migration_metadata).read_text())
-            if (
-                metadata.get("checkpoint_sha256") != file_hash(path)
-                or metadata.get("algorithm") != "actor-only-exact-bptt"
-            ):
-                raise ValueError("migration metadata must certify this exact Actor-only checkpoint")
-            if metadata.get("binding") != {
-                k: v for k, v in run_binding.items() if k != "source_sha256"
-            }:
-                raise ValueError("explicit legacy migration training semantics mismatch")
-            migrate_named_adam(
-                optimizer, policy, saved["optimizer"], metadata["optimizer_parameter_names"]
-            )
-            progress.update(updates=int(metadata["next_update"]))
-            restore_rng(saved["rng"])
+        if saved.get("model_sha256") != model_hash(policy):
+            raise ValueError("checkpoint model digest mismatch")
+        progress["initialization"] = {"file_sha256": file_hash(args.init_checkpoint), "weights_only": True}
     for name in ("history.jsonl", "evaluation.jsonl"):
         _recover_log(work / name, progress["updates"])
     elapsed_before = progress["elapsed_seconds"]
@@ -456,12 +441,13 @@ def train(args, policy_config, loss_config):
     eval_initial = pool_states(
         [
             sample_scenarios(
-                args.scenarios,
+                args.eval_scenarios,
                 seed=s,
                 dt=policy_config.dt,
                 device=device,
                 dtype=dtype,
                 scenario_mode=args.scenario_mode,
+                horizon=args.horizon,
             )
             for s in DEVELOPMENT_SEEDS
         ]
@@ -517,23 +503,23 @@ def train(args, policy_config, loss_config):
                     device=device,
                     dtype=dtype,
                     scenario_mode=args.scenario_mode,
+                    horizon=args.horizon,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                with simulator.defer_solve_errors():
-                    record = collect_boundary_rollout(
-                        policy,
-                        simulator,
-                        initial,
-                        loss_config,
-                        horizon=args.horizon,
-                        window_steps=args.window_steps,
-                        backprop_mode=args.backprop_mode,
-                    )
-                    _sync(device)
-                    forward_done = time.monotonic()
-                    backward = backward_actor(
-                        policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
-                    )
+                record = collect_boundary_rollout(
+                    policy,
+                    simulator,
+                    initial,
+                    loss_config,
+                    horizon=args.horizon,
+                    window_steps=args.window_steps,
+                    backprop_mode=args.backprop_mode,
+                )
+                _sync(device)
+                forward_done = time.monotonic()
+                backward = backward_actor(
+                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
+                )
                 raw_norm = gradient_norm(policy.parameters()) if args.agc else None
                 adaptive_clip(policy.parameters(), args.agc)
                 pre_clip = safe_global_clip(policy.parameters(), args.gradient_clip)
@@ -609,6 +595,7 @@ def train(args, policy_config, loss_config):
 def evaluate_checkpoint(args):
     """Rescore compatible Actor weights with current metrics; never relax resume."""
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    params = require_reference_checkpoint(saved)
     checkpoint_source = saved["binding"]["source_sha256"]
     evaluator_source = source_hash()
     device = torch.device(
@@ -622,19 +609,20 @@ def evaluate_checkpoint(args):
     initial = pool_states(
         [
             sample_scenarios(
-                cfg["scenarios_per_bank"],
+                cfg["eval_scenarios_per_bank"],
                 seed=s,
                 dt=policy.config.dt,
                 device=device,
                 dtype=dtype,
                 scenario_mode=cfg["scenario_mode"],
+                horizon=saved["binding"]["horizon"],
             )
             for s in DEVELOPMENT_SEEDS
         ]
     )
     report = evaluate(
         policy,
-        L2FSimulator(L2FParams(dt=policy.config.dt)),
+        L2FSimulator(params),
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),
