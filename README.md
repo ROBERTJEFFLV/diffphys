@@ -5,6 +5,18 @@ quadrotor flight. The Actor consumes 25 deployable observation entries and outpu
 four **absolute normalized motor commands** in [-1,1]. No mass, inertia, motor
 state or external-force truth is given to the Actor.
 
+## Learning approach
+
+DiffPhys trains the Actor by differentiating the physical task objective through
+the simulated dynamics and recurrent policy. The comparison below shows how this
+direct gradient path replaces the learned Critic used in Actor-Critic training;
+the current DiffPhys pipeline has no value network.
+
+![Actor-Critic training compared with DiffPhys Actor-only training through differentiable physics](docs/images/Diffphys.png)
+
+*Figure 1. From Critic-based policy updates to direct task gradients through
+differentiable quadrotor dynamics.*
+
 ## Reference environment v3
 
 The production path now uses two explicit reference protocols:
@@ -37,6 +49,17 @@ path; it is historical, not the current motor/scene contract.
 The seven production files remain `env_l2f.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_training.py`,
 `response_execution.py` and `tools/train_response_control.py`.
+
+The architecture below connects scenario sampling, the 25-entry observation,
+response encoding and GRU memory to the four motor commands. The lower training
+path shows how the physical task loss updates the Actor through BPTT and Adam.
+
+![DiffPhys architecture showing scenario sampling, 25D observations, response encoder and GRU motor policy, and the BPTT training pipeline](docs/images/Diffphys_Architecture.png)
+
+*Figure 2. Response-conditioned motor control and Actor-only training, shown with
+the default network widths. The diagram's "Continuous H500" label denotes the
+maximum rollout horizon; the current implementation stops each aircraft at its
+first boundary violation, as described below.*
 
 Each aircraft stops at its first boundary violation or the horizon cap (default
 500). The crossing transition is retained; other aircraft continue independently.
