@@ -125,7 +125,11 @@ TRAIN batch size. Float32/float64 and device placement are preserved.
 Only the matching reference metric prefix is published. `l2f_*` cannot be
 computed on a RAPTOR bank with the wrong box. A bank starting outside its own
 reference limits is rejected. Reference episode length counts transitions up
-to the first failure; later return to the box never rescues a failed episode.
+to and including the first failure. TRAIN and EVAL stop each aircraft there;
+other aircraft continue to their own first failure or the horizon cap. No failed
+row is reset or passed back into Actor/RK4. Frozen storage padding is marked by
+`TaskTrajectory.valid` and excluded from costs and statistics. BPTT remains
+complete on each executed prefix; reverse windows verify the same validity mask.
 L2F's 200 mm settling statistic retains its source final-distance convention.
 
 ## Checkpoints and remaining experimental differences
@@ -140,8 +144,11 @@ is independently bound through `--eval-scenarios`.
 
 This revision implements the five requested environment/motor changes. It does
 not replace Actor-only BPTT with teacher distillation or silently change the
-Huber/CVaR training objective. Continuous H500 training and offline termination
-scoring remain explicit. Absolute-yaw objectives, Langevin reference tracking,
+Huber/CVaR terms or weights. Only post-termination padding is excluded; the
+original fixed-horizon normalization and steady window remain. Failure penalties
+and other loss changes are deferred for discussion, so short failures may still
+look artificially cheap under this interim objective. No long training is
+validated by this termination-only change. Absolute-yaw objectives, Langevin reference tracking,
 1000 frozen published teacher airframes and the seven held-out real models are
 not reproduced. The current control features are still the original response-
 conditioned features, not RAPTOR's network. Matching these environment conditions

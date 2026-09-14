@@ -38,7 +38,10 @@ The seven production files remain `env_l2f.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_training.py`,
 `response_execution.py` and `tools/train_response_control.py`.
 
-`full` BPTT retains the entire H500 graph. H50 windows do not detach the graph.
+Each aircraft stops at its first boundary violation or the horizon cap (default
+500). The crossing transition is retained; other aircraft continue independently.
+Stopped rows are not passed to Actor or RK4 again and are not reset/replaced.
+`full` BPTT retains every executed transition. H50 windows do not detach the graph.
 `windowed` recomputes windows in reverse with exact boundary covectors. Each
 scene's observation noise is pre-sampled once, held fixed for that rollout and
 reused during recomputation. Immutable noise tapes are shared across snapshots.
@@ -80,9 +83,12 @@ OMP_NUM_THREADS=1 python3 -m pytest tests -q
 
 This changes the requested scene, sensor/disturbance and motor semantics, not the
 learning algorithm. The Actor-only response/GRU architecture and existing
-Huber/CVaR objective remain. Training trajectories are still continuous H500;
-reference episode metrics end logically at the **first** failure and only publish
-the matching profile. We do not reproduce RAPTOR's teachers, distillation, reward,
+Huber/CVaR terms and weights remain. Only post-termination padding is excluded
+from costs and statistics; horizon normalization and the original steady window
+are unchanged. **Failure penalties and loss redesign are deferred:** the present
+positive-cost objective can favor short failures and is not a finished episodic
+training objective. Reference metrics retain the **first** failure and publish
+only the matching profile. We do not reproduce RAPTOR's teachers, distillation, reward,
 Langevin trajectory curriculum or seven-airframe published evaluation set. Fresh
 TRAIN episodes sample the same source distribution, not a byte-identical copy of
 the original 1000-airframe archive. Therefore these are reference-environment

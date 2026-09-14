@@ -98,6 +98,7 @@ class BoundaryRecord:
     window_steps: int
     loss_config: TaskLossConfig
     metrics: dict
+    valid: torch.Tensor
     backprop_mode: str = "windowed"
 
 
@@ -112,11 +113,12 @@ def collect_boundary_rollout(
         closed = initialize(policy, initial)
         boundaries = {0: snapshot(closed)}
         statistics = FlightStatistics(initial, horizon, config)
-        cost_chunks = []
+        cost_chunks, valid_chunks = [], []
         for start in range(0, horizon, window_steps):
             trace = rollout(policy, simulator, closed, window_steps)
             # No detach between windows: full mode retains the entire H500 graph.
             cost_chunks.append(step_costs(trace, config, start=start, horizon=horizon))
+            valid_chunks.append(trace.valid)
             statistics.add(trace, start)
             closed = trace.end
             boundaries[start + window_steps] = snapshot(closed)
@@ -127,7 +129,7 @@ def collect_boundary_rollout(
         weights = risk_weights(costs, config)
     return BoundaryRecord(
         boundaries, costs, weights, horizon, window_steps, config,
-        statistics.finish(costs.detach(), weights), backprop_mode
+        statistics.finish(costs.detach(), weights), torch.cat(valid_chunks), backprop_mode
     )
 
 
@@ -155,6 +157,8 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
         end = start + record.window_steps
         state, leaves, names = dynamic_closed_state(record.boundaries[start])
         trace = rollout(policy, simulator, state, record.window_steps)
+        if not torch.equal(trace.valid, record.valid[start:end]):
+            raise RuntimeError("inconsistent termination mask at step %d" % start)
         rows.append(compare_boundary(record.boundaries[end], trace.end, end))
         objective = (
             record.weights * step_costs(trace, config, start=start, horizon=record.horizon).sum(0)

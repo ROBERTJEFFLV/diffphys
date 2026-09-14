@@ -56,6 +56,7 @@ class TaskTrajectory:
     action_deltas: torch.Tensor
     omega_deltas: torch.Tensor
     initial: L2FState
+    valid: torch.Tensor  # [time, scene], including the first terminal transition
 
 
 def observation(physical: L2FState, integral: torch.Tensor) -> torch.Tensor:
@@ -82,6 +83,26 @@ def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClose
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
 
+def _select_rows(state, indices: torch.Tensor):
+    """Compact live rows without detaching their physical or recurrent graph."""
+    if indices.numel() == getattr(state, fields(state)[0].name).shape[0]:
+        return state
+    return type(state)(**{f.name: getattr(state, f.name).index_select(0, indices)
+                          for f in fields(state)})
+
+
+def _merge_rows(full, before, after, indices: torch.Tensor):
+    if indices.numel() == getattr(full, fields(full)[0].name).shape[0]:
+        return after
+    # Only dynamic fields changed by step/Actor are scattered. In particular,
+    # do not copy the full immutable noise tape on every physical time step.
+    return type(full)(**{
+        f.name: (getattr(full, f.name) if getattr(before, f.name) is getattr(after, f.name)
+                 else getattr(full, f.name).index_copy(0, indices, getattr(after, f.name)))
+        for f in fields(full)
+    })
+
+
 def rollout(
     policy: ResponseMotorPolicy,
     simulator: L2FSimulator,
@@ -102,24 +123,44 @@ def rollout(
     initial_physical = closed.physical
     observations = [observation(closed.physical, closed.policy.integral)]
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
+    valid = []
+    # A terminal row stays frozen outside its boundary, so it cannot become live
+    # again when this rollout is resumed at the next reverse-window boundary.
+    indices = (~simulator.terminated(closed.physical)).nonzero(as_tuple=True)[0]
+    live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
+                                   _select_rows(closed.policy, indices))
     for step in range(steps):
-        output = policy(observations[-1], closed.policy)
         before = closed.physical
-        # The same action is executed and recorded, and the policy state is
-        # advanced once. No truth reset, detached burn-in, or hidden-state splice.
-        physical = simulator.step(before, output.action)
-        closed = ResponseClosedLoopState(physical, output.next_state)
-        actions.append(output.action)
+        action = before.previous_action
+        active = torch.zeros_like(before.step_index, dtype=torch.bool)
+        if indices.numel():
+            active[indices] = True  # The upcoming crossing transition counts.
+            output = policy(observations[-1].index_select(0, indices), live.policy)
+            physical = simulator.step(live.physical, output.action)
+            closed = ResponseClosedLoopState(
+                _merge_rows(closed.physical, live.physical, physical, indices),
+                _merge_rows(closed.policy, live.policy, output.next_state, indices),
+            )
+            action = action.index_copy(0, indices, output.action)
+            keep = (~simulator.terminated(physical)).nonzero(as_tuple=True)[0]
+            indices = indices.index_select(0, keep)
+            live = ResponseClosedLoopState(_select_rows(physical, keep),
+                                           _select_rows(output.next_state, keep))
+        # Frozen terminal rows are storage padding only: no further Actor, RK4,
+        # memory or noise-index updates, and no costs/statistics for padded steps.
+        physical = closed.physical
+        valid.append(active)
+        actions.append(action)
         positions.append(physical.position)
         velocities.append(physical.velocity)
         omegas.append(physical.omega)
-        action_deltas.append(output.action - before.previous_action)
+        action_deltas.append(action - before.previous_action)
         omega_deltas.append(physical.omega - before.omega)
         observations.append(observation(physical, closed.policy.integral))
     return TaskTrajectory(
         closed, torch.stack(observations), torch.stack(actions), torch.stack(positions),
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
-        torch.stack(omega_deltas), initial_physical,
+        torch.stack(omega_deltas), initial_physical, torch.stack(valid),
     )
 
 
@@ -134,6 +175,9 @@ def weighted_task_features(
     Delta=0 is available only to reproduce historical quadratic objectives.
     """
     def robust(value):
+        # Only remove post-termination padding. Existing losses, weights, CVaR
+        # and the fixed horizon/steady-window normalization are unchanged.
+        value = torch.where(trajectory.valid[..., None], value, 0.0)
         delta = config.huber_delta
         if delta == 0:
             return value
@@ -172,9 +216,10 @@ def step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
 def warning_risk_steps(trajectory) -> dict[str, torch.Tensor]:
     """Unchanged hover warning exposure, used only as a physical observation."""
     return {
-        "omega": (trajectory.omegas.detach().norm(dim=-1) / 10.0 - 1).clamp_min(0).square(),
+        "omega": (trajectory.omegas.detach().norm(dim=-1) / 10.0 - 1).clamp_min(0).square()
+                 * trajectory.valid,
         "saturation": ((trajectory.actions.detach().abs() - .95) / (1.0 - .95))
-                      .clamp_min(0).square().mean(-1),
+                      .clamp_min(0).square().mean(-1) * trajectory.valid,
     }
 
 
@@ -246,13 +291,16 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
             value = getattr(trajectory.end.physical, field.name)
             finite = finite & torch.isfinite(value).reshape(value.shape[0], -1).all(-1)
         finite = finite & torch.isfinite(trajectory.end.policy.memory).all(-1)
-    saturation = (trajectory.actions.detach().abs() >= 1.0 - 1.0e-6).to(p.dtype).mean(dim=(0, 2))
+    valid = trajectory.valid
+    count = valid.sum().clamp_min(1)
+    saturation = (trajectory.actions.detach().abs() >= 1.0 - 1.0e-6).to(p.dtype).mean(-1)
     return {
         "task_objective": float(task_loss(trajectory, config).detach()),
-        "position_rms": float(p.square().mean().sqrt()),
-        "velocity_rms": float(v.square().mean().sqrt()),
-        "omega_rms": float(w.square().mean().sqrt()),
-        "motor_saturation_fraction": float(saturation.mean()),
+        "position_rms": float((p.square()[valid].sum() / count).sqrt()),
+        "velocity_rms": float((v.square()[valid].sum() / count).sqrt()),
+        "omega_rms": float((w.square()[valid].sum() / count).sqrt()),
+        "motor_saturation_fraction": float(saturation[valid].sum() / count),
+        "physical_transitions": int(valid.sum()),
         "finite": bool(finite.all()),
         "scenario_count": costs.numel(),
     }
@@ -263,8 +311,8 @@ def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
     """Score first termination with each airframe's own reference boundaries.
 
     Only publish the matching profile, never apply a L2F box to RAPTOR scenes.
-    Physical trajectories remain continuous for exact BPTT; reference metrics
-    stop logically at the first violation, regardless of any later recovery.
+    The terminal transition is retained; subsequent entries are frozen padding.
+    The first violation remains a failure even on the final allowed transition.
     """
     state = trajectory.initial
     code = int(state.profile_code[0])
@@ -319,6 +367,7 @@ class FlightStatistics:
         self.horizon, self.config = horizon, config
         self.squares = initial.position.new_zeros(3, initial.position.shape[0])
         self.saturation = self.squares[0].clone()
+        self.valid_steps = torch.zeros_like(initial.step_index)
         self.components = initial.position.new_zeros(4, initial.position.shape[0])
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
@@ -329,9 +378,11 @@ class FlightStatistics:
         values = [magnitudes, trace.actions]
         values += [getattr(s, f.name) for s in (trace.end.physical, trace.end.policy) for f in fields(s)]
         if not tensors_finite(values):
-            raise FloatingPointError('nonfinite continuous closed-loop state')
-        self.squares.add_(magnitudes.square().sum(1))
-        self.saturation.add_((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2).sum(0))
+            raise FloatingPointError('nonfinite closed-loop state')
+        self.valid_steps.add_(trace.valid.sum(0))
+        self.squares.add_((magnitudes.square() * trace.valid[None]).sum(1))
+        self.saturation.add_(((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2)
+                              * trace.valid).sum(0))
         features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
         for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9), slice(9, None))):
             self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))
@@ -339,11 +390,13 @@ class FlightStatistics:
             self.risks[i].add_(value.sum(0))
 
     def finish(self, costs, weights):
-        result = {name: float((self.squares[i].mean()/self.horizon).sqrt())
+        count = self.valid_steps.sum().clamp_min(1)
+        result = {name: float((self.squares[i].sum()/count).sqrt())
                   for i, name in enumerate(('position_rms', 'velocity_rms', 'omega_rms'))}
         result.update(task_objective=float((costs*weights).sum()), finite=True,
                       scenario_count=costs.numel(),
-                      motor_saturation_fraction=float(self.saturation.mean()/self.horizon),
+                      motor_saturation_fraction=float(self.saturation.sum()/count),
+                      physical_transitions=int(self.valid_steps.sum()),
                       task_components={name: float((self.components[i]*weights).sum())
                                        for i, name in enumerate(('position','velocity','omega','regularization'))},
                       omega_risk=float((self.risks[0]*risk_weights(self.risks[0], self.config)).sum()),
