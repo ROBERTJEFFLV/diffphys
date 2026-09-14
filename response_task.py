@@ -26,6 +26,8 @@ class TaskLossConfig:
     tail_weight: float = 0.5
     tail_fraction: float = 0.2
     huber_delta: float = 1.0
+    dead_cost: float = 3.0  # Raw cost per unflown step after failure.
+    terminal_cost: float = 200.0  # Raw one-off cost, including failure at H.
 
     def __post_init__(self) -> None:
         weights = [getattr(self, f.name) for f in fields(self) if f.name.endswith("weight")]
@@ -37,6 +39,8 @@ class TaskLossConfig:
             raise ValueError("invalid steady window or CVaR tail fraction")
         if not math.isfinite(self.huber_delta) or self.huber_delta < 0:
             raise ValueError("Huber delta must be finite and non-negative (0 selects historical squares)")
+        if any(not math.isfinite(c) or c < 0 for c in (self.dead_cost, self.terminal_cost)):
+            raise ValueError("failure costs must be finite and non-negative")
 
 
 @dataclass(frozen=True)
@@ -173,10 +177,13 @@ def weighted_task_features(
     Robustify physical errors before applying their weights. Global time indices
     retain the full-flight mean and final steady window when used on short slices.
     Delta=0 is available only to reproduce historical quadratic objectives.
+    Two constant residuals add ((H-X)*dead_cost + terminal_cost)/H at the
+    first failed transition. They bypass Huber and steady-window weighting;
+    no post-failure physics or gradient through the discrete failure time.
     """
     def robust(value):
-        # Only remove post-termination padding. Existing losses, weights, CVaR
-        # and the fixed horizon/steady-window normalization are unchanged.
+        # Physical costs and their normalization are unchanged. Failure
+        # bookkeeping is added separately after applying these time weights.
         value = torch.where(trajectory.valid[..., None], value, 0.0)
         delta = config.huber_delta
         if delta == 0:
@@ -201,7 +208,22 @@ def weighted_task_features(
     time_weights = time_weights + (
         torch.arange(start, start + steps, device=features.device) >= horizon - tail
     ).to(features) * (config.steady_weight / tail)
-    return features * time_weights.sqrt()[:, None, None]
+    features = features * time_weights.sqrt()[:, None, None]
+    with torch.no_grad():
+        state = trajectory.initial
+        terminal = trajectory.valid & (
+            (trajectory.positions.abs() > state.position_limit[None, :, None]).any(-1)
+            | (trajectory.velocities.abs() > state.velocity_limit[None, :, None]).any(-1)
+            | (trajectory.omegas.abs() > state.omega_limit[None, :, None]).any(-1)
+        )
+        remaining = horizon - torch.arange(start + 1, start + steps + 1,
+                                            device=features.device, dtype=features.dtype)
+        # Book all missing steps once at failure, not at each window end.
+        # valid excludes frozen padding; reaching H without a violation costs zero.
+        failed = terminal.to(features)
+        failure = torch.stack((failed * remaining[:, None] * (config.dead_cost / horizon),
+                               failed * (config.terminal_cost / horizon)), -1)
+    return torch.cat((features, failure.sqrt()), -1)
 
 
 def scenario_costs(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
@@ -348,7 +370,8 @@ def task_loss_components(trajectory, config, *, start=0, horizon=None, weights=N
         weights = risk_weights(features.sum(dim=(0, 2)), config)
     return {name: float((weights * features[:, :, section].sum(dim=(0, 2))).sum().detach())
             for name, section in (('position', slice(0, 3)), ('velocity', slice(3, 6)),
-                                  ('omega', slice(6, 9)), ('regularization', slice(9, None)))}
+                                  ('omega', slice(6, 9)), ('regularization', slice(9, 20)),
+                                  ('dead', slice(20, 21)), ('terminal', slice(21, 22)))}
 
 
 def tensors_finite(values):
@@ -368,7 +391,7 @@ class FlightStatistics:
         self.squares = initial.position.new_zeros(3, initial.position.shape[0])
         self.saturation = self.squares[0].clone()
         self.valid_steps = torch.zeros_like(initial.step_index)
-        self.components = initial.position.new_zeros(4, initial.position.shape[0])
+        self.components = initial.position.new_zeros(6, initial.position.shape[0])
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
     @torch.no_grad()
@@ -384,7 +407,8 @@ class FlightStatistics:
         self.saturation.add_(((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2)
                               * trace.valid).sum(0))
         features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
-        for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9), slice(9, None))):
+        for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9),
+                                     slice(9, 20), slice(20, 21), slice(21, 22))):
             self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))
         for i, value in enumerate(warning_risk_steps(trace).values()):
             self.risks[i].add_(value.sum(0))
@@ -398,7 +422,7 @@ class FlightStatistics:
                       motor_saturation_fraction=float(self.saturation.sum()/count),
                       physical_transitions=int(self.valid_steps.sum()),
                       task_components={name: float((self.components[i]*weights).sum())
-                                       for i, name in enumerate(('position','velocity','omega','regularization'))},
+                                       for i, name in enumerate(('position','velocity','omega','regularization','dead','terminal'))},
                       omega_risk=float((self.risks[0]*risk_weights(self.risks[0], self.config)).sum()),
                       saturation_risk=float((self.risks[1]*risk_weights(self.risks[1], self.config)).sum()))
         return result
