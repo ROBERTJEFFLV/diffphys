@@ -18,4 +18,6 @@
 --development-every 50
 --checkpoint-every 50
 --huber-delta 1
+--dead-cost 3
+--terminal-cost 200
 --work-dir runs/raptor_reference/seed7

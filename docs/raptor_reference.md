@@ -132,6 +132,41 @@ row is reset or passed back into Actor/RK4. Frozen storage padding is marked by
 complete on each executed prefix; reverse windows verify the same validity mask.
 L2F's 200 mm settling statistic retains its source final-distance convention.
 
+## Failure cost accounting
+
+For each scene with first failure at transition X and horizon cap H, add
+`(dead_cost*(H-X) + terminal_cost)/H`. Defaults are 3 and 200 in **raw**
+units. A scene reaching H without crossing has zero extra cost; crossing on H
+still incurs `200/H`. Both L2F and RAPTOR profiles use this explicitly configured
+DiffPhys objective; these coefficients are not claimed to reproduce either
+source reward or its discounted return.
+
+The total is booked once on the valid crossing transition. No penalty is attached
+to frozen padding and no additional physical step is executed. Absolute time
+indices retain exactly the same cost when H50 windows are recomputed. The extra
+cost is not Huber-transformed or multiplied by the last-100-step steady bonus.
+For H=500 and X=19, the added cost is `(481*3+200)/500 = 3.286`.
+
+Mean/CVaR weights are selected from each scene's state/action cost **plus** its
+failure cost. The score-only constants have no direct parameter gradient at a
+fixed termination pattern, but can change which existing scene gradients get
+the additional CVaR weight. Full and windowed BPTT still differentiate every
+executed transition. No soft boundary loss, likelihood-ratio gradient, Critic,
+new clipping rule or optimizer change is introduced.
+
+`task_components.dead` and `task_components.terminal` report the weighted
+contributions in both TRAIN and EVAL. Other component definitions remain unchanged and their sum includes this
+new component. `--dead-cost` and `--terminal-cost` configure the raw values;
+nonfinite/negative values are rejected, and setting both to zero disables them.
+They are persisted by the existing loss binding. Old v3 checkpoint loss dictionaries
+without the fields are evaluated with both set to zero; an EVAL `loss_config`
+records the actual values. This does not relax exact resume or motor compatibility.
+
+The 3:200 ratio follows the requested 1.5:100 ratio, not a theorem that prevents
+all early-termination incentives. In particular, existing state costs and the
+steady-window emphasis can exceed this accounting. Increased survival and
+better control must be verified together in a separate training experiment.
+
 ## Checkpoints and remaining experimental differences
 
 Schema `response-actor-only-reference-v3` and architecture
@@ -145,10 +180,11 @@ is independently bound through `--eval-scenarios`.
 This revision implements the five requested environment/motor changes. It does
 not replace Actor-only BPTT with teacher distillation or silently change the
 Huber/CVaR terms or weights. Only post-termination padding is excluded; the
-original fixed-horizon normalization and steady window remain. Failure penalties
-and other loss changes are deferred for discussion, so short failures may still
-look artificially cheap under this interim objective. No long training is
-validated by this termination-only change. Absolute-yaw objectives, Langevin reference tracking,
+original fixed-horizon normalization and steady window remain. The failure
+accounting described above adds constants to the stopped episode score without
+adding post-failure physics or differentiating discrete events. Its coefficient
+choice is a first-run setting, not validated convergence or an ordering guarantee.
+Absolute-yaw objectives, Langevin reference tracking,
 1000 frozen published teacher airframes and the seven held-out real models are
 not reproduced. The current control features are still the original response-
 conditioned features, not RAPTOR's network. Matching these environment conditions
@@ -171,3 +207,8 @@ failure semantics. `tests/test_reference_training.py` checks bounded updates,
 exact resume, separate EVAL count, stored-protocol evaluation, legacy-checkpoint
 rejection and failure rollback. These are correctness checks, not performance
 experiments. CUDA throughput and real-flight adaptation require separate tests.
+
+`tests/test_failure_costs.py` checks the numeric schedule, final-step failure vs
+timeout, window additivity, unchanged gradients with fixed CVaR weights, failure
+selection and component reconciliation. `tests/test_failure_cost_compatibility.py`
+checks new/legacy checkpoint loss semantics and exact resumed updates.

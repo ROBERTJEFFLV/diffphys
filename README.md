@@ -79,6 +79,13 @@ Periodic evaluation/checkpoint cadence remains 50 updates. Checkpoints bind the
 protocol, environment source hash, action convention and sampling configuration.
 Only compatible v3 checkpoints can be rescored with newer metric code.
 
+New runs default to `--dead-cost 3 --terminal-cost 200` (raw units, divided
+by H exactly once). The values are bound in checkpoint loss configuration and
+`loss_config` in EVAL reports. Set both to zero for the earlier accounting.
+Older v3 checkpoints without these fields keep zero failure costs on evaluation;
+strict resume still rejects source/objective changes. Start a new run and use
+compatible weights-only initialization when explicitly changing the objective.
+
 ## Run
 
 Python, PyTorch and NumPy are required; no native extension is needed. Launch
@@ -108,9 +115,14 @@ This changes the requested scene, sensor/disturbance and motor semantics, not th
 learning algorithm. The Actor-only response/GRU architecture and existing
 Huber/CVaR terms and weights remain. Only post-termination padding is excluded
 from costs and statistics; horizon normalization and the original steady window
-are unchanged. **Failure penalties and loss redesign are deferred:** the present
-positive-cost objective can favor short failures and is not a finished episodic
-training objective. Reference metrics retain the **first** failure and publish
+are unchanged. Failure accounting adds `d * (3*(H-X) + 200) / H` to each
+scene, once at its first crossing and before pooled CVaR selection. Here `X`
+includes the crossing transition, and `d` is false for a clean horizon timeout.
+At H=500, failure at X=19 adds 3.286; failure at X=500 adds 0.4. No dead-state
+physics, extra steady-window weighting, barrier or Critic is added. These
+constants change scores/CVaR selection, not the derivative of the discrete
+failure event. They do not guarantee that every failure scores worse than every
+survivor. Reference metrics retain the **first** failure and publish
 only the matching profile. We do not reproduce RAPTOR's teachers, distillation, reward,
 Langevin trajectory curriculum or seven-airframe published evaluation set. Fresh
 TRAIN episodes sample the same source distribution, not a byte-identical copy of

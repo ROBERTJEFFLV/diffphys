@@ -356,6 +356,7 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
         raise FloatingPointError("nonfinite fixed EVAL")
     report.update(reference_episode_metrics(trace))
     report["task_components"] = task_loss_components(trace, loss_config)
+    report["loss_config"] = asdict(loss_config)
     risk = hard_risk_metrics(trace, loss_config)
     report["risk"] = risk
     return report
@@ -625,7 +626,9 @@ def evaluate_checkpoint(args):
         L2FSimulator(params),
         initial,
         saved["binding"]["horizon"],
-        TaskLossConfig(**cfg["loss"]),
+        # Older v3 checkpoints had no failure costs. Preserve their stored
+        # objective on evaluation rather than silently adopting new defaults.
+        TaskLossConfig(**{"dead_cost": 0.0, "terminal_cost": 0.0, **cfg["loss"]}),
     )
     report.update(
         checkpoint_source_sha256=checkpoint_source,
