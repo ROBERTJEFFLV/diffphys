@@ -224,6 +224,13 @@ def local_flow(policy, simulator, closed, geometry, steps):
     for _ in range(steps):
         trace = rollout(policy, simulator, closed, 1, time_decay=0.0)
         closed = trace.end
+        if simulator.params.protocol == 'raptor' and any(
+            bool((getattr(closed.physical, name).abs() >= 100000).any())
+            for name in ('position', 'velocity', 'omega')
+        ):
+            # This is the simulator's numerical guard, not a task boundary.
+            # Its clipped derivative is not evidence of physical contraction.
+            raise FloatingPointError('contraction probe reached numerical state clamp')
         values.append(geometry.pack(closed))
         valid.append(trace.valid[0])
     return torch.stack(values), torch.stack(valid)
