@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from response_policy import ResponsePolicyConfig
 from response_task import TaskLossConfig
+from response_contraction import ContractionConfig
 from response_training import train, evaluate_checkpoint
 
 
@@ -86,7 +87,17 @@ def parse_args(argv=None):
             parser.add_argument(
                 "--" + field.name.replace("_", "-"), type=type(default), default=default
             )
+    for field in fields(ContractionConfig()):
+        default = getattr(ContractionConfig(), field.name)
+        parser.add_argument('--contraction-' + field.name.replace('_', '-'),
+                            type=type(default), default=default)
     args = parser.parse_args(argv)
+    try:
+        contraction = ContractionConfig.from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if contraction.weight > 0 and contraction.steps > args.horizon:
+        parser.error('contraction-steps must not exceed horizon')
     for name in (
         "threads",
         "scenarios",

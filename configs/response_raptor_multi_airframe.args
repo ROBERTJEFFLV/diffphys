@@ -21,4 +21,8 @@
 --huber-delta 1
 --dead-cost 3
 --terminal-cost 200
---work-dir runs/raptor_reference/seed7
+--contraction-weight 0.1
+--contraction-steps 10
+--contraction-samples 8
+--contraction-directions 2
+--work-dir runs/raptor_contraction/seed7

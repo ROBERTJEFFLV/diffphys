@@ -31,6 +31,10 @@ from response_task import (
 )
 from response_adjoints import collect_boundary_rollout, backward_actor
 from response_execution import exit_class
+from response_contraction import (
+    CONTRACTION_VERSION, ContractionConfig, ContractionMetric,
+    contraction_loss, sample_boundaries,
+)
 
 ROOT = Path(__file__).resolve().parent
 PROTOCOL_VERSION = "response-actor-only-reference-v3"
@@ -43,6 +47,7 @@ SOURCE_FILES = (
     "response_adjoints.py",
     "response_training.py",
     "response_execution.py",
+    "response_contraction.py",
     "env_l2f.py",
     "tools/train_response_control.py",
 )
@@ -272,7 +277,8 @@ def adaptive_clip(parameters, limit):
 def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
-        "algorithm": "time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam",
+        "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
+                     + ("+metric-dissipativity" if args.contraction_weight > 0 else ""),
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -304,12 +310,13 @@ def binding(args, policy_config, loss_config):
                 "threads",
             )
         },
+        "contraction": {"version": CONTRACTION_VERSION, **asdict(ContractionConfig.from_args(args))},
         "training_banks": TRAINING_BANKS,
         "torch_version": str(torch.__version__),
     }
 
 
-def _checkpoint(policy, optimizer, progress, run_binding):
+def _checkpoint(policy, optimizer, progress, run_binding, metric=None, metric_optimizer=None):
     return {
         "schema": PROTOCOL_VERSION,
         "architecture": ARCHITECTURE,
@@ -319,6 +326,11 @@ def _checkpoint(policy, optimizer, progress, run_binding):
         "optimizer": optimizer.state_dict(),
         "optimizer_parameter_names": optimizer_parameter_names(policy, optimizer),
         "rng": capture_rng(),
+        "contraction": None if metric is None else {
+            "model": metric.state_dict(), "model_sha256": model_hash(metric),
+            "optimizer": metric_optimizer.state_dict(),
+            "optimizer_parameter_names": optimizer_parameter_names(metric, metric_optimizer),
+        },
         "next_update": progress["updates"],
         "progress": copy.deepcopy(progress),
         "binding": run_binding,
@@ -363,6 +375,52 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     return report
 
 
+def _add_contraction_gradient(policy, simulator, metric, record, config, *, seed, gradient_scale):
+    """Add the genuine short-window auxiliary gradient before the existing clip."""
+    start = time.monotonic()
+    closed, selection = sample_boundaries(record, config.samples, config.steps, seed)
+    if closed is None:
+        return {"certified":False, "selection":selection, "loss":None, "status":"no_live_state"}
+    loss, report = contraction_loss(policy, simulator, metric, closed, config, seed=seed+1)
+    actor_parameters, metric_parameters = list(policy.parameters()), list(metric.parameters())
+    parameters = actor_parameters + metric_parameters
+    grads = torch.autograd.grad(loss, parameters, allow_unused=True)
+    if not tensors_finite(grads):
+        raise FloatingPointError("nonfinite contraction Actor/metric gradient")
+    scale = config.weight * gradient_scale
+    def norm(gs):
+        return math.sqrt(sum(float(g.detach().double().square().sum()) for g in gs if g is not None))
+    report.update(actor_gradient_norm=norm(grads[:len(actor_parameters)]),
+                  metric_gradient_norm=norm(grads[len(actor_parameters):]),
+                  gradient_multiplier=scale, selection=selection)
+    for p, g in zip(parameters, grads):
+        if g is not None:
+            value = g.detach()*scale
+            if p.grad is None:
+                p.grad = value
+            else:
+                p.grad.add_(value)
+    report["seconds"] = time.monotonic()-start
+    return report
+
+
+def _evaluate_contraction(policy, simulator, metric, initial, horizon, window_steps, loss_config, config):
+    """A small fixed independent EVAL subset; diagnostic only, no optimizer use."""
+    from response_task import _select_rows
+    generator = torch.Generator(device="cpu").manual_seed(410_000_007)
+    rows = torch.randperm(initial.position.shape[0], generator=generator)[:config.samples].to(initial.position.device)
+    bank = _select_rows(initial, rows)
+    record = collect_boundary_rollout(policy, simulator, bank, loss_config, horizon=horizon,
+                                     window_steps=window_steps, backprop_mode="windowed", time_decay=0.)
+    closed, selection = sample_boundaries(record, config.samples, config.steps, 410_000_017)
+    if closed is None:
+        return {"certified":False, "selection":selection, "loss":None, "status":"no_live_state"}
+    _, report = contraction_loss(policy, simulator, metric, closed, config,
+                                 seed=410_000_027, differentiable=False)
+    report.update(selection=selection, bank_forward_transitions=int(record.valid.sum()))
+    return report
+
+
 def _sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -389,6 +447,14 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    contraction_config = ContractionConfig.from_args(args)
+    metric = metric_optimizer = None
+    if contraction_config.weight > 0:
+        # Keep metric initialization from changing Actor or rollout RNG streams.
+        with torch.random.fork_rng():
+            torch.manual_seed(args.seed + 400_009)
+            metric = ContractionMetric(policy_config.memory_dim, contraction_config).to(device=device, dtype=dtype)
+        metric_optimizer = torch.optim.Adam(metric.parameters(), lr=args.lr)
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode))
     run_binding = binding(args, policy_config, loss_config)
     work = Path(args.work_dir)
@@ -416,6 +482,14 @@ def train(args, policy_config, loss_config):
         migrate_named_adam(
             optimizer, policy, saved["optimizer"], saved["optimizer_parameter_names"]
         )
+        if metric is not None:
+            stored = saved.get("contraction")
+            if not stored:
+                raise ValueError("resume requires the saved contraction metric and Adam state")
+            metric.load_state_dict(stored["model"], strict=True)
+            if model_hash(metric) != stored.get("model_sha256") or not tensors_finite(metric.parameters()):
+                raise ValueError("contraction metric digest mismatch or nonfinite state")
+            migrate_named_adam(metric_optimizer, metric, stored["optimizer"], stored["optimizer_parameter_names"])
         progress = copy.deepcopy(saved["progress"])
         if saved["next_update"] != progress["updates"]:
             raise ValueError("inconsistent checkpoint sampling index")
@@ -456,12 +530,16 @@ def train(args, policy_config, loss_config):
     )
 
     def save(name="latest.pt"):
-        atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
+        atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding, metric, metric_optimizer))
 
     def evaluation():
         rng = capture_rng()
         try:
             report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config)
+            if metric is not None:
+                report["contraction"] = _evaluate_contraction(
+                    policy, simulator, metric, eval_initial, args.horizon,
+                    args.window_steps, loss_config, contraction_config)
         finally:
             restore_rng(rng)
         _append(work / "evaluation.jsonl", {"update": progress["updates"], **report})
@@ -492,6 +570,8 @@ def train(args, policy_config, loss_config):
                 copy.deepcopy(policy.state_dict()),
                 copy.deepcopy(optimizer.state_dict()),
                 capture_rng(),
+                None if metric is None else copy.deepcopy(metric.state_dict()),
+                None if metric_optimizer is None else copy.deepcopy(metric_optimizer.state_dict()),
             )
             _sync(device)
             update_start = time.monotonic()
@@ -523,20 +603,37 @@ def train(args, policy_config, loss_config):
                 backward = backward_actor(
                     policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
                 )
+                contraction_report = None
+                if metric is not None:
+                    metric_optimizer.zero_grad(set_to_none=True)
+                    contraction_report = _add_contraction_gradient(
+                        policy, simulator, metric, record, contraction_config,
+                        seed=400_000_007 + progress["updates"], gradient_scale=args.gradient_scale)
                 raw_norm = gradient_norm(policy.parameters()) if args.agc else None
                 adaptive_clip(policy.parameters(), args.agc)
                 pre_clip = safe_global_clip(policy.parameters(), args.gradient_clip)
                 if raw_norm is None:
                     raw_norm = pre_clip
+                if metric is not None and any(p.grad is not None for p in metric.parameters()):
+                    safe_global_clip(metric.parameters(), args.gradient_clip)
+                    metric_optimizer.step()
                 optimizer.step()
                 tensors = list(policy.parameters()) + [
                     v for s in optimizer.state.values() for v in s.values() if torch.is_tensor(v)
                 ]
+                if metric is not None:
+                    tensors += list(metric.parameters()) + [
+                        v for state in metric_optimizer.state.values() for v in state.values() if torch.is_tensor(v)
+                    ]
                 if not tensors_finite(tensors):
                     raise FloatingPointError("nonfinite Adam parameters or moments")
             except Exception:
                 policy.load_state_dict(before[0])
                 optimizer.load_state_dict(before[1])
+                if metric is not None:
+                    metric.load_state_dict(before[3])
+                    metric_optimizer.load_state_dict(before[4])
+                    metric_optimizer.zero_grad(set_to_none=True)
                 restore_rng(before[2])
                 optimizer.zero_grad(set_to_none=True)
                 raise
@@ -547,6 +644,7 @@ def train(args, policy_config, loss_config):
                 "update": progress["updates"],
                 "train_seeds": seeds,
                 **record.metrics,
+                "contraction": contraction_report,
                 "raw_gradient_norm": raw_norm,
                 "pre_global_clip_norm": pre_clip,
                 "gradient_scale": args.gradient_scale,
@@ -633,6 +731,21 @@ def evaluate_checkpoint(args):
         # objective on evaluation rather than silently adopting new defaults.
         TaskLossConfig(**{"dead_cost": 0.0, "terminal_cost": 0.0, **cfg["loss"]}),
     )
+    if saved.get("contraction") is not None:
+        stored_config = dict(saved["binding"]["contraction"])
+        version = stored_config.pop("version")
+        if version != CONTRACTION_VERSION:
+            raise ValueError("unknown contraction checkpoint version")
+        cc = ContractionConfig(**stored_config)
+        with torch.random.fork_rng():
+            metric = ContractionMetric(policy.config.memory_dim, cc).to(device=device, dtype=dtype)
+        metric.load_state_dict(saved["contraction"]["model"], strict=True)
+        if model_hash(metric) != saved["contraction"]["model_sha256"] or not tensors_finite(metric.parameters()):
+            raise ValueError("invalid saved contraction metric")
+        report["contraction"] = _evaluate_contraction(
+            policy, L2FSimulator(params), metric, initial, saved["binding"]["horizon"],
+            saved["binding"]["window_steps"],
+            TaskLossConfig(**{"dead_cost":0., "terminal_cost":0., **cfg["loss"]}), cc)
     report.update(
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,

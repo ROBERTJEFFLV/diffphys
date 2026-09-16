@@ -46,9 +46,9 @@ path; it is historical, not the current motor/scene contract.
 
 ## Production path
 
-The seven production files remain `env_l2f.py`, `response_policy.py`,
+The eight production files are `env_l2f.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_training.py`,
-`response_execution.py` and `tools/train_response_control.py`.
+`response_execution.py`, `response_contraction.py` and `tools/train_response_control.py`.
 
 The architecture below connects scenario sampling, the 25-entry observation,
 response encoding and GRU memory to the four motor commands. The lower training
@@ -101,6 +101,32 @@ Older v3 checkpoints without these fields keep zero failure costs on evaluation;
 strict resume still rejects source/objective changes. Start a new run and use
 compatible weights-only initialization when explicitly changing the objective.
 
+## Actor + contraction metric (training only)
+
+The reference launch configurations now enable `--contraction-weight 0.1`.
+A separate bounded positive-definite Metric MLP learns alongside the unchanged
+Actor. Small real closed-loop intervals use **unmodified** derivatives, not the
+surrogate time-decay derivative, to penalize disturbance amplification.
+
+The auxiliary criterion asks for full dynamic-state non-expansion and dissipation
+of task-relevant perturbations; it does not impose a new absolute-yaw target or
+remove yaw coupling. The metric includes physical state, actuator state, GRU and
+response history. It never supplies extra information to the deployed Actor.
+
+Defaults are 8 sampled scenes, 2 directions, and a 10-step local interval per
+update. Current H500 task BPTT, time decay, RK4, first-failure handling, original
+loss/CVaR, and Actor architecture remain. These checks are sampled regularization,
+**not a stability certificate or proof of eliminating gradient explosions**.
+Task scores and metric diagnostics are reported separately; best.pt is still
+selected by the original task score. The two launch configs use new work dirs.
+
+Set `--contraction-weight 0` for a baseline (also the bare CLI default). New
+checkpoints bind the metric/configuration and both optimizers. Old compatible
+v3 Actor weights can initialize a NEW run; old exact resume is not relaxed.
+See [the precise criterion, geometry, assumptions and validation](docs/contraction.md).
+The existing figures depict the Actor/task path and do not depict this new
+training-only auxiliary branch.
+
 ## Run
 
 Python, PyTorch and NumPy are required; no native extension is needed. Launch
@@ -110,7 +136,7 @@ training only with an explicit time/update budget:
 # Multi-airframe, paper-first initialization
 python3 tools/train_response_control.py $(cat configs/response_raptor_multi_airframe.args)
 
-# Single-airframe L2F baseline
+# Single-airframe L2F with metric regularization
 python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
 ```
 
