@@ -64,13 +64,28 @@ first boundary violation, as described below.*
 Each aircraft stops at its first boundary violation or the horizon cap (default
 500). The crossing transition is retained; other aircraft continue independently.
 Stopped rows are not passed to Actor or RK4 again and are not reset/replaced.
-`full` BPTT retains every executed transition. H50 windows do not detach the graph.
-`windowed` recomputes windows in reverse with exact boundary covectors. Each
+`full` retains every executed transition. `windowed` recomputes windows in
+reverse with boundary covectors, reproducing the same configured backward rule. Each
 scene's observation noise is pre-sampled once, held fixed for that rollout and
 reused during recomputation. Immutable noise tapes are shared across snapshots.
 Both modes keep finite checks, optional AGC, global clipping, atomic checkpoints,
 RNG restoration and persistent Adam. The old implicit angular solver is replaced
 by reference RK4; there are no implicit-solve status checks to defer.
+
+New training defaults to `--time-decay 1`: at every 10 ms control step, incoming
+physical and recurrent-state gradients are multiplied by `exp(-1*0.01)`.
+Forward states, actions, GRU memory values, termination, loss and CVaR scores
+are unchanged. This is a **surrogate gradient**, not exact H500 BPTT or physical
+damping. H50 boundaries apply no additional decay; both backprop modes implement
+the same rule. Use `--time-decay 0` for the earlier exact derivative. The rate is
+in seconds^-1, recorded in training logs and checkpoint binding; changing it
+is not exact resume. Existing compatible v3 weights may initialize a new run
+with fresh Adam via `--init-checkpoint`. The deployed Actor has no new parameters.
+This is an independently implemented full-state adaptation of temporal gradient
+decay from Zhang et al., *Learning vision-based agile flight via differentiable
+physics* (NMI 2025; DOI `10.1038/s42256-025-01048-0`), not a reproduction of its
+controller. The source `HenryHuYu/DiffPhysDrone@2719361` damps selected physics
+paths; this implementation also covers the recurrent/history paths.
 
 `--scenarios` is per TRAIN bank (four banks); `--eval-scenarios` is per fixed EVAL
 bank (two banks) and is independent of TRAIN batch size. Defaults are 512 TRAIN
@@ -111,8 +126,9 @@ OMP_NUM_THREADS=1 python3 -m pytest tests -q
 
 ## Scope and provenance
 
-This changes the requested scene, sensor/disturbance and motor semantics, not the
-learning algorithm. The Actor-only response/GRU architecture and existing
+The reference profiles define scene, sensor/disturbance and motor semantics.
+Temporal decay changes the training gradient, not the forward task. The
+Actor-only response/GRU architecture and existing
 Huber/CVaR terms and weights remain. Only post-termination padding is excluded
 from costs and statistics; horizon normalization and the original steady window
 are unchanged. Failure accounting adds `d * (3*(H-X) + 200) / H` to each

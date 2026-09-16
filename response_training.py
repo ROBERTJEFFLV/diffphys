@@ -1,4 +1,4 @@
-"""One production path: exact H500 BPTT and persistent Adam."""
+"""One production path: configurable temporal BPTT decay and persistent Adam."""
 
 from __future__ import annotations
 
@@ -272,7 +272,7 @@ def adaptive_clip(parameters, limit):
 def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
-        "algorithm": "exact-horizon-bptt-adam",
+        "algorithm": "time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam",
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -296,6 +296,7 @@ def binding(args, policy_config, loss_config):
                 "horizon",
                 "backprop_mode",
                 "window_steps",
+                "time_decay",
                 "lr",
                 "gradient_clip",
                 "gradient_scale",
@@ -515,6 +516,7 @@ def train(args, policy_config, loss_config):
                     horizon=args.horizon,
                     window_steps=args.window_steps,
                     backprop_mode=args.backprop_mode,
+                    time_decay=args.time_decay,
                 )
                 _sync(device)
                 forward_done = time.monotonic()
@@ -549,6 +551,7 @@ def train(args, policy_config, loss_config):
                 "pre_global_clip_norm": pre_clip,
                 "gradient_scale": args.gradient_scale,
                 "backprop_mode": args.backprop_mode,
+                "time_decay": args.time_decay,
                 "boundary_checks": len(backward["boundaries"]),
                 "boundary_exact": (
                     all(r["exact"] for r in backward["boundaries"]) if backward["boundaries"] else None

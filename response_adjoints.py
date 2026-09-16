@@ -1,4 +1,4 @@
-"""Exact Actor BPTT with a retained full graph or reverse-window recomputation."""
+"""Full or recomputed Actor gradients, exact at zero temporal decay."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import torch
 
 from response_task import (
     ResponseClosedLoopState,
+    PHYSICAL_DYNAMIC,
+    POLICY_DYNAMIC,
     TaskLossConfig,
     FlightStatistics,
     initialize,
@@ -17,15 +19,6 @@ from response_task import (
     tensors_finite,
 )
 
-PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action")
-POLICY_DYNAMIC = (
-    "memory",
-    "integral",
-    "previous_velocity",
-    "previous_omega",
-    "previous_rotation",
-    "older_action",
-)
 POLICY_NONDIFFERENTIABLE = ("calls", "last_action")
 
 
@@ -100,10 +93,12 @@ class BoundaryRecord:
     metrics: dict
     valid: torch.Tensor
     backprop_mode: str = "windowed"
+    time_decay: float = 0.0
 
 
 def collect_boundary_rollout(
-    policy, simulator, initial, config, *, horizon=500, window_steps=50, backprop_mode="windowed"
+    policy, simulator, initial, config, *, horizon=500, window_steps=50,
+    backprop_mode="windowed", time_decay=0.0,
 ):
     if horizon < 1 or window_steps < 1 or horizon % window_steps:
         raise ValueError("horizon must be divisible by window_steps")
@@ -115,7 +110,7 @@ def collect_boundary_rollout(
         statistics = FlightStatistics(initial, horizon, config)
         cost_chunks, valid_chunks = [], []
         for start in range(0, horizon, window_steps):
-            trace = rollout(policy, simulator, closed, window_steps)
+            trace = rollout(policy, simulator, closed, window_steps, time_decay=time_decay)
             # No detach between windows: full mode retains the entire H500 graph.
             cost_chunks.append(step_costs(trace, config, start=start, horizon=horizon))
             valid_chunks.append(trace.valid)
@@ -129,7 +124,7 @@ def collect_boundary_rollout(
         weights = risk_weights(costs, config)
     return BoundaryRecord(
         boundaries, costs, weights, horizon, window_steps, config,
-        statistics.finish(costs.detach(), weights), torch.cat(valid_chunks), backprop_mode
+        statistics.finish(costs.detach(), weights), torch.cat(valid_chunks), backprop_mode, time_decay
     )
 
 
@@ -156,7 +151,7 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
     for start in reversed(range(0, record.horizon, record.window_steps)):
         end = start + record.window_steps
         state, leaves, names = dynamic_closed_state(record.boundaries[start])
-        trace = rollout(policy, simulator, state, record.window_steps)
+        trace = rollout(policy, simulator, state, record.window_steps, time_decay=record.time_decay)
         if not torch.equal(trace.valid, record.valid[start:end]):
             raise RuntimeError("inconsistent termination mask at step %d" % start)
         rows.append(compare_boundary(record.boundaries[end], trace.end, end))
@@ -171,7 +166,7 @@ def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
         gradients = torch.autograd.grad(objective, leaves + parameters, allow_unused=True)
         if not tensors_finite(gradients):
             raise FloatingPointError("nonfinite full-horizon gradient at %d" % start)
-        # Covectors already contain scene weights; no decay or boundary clipping.
+        # Decay already occurred per physical step; do not apply it again at boundaries.
         adjoint = {
             n: torch.zeros_like(z) if g is None else g.detach()
             for n, z, g in zip(names, leaves, gradients[: len(leaves)])

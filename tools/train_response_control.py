@@ -38,6 +38,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--window-steps", type=int, default=50)
     parser.add_argument(
+        "--time-decay", type=float, default=1.0,
+        help="backward-only alpha in s^-1; each state edge uses exp(-alpha*dt); 0 restores exact BPTT",
+    )
+    parser.add_argument(
         "--updates",
         type=int,
         default=50,
@@ -101,6 +105,8 @@ def parse_args(argv=None):
     for name in ("max_seconds", "lr", "gradient_clip", "gradient_scale"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(name + " must be finite and positive")
+    if not math.isfinite(args.time_decay) or args.time_decay < 0:
+        parser.error("time-decay must be finite and nonnegative")
     if not math.isfinite(args.agc) or args.agc < 0:
         parser.error("agc must be finite and nonnegative")
     if args.mode == "evaluate" and not args.checkpoint:

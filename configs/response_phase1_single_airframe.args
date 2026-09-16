@@ -8,6 +8,7 @@
 --horizon 500
 --backprop-mode full
 --window-steps 50
+--time-decay 1
 --action-rate 0
 --gradient-scale 0.1
 --updates 50

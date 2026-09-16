@@ -1,7 +1,7 @@
 """Teacher-free causal rollout, physical task objective, and scenario banks."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import math
 from typing import Optional
 
@@ -10,6 +10,18 @@ import torch
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import (
     ResponseMotorPolicy, ResponsePolicyState, body_vector,
+)
+
+
+# Shared by per-step gradient decay and exact reverse-window state covectors.
+PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action")
+POLICY_DYNAMIC = (
+    "memory",
+    "integral",
+    "previous_velocity",
+    "previous_omega",
+    "previous_rotation",
+    "older_action",
 )
 
 
@@ -107,12 +119,44 @@ def _merge_rows(full, before, after, indices: torch.Tensor):
     })
 
 
+class _GradientDecay(torch.autograd.Function):
+    """Identity forward; deliberately replace the state VJP by rho times itself."""
+    @staticmethod
+    def forward(ctx, value, rho):
+        ctx.rho = rho
+        return value
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient * ctx.rho, None
+
+
+def _decay_closed_state(closed: ResponseClosedLoopState, rho: float) -> ResponseClosedLoopState:
+    # No tensor clones: immutable physics parameters and the noise tape stay shared.
+    return ResponseClosedLoopState(*(
+        replace(state, **{name: _GradientDecay.apply(getattr(state, name), rho)
+                          for name in names})
+        for state, names in ((closed.physical, PHYSICAL_DYNAMIC), (closed.policy, POLICY_DYNAMIC))
+    ))
+
+
 def rollout(
     policy: ResponseMotorPolicy,
     simulator: L2FSimulator,
     initial: L2FState | ResponseClosedLoopState,
     steps: int,
+    *,
+    time_decay: float = 0.0,
 ) -> TaskTrajectory:
+    """Unchanged flight; optional backward-only decay at every control step.
+
+    time_decay is alpha in s^-1, rho=exp(-alpha*dt). Zero keeps exact BPTT.
+    Positive values define a surrogate gradient, not a discounted forward loss.
+    """
+    if not math.isfinite(time_decay) or time_decay < 0:
+        raise ValueError("time_decay must be finite and non-negative")
+    rho = math.exp(-time_decay * simulator.params.dt)
+    decay = time_decay > 0 and torch.is_grad_enabled()
     if steps < 1:
         raise ValueError("rollout must contain physical transitions")
     if abs(simulator.params.dt - policy.config.dt) > 1.0e-12:
@@ -134,12 +178,19 @@ def rollout(
     live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
                                    _select_rows(closed.policy, indices))
     for step in range(steps):
+        current_observation = observations[-1]
+        if decay and indices.numel():
+            # Full and compact tensors are parallel aliases, not serial gates.
+            # Cover observation, physics, GRU/history and delta-cost paths once.
+            closed = _decay_closed_state(closed, rho)
+            live = _decay_closed_state(live, rho)
+            current_observation = observation(closed.physical, closed.policy.integral)
         before = closed.physical
         action = before.previous_action
         active = torch.zeros_like(before.step_index, dtype=torch.bool)
         if indices.numel():
             active[indices] = True  # The upcoming crossing transition counts.
-            output = policy(observations[-1].index_select(0, indices), live.policy)
+            output = policy(current_observation.index_select(0, indices), live.policy)
             physical = simulator.step(live.physical, output.action)
             closed = ResponseClosedLoopState(
                 _merge_rows(closed.physical, live.physical, physical, indices),
