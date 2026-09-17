@@ -99,9 +99,12 @@ def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClose
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
 
-def _select_rows(state, indices: torch.Tensor):
+def _select_rows(state, indices: torch.Tensor, *, ordered_unique: bool = False):
     """Compact live rows without detaching their physical or recurrent graph."""
-    if indices.numel() == getattr(state, fields(state)[0].name).shape[0]:
+    # Only callers using nonzero() may promise ordered, unique indices. Length
+    # alone does not imply identity for random permutations or repeated samples.
+    # Keep the no-copy/no-GPU-sync path for full live banks and their noise tape.
+    if ordered_unique and indices.numel() == getattr(state, fields(state)[0].name).shape[0]:
         return state
     return type(state)(**{f.name: getattr(state, f.name).index_select(0, indices)
                           for f in fields(state)})
@@ -175,8 +178,8 @@ def rollout(
     # A terminal row stays frozen outside its boundary, so it cannot become live
     # again when this rollout is resumed at the next reverse-window boundary.
     indices = (~simulator.terminated(closed.physical)).nonzero(as_tuple=True)[0]
-    live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
-                                   _select_rows(closed.policy, indices))
+    live = ResponseClosedLoopState(_select_rows(closed.physical, indices, ordered_unique=True),
+                                   _select_rows(closed.policy, indices, ordered_unique=True))
     for step in range(steps):
         current_observation = observations[-1]
         if decay and indices.numel():
@@ -199,8 +202,8 @@ def rollout(
             action = action.index_copy(0, indices, output.action)
             keep = (~simulator.terminated(physical)).nonzero(as_tuple=True)[0]
             indices = indices.index_select(0, keep)
-            live = ResponseClosedLoopState(_select_rows(physical, keep),
-                                           _select_rows(output.next_state, keep))
+            live = ResponseClosedLoopState(_select_rows(physical, keep, ordered_unique=True),
+                                           _select_rows(output.next_state, keep, ordered_unique=True))
         # Frozen terminal rows are storage padding only: no further Actor, RK4,
         # memory or noise-index updates, and no costs/statistics for padded steps.
         physical = closed.physical
