@@ -1,211 +1,138 @@
 # Response Actor-only training
 
-The production path is `tools/train_response_control.py → response_training.py`.
-It trains the existing response encoder, GRU and motor controller with the exact
-full-flight task gradient. `response_predictor` and its unused auxiliary output
-are removed. The observation, recurrent state, integral, action histories, motor
-lag, action mapping and physics are preserved.
+The production entry is `tools/train_response_control.py → response_training.py`.
+It trains the existing response encoder, GRU and four-motor controller. There
+is no stability Metric MLP, learned Critic, auxiliary prediction loss, candidate
+search, finite-difference solver or MS/PETSc dependency in the production path.
 
-## One full graph by default; optional exact window recomputation
+## Rollout and gradient
 
-1. Sample four independent TRAIN banks and pool their initial states (default 4×128=512).
-2. Hold Actor parameters fixed and fly H500 continuously with gradients enabled.
-   H50 chunks retain the complete computation graph across physical, memory,
-   integral and history states. Compute per-scene full-flight costs and choose
-   the pooled CVaR tail once.
-3. With `--backprop-mode full` (default), differentiate that graph once without
-   repeating its forward flight. With `--backprop-mode windowed`, collect without
-   a graph, then recompute windows in reverse order. Each window returns Actor
-   contributions and the preceding boundary covector. That covector already
-   contains scene weights; never multiply them again.
-4. Apply the explicit `--gradient-scale 0.1` to the total Actor gradient.
-   This multiplier does **not** change with `--window-steps`.
-5. Check finite gradients, optionally apply AGC, globally clip using a float64
-   norm, then take one persistent Adam update. Parameters with no gradient retain
-   `grad=None`. No optimizer update or gradient clipping occurs inside a window.
+1. Sample four independent TRAIN banks and pool them (default 4×128=512).
+2. Keep Actor parameters fixed while each aircraft flies until its first
+   boundary violation or the H500 cap. Include the crossing transition. Ended
+   aircraft are not passed to the Actor or physics again and are not replaced.
+3. Compute each aircraft's full-flight task cost and select the pooled CVaR tail
+   once. All windows share those weights.
+4. Backpropagate with the configured Time Decay. Default `--time-decay 1`
+   multiplies incoming physical and recurrent-state derivatives by
+   `exp(-alpha * dt)` at each control step. It changes gradients only: forward
+   states, actions, history, noise, first failure and cost are unchanged.
+5. Apply `--gradient-scale 0.1` once, check finite gradients, optionally apply
+   AGC, globally clip using a float64 norm, and perform one persistent Adam
+   update. Parameters without a gradient retain `grad=None`.
 
-Both modes provide full H500 BPTT, so true long-range gradient explosion remains
-possible. Windowed mode limits graph storage and retains runtime recomputation
-checks. Full mode has no recomputation to compare: logs explicitly record
-`boundary_checks=0`, `boundary_exact=null`, `boundary_max_error=null`, rather
-than claiming a boundary check passed. Continuous-state finite checks still run
-at every H50 chunk. The reference path and offline full/windowed gradient
-comparison remain available. A finite cost increase does not trigger rejection.
+Default `--backprop-mode full` retains all executed transition graphs across
+H50 chunks. `windowed` collects without gradients, then recomputes windows in
+reverse and propagates complete boundary covectors. Covectors already include
+scene weights; do not multiply the weights twice. Window boundaries introduce
+no additional decay, reset, clipping or optimizer update. Each scene's sensor
+noise tape is sampled once and reused during recomputation.
 
-The implicit midpoint method still uses four Newton solves forward and one
-transpose solve backward, with unchanged stabilization and derivative formulas.
-`L2FSimulator.defer_solve_errors()` scopes the whole forward/backward transaction.
-`solve_ex(check_errors=False)` status tensors remain on-device and are checked
-together before clipping/Adam. Evaluation checks its forward statuses too.
-Calls outside this scope check immediately, including a backward performed after
-its forward scope has closed. Any reported solve error aborts the transaction
-even when its returned solution is finite. Tensor finite checks aggregate per
-device before host reads; CPU Adam step counters are included.
+Time Decay is a surrogate backward rule, not physical damping or exact H500
+BPTT. `--time-decay 0` retains the exact derivative for diagnostics. Both modes
+can still produce extreme gradients. Reverse-window recomputation keeps its
+runtime boundary checks; full mode reports zero boundary comparisons rather
+than claiming a check was performed.
 
-There is no Critic/target, derivative dataset, readiness check, candidate search,
-finite difference or MS/PETSc import in this path. The simulator's own implicit
-angular-velocity integration is unchanged.
+## Actor and physics
 
-## Task and observations
+The Actor still consumes deployable observations and action-response history,
+updates its GRU memory and integral, and produces four motor commands. Dynamics
+truth does not enter the Actor. Control-network parameters, dimensions, memory,
+integral, action/response histories and action limits are unchanged.
 
-`response_task.step_costs(..., start=absolute_step, horizon=500)` is the sole
-training cost. It preserves position/velocity/omega tracking, motor effort,
-first action difference, omega difference, existing Huber transformation and
-the absolute final steady interval. No new shaping or weight changes are applied.
-`risk_weights()` still selects the full-flight pooled worst 20% once, giving
-mean cost plus the existing CVaR coefficient. Banks and windows never select
-their own independent tail.
+Physics uses the selected reference protocol, joint RK4, its native motor curve,
+X-frame convention and protocol-specific motor dynamics. The production path
+does not use implicit midpoint integration. Protocol definitions and
+initialization are in `env_l2f.py`; their source hashes are checkpoint-bound.
 
-Logs attribute the objective to position, velocity, omega and regularization.
-They also report full-flight RMS, saturation and warning-zone omega/saturation
-risk. These are observations, not update vetoes. The former last-100-step strict
-success score is removed from both TRAIN statistics and EVAL.
+The L2F configuration selects the single nominal airframe. RAPTOR selects
+variable airframes, paper initialization, sensor noise and external-force
+sampling. No auxiliary network changes either sampler.
 
-### Offline EVAL reference metrics
+## Task and evaluation
 
-`reference_episode_metrics()` runs only after a complete EVAL rollout has passed
-the existing finite checks. It uses these explicitly configured reference profiles:
+`response_task.step_costs(..., start=absolute_step, horizon=500)` supplies the
+task objective, retaining position, velocity, angular velocity, motor effort,
+first action difference, omega difference, Huber weights and the absolute final
+steady interval. Costs after a scene's first failure are excluded. First-failure
+accounting adds `d * (dead_cost * (H-X) + terminal_cost) / H` once, where X
+includes the crossing transition and d is false for a clean horizon timeout.
+Defaults are dead_cost=3 and terminal_cost=200.
 
-| Profile | Per-axis position limit | Per-axis velocity limit | Per-axis omega limit |
-| --- | --- | --- | --- |
-| L2F reference | 0.6 m | 1000 m/s | 1000 rad/s |
-| RAPTOR reference | 1.0 m | 2.0 m/s | 35 rad/s |
+`risk_weights()` selects the full pooled worst 20% and combines the mean cost
+with the configured CVaR weight. Banks and H50 windows do not select separate
+tails. Loss weights, failure accounting and CVaR are unchanged by removal of
+the stability teacher.
 
-These profiles do not change simulator or training settings. In particular, the
-archived L2F `fast_learning` configuration contains different default thresholds;
-the table above defines this evaluator's requested limits explicitly.
+Fixed EVAL uses two banks (default 2×128=256), every 50 updates. It reports task
+objective and components, valid-transition position/velocity/omega RMS, motor
+saturation, physical risk and the selected protocol's episode-length and
+termination metrics. Survival to H500 is not a hover-success certificate.
+Evaluation observes performance and refreshes `best.pt` on any strictly lower
+task objective; it does not approve or reject finite Actor updates.
 
-For each scene, find the first post-transition state with any absolute axis value
-strictly exceeding its limit. Count the terminating transition: lengths are
-1..H500; a scene with no crossing has length 500. Initial state Z0 is not a
-completed transition. Return `l2f_episode_length_mean`, `l2f_episode_length_std`,
-`l2f_share_terminated` and the analogous `raptor_*` fields. Standard deviations
-use the population denominator N; a single scene has zero std. A crossing on
-step 500 still counts in share_terminated, with episode length 500.
+TRAIN seeds are `31000007 + 4*zero_based_update + bank`. Fixed EVAL seeds are
+32000007 and 32010007. The seed-overlap guard prevents TRAIN sampling from entering
+the reserved EVAL range. FINAL is not consumed by this entry.
 
-`l2f_settling_fraction_200mm` reproduces the L2F condition: episode length equals
-the full horizon and final position norm is strictly below 0.20 m. Earlier
-crossings remain disqualifying even if the flight later recovers. It imposes no
-last-100-step condition or additional final velocity/omega test; a first
-velocity/omega crossing exactly at H still has full episode length.
+## Execution
 
-All flights still run to H500. Task objective, RMS, saturation and risk continue
-to use the complete trajectory, including samples after a reference crossing.
-The new fields never enter loss, CVaR weights, gradients or checkpoint selection.
+The two maintained configs are:
 
-The Phase 1 config uses seed7, nominal L2F dynamics, no external force, new
-random position/velocity/attitude/omega for each episode, 4×128=512 pooled TRAIN states,
-H500/W50, dt=.01, Adam lr=.0003, no weight decay, clip10 and AGC disabled.
-TRAIN seeds are `31000007 + 4*zero_based_update + bank`; fixed development seeds
-are 32000007/32010007, pooled 2×128=256. Development evaluation and periodic
-checkpoint saving both occur every 50 updates by default. Development evaluation
-only observes/saves models. Initial and final/interrupted saves remain in place.
-FINAL is not part of this entry point.
+- `configs/response_phase1_single_airframe.args`: nominal L2F.
+- `configs/response_raptor_multi_airframe.args`: multi-airframe RAPTOR.
 
-## Commands
+Both use seed7, CUDA float32, H500/W50, dt=.01, lr=.0003, gradient scale=.1,
+clip10, no AGC, and Time Decay=1. `--scenarios` and `--eval-scenarios` count
+scenes per bank. Default EVAL and checkpoint cadence is 50 updates.
 
-Run jobs only with an explicit experiment budget:
+Run only with an explicitly authorized budget:
 
 ```bash
-python tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args) \
-  --mode profile --work-dir runs/response_actor_only/profile
-
-python tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args) \
-  --updates 10 --max-seconds 600 --work-dir runs/response_actor_only/smoke
-
-python tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args) \
-  --resume runs/response_actor_only/smoke/latest.pt --updates 20 \
-  --work-dir runs/response_actor_only/smoke
-
-python tools/train_response_control.py --mode evaluate --device cuda \
-  --checkpoint runs/response_actor_only/smoke/best.pt \
-  --work-dir reports/response_actor_only_eval
+python3 tools/train_response_control.py $(cat configs/response_raptor_multi_airframe.args)
+python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
 ```
 
-`profile` executes at most one update, including cold setup/initial EVAL; update
-timings separately report collection and forward+backward+Adam, with CUDA
-synchronization. `max-seconds` is per invocation and checked between updates.
-SIGINT/SIGTERM likewise finish the current transaction and save. The update
-budget is the total target index, including resumed updates.
+`--mode profile` limits the same trainer to one update. `--max-seconds` is a
+per-invocation budget checked between updates. `--updates` is the total update
+index including resumed progress. SIGINT/SIGTERM requests completion of the
+current transaction and an atomic save.
 
-## Checkpoint contract
+## Checkpoints and recovery
 
-`latest.pt` and `best.pt` contain actual Actor weights,
-Adam, explicit parameter names, primitive/tensor RNG metadata, next update index,
-source/config bindings and a small progress record. History resides in JSONL,
-not in every checkpoint. Every strictly lower evaluated task objective refreshes
-`best.pt`. No success-selected checkpoint or plateau gate is used.
+New checkpoints contain only Actor weights, named Actor Adam state, RNG,
+sampling/update index, source/config bindings and progress. Full history lives
+in JSONL. `latest.pt`, `best.pt`, failure recovery and fixed EVAL remain.
+There is no second network, optimizer or auxiliary payload in new checkpoints.
 
-`--resume` requires the exact current algorithm/source/config and preserves Adam,
-sampling index and RNG. On recovery, log records beyond the saved update and a
-partial trailing record are discarded before appending. Budgets and logging
-cadence may change; dynamics/loss/Actor/optimizer semantics may not.
-The explicit `backprop_mode` is bound in checkpoints too. Switching full/windowed
-changes floating-point accumulation order, so it requires a new audited execution
-configuration even though the mathematical full-horizon objective is identical.
-No automatic OOM fallback silently changes this setting.
+`--resume` requires exact source/config bindings and preserves Adam, RNG and
+sampling index. Budgets and logging cadence can change; physical, task, Actor,
+gradient-decay and optimizer semantics cannot. Changing full/windowed mode also
+requires a new execution binding because floating-point accumulation order can
+differ. There is no automatic OOM fallback or source-hash bypass.
 
-`--init-checkpoint` explicitly imports effective Actor weights into a new run,
-drops only the four known prediction-head tensors and creates fresh Adam. Unknown
-or missing control tensors are errors. It does not claim resume equivalence.
+`--init-checkpoint` explicitly loads compatible Actor weights into a new run
+with fresh Adam. `--mode evaluate --checkpoint PATH --work-dir NEW_DIR` uses
+the stored Actor, environment, task loss, horizon and fixed EVAL bank. Compatible
+v3 archives containing a removed auxiliary network can still be scored: that
+payload is ignored, while Actor/environment contract checks remain in force.
+Evaluation reports checkpoint_source_sha256, evaluator_source_sha256 and
+source_match. This does not permit resuming an old experiment under new source.
 
-`--migrate-checkpoint` is for an audited **old Actor-only exact-BPTT** checkpoint.
-`--migration-metadata` must supply its SHA256, `algorithm=actor-only-exact-bptt`,
-the intended `binding` (excluding source hash), nested
-`optimizer_parameter_names` per group and `next_update`. Adam states map by names,
-never inferred IDs. A Critic-era checkpoint can initialize weights; it cannot be
-silently relabeled as an Actor-only optimizer continuation. Legacy import reads
-local trusted pickle data; new checkpoints load with `weights_only=True`.
+On numerical failure, the current update's Actor, Adam and RNG are restored,
+and failure.pt plus an error summary are saved. No further update is attempted.
+All previously generated checkpoints, logs and frozen experiment source remain
+historical evidence. Reproduce those runs using their matching source snapshot.
 
-On numerical failure, the failed update's Actor/Adam/RNG are restored and
-`failure.pt` plus an error summary are saved. No further update is attempted.
-Source binding covers only production dependencies, including physics. Editing
-an archived Critic or solver does not invalidate an Actor-only checkpoint.
+## Verification
 
-Source edits change this binding even when numerical behavior is equivalent.
-An earlier checkpoint therefore cannot use `--resume` under the new source.
-Standalone `--mode evaluate` can rescore compatible Actor-only checkpoints with
-the current evaluator, retaining the checkpoint's loss, horizon, scenario mode,
-batch size, dtype and policy configuration. Its output records
-`checkpoint_source_sha256`, `evaluator_source_sha256` and `source_match`.
-This exception loads weights for evaluation only; it never rewrites checkpoint
-hashes or restores Adam for continuation. Preserve the old source and checkpoint
-together when reproducing historical execution. After an
-explicit equivalence audit, `--migrate-checkpoint` can carry named Adam moments,
-RNG and the update index into a new run with matching semantics. Do not rewrite
-the old checkpoint's hash or disable source checks. Weights-only initialization
-does not provide exact optimizer continuation.
+Existing tests cover first failure and frozen rows, reference physics, noise
+replay, failure cost/CVaR, Time Decay's independent backward rule, full/windowed
+agreement, CUDA gradients, checkpoint recovery and numeric rollback. Small
+integration tests verify that training and evaluation work without the removed
+auxiliary module. Production source binding includes only the seven active
+Python files.
 
-Legacy pickle data can reference modules removed from the production tree.
-Such artifacts require conversion to dictionaries, tensors and primitive
-metadata in their original environment before import here. The legacy loader
-does not promise to recreate arbitrary historical Python objects.
-
-## Production interfaces
-
-`sample_scenarios()` returns only `L2FState`. Fixed-airframe uses nominal dynamics
-and zero disturbance; physical-fit retains the same random draws, candidate pool
-and outer 4x4 thrust-to-weight / roll-authority selection. Internal alternative
-samplers and capability-label outputs are absent.
-
-`rollout()` calls the Actor once per physical step and executes its returned
-action. It has no parameter injection, memory ablation or boundary callback.
-`ResponsePolicyOutput` contains `action` and `next_state`; recurrent memory stays
-in `next_state.memory`. Complete state schemas and control parameter names are
-unchanged. `compare_boundary()` and all finite-gradient checks remain runtime
-requirements of the reverse traversal.
-
-## Historical scope
-
-The seven production Python files and one training config are the only active
-code. Baselines, optional native CUDA backends, reference implementations,
-external tests and diagnostics are archived at Git commit
-`76b3a02857e122fbfdef5ece5d0ae7dbf98a870b`; restore them with their matching source
-when needed. The older learned-Critic path is available at `e6559deb`.
-Local snapshots and cleanup acceptance scripts stay outside the production tree.
-Existing models, logs, audit evidence, physical-fit provenance and applicable
-license/source notices must be preserved separately from source pruning.
-
-Correct gradient equivalence and reproducible optimizer state do not establish
-reliable hover, generalization across airframes or deployment safety. Numerical
-checks, learned performance and real-flight authorization remain separate.
+Passing these checks establishes implementation behavior. It does not establish
+reliable hovering, broad airframe adaptation or authorization for deployment.

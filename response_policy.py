@@ -99,7 +99,8 @@ class ResponseMotorPolicy(nn.Module):
 
     def control_features(self, observation: torch.Tensor) -> torch.Tensor:
         rotation = observation[:, 6:15].reshape(-1, 3, 3)
-        up = observation.new_tensor((0.0, 0.0, 1.0)).expand(observation.shape[0], 3)
+        up = torch.tensor((0.0, 0.0, 1.0), device=observation.device,
+                          dtype=observation.dtype).expand(observation.shape[0], 3)
         return torch.cat((
             body_vector(rotation, observation[:, :3]),
             body_vector(rotation, observation[:, 3:6]) / 3.0,
@@ -126,7 +127,8 @@ class ResponseMotorPolicy(nn.Module):
         delta_omega = (observation[:, 15:18] - state.previous_omega) / (
             self.config.dt * 1000.0
         )
-        up = observation.new_tensor((0.0, 0.0, 1.0)).expand(observation.shape[0], 3)
+        up = torch.tensor((0.0, 0.0, 1.0), device=observation.device,
+                          dtype=observation.dtype).expand(observation.shape[0], 3)
         response_input = torch.cat((
             executed_previous, executed_previous - state.older_action,
             delta_velocity, delta_omega,

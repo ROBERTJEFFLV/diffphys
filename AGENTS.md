@@ -35,13 +35,16 @@ The production response chain contains seven Python files:
 
 - `tools/train_response_control.py`: train/profile/evaluate CLI.
 - `response_policy.py`: deployable response encoder, GRU and motor controller.
-- `response_task.py`: fixed-airframe/physical-fit sampling, rollout, task/CVaR loss and metrics.
-- `response_adjoints.py`: exact full-graph Actor backpropagation with optional reverse-window recomputation.
+- `response_task.py`: L2F/RAPTOR sampling, first-failure rollout, task/CVaR loss and metrics.
+- `response_adjoints.py`: full-graph Actor backpropagation with Time Decay and optional reverse-window recomputation.
 - `response_training.py`: Adam, fixed development evaluation, checkpoints and resume.
 - `response_execution.py`: exit classification.
-- `env_l2f.py`: motor response and rigid-body physics, including implicit angular integration.
+- `env_l2f.py`: native motor response and joint RK4 rigid-body physics.
 
-The only training config is `configs/response_phase1_single_airframe.args`.
+The training configs are `configs/response_phase1_single_airframe.args` (L2F)
+and `configs/response_raptor_multi_airframe.args` (RAPTOR). Both default to
+`--time-decay 1`. Only the deployable Actor is trained; no auxiliary Metric MLP
+or contraction loss belongs to the production chain.
 Generated runs/checkpoints, audit evidence, physics provenance, applicable source
 and license notices, and local agent configuration are not disposable source.
 Historical code and standalone tests/checks are available at Git revision

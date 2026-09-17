@@ -21,8 +21,4 @@
 --huber-delta 1
 --dead-cost 3
 --terminal-cost 200
---contraction-weight 0.1
---contraction-steps 10
---contraction-samples 8
---contraction-directions 2
---work-dir runs/l2f_contraction/seed7
+--work-dir runs/l2f_time_decay/seed7

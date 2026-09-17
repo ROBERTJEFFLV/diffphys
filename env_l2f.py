@@ -232,7 +232,7 @@ class L2FSimulator:
     @staticmethod
     def body_torque(state: L2FState, thrust: torch.Tensor) -> torch.Tensor:
         x, y = state.rotor_positions[..., 0], state.rotor_positions[..., 1]
-        signs = thrust.new_tensor((-1, 1, -1, 1))
+        signs = torch.tensor((-1, 1, -1, 1), device=thrust.device, dtype=thrust.dtype)
         return torch.stack(((y*thrust).sum(-1), -(x*thrust).sum(-1),
                             (signs*state.rotor_torque_constant*thrust).sum(-1)), -1)
 
@@ -249,7 +249,8 @@ class L2FSimulator:
             thrust = self.thrust(state, m)
             body_z = quaternion_rotation(q)[..., 2]
             acceleration = body_z * (thrust.sum(-1)/state.mass)[:, None]
-            acceleration = acceleration + v.new_tensor((0., 0., -9.81)) + state.external_force/state.mass[:, None]
+            gravity = torch.tensor((0., 0., -9.81), device=v.device, dtype=v.dtype)
+            acceleration = acceleration + gravity + state.external_force/state.mass[:, None]
             torque = self.body_torque(state, thrust) + state.external_torque
             w_dot = (torque - torch.linalg.cross(w, state.inertia*w, dim=-1))/state.inertia
             qw, qv = q[:, :1], q[:, 1:]
