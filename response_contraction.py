@@ -18,8 +18,10 @@ from torch.nn import functional as F
 from env_l2f import quaternion_rotation
 from response_task import ResponseClosedLoopState, rollout, _select_rows
 
-CONTRACTION_VERSION = "sampled-task-dissipativity-v1"
+CONTRACTION_VERSION = "sampled-task-dissipativity-v2"
+LEGACY_CONTRACTION_VERSION = "sampled-task-dissipativity-v1"
 CONTEXT_DIM = 20
+PHYSICS_CONTEXT_DIM = 67
 
 
 @dataclass(frozen=True)
@@ -33,9 +35,19 @@ class ContractionConfig:
     rank: int = 4
     metric_min: float = 0.5
     metric_max: float = 2.0
+    context: str = 'legacy'  # Keep original checkpoints and ablation baseline.
+    fusion: str = 'concat'
+    sampling: str = 'uniform'
+    prefix_weight: float = 0.0
+    prefix_max_gain_squared: float = 4.0  # Norm amplification budget = 2.
+    tail_fraction: float = 1.0  # Mean by default; <1 targets worst sampled pairs.
+    actor_max_ratio: float = 0.0  # 0 disables auxiliary/task gradient norm cap.
+    metric_gradient_scale: float = 0.0  # 0 retains the legacy shared multiplier.
 
     def __post_init__(self) -> None:
-        for name in ('weight', 'rate', 'metric_min', 'metric_max'):
+        for name in ('weight', 'rate', 'metric_min', 'metric_max', 'prefix_weight',
+                     'prefix_max_gain_squared', 'tail_fraction', 'actor_max_ratio',
+                     'metric_gradient_scale'):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError('contraction constants must be finite')
         if self.weight < 0 or self.rate < 0 or not 0 < self.metric_min < self.metric_max:
@@ -43,6 +55,13 @@ class ContractionConfig:
         for name in ('steps', 'samples', 'directions', 'hidden_dim', 'rank'):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError('contraction sizes must be positive integers')
+        if self.context not in ('legacy', 'physics') or self.fusion not in ('concat', 'film_gated'):
+            raise ValueError('unknown contraction context or fusion')
+        if self.sampling not in ('uniform', 'mass_quantiles'):
+            raise ValueError('unknown contraction sampling')
+        if (min(self.prefix_weight, self.actor_max_ratio, self.metric_gradient_scale) < 0
+                or self.prefix_max_gain_squared < 1 or not 0 < self.tail_fraction <= 1):
+            raise ValueError('invalid contraction guidance constants')
 
     @classmethod
     def from_args(cls, args):
@@ -126,16 +145,36 @@ class StateGeometry:
         ), -1)
 
     @staticmethod
-    def context(closed: ResponseClosedLoopState) -> torch.Tensor:
+    def context(closed: ResponseClosedLoopState, mode: str = 'legacy') -> torch.Tensor:
         p = closed.physical
         # Privileged constants condition ONLY the training metric.
-        return torch.cat((
+        legacy = torch.cat((
             p.mass[:,None].log()/5, p.inertia.log()/15,
             p.motor_time_rising.log()/5, p.motor_time_falling.log()/5,
             p.thrust_to_weight[:,None]/5, p.torque_to_inertia[:,None]/1200,
             p.external_force/(p.mass[:,None]*9.81),
             p.external_torque/(p.inertia*1000),
         ), -1)
+        if mode == 'legacy':
+            return legacy
+        if mode != 'physics':
+            raise ValueError('unknown metric context')
+        # Express thrust in the normalized rotor coordinate r in [0,1], so
+        # RPM and normalized-motor protocols have comparable physical units.
+        c0, c1, c2 = p.thrust_coefficients.unbind(-1)
+        low = p.motor_min[:, None]
+        span = (p.motor_max - p.motor_min)[:, None]
+        polynomial = torch.stack((c0 + c1*low + c2*low.square(),
+                                  (c1 + 2*c2*low)*span, c2*span.square()), -1)
+        polynomial = polynomial / (p.mass[:, None, None] * 9.81)
+        sensor_scale = torch.cat((p.position_limit[:, None].expand(-1, 3),
+                                  torch.full_like(p.velocity, 2.),
+                                  torch.full_like(p.rotation.flatten(1), math.sqrt(2)),
+                                  torch.full_like(p.omega, 10.)), -1)
+        return torch.cat((legacy, p.arm_length[:, None].log()/5,
+                          (p.rotor_positions/p.arm_length[:, None, None]).flatten(1),
+                          p.rotor_torque_constant/p.arm_length[:, None],
+                          polynomial.flatten(1), p.noise_std/sensor_scale), -1)
 
     @staticmethod
     def task_direction(tangent: torch.Tensor) -> torch.Tensor:
@@ -157,14 +196,39 @@ class ContractionMetric(nn.Module):
         self.config = config
         self.dim = memory_dim + 48
         h = config.hidden_dim
-        self.net = nn.Sequential(nn.Linear(self.dim+CONTEXT_DIM,h),nn.SiLU(),
-                                 nn.Linear(h,h),nn.SiLU(),
-                                 nn.Linear(h,self.dim*(config.rank+1)))
-        nn.init.normal_(self.net[-1].weight, std=.005)
-        nn.init.zeros_(self.net[-1].bias)
+        self.context_dim = CONTEXT_DIM if config.context == 'legacy' else PHYSICS_CONTEXT_DIM
+        output_dim = self.dim*(config.rank+1)
+        if config.fusion == 'concat':
+            # Preserve original names, initialization order and shapes in legacy mode.
+            self.net = nn.Sequential(nn.Linear(self.dim+self.context_dim,h),nn.SiLU(),
+                                     nn.Linear(h,h),nn.SiLU(),nn.Linear(h,output_dim))
+            head = self.net[-1]
+        else:
+            self.state_encoder = nn.Sequential(nn.Linear(self.dim,h),nn.SiLU())
+            self.conditioner = nn.Sequential(nn.Linear(self.context_dim,h),nn.SiLU(),nn.Linear(h,2*h))
+            self.gate = nn.Linear(h+self.context_dim,h)
+            self.head = nn.Sequential(nn.Linear(h,h),nn.SiLU(),nn.Linear(h,output_dim))
+            nn.init.normal_(self.conditioner[-1].weight, std=.005)
+            nn.init.zeros_(self.conditioner[-1].bias)
+            nn.init.normal_(self.gate.weight, std=.005)
+            nn.init.ones_(self.gate.bias)
+            head = self.head[-1]
+        nn.init.normal_(head.weight, std=.005)
+        nn.init.zeros_(head.bias)
 
     def factors(self, x: torch.Tensor, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raw = self.net(torch.cat((x, context), -1))
+        if x.shape[:-1] != context.shape[:-1] or context.shape[-1] != self.context_dim:
+            raise ValueError('metric state/context shape mismatch')
+        if self.config.fusion == 'concat':
+            raw = self.net(torch.cat((x, context), -1))
+        else:
+            hidden = self.state_encoder(x)
+            gamma, beta = self.conditioner(context).chunk(2, -1)
+            gate = self.gate(torch.cat((hidden, context), -1)).sigmoid()
+            # Bounded residual FiLM. Keep absolute physical scale information;
+            # no per-sample LayerNorm or clipping of signed/log context values.
+            hidden = hidden + gate * (.5*gamma.tanh()*hidden + .5*beta.tanh())
+            raw = self.head(hidden)
         d = raw[..., :self.dim].sigmoid()
         b = raw[..., self.dim:].reshape(*x.shape[:-1], self.config.rank, self.dim)
         b = b / (1 + b.square().sum((-1,-2), keepdim=True)).sqrt()
@@ -237,11 +301,20 @@ def local_flow(policy, simulator, closed, geometry, steps):
 
 
 @torch.no_grad()
-def sample_boundaries(record, count: int, steps: int, seed: int) -> tuple[ResponseClosedLoopState | None, dict]:
-    """Uniform scenes first, then a live boundary per scene; no survivor filter."""
+def sample_boundaries(record, count: int, steps: int, seed: int, *, sampling: str = 'uniform') -> tuple[ResponseClosedLoopState | None, dict]:
+    """Choose scenes, then a live boundary per scene; no survivor filter."""
     generator = torch.Generator(device='cpu').manual_seed(int(seed))
     n = record.valid.shape[1]
-    ids = torch.randperm(n, generator=generator)[:min(count,n)].tolist()
+    if sampling == 'uniform':
+        ids = torch.randperm(n, generator=generator)[:min(count,n)].tolist()
+    elif sampling == 'mass_quantiles':
+        # Cover the batch's mass range at the same probe count, including failed
+        # scenes. This is auxiliary coverage, NOT balanced task/size updates.
+        order = record.boundaries[0].physical.mass.detach().cpu().argsort(stable=True)
+        bins = torch.tensor_split(order, min(count,n))
+        ids = [int(group[torch.randint(group.numel(), (), generator=generator)]) for group in bins]
+    else:
+        raise ValueError('unknown contraction sampling')
     starts = sorted(t for t in record.boundaries if t+steps<=record.horizon)
     if not starts:
         raise ValueError('contraction interval exceeds episode horizon')
@@ -256,7 +329,8 @@ def sample_boundaries(record, count: int, steps: int, seed: int) -> tuple[Respon
         chosen.append(ResponseClosedLoopState(_select_rows(z.physical,row),_select_rows(z.policy,row)))
         metadata.append({'scene':idx,'start':t})
     if not chosen:
-        return None, {'requested':len(ids),'selected':0,'initially_inactive':len(ids),'boundaries':[]}
+        return None, {'requested':len(ids),'selected':0,'initially_inactive':len(ids),'boundaries':[],
+                      'sampling':sampling}
     combined = ResponseClosedLoopState(*(
         type(getattr(chosen[0],name))(**{
             f.name: torch.cat([getattr(getattr(c,name),f.name) for c in chosen],0)
@@ -264,7 +338,24 @@ def sample_boundaries(record, count: int, steps: int, seed: int) -> tuple[Respon
         }) for name in ('physical','policy')
     ))
     return _detached(combined), {'requested':len(ids),'selected':len(chosen),
-                                 'initially_inactive':len(ids)-len(chosen),'boundaries':metadata}
+                                 'initially_inactive':len(ids)-len(chosen),'boundaries':metadata,
+                                 'sampling':sampling}
+
+
+def _direction_penalties(ratio, prefix_gain_squared, valid, config):
+    """Endpoint metric objective plus a metric-independent transient budget."""
+    endpoint = torch.relu(ratio.clamp_min(torch.finfo(ratio.dtype).eps).log()).square()
+    real = torch.cat((torch.ones_like(valid[:1]), valid), 0)
+    peak = torch.where(real, prefix_gain_squared, torch.zeros_like(prefix_gain_squared)).amax(0)
+    prefix = torch.relu((peak/config.prefix_max_gain_squared).clamp_min(
+        torch.finfo(peak.dtype).eps).log()).square()
+    return endpoint + config.prefix_weight*prefix, endpoint, prefix, peak
+
+
+def _reduce_penalties(penalties, fraction):
+    if fraction == 1.0:
+        return penalties.mean()
+    return penalties.topk(max(1, math.ceil(fraction*penalties.numel()))).values.mean()
 
 
 def contraction_loss(policy, simulator, metric, closed, config, *, seed, differentiable=True):
@@ -280,8 +371,9 @@ def contraction_loss(policy, simulator, metric, closed, config, *, seed, differe
     geo = StateGeometry(closed,policy.config.integral_limit)
     zero = closed.physical.position.new_zeros(closed.physical.position.shape[0],geo.tangent_dim)
     generator = torch.Generator(device='cpu').manual_seed(int(seed))
-    context = geo.context(geo.base)
+    context = geo.context(geo.base, config.context)
     terms, ratios, euclidean, transient = [], [], [], []
+    endpoint_terms, prefix_terms, raw_transient = [], [], []
     lengths = None
     def function(delta):
         return local_flow(policy,simulator,geo.retract(delta),geo,config.steps)
@@ -306,17 +398,24 @@ def contraction_loss(policy, simulator, metric, closed, config, *, seed, differe
             duration = lengths*simulator.params.dt
             ratio = (end_energy+config.rate*duration*task_energy)/start_energy
             active = lengths > 0
-            terms.append(torch.relu(ratio.clamp_min(torch.finfo(ratio.dtype).eps).log()).square()[active])
+            raw_gains = tangent.square().sum(-1)/tangent[0].square().sum(-1)[None, :]
+            penalty, endpoint_penalty, prefix_penalty, raw_peak = _direction_penalties(
+                ratio, raw_gains, valid, config)
+            terms.append(penalty[active])
+            endpoint_terms.append(endpoint_penalty.detach()[active])
+            prefix_terms.append(prefix_penalty.detach()[active])
+            raw_transient.append(raw_peak.detach()[active])
             ratios.append(ratio.detach()[active])
             raw = end_tangent.square().sum(-1)/tangent[0].square().sum(-1)
             euclidean.append(raw.detach()[active])
             # Examine ALL real prefixes, never repeated/frozen padding.
-            energies = metric.energy(values,context.expand(values.shape[0],-1,-1),tangent)
-            gains = energies/start_energy[None,:]
+            with torch.no_grad():
+                energies = metric.energy(values,context.expand(values.shape[0],-1,-1),tangent)
+                gains = energies/start_energy[None,:]
             real = torch.cat((torch.ones_like(valid[:1]),valid),0)
             transient.append(torch.where(real,gains,torch.zeros_like(gains)).amax(0).detach()[active])
     collected = torch.cat(terms)
-    loss = collected.mean() if collected.numel() else sum(p.sum()*0 for p in metric.parameters())
+    loss = _reduce_penalties(collected, config.tail_fraction) if collected.numel() else sum(p.sum()*0 for p in metric.parameters())
     r, raw, peak = torch.cat(ratios),torch.cat(euclidean),torch.cat(transient)
     # Inspect the actual terminal state; failure on the last step is still failure.
     with torch.no_grad():
@@ -342,6 +441,11 @@ def contraction_loss(policy, simulator, metric, closed, config, *, seed, differe
         'direction_violation_fraction':float((r>1).double().mean()) if r.numel() else None,
         'max_euclidean_gain_squared':float(raw.max()) if raw.numel() else None,
         'max_prefix_metric_gain_squared':float(peak.max()) if peak.numel() else None,
+        'max_prefix_euclidean_gain_squared':float(torch.cat(raw_transient).max()) if r.numel() else None,
+        'endpoint_loss_mean':float(torch.cat(endpoint_terms).mean()) if r.numel() else None,
+        'prefix_loss_mean':float(torch.cat(prefix_terms).mean()) if r.numel() else None,
+        'tail_fraction':config.tail_fraction,
+        'context':config.context,'fusion':config.fusion,
         'true_forward_transitions':int(lengths.sum())*(config.directions+1),
     }
     if not math.isfinite(report['loss']):
@@ -369,7 +473,7 @@ def worst_direction(policy, simulator, metric, closed, config):
     with torch.no_grad():
         values,valid = local_flow(policy,simulator,geo.base,geo,config.steps)
         elapsed = int(valid.sum())*simulator.params.dt
-        context = geo.context(geo.base)
+        context = geo.context(geo.base, config.context)
         m0 = metric.matrix(values[0],context)[0]
         m1 = metric.matrix(values[-1],context)[0]
         E = geo.task_direction(C.T).T

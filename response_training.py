@@ -32,7 +32,7 @@ from response_task import (
 from response_adjoints import collect_boundary_rollout, backward_actor
 from response_execution import exit_class
 from response_contraction import (
-    CONTRACTION_VERSION, ContractionConfig, ContractionMetric,
+    CONTRACTION_VERSION, LEGACY_CONTRACTION_VERSION, ContractionConfig, ContractionMetric,
     contraction_loss, sample_boundaries,
 )
 
@@ -375,10 +375,57 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     return report
 
 
+@torch.no_grad()
+def _merge_contraction_gradients(actor_parameters, metric_parameters, grads, config, gradient_scale):
+    """Measure both branches before merging; optionally cap auxiliary influence.
+
+    Task gradients already include gradient_scale. The cap is relative to that
+    exact pre-merge norm; the metric optimizer is never affected by the cap.
+    This controls gradient magnitude, not Adam step size or task improvement.
+    """
+    actor_grads = grads[:len(actor_parameters)]
+    zero = actor_parameters[0].new_zeros((), dtype=torch.float64)
+    stats = torch.stack((
+        sum((p.grad.double().square().sum() for p in actor_parameters if p.grad is not None), zero),
+        sum((g.double().square().sum() for g in actor_grads if g is not None), zero),
+        sum(((p.grad.double()*g.double()).sum() for p,g in zip(actor_parameters,actor_grads)
+             if p.grad is not None and g is not None), zero),
+        sum((g.double().square().sum() for g in grads[len(actor_parameters):] if g is not None), zero),
+    )).cpu().tolist()
+    if not all(math.isfinite(value) for value in stats):
+        raise FloatingPointError('nonfinite task/auxiliary gradient statistics')
+    task_norm, aux_norm, metric_norm = math.sqrt(stats[0]), math.sqrt(stats[1]), math.sqrt(stats[3])
+    requested_scale = config.weight * gradient_scale
+    actor_scale = requested_scale
+    if config.actor_max_ratio > 0 and aux_norm > 0:
+        actor_scale = min(actor_scale, config.actor_max_ratio*task_norm/aux_norm)
+    metric_scale = config.metric_gradient_scale or requested_scale
+    for parameters, gradients, scale in (
+        (actor_parameters, actor_grads, actor_scale),
+        (metric_parameters, grads[len(actor_parameters):], metric_scale),
+    ):
+        for p,g in zip(parameters,gradients):
+            if g is not None:
+                value = g.detach()*scale
+                if p.grad is None:
+                    p.grad = value
+                else:
+                    p.grad.add_(value)
+    return {
+        'task_gradient_norm':task_norm, 'actor_gradient_norm':aux_norm,
+        'metric_gradient_norm':metric_norm, 'gradient_multiplier':actor_scale,
+        'requested_gradient_multiplier':requested_scale, 'metric_gradient_multiplier':metric_scale,
+        'weighted_actor_gradient_norm':actor_scale*aux_norm,
+        'auxiliary_task_norm_ratio':actor_scale*aux_norm/task_norm if task_norm else None,
+        'task_auxiliary_cosine':max(-1.,min(1.,stats[2]/(task_norm*aux_norm))) if task_norm and aux_norm else None,
+        'actor_gradient_capped':actor_scale < requested_scale,
+    }
+
+
 def _add_contraction_gradient(policy, simulator, metric, record, config, *, seed, gradient_scale):
     """Add the genuine short-window auxiliary gradient before the existing clip."""
     start = time.monotonic()
-    closed, selection = sample_boundaries(record, config.samples, config.steps, seed)
+    closed, selection = sample_boundaries(record, config.samples, config.steps, seed, sampling=config.sampling)
     if closed is None:
         return {"certified":False, "selection":selection, "loss":None, "status":"no_live_state"}
     loss, report = contraction_loss(policy, simulator, metric, closed, config, seed=seed+1)
@@ -387,19 +434,8 @@ def _add_contraction_gradient(policy, simulator, metric, record, config, *, seed
     grads = torch.autograd.grad(loss, parameters, allow_unused=True)
     if not tensors_finite(grads):
         raise FloatingPointError("nonfinite contraction Actor/metric gradient")
-    scale = config.weight * gradient_scale
-    def norm(gs):
-        return math.sqrt(sum(float(g.detach().double().square().sum()) for g in gs if g is not None))
-    report.update(actor_gradient_norm=norm(grads[:len(actor_parameters)]),
-                  metric_gradient_norm=norm(grads[len(actor_parameters):]),
-                  gradient_multiplier=scale, selection=selection)
-    for p, g in zip(parameters, grads):
-        if g is not None:
-            value = g.detach()*scale
-            if p.grad is None:
-                p.grad = value
-            else:
-                p.grad.add_(value)
+    report.update(_merge_contraction_gradients(actor_parameters, metric_parameters, grads, config, gradient_scale))
+    report['selection'] = selection
     report["seconds"] = time.monotonic()-start
     return report
 
@@ -734,7 +770,7 @@ def evaluate_checkpoint(args):
     if saved.get("contraction") is not None:
         stored_config = dict(saved["binding"]["contraction"])
         version = stored_config.pop("version")
-        if version != CONTRACTION_VERSION:
+        if version not in (CONTRACTION_VERSION, LEGACY_CONTRACTION_VERSION):
             raise ValueError("unknown contraction checkpoint version")
         cc = ContractionConfig(**stored_config)
         with torch.random.fork_rng():
@@ -746,6 +782,7 @@ def evaluate_checkpoint(args):
             policy, L2FSimulator(params), metric, initial, saved["binding"]["horizon"],
             saved["binding"]["window_steps"],
             TaskLossConfig(**{"dead_cost":0., "terminal_cost":0., **cfg["loss"]}), cc)
+        report['contraction']['checkpoint_metric_version'] = version
     report.update(
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,

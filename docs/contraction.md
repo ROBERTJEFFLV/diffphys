@@ -1,5 +1,9 @@
 # Actor + training-only contraction metric
 
+The optional physical-context/FiLM and transient-gradient guidance extension is
+described in [the audit and experiment guide](contraction_guidance_audit.md).
+Original 20D concatenation and endpoint-mean loss remain the CLI defaults.
+
 ## Scope
 
 This is a **sampled differential dissipativity regularizer**, not a certified
@@ -72,6 +76,13 @@ thrust-to-weight, torque-to-inertia, and external force/torque. These are
 fixed across a pair and enter ONLY the metric. All state-induced feedback
 through the Actor and GRU remains differentiable.
 
+`--contraction-context physics` extends the context to 67 dimensions with arm
+length, rotor geometry, individual yaw-torque constants, normalized thrust
+polynomials and observation-noise standard deviations. `--contraction-fusion
+film_gated` selects a bounded residual FiLM conditioner. These are independent
+switches, permitting a context-only concatenation ablation. The SPD output
+parameterization and bounds below are identical for both architectures.
+
 ## Bounded metric -- no zero-ruler solution
 
 The MLP has two SiLU hidden layers (default width 64), and outputs diagonal
@@ -122,12 +133,25 @@ The update combines `gradient_scale * (g_task + weight*g_aux)` for Actor and
 finite checks and clip. Separate Adam states share the configured learning
 rate. Parameters, both optimizers and RNG are committed/rolled back together.
 
+Those are the default multipliers. Optional `actor_max_ratio` caps the weighted
+auxiliary gradient relative to the already-scaled task gradient; a positive
+`metric_gradient_scale` independently sets the metric multiplier. Norms and
+cosine similarity are logged before merging. A cap on raw gradients is not a
+bound on Adam's parameter update and does not guarantee task improvement.
+
 Periodic fixed EVAL preserves the original task score/best-model selection.
 A small fixed EVAL subset supplies independent contraction diagnostics without
 training on them. Reports include directional violations, terminal/complete
 interval counts, metric gain, **unweighted Euclidean tangent gain**, internal
 prefix gain, sample coverage, and `certified=false`. Endpoints improving does
 not bound the interior; the maximum real-prefix gain is separately reported.
+
+Optional `prefix_weight > 0` adds a penalty on the maximum **unweighted,
+normalized-state** tangent gain over real prefixes, above a configurable squared
+gain budget. This term cannot be reduced by changing the metric. Optional
+`tail_fraction < 1` averages the worst sampled scene/direction penalties. Neither
+option changes the sampled endpoint ratio, certifies untested directions, or
+requires strict one-step contraction. The task and EVAL objectives are unchanged.
 
 ## Configuration and compatibility
 
@@ -152,6 +176,10 @@ A compatible native-motor v3 checkpoint can initialize Actor weights through
 Old runs cannot strictly resume after source/algorithm changes. New exact
 resume restores Actor, metric, both Adam states, RNG and sampling progress.
 Actor-only export/load does not require or use metric outputs.
+
+Version-v1 metrics can still be rescored with their stored legacy settings.
+Version-v2 records bind all guidance options, including sampling and gradient
+scales. Source/configuration checks remain mandatory for exact resume.
 
 ## Verification and limits
 

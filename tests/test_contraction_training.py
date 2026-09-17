@@ -33,10 +33,16 @@ def run(options):
 def load(path):return torch.load(path,weights_only=True)
 
 
-def test_both_models_train_resume_and_export_actor_only(tmp_path):
+@pytest.mark.parametrize('guidance', [(), (
+    '--contraction-context','physics','--contraction-fusion','film_gated',
+    '--contraction-prefix-weight','.1','--contraction-tail-fraction','.5',
+    '--contraction-actor-max-ratio','.5','--contraction-metric-gradient-scale','1',
+    '--contraction-sampling','mass_quantiles',
+)])
+def test_both_models_train_resume_and_export_actor_only(tmp_path, guidance):
     paths=[tmp_path/n for n in ('init','a','b')]
-    run(args(paths[0]));run(args(paths[1],updates=2));run(args(paths[2],updates=1))
-    run(args(paths[2],updates=2,extra=('--resume',str(paths[2]/'latest.pt'))))
+    run(args(paths[0],extra=guidance));run(args(paths[1],updates=2,extra=guidance));run(args(paths[2],updates=1,extra=guidance))
+    run(args(paths[2],updates=2,extra=(*guidance,'--resume',str(paths[2]/'latest.pt'))))
     initial,first,second=[load(p/'latest.pt') for p in paths]
     assert first['model_sha256']==second['model_sha256']!=initial['model_sha256']
     assert first['contraction']['model_sha256']==second['contraction']['model_sha256']!=initial['contraction']['model_sha256']
@@ -54,8 +60,25 @@ def test_both_models_train_resume_and_export_actor_only(tmp_path):
     ev=args(tmp_path/'eval');ev.checkpoint=paths[1]/'latest.pt'
     report=training.evaluate_checkpoint(ev)
     assert report['contraction']['certified'] is False
-    altered=args(paths[1],updates=3,extra=('--resume',str(paths[1]/'latest.pt'),'--contraction-rate','.2'))
+    altered=args(paths[1],updates=3,extra=(*guidance,'--resume',str(paths[1]/'latest.pt'),'--contraction-rate','.2'))
     with pytest.raises(ValueError,match='configuration'):run(altered)
+
+
+def test_v1_metric_can_be_rescored_but_not_resumed(tmp_path):
+    from response_contraction import LEGACY_CONTRACTION_VERSION
+    path=tmp_path/'legacy';run(args(path))
+    saved=load(path/'latest.pt')
+    saved['binding']['contraction']={key:value for key,value in saved['binding']['contraction'].items()
+        if key in ('version','weight','steps','samples','directions','rate','hidden_dim','rank','metric_min','metric_max')}
+    saved['binding']['contraction']['version']=LEGACY_CONTRACTION_VERSION
+    old_path=path/'v1.pt';torch.save(saved,old_path)
+    ev=args(tmp_path/'rescore');ev.checkpoint=old_path
+    report=training.evaluate_checkpoint(ev)
+    assert report['contraction']['checkpoint_metric_version']==LEGACY_CONTRACTION_VERSION
+    assert report['contraction']['context']=='legacy'
+    assert report['contraction']['fusion']=='concat'
+    with pytest.raises(ValueError,match='configuration'):
+        run(args(path,updates=1,extra=('--resume',str(old_path))))
 
 
 def test_zero_weight_preserves_initial_actor_and_training_stream(tmp_path):
