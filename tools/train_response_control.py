@@ -66,6 +66,10 @@ def parse_args(argv=None):
     parser.add_argument("--group-vjp-chunk-size", type=int, default=16,
                         help="number of GROUP VJPs evaluated together; 1 is serial reference")
     parser.add_argument(
+        "--group-gru-vmap-mode", choices=("fallback", "native", "verify", "sparse", "sparse-verify"), default="fallback",
+        help="opt-in native CUDA GRU backward batching; verify checks every invocation",
+    )
+    parser.add_argument(
         "--gradient-scale",
         type=float,
         default=0.1,

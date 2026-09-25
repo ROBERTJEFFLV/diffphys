@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          ref: 3ea9fe8cf7d297e58413456af948f3bb2f69c99a
+          ref: 0417ad3bd5b546e7e9ed3bd813e19fdf19236f6d
           path: _baseline
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -31,21 +31,27 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install numpy pytest
-      - name: Regression tests
+      - name: Regression tests (CUDA skips reported)
         run: python -m pytest -q tests --junitxml=group-tests.xml
-      - name: Group-gradient H500 probes
+      - name: Existing group-gradient H500 probes
         run: python tools/verify_group_balance.py --baseline-root _baseline --repeats 1 --output group-gradient-verification.json
+      - name: Unchanged default and preserved Adam
+        run: python tools/verify_vjp_acceleration.py --device cpu --horizon 8 --scenarios 64 --baseline-root _baseline --output vjp-acceleration-audit.json
+      - name: Rejected single-adjoint research probe
+        run: python tools/probe_group_capture.py --output capture-probe.json
       - name: Preserve sources and measurements
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: physics-group-gradient-${{ github.sha }}
+          name: gru-vjp-audit-${{ github.sha }}
           retention-days: 7
           path: |
             *.py
             tools/*.py
             tests/*.py
             configs/*.args
-            docs/physics_group_balance.md
+            docs/gru_vjp_acceleration.md
             group-gradient-verification.json
+            vjp-acceleration-audit.json
+            capture-probe.json
             group-tests.xml
