@@ -17,7 +17,7 @@ def training_args(path, updates=0, extra=()):
     return parse_args(['--device', 'cpu', '--dtype', 'float64', '--scenarios', '1',
                       '--eval-scenarios', '2', '--horizon', '8', '--window-steps', '4',
                       '--updates', str(updates), '--max-seconds', '60',
-                      '--hidden-dim', '8', '--memory-dim', '8',
+                      '--memory-dim', '8',
                       '--work-dir', str(path), *extra])
 
 

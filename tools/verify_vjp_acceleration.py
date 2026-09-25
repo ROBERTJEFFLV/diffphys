@@ -27,7 +27,7 @@ from response_task import TaskLossConfig
 from response_adjoints import collect_boundary_rollout
 from response_training import (load_policy_checkpoint, migrate_named_adam, sample_training_scenarios,
                                safe_global_clip, capture_rng, SOURCE_FILES)
-from tools.verify_group_balance import same
+from tools.verify_group_balance import same, require_same_actor
 
 
 def byte_equal(a, b):
@@ -81,6 +81,7 @@ def shadow(policy, gradients, saved, limit):
 
 
 def enabled_parent_equivalence(baseline):
+    require_same_actor(baseline)
     with tempfile.TemporaryDirectory() as tmp:
         values=[]
         for name,root in [('parent',baseline),('candidate',ROOT)]:

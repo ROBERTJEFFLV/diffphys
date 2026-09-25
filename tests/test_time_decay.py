@@ -27,7 +27,7 @@ def manual_prefix(policy, simulator, initial, horizon, alpha):
     """Independent scalar-episode recurrence using ordinary stop-gradient arithmetic."""
     rho = math.exp(-alpha * simulator.params.dt)
     closed = task.initialize(policy, initial)
-    observations = [task.observation(initial, closed.policy.integral)]
+    observations = [task.observation(initial)]
     data = {n: [] for n in ('actions', 'positions', 'velocities', 'omegas',
                             'action_deltas', 'omega_deltas')}
     for _ in range(horizon):
@@ -37,14 +37,14 @@ def manual_prefix(policy, simulator, initial, horizon, alpha):
                                      for n in names})
         before = incoming(closed.physical, task.PHYSICAL_DYNAMIC)
         history = incoming(closed.policy, task.POLICY_DYNAMIC)
-        output = policy(task.observation(before, history.integral), history)
+        output = policy(task.observation(before), history)
         after = simulator.step(before, output.action)
         closed = task.ResponseClosedLoopState(after, output.next_state)
         for name, value in zip(data, (output.action, after.position, after.velocity,
                                      after.omega, output.action - before.previous_action,
                                      after.omega - before.omega)):
             data[name].append(value)
-        observations.append(task.observation(after, output.next_state.integral))
+        observations.append(task.observation(after))
         if bool(simulator.terminated(after).all()):
             break
     return task.TaskTrajectory(end=closed, observations=torch.stack(observations),
@@ -88,7 +88,7 @@ def test_every_adjoint_state_field_is_decayed_but_metadata_is_shared():
         torch.testing.assert_close(g, torch.full_like(z, rho), rtol=0, atol=0)
     assert decayed.physical.noise_tape is closed.physical.noise_tape
     assert decayed.physical.mass is closed.physical.mass
-    assert decayed.policy.calls is closed.policy.calls
+    assert {f.name for f in fields(decayed.policy)} == {'memory'}
     assert decayed.physical.step_index is closed.physical.step_index
 
 
@@ -185,7 +185,11 @@ def test_termination_does_not_restart_or_skip_crossing():
     assert torch.equal(trace.valid.sum(0), lengths)
     assert torch.equal(trace.end.physical.step_index, lengths)
     assert sum(seen) == len(sim.ids) == int(lengths.sum())
-    assert torch.equal(trace.end.policy.calls[:, 0], lengths.double())
+    with torch.no_grad():
+        for i in range(len(lengths)):
+            single = manual_prefix(p, CountingSimulator(), select(initial, slice(i, i+1)), h, 1.)
+            torch.testing.assert_close(trace.end.policy.memory[i:i+1], single.end.policy.memory,
+                                       rtol=1e-11, atol=1e-12)
     task.task_loss(trace, task.TaskLossConfig()).backward()
     assert torch.isfinite(flat_grads(p)).all()
 

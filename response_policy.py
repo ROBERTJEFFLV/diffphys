@@ -1,4 +1,4 @@
-"""Deployable response-conditioned motor policy, without action teachers."""
+"""Minimal recurrent motor policy with a direct state-to-action readout."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,40 +8,30 @@ from typing import Optional
 import torch
 from torch import nn
 
-ARCHITECTURE = "response-conditioned-absolute-motor-policy-v3"
-OBSERVATION_DIM = 25
+ARCHITECTURE = "gru16-direct-readout-absolute-motor-policy-v4"
+OBSERVATION_DIM = 22
+CONTROL_FEATURE_DIM = 16
 
 
 @dataclass(frozen=True)
 class ResponsePolicyConfig:
     memory_dim: int = 64
-    hidden_dim: int = 64
     dt: float = 0.01
-    action_rate: float = 0.0  # 0: native absolute motor commands, no slew projection
-    integral_limit: float = 0.5
-    integral_leak: float = 0.0
+    action_rate: float = 0.0  # Preserve the optional absolute-command slew projection.
 
     def __post_init__(self) -> None:
-        if min(self.memory_dim, self.hidden_dim) < 1:
-            raise ValueError("network widths must be positive")
-        if not all(math.isfinite(x) for x in (
-            self.dt, self.action_rate, self.integral_limit, self.integral_leak
-        )):
+        if (not isinstance(self.memory_dim, int) or isinstance(self.memory_dim, bool)
+                or self.memory_dim < 1):
+            raise ValueError("memory_dim must be a positive integer")
+        if not all(math.isfinite(x) for x in (self.dt, self.action_rate)):
             raise ValueError("policy constants must be finite")
-        if min(self.dt, self.integral_limit) <= 0 or min(self.integral_leak, self.action_rate) < 0:
-            raise ValueError("invalid policy integration or actuator constraints")
+        if self.dt <= 0 or self.action_rate < 0:
+            raise ValueError("invalid policy timestep or actuator constraints")
 
 
 @dataclass(frozen=True)
 class ResponsePolicyState:
     memory: torch.Tensor
-    integral: torch.Tensor
-    previous_velocity: torch.Tensor
-    previous_omega: torch.Tensor
-    previous_rotation: torch.Tensor
-    last_action: torch.Tensor
-    older_action: torch.Tensor
-    calls: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -55,59 +45,47 @@ def body_vector(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
 
 
 class ResponseMotorPolicy(nn.Module):
-    """Fixed deployment weights; recurrent memory adapts after real responses.
+    """One native GRU and one affine readout; hidden state is the only memory.
 
-    Only the 25 deployable observation entries and executed actions enter this
-    class. No motor truth, dynamics parameters, external-force truth, teacher,
-    calibration flag, or privileged capability certificate is accepted.
+    Observation: p(3), v(3), measured R(9), body omega(3), executed action(4).
+    No physical parameters, motor truth, learned encoder, explicit integral,
+    response-difference cache, external controller or auxiliary network is used.
+    Weights are fixed at deployment; memory updates from the FIRST observation.
     """
 
     def __init__(self, config: ResponsePolicyConfig = ResponsePolicyConfig()) -> None:
         super().__init__()
         self.config = config
-        self.response_encoder = nn.Sequential(
-            nn.Linear(26, config.hidden_dim), nn.SiLU()
-        )
-        self.response_memory = nn.GRUCell(config.hidden_dim, config.memory_dim)
-        self.controller = nn.Sequential(
-            nn.Linear(19 + config.memory_dim, config.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(config.hidden_dim, 4),
-        )
-        # Small but nonzero weights preserve the cold-start task gradient into
-        # memory. There is no zero authorization multiplier on learned control.
-        nn.init.xavier_uniform_(self.controller[-1].weight, gain=0.1)
-        nn.init.zeros_(self.controller[-1].bias)
+        # Keep the native GRU and attribute name used by the existing VJP tools.
+        self.response_memory = nn.GRUCell(CONTROL_FEATURE_DIM, config.memory_dim)
+        self.readout = nn.Linear(CONTROL_FEATURE_DIM + config.memory_dim, 4)
+        # One weight matrix [W_c | W_h], not two controllers or two optimizers.
+        # Zero W_c is trainable immediately; nonzero W_h admits GRU gradients.
+        with torch.no_grad():
+            self.readout.weight[:, :CONTROL_FEATURE_DIM].zero_()
+            nn.init.xavier_uniform_(self.readout.weight[:, CONTROL_FEATURE_DIM:], gain=0.1)
+            self.readout.bias.zero_()
 
     def initial_state(self, observation: torch.Tensor) -> ResponsePolicyState:
         self._check_observation(observation)
-        rotation = observation[:, 6:15].reshape(-1, 3, 3)
-        integral = (rotation @ observation[:, 18:21, None]).squeeze(-1)
-        action = observation[:, 21:25]
         return ResponsePolicyState(
-            observation.new_zeros(observation.shape[0], self.config.memory_dim),
-            integral, observation[:, 3:6], observation[:, 15:18], rotation,
-            action, action, observation.new_zeros(observation.shape[0], 1),
+            observation.new_zeros(observation.shape[0], self.config.memory_dim)
         )
 
     @staticmethod
     def _check_observation(observation: torch.Tensor) -> None:
         if observation.ndim != 2 or observation.shape[-1] != OBSERVATION_DIM:
-            raise ValueError("expected [batch,25] deployable observation")
+            raise ValueError("expected [batch,22] deployable observation")
 
     def control_features(self, observation: torch.Tensor) -> torch.Tensor:
+        self._check_observation(observation)
         rotation = observation[:, 6:15].reshape(-1, 3, 3)
-        up = torch.tensor((0.0, 0.0, 1.0), device=observation.device,
-                          dtype=observation.dtype).expand(observation.shape[0], 3)
         return torch.cat((
             body_vector(rotation, observation[:, :3]),
             body_vector(rotation, observation[:, 3:6]) / 3.0,
-            body_vector(rotation, up),
+            rotation[:, 2, :],  # R.T @ world-up, including the original sensor noise.
             observation[:, 15:18] / 10.0,
-            observation[:, 18:21] / self.config.integral_limit,
-            observation[:, 21:25],
+            observation[:, 18:22],  # Command actually executed, not motor truth.
         ), -1)
 
     def forward(
@@ -117,46 +95,19 @@ class ResponseMotorPolicy(nn.Module):
     ) -> ResponsePolicyOutput:
         self._check_observation(observation)
         state = self.initial_state(observation) if state is None else state
-        rotation = observation[:, 6:15].reshape(-1, 3, 3)
-        # Observation previous_action is the command actually executed. This
-        # is not a proposed action from a hypothetical policy evaluation.
-        executed_previous = observation[:, 21:25]
-        delta_velocity = body_vector(
-            state.previous_rotation, observation[:, 3:6] - state.previous_velocity
-        ) / (self.config.dt * 9.80665)
-        delta_omega = (observation[:, 15:18] - state.previous_omega) / (
-            self.config.dt * 1000.0
-        )
-        up = torch.tensor((0.0, 0.0, 1.0), device=observation.device,
-                          dtype=observation.dtype).expand(observation.shape[0], 3)
-        response_input = torch.cat((
-            executed_previous, executed_previous - state.older_action,
-            delta_velocity, delta_omega,
-            (state.previous_omega + observation[:, 15:18]) / 20.0,
-            body_vector(state.previous_rotation, up),
-            body_vector(state.previous_rotation, state.previous_velocity) / 3.0,
-            observation[:, 15:18] / 10.0,
-        ), -1)
-        proposed_memory = self.response_memory(
-            self.response_encoder(torch.tanh(response_input)), state.memory
-        )
-        # At call0 no physical response exists yet; at call1 the first executed
-        # action/response pair is available. No startup segment is detached.
-        memory = torch.where(state.calls > 0, proposed_memory, state.memory)
+        if (state.memory.shape != (observation.shape[0], self.config.memory_dim)
+                or state.memory.device != observation.device
+                or state.memory.dtype != observation.dtype):
+            raise ValueError("policy memory must match observation batch, device and dtype")
         features = self.control_features(observation)
-        proposed = torch.tanh(self.controller(torch.cat((features, memory), -1)))
+        # Never skip call zero: current state must affect h_t and the first action.
+        memory = self.response_memory(features, state.memory)
+        proposed = torch.tanh(self.readout(torch.cat((features, memory), -1)))
         action = proposed
-        if self.config.action_rate > 0:  # Explicit non-reference experiment only.
+        if self.config.action_rate > 0:  # Same optional projection as the parent.
+            executed_previous = observation[:, 18:22]
             radius = self.config.action_rate * self.config.dt
             lower = (executed_previous - radius).clamp(-1.0, 1.0)
             upper = (executed_previous + radius).clamp(-1.0, 1.0)
             action = torch.maximum(lower, torch.minimum(upper, proposed))
-        integral = (
-            max(0.0, 1.0 - self.config.integral_leak * self.config.dt) * state.integral
-            + self.config.dt * observation[:, :3]
-        ).clamp(-self.config.integral_limit, self.config.integral_limit)
-        next_state = ResponsePolicyState(
-            memory, integral, observation[:, 3:6], observation[:, 15:18], rotation,
-            action, executed_previous, state.calls + 1.0,
-        )
-        return ResponsePolicyOutput(action, next_state)
+        return ResponsePolicyOutput(action, ResponsePolicyState(memory))

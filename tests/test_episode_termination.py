@@ -22,7 +22,7 @@ def select(state, index):
 
 def actor(dtype=torch.float64):
     torch.manual_seed(17)
-    return ResponseMotorPolicy(ResponsePolicyConfig(hidden_dim=8, memory_dim=8)).to(dtype=dtype)
+    return ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(dtype=dtype)
 
 
 class CountingSimulator(L2FSimulator):
@@ -52,7 +52,7 @@ def scheduled(lengths, horizon, dtype=torch.float64):
 def manual_prefix(policy, simulator, initial, horizon):
     """Independent serial implementation: no padding and no production rollout()."""
     closed = initialize(policy, initial)
-    obs = [observation(initial, closed.policy.integral)]
+    obs = [observation(initial)]
     actions, positions, velocities, omegas, da, dw = [], [], [], [], [], []
     for _ in range(horizon):
         before = closed.physical
@@ -62,7 +62,7 @@ def manual_prefix(policy, simulator, initial, horizon):
         actions.append(output.action); positions.append(after.position)
         velocities.append(after.velocity); omegas.append(after.omega)
         da.append(output.action - before.previous_action); dw.append(after.omega - before.omega)
-        obs.append(observation(after, closed.policy.integral))
+        obs.append(observation(after))
         if bool(simulator.terminated(after).all()):
             break
     return TaskTrajectory(closed, torch.stack(obs), torch.stack(actions), torch.stack(positions),
@@ -86,7 +86,11 @@ def test_first_crossing_independent_stop_and_no_post_terminal_calls():
     lengths = torch.tensor([1, 19, 50, 500, 500])
     assert torch.equal(trace.valid.sum(0), lengths)
     assert torch.equal(trace.end.physical.step_index, lengths)
-    assert torch.equal(trace.end.policy.calls[:, 0], lengths.to(torch.float64))
+    # No production call counter: independently compare each terminal hidden state.
+    for i in range(len(lengths)):
+        single = manual_prefix(policy, CountingSimulator(), select(initial, slice(i, i+1)), horizon)
+        torch.testing.assert_close(trace.end.policy.memory[i:i+1], single.end.policy.memory,
+                                   rtol=1e-11, atol=1e-12)
     assert sum(actor_rows) == int(lengths.sum()) == len(sim.ids)
     assert [sim.ids.count(float(i+1)) for i in range(5)] == lengths.tolist()
     for i, length in enumerate(lengths):
@@ -151,7 +155,9 @@ def test_real_physics_noise_and_windowed_gradients(profile, dtype):
     assert records[1].boundaries[h].physical.noise_tape.data_ptr() == initial.noise_tape.data_ptr()
     # Frozen memory and noise index: no repeated observation updates after failure.
     assert records[0].boundaries[h].physical.step_index[0] == 1
-    assert records[0].boundaries[h].policy.calls[0] == 1
+    first = a(observation(initial)).next_state.memory[0]
+    torch.testing.assert_close(records[0].boundaries[h].policy.memory[0], first,
+                               rtol=0, atol=0)
     trace = rollout(a, sim, initial, h)
     # Batch compaction must not change another aircraft's flight or noise tape.
     for i in (1, 2):

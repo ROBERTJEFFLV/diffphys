@@ -179,8 +179,8 @@ def test_exact_weighted_group_gradients_match_closed_form(chunk):
 
 
 def test_group_vjp_avoids_legacy_activation_fallbacks():
-    # Both nonlinearities occur in the real Actor; their legacy batching rules
-    # caused the measured kernel-launch regression on PyTorch 2.2.
+    # Preserve the historical nonlinear-operator regression even though the
+    # new Actor no longer has an external SiLU encoder.
     p = torch.nn.Parameter(torch.tensor([.1, -.3], dtype=torch.float64))
     x = torch.arange(24, dtype=p.dtype).reshape(12, 2) / 24
     costs = torch.nn.functional.silu(x @ p).tanh()
@@ -243,7 +243,7 @@ def test_group_coefficients_do_not_depend_on_cost_offsets():
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 def test_real_graph_batched_and_serial_agree_without_forward_change(decay,dtype):
     torch.set_num_threads(1); torch.manual_seed(7)
-    policy=ResponseMotorPolicy(ResponsePolicyConfig(hidden_dim=8,memory_dim=8)).to(dtype=dtype)
+    policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(dtype=dtype)
     sim=L2FSimulator(L2FParams())
     state=bank(128,dtype=dtype); loss=TaskLossConfig()
     results=[]; records=[]
@@ -294,7 +294,7 @@ def test_invalid_old_or_conflicting_flags_rejected(options):
 
 def args_for(path,updates,extra=()):
     return parse_args(['--device','cpu','--dtype','float64','--scenarios','16',
-        '--eval-scenarios','2','--horizon','8','--window-steps','4','--hidden-dim','8',
+        '--eval-scenarios','2','--horizon','8','--window-steps','4',
         '--memory-dim','8','--updates',str(updates),'--max-seconds','60',
         '--development-every','1','--checkpoint-every','1','--group-balance',
         '--work-dir',str(path),*extra])

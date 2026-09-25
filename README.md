@@ -1,9 +1,41 @@
 # DiffPhys response motor control
 
-A response encoder, GRU memory and motor controller learn from differentiable
-quadrotor flight. The Actor consumes 25 deployable observation entries and outputs
+A single GRU and direct-state linear readout learn from differentiable
+quadrotor flight. The Actor consumes 22 deployable observation entries and outputs
 four **absolute normalized motor commands** in [-1,1]. No mass, inertia, motor
 state or external-force truth is given to the Actor.
+
+## GRU16 direct-readout architecture
+
+This branch changes only the Actor architecture and necessary state/checkpoint
+interfaces from `codex/time-decay-bounded-influence-20260925@ea5a8f2`.
+
+```text
+22D observation -> existing frame/scaling -> c_t (16D)
+                                             | \
+                    h_(t-1) -> GRU(16,64) <---+  \
+                                  |               \
+                            h_t (64D) ------------ concat(c_t,h_t)
+                                  |                       |
+                             next step              Linear(80,4)
+                                                          |
+                                                        tanh
+                                                          |
+                                                 4 absolute motors
+```
+
+`h_t = GRU(c_t,h_(t-1))`; `a_t = tanh(W_c c_t + W_h h_t + b)`.
+The single readout contains `[W_c | W_h]`. W_c starts at zero; W_h is small
+and nonzero. All blocks train together with the original group-gradient
+normalization and one Adam update. Hidden updates on the first observation;
+there is no external encoder, MLP, explicit integral or response-history cache.
+Default parameter count: **16,068**. See [architecture and migration details](docs/gru16_direct_readout.md).
+
+**New architecture, new training run:** old response-encoder/MLP v3 checkpoints
+cannot initialize, resume or evaluate this Actor. Only matching GRU16 checkpoints
+are supported. Do not overwrite old work directories or edit checkpoint hashes.
+Physics, losses, Time Decay, group averaging and optimizer settings are retained;
+this is not a claim of equal flight trajectories or faster learned convergence.
 
 ## Learning approach
 
@@ -46,20 +78,21 @@ path; it is historical, not the current motor/scene contract.
 
 ## Production path
 
-The seven production files are `env_l2f.py`, `response_policy.py`,
+The eight production files are `env_l2f.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_training.py`,
-`response_execution.py` and `tools/train_response_control.py`.
+`response_groups.py`, `response_execution.py` and `tools/train_response_control.py`.
 
-The architecture below connects scenario sampling, the 25-entry observation,
-response encoding and GRU memory to the four motor commands. The lower training
-path shows how the physical task loss updates the Actor through BPTT and Adam.
+The current Actor is the GRU16 graph above. The previous
+[response-encoder architecture image](docs/images/Diffphys_Architecture.png)
+is retained as a historical illustration, not the current network specification.
 
-![DiffPhys architecture showing scenario sampling, 25D observations, response encoder and GRU motor policy, and the BPTT training pipeline](docs/images/Diffphys_Architecture.png)
+The inherited [physical-group update](docs/physics_group_balance.md) is unchanged:
+whole-Actor gradients are normalized by group and averaged before a single Adam
+step. `configs/response_raptor_multi_airframe.args` enables this path; the CLI
+switch default remains off. Group balancing requires full BPTT and AGC off.
 
-*Figure 2. Response-conditioned motor control and Actor-only training, shown with
-the default network widths. The diagram's "Continuous H500" label denotes the
-maximum rollout horizon; the current implementation stops each aircraft at its
-first boundary violation, as described below.*
+Termination is **position-only**, with strict per-axis boundary exceedance;
+velocity and angular velocity remain costs, not episode termination triggers.
 
 Each aircraft stops at its first boundary violation or the horizon cap (default
 500). The crossing transition is retained; other aircraft continue independently.
@@ -79,7 +112,7 @@ are unchanged. This is a **surrogate gradient**, not exact H500 BPTT or physical
 damping. H50 boundaries apply no additional decay; both backprop modes implement
 the same rule. Use `--time-decay 0` for the earlier exact derivative. The rate is
 in seconds^-1, recorded in training logs and checkpoint binding; changing it
-is not exact resume. Existing compatible v3 weights may initialize a new run
+is not exact resume. Existing compatible GRU16 weights may initialize a new run
 with fresh Adam via `--init-checkpoint`. The deployed Actor has no new parameters.
 This is an independently implemented full-state adaptation of temporal gradient
 decay from Zhang et al., *Learning vision-based agile flight via differentiable
@@ -92,21 +125,21 @@ bank (two banks) and is independent of TRAIN batch size. Defaults are 512 TRAIN
 and 256 EVAL trajectories, seed 7, H500, lr=3e-4, gradient scale 0.1 and clip 10.
 Periodic evaluation/checkpoint cadence remains 50 updates. Checkpoints bind the
 protocol, environment source hash, action convention and sampling configuration.
-Only compatible v3 checkpoints can be rescored with newer metric code.
+Only compatible GRU16 checkpoints can be rescored with newer metric code.
 
 New runs default to `--dead-cost 3 --terminal-cost 200` (raw units, divided
 by H exactly once). The values are bound in checkpoint loss configuration and
 `loss_config` in EVAL reports. Set both to zero for the earlier accounting.
-Older v3 checkpoints without these fields keep zero failure costs on evaluation;
+Matching-architecture checkpoints without these fields keep zero failure costs on evaluation;
 strict resume still rejects source/objective changes. Start a new run and use
 compatible weights-only initialization when explicitly changing the objective.
 
 The production trainer updates only the Actor. The stability Metric MLP,
 auxiliary contraction loss and its optimizer have been removed. Both launch
-configs use Time Decay with fresh `runs/*_time_decay/seed7` output directories.
-Compatible archived Actor checkpoints can still be evaluated or used for
-weights-only initialization; their auxiliary network payloads are ignored by
-Actor evaluation. Source changes prevent exact resume across this cleanup.
+configs retain their original Time Decay and output-path settings. Override
+`--work-dir` for this architecture. Only matching GRU16 Actor checkpoints can
+be evaluated or used for weights-only initialization; irrelevant auxiliary
+network payloads remain ignored. Source changes prevent exact resume.
 Time Decay does not guarantee bounded gradients or stable flight.
 
 ## Run
@@ -116,14 +149,16 @@ training only with an explicit time/update budget:
 
 ```bash
 # Multi-airframe, paper-first initialization
-python3 tools/train_response_control.py $(cat configs/response_raptor_multi_airframe.args)
+python3 tools/train_response_control.py $(cat configs/response_raptor_multi_airframe.args) \
+  --work-dir runs/gru16_direct_readout/seed7
 
 # Single-airframe L2F with Time Decay
-python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
+python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args) \
+  --work-dir runs/gru16_direct_readout_l2f/seed7
 ```
 
 `--mode profile` executes at most one update. Use `--mode evaluate --checkpoint
-PATH --work-dir NEW_DIR` to evaluate a v3 checkpoint; it uses the checkpoint's
+PATH --work-dir NEW_DIR` to evaluate a matching GRU16 checkpoint; it uses the checkpoint's
 protocol, horizon and fixed EVAL count, not unrelated CLI defaults.
 
 Bounded verification (no long training or external downloads):
@@ -136,7 +171,7 @@ OMP_NUM_THREADS=1 python3 -m pytest tests -q
 
 The reference profiles define scene, sensor/disturbance and motor semantics.
 Temporal decay changes the training gradient, not the forward task. The
-Actor-only response/GRU architecture and existing
+GRU16 Actor replaces the response-encoder/MLP architecture; existing
 Huber/CVaR terms and weights remain. Only post-termination padding is excluded
 from costs and statistics; horizon normalization and the original steady window
 are unchanged. Failure accounting adds `d * (3*(H-X) + 200) / H` to each

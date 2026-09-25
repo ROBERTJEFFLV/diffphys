@@ -9,20 +9,13 @@ import torch
 
 from env_l2f import L2FParams, L2FSimulator, L2FState
 from response_policy import (
-    ResponseMotorPolicy, ResponsePolicyState, body_vector,
+    ResponseMotorPolicy, ResponsePolicyState,
 )
 
 
 # Shared by per-step gradient decay and exact reverse-window state covectors.
 PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action")
-POLICY_DYNAMIC = (
-    "memory",
-    "integral",
-    "previous_velocity",
-    "previous_omega",
-    "previous_rotation",
-    "older_action",
-)
+POLICY_DYNAMIC = ("memory",)
 
 
 @dataclass(frozen=True)
@@ -75,7 +68,7 @@ class TaskTrajectory:
     valid: torch.Tensor  # [time, scene], including the first terminal transition
 
 
-def observation(physical: L2FState, integral: torch.Tensor) -> torch.Tensor:
+def observation(physical: L2FState) -> torch.Tensor:
     """Noisy deployable state only; one fixed noise sample per physical time step.
 
     Re-observing a window boundary MUST NOT draw a second noise realization.
@@ -89,13 +82,11 @@ def observation(physical: L2FState, integral: torch.Tensor) -> torch.Tensor:
         rows = torch.arange(clean.shape[0], device=clean.device)
         noise = physical.noise_tape[rows, physical.step_index]
     measured = clean + noise
-    rotation_measured = measured[:, 6:15].reshape(-1, 3, 3)
-    return torch.cat((measured, body_vector(rotation_measured, integral),
-                      physical.previous_action), -1)
+    return torch.cat((measured, physical.previous_action), -1)
 
 
 def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClosedLoopState:
-    obs = observation(physical, torch.zeros_like(physical.position))
+    obs = observation(physical)
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
 
@@ -169,7 +160,7 @@ def rollout(
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
     initial_physical = closed.physical
-    observations = [observation(closed.physical, closed.policy.integral)]
+    observations = [observation(closed.physical)]
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
     # A terminal row stays frozen outside its boundary, so it cannot become live
@@ -184,7 +175,7 @@ def rollout(
             # Cover observation, physics, GRU/history and delta-cost paths once.
             closed = _decay_closed_state(closed, rho)
             live = _decay_closed_state(live, rho)
-            current_observation = observation(closed.physical, closed.policy.integral)
+            current_observation = observation(closed.physical)
         before = closed.physical
         action = before.previous_action
         active = torch.zeros_like(before.step_index, dtype=torch.bool)
@@ -211,7 +202,7 @@ def rollout(
         omegas.append(physical.omega)
         action_deltas.append(action - before.previous_action)
         omega_deltas.append(physical.omega - before.omega)
-        observations.append(observation(physical, closed.policy.integral))
+        observations.append(observation(physical))
     return TaskTrajectory(
         closed, torch.stack(observations), torch.stack(actions), torch.stack(positions),
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),

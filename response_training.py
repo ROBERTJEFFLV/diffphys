@@ -118,33 +118,22 @@ def restore_rng(state):
 
 
 def migrate_actor_weights(policy, state):
-    """Drop only the known unused head; all effective weights remain strict."""
+    """Load only this architecture; old response-MLP weights are not equivalent."""
     expected = policy.state_dict()
-    extra = set(state) - set(expected)
-    h, m = policy.config.hidden_dim, policy.config.memory_dim
-    head_shapes = {
-        "response_predictor.0.weight": (h, m + 23),
-        "response_predictor.0.bias": (h,),
-        "response_predictor.2.weight": (6, h),
-        "response_predictor.2.bias": (6,),
-    }
-    if set(expected) - set(state) or (extra and extra != set(head_shapes)):
-        raise ValueError("unknown or missing Actor keys; only response_predictor may be removed")
-    for name in extra:
-        if tuple(state[name].shape) != head_shapes[name]:
-            raise ValueError("unexpected legacy prediction head shape")
+    if set(state) != set(expected):
+        raise ValueError("Actor keys do not match GRU16 direct readout; retrain old architectures")
     if any(
         state[n].shape != v.shape or not bool(torch.isfinite(state[n]).all())
         for n, v in expected.items()
     ):
         raise ValueError("Actor tensor shape mismatch or nonfinite weights")
-    policy.load_state_dict({n: state[n] for n in expected}, strict=True)
+    policy.load_state_dict(state, strict=True)
 
 
 def require_reference_checkpoint(value):
     """A shape match cannot certify old hover-centered or plus-frame semantics."""
     if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("incompatible motor semantics: pre-v3 checkpoints cannot be resumed, initialized or evaluated; retrain")
+        raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 direct-readout checkpoint or retrain")
     cfg = value["binding"]["protocol"]
     params = L2FParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
@@ -171,9 +160,7 @@ def migrate_named_adam(optimizer, policy, saved, saved_names):
     lookup = dict(zip(names, old_group["params"]))
     new = optimizer.state_dict()
     current = optimizer_parameter_names(policy, optimizer)[0]
-    if not set(current).issubset(lookup) or any(
-        not n.startswith("response_predictor.") for n in set(names) - set(current)
-    ):
+    if set(current) != set(lookup):
         raise ValueError("optimizer parameter names do not match effective Actor")
     parameters = dict(policy.named_parameters())
     for n, new_id in zip(current, new["param_groups"][0]["params"]):

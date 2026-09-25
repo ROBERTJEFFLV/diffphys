@@ -2,6 +2,7 @@
 """Bounded CPU/CUDA checks of physical-group gradient normalization and cost."""
 from __future__ import annotations
 import argparse
+import ast
 from dataclasses import replace
 import gc
 import hashlib
@@ -18,7 +19,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from env_l2f import L2FParams, L2FSimulator
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import TaskLossConfig, tensors_finite
 from response_groups import GroupBalanceConfig, group_gradient_coefficients, normalize_group_rows
 from response_adjoints import collect_boundary_rollout, backward_actor
@@ -42,14 +43,26 @@ def same(a, b):
         assert a == b
 
 
+def require_same_actor(baseline):
+    """Cross-version bitwise audits require the SAME Actor, not an architecture ablation."""
+    source = ast.parse((baseline / 'response_policy.py').read_text())
+    tag = next((ast.literal_eval(node.value) for node in source.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'ARCHITECTURE' for t in node.targets)), None)
+    if tag != ARCHITECTURE:
+        raise ValueError('parent equivalence requires the same Actor architecture; '
+                         'the pre-GRU16 model is not an equivalence baseline')
+
+
 def disabled_parent_equivalence(baseline):
+    require_same_actor(baseline)
     with tempfile.TemporaryDirectory() as tmp:
         saved = []
         for name, root in [('parent', baseline), ('new', ROOT)]:
             work = Path(tmp)/name
             cmd = [sys.executable, str(root/'tools/train_response_control.py'),
                 '--device','cpu','--dtype','float64','--scenarios','2','--eval-scenarios','2',
-                '--horizon','8','--window-steps','4','--hidden-dim','8','--memory-dim','8',
+                '--horizon','8','--window-steps','4','--memory-dim','8',
                 '--updates','2','--max-seconds','60','--work-dir',str(work)]
             r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=90)
             if r.returncode: raise RuntimeError(r.stdout+r.stderr)
@@ -73,8 +86,8 @@ def fixture(device, hover):
         rotor = (-c1+(c1*c1-4*c2*(c0-mass[0]*9.81/4)).sqrt())/(2*c2)
         action = 2*rotor-1
         with torch.no_grad():
-            policy.controller[-1].weight.zero_()
-            policy.controller[-1].bias.fill_(float(torch.atanh(action)))
+            policy.readout.weight.zero_()
+            policy.readout.bias.fill_(float(torch.atanh(action)))
         q = torch.zeros_like(z.orientation); q[:,0] = 1
         z = replace(z, mass=mass, thrust_to_weight=twr, inertia=inertia,
             thrust_coefficients=coefficients,

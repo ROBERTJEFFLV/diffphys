@@ -1,0 +1,71 @@
+{
+  "base_commit": "ea5a8f2eb1dbe8edba85cfa3ae26aa0e5834f76d",
+  "description": "Parent source guards: unchanged simulator, physical groups, CLI and configs; preserved loss, BPTT/Time Decay and train-loop definitions.",
+  "unchanged_files": {
+    "configs/response_phase1_single_airframe.args": "a409f2fcd6bda7e6f1726f2fbb63f50a98daddd8",
+    "configs/response_raptor_group_gradient_smoke.args": "1def1cc1dafbe3954631da07d9ec6f2324c363a8",
+    "configs/response_raptor_multi_airframe.args": "d31bafe5ff34d9748abde538c94e40f8c2ee733c",
+    "env_l2f.py": "0115441e813fa9b1e70158cf82dfff515e7d6ee8",
+    "response_execution.py": "455ea13d9bba81259e90cb161dd987cf94b3d8e4",
+    "response_groups.py": "a1374db4a575e8a65fc7a4dfb6c10ac75ec15f7f",
+    "tools/train_response_control.py": "cebea32faeb07a314a3725c3bc353c26ffc39d9c"
+  },
+  "unchanged_source_segments": {
+    "response_adjoints.py": {
+      "BoundaryRecord": "42d1f346712f8e9c7dee9b74085f2b7f6aa36626dd01c75bc59bbe832312fa41",
+      "backward_actor": "168829c355494a5461335ab9369875e61ebe4070389885a837dbf259e6699f4d",
+      "collect_boundary_rollout": "60e1b479ab95988dd775613e159702fc4d4c3bcba8bd5f2599c5ff475e449d1a",
+      "compare_boundary": "73aa929beb0864e54bdcc2f74edfc64e053c614c4c92f72f87f252fcf8dbc754",
+      "dynamic_closed_state": "e29458221cc0b21f09616a8473c10a8c8d5e09396815f1723957a8c64df4096c",
+      "snapshot": "4efed1b47eb06c02ff0c4503d5297011655164a2fb54bb110a5a09b6ba4640c4"
+    },
+    "response_task.py": {
+      "FlightStatistics": "7e40b07707bdefecc7a725320c9f83b314b6da085b67a9e36d90219e9832c537",
+      "ResponseClosedLoopState": "678f3116bde1c79ef5c621177f7afa4ce450033c217e89115adc4bd349c24bf9",
+      "TaskLossConfig": "c781e5331c07c33d108788712febfcdffd500a3771d9026e4499dd0f94780ae5",
+      "TaskTrajectory": "315ab91a92fc8f6e4ff67b6e4880cbfa7c1b8d5a59f46620a5280d5f62a74bf3",
+      "_GradientDecay": "15d7468afad48811148210409ea239819812481e7041a83984bc9977b9143e0f",
+      "_decay_closed_state": "3eddc33727fdcb45ac1f91e6be8aaae56abbfa98b5c9d9b1ddbf2394bf4ebe08",
+      "_merge_rows": "794c2418b733d5dcb211d403c3c1613d5a166f2f875a442c630a9fc735550fe6",
+      "_select_rows": "6909a5a01930e54e2aea2851afa41877f478e085057d676394662539d4647920",
+      "hard_risk_metrics": "d4351580460d02f31764100776189535e8e2ada6b0e47495cfecbbd657e50f5e",
+      "reference_episode_metrics": "a08e01b807bbf4809347d3e7bcb1612d309da1568eaa710755df738ed9775757",
+      "risk_weights": "66676e1db9f852ec192f1d056a85f653bea9b6c5b4768762962a702b6acda5c3",
+      "sample_scenarios": "aceb820fc51474c678028db8429d0d60bfd5c7baf711a90e7064d7d3fa9aa9bd",
+      "scenario_costs": "7a82c8c01be9088834726f9ca1e2eb2f7c318c51b9f252ddb4c461ef6eb406de",
+      "step_costs": "7872a753cd79db8ac82fa0e666ef08415812682c9bc94d428bf08fb82852659c",
+      "task_loss": "b33769c9cbc3012e17ba0f377d0e5b25b460d3f7d2ec509bc2a3850f46a97de6",
+      "task_loss_components": "8e8809dd4d17d4e8f871e85ca2f5f49a42cfe822101a5776e0c2c89286d1ddcf",
+      "task_residual": "81afbe869b01a615d775e3ca81e135cc4a3c45f95ba6d2e9186e6bb4e69a782b",
+      "tensors_finite": "a5c145471eea3f46426887d8deb6d62df606ccf7a66d261241aa42ec00d560be",
+      "trajectory_metrics": "fc81f61b9f90427709a1a5ea96ccc836efe3543ebd2328d9c3a0a86d0e84ec38",
+      "warning_risk_steps": "7cb2b51cbde0d3412c166e886fda65886bd19581d7a15fc6e73f29938691fb5e",
+      "weighted_task_features": "0e8f3122496ebb242ab2b33a54d2b118b51ca31e2f73588998fcd1d236c9b542"
+    },
+    "response_training.py": {
+      "_append": "eac5539fc4201cc32ba1a2349333fb8ccdd618f1e86297855e147e95fb5c1401",
+      "_atomic": "d4b9604f219a96ad0a2252747b3b3e04390f1aae160d9eb593c01336bd8b2fd1",
+      "_checkpoint": "d958992e307a475d21469a1ead764da9ab57d45c4a198718088943a0ef5faa31",
+      "_recover_log": "5b3cd618bb284e364ef78422e006bd5c5546ff2a214f8f2f16fee16ce6c90460",
+      "_sync": "c2ae059d4ae42427e913d9631370c3cb745ac9662828903140121cef03c8f41e",
+      "adaptive_clip": "779ce063f6fe5fa539dae000fb3fbe03d951334168253941fd62aabbe6315ec7",
+      "atomic_json": "a35a096843815973decea71b0a908e98fa9a7a174ef01c1da3f7e9301f350e62",
+      "atomic_torch": "fd10745e3a1c21a36be82e5824811713fe969b2a2a2ab6ca1da7abbf84132b08",
+      "binding": "04ba49a1adaced645345519bfec53d32fce3081b5ab839d19cfc74b1f4798344",
+      "capture_rng": "479801d7cf2ecb11660c73920b4b0f6164b2cea5754aa9240b7700d599d291d5",
+      "evaluate": "7d3dc4818b57ca1dd6ad424efa69960c5f498dab69c5d4085c19a4154fcdc575",
+      "evaluate_checkpoint": "d6e8dffa2ccba8864287ab0da629ef09db0464367ecddef9008060eb39d921b1",
+      "file_hash": "99bdb0f29c98718baa48130b7ae1b2029e7bd29aa1f9ea8b295530ef4f5d72e7",
+      "gradient_norm": "2c979ac93713f86560cd2c54be02191cbd733f967ceecb3db968406312520cae",
+      "load_policy_checkpoint": "401a31bfa14f308b06188201cfc93d1aebc412572789f64e0680b5cd3e17fe80",
+      "model_hash": "85ff6332c41b529448d79a25945fb3507dfaef3e4bf44e4ae392bdb89151b20c",
+      "optimizer_parameter_names": "44a0597c81da4d3df144e4532e7d429c51852ae1f55442f592ad0c48746b899e",
+      "pool_states": "edaa2cc335e6898c840953c57fe0f3266fa6465544b5a909310fcf90f52fe7f0",
+      "restore_rng": "ef76c9e3553224a93c0ed047f077f8a0613ce9dbdf65367ba496a228827fa98d",
+      "safe_global_clip": "eb22042aadfc8ee0ae4460ebac1c90211db07b602e7938a8037aca6d521cbceb",
+      "sample_training_scenarios": "e5ca4aaa11b5043af7d509fcd356ebfb9533ae9b4afb67cc34915b219a692b62",
+      "source_hash": "6e0475c7df951d41804ffce4acfdaebc2bae618d78480d050ff3448dd70729fb",
+      "train": "5bf42790b413a29dd30a6b2a11accbd20c8bcbf0d5b45405fe1165f7b4ca38f4"
+    }
+  }
+}

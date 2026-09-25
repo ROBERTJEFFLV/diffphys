@@ -71,11 +71,14 @@ def test_noise_profiles_and_consistency():
             assert (s.noise_tape == 0).all()
             assert (s.external_torque == 0).all()
             assert s.external_force.abs().max() > 0
-        obs = observation(s, torch.zeros_like(s.position))
-        torch.testing.assert_close(obs, observation(s, torch.zeros_like(s.position)), rtol=0, atol=0)
+        obs = observation(s)
+        torch.testing.assert_close(obs, observation(s), rtol=0, atol=0)
         # Memory is built from noisy observations, never privileged motor states.
         p = ResponseMotorPolicy().double()
-        torch.testing.assert_close(p.initial_state(obs).previous_velocity, obs[:,3:6])
+        hidden = p.initial_state(obs).memory
+        assert hidden.shape == (256, p.config.memory_dim) and not hidden.any()
+        expected_hidden = p.response_memory(p.control_features(obs), hidden)
+        torch.testing.assert_close(p(obs).next_state.memory, expected_hidden, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('protocol', ['l2f', 'raptor'])
@@ -184,7 +187,7 @@ def test_action_gradient_finite_difference(protocol):
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
 def test_full_and_windowed_bptt_share_noise_and_gradients(protocol,dtype):
     torch.manual_seed(7)
-    config=ResponsePolicyConfig(hidden_dim=8,memory_dim=8)
+    config=ResponsePolicyConfig(memory_dim=8)
     policies=[ResponseMotorPolicy(config).to(dtype=dtype)]
     policies.append(copy.deepcopy(policies[0]))
     s=make(protocol,8,horizon=20,dtype=dtype)
@@ -238,7 +241,7 @@ def test_native_motor_action_has_no_default_slew_projection():
     p=ResponseMotorPolicy().double()
     for x in p.parameters():
         x.data.zero_()
-    p.controller[-1].bias.data.fill_(10)
+    p.readout.bias.data.fill_(10)
     s=make('raptor',1)
-    obs=observation(s,torch.zeros_like(s.position));obs[:,21:]=-1
+    obs=observation(s);obs[:,18:22]=-1
     assert (p(obs).action>.99).all()

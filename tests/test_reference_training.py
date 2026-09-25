@@ -19,7 +19,7 @@ def args_for(path, profile='l2f', updates=2, extra=()):
     return parse_args(['--device','cpu','--dtype','float64','--scenarios','2',
                       '--eval-scenarios','3','--horizon','8','--window-steps','4',
                       '--development-every','1','--checkpoint-every','1','--updates',str(updates),
-                      '--max-seconds','60','--hidden-dim','8','--memory-dim','8',
+                      '--max-seconds','60','--memory-dim','8',
                       '--scenario-mode',profile,'--work-dir',str(path),*extra])
 
 

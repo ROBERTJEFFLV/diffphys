@@ -22,7 +22,7 @@ from response_task import (
 from response_groups import (GroupBalanceConfig, group_gradient_coefficients,
                              backward_group_gradients)
 
-POLICY_NONDIFFERENTIABLE = ("calls", "last_action")
+POLICY_NONDIFFERENTIABLE = ()
 
 
 def snapshot(closed: ResponseClosedLoopState) -> ResponseClosedLoopState:
