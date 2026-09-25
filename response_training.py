@@ -275,7 +275,7 @@ def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
         "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
-                     + ("+physics-group-score" if args.group_balance else ""),
+                     + ("+physics-group-gradient-median" if args.group_balance else ""),
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -396,6 +396,8 @@ def train(args, policy_config, loss_config):
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode))
     group_config = GroupBalanceConfig.from_args(args)
+    if group_config.enabled and (args.backprop_mode != "full" or args.agc != 0):
+        raise ValueError("group gradient normalization requires full BPTT and AGC disabled")
     if group_config.enabled and TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
         raise ValueError("not enough unique TRAIN scenes for group balancing")
     run_binding = binding(args, policy_config, loss_config)
@@ -561,6 +563,9 @@ def train(args, policy_config, loss_config):
                 "gradient_scale": args.gradient_scale,
                 "group_balance": (None if record.group_balance is None else {
                     **record.group_balance, "values": record.group_balance["values"].cpu().tolist()}),
+                "group_gradient": (None if "group_gradient" not in backward else {
+                    **backward["group_gradient"],
+                    "values": backward["group_gradient"]["values"].cpu().tolist()}),
                 "backprop_mode": args.backprop_mode,
                 "time_decay": args.time_decay,
                 "boundary_checks": len(backward["boundaries"]),

@@ -1,4 +1,4 @@
-"""Physical grouping + detached score scaling; one ordinary task backward."""
+"""Physical grouping and normalization of true group parameter gradients."""
 from __future__ import annotations
 from dataclasses import fields, replace
 import copy
@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from env_l2f import L2FParams, L2FSimulator
 from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import sample_scenarios, TaskLossConfig, risk_weights
-from response_groups import GroupBalanceConfig, physics_group_layout, group_balanced_weights
+from response_groups import (GroupBalanceConfig, physics_group_layout,
+    group_gradient_coefficients, normalize_group_rows, backward_group_gradients)
 from response_adjoints import backward_actor, collect_boundary_rollout
 from response_training import train
 from tools.train_response_control import parse_args
@@ -78,139 +79,156 @@ def test_mass_or_radius_alone_does_not_define_groups_and_equal_dynamics_not_spli
     assert torch.equal(indices[0],torch.arange(128))
 
 
-@pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
-@pytest.mark.parametrize('mode',['none','rms'])
-@pytest.mark.parametrize('n',[100,101])
-def test_vectorized_weights_equal_explicit_group_formula(dtype,mode,n):
-    state=bank(n,dtype=dtype)
-    costs=torch.linspace(.1,40.,n,dtype=dtype,requires_grad=True)
-    cfg=GroupBalanceConfig(enabled=True,scale_mode=mode)
-    base=risk_weights(costs,TaskLossConfig())
-    weights,report=group_balanced_weights(costs,base,state,cfg)
-    indices,counts=physics_group_layout(state,cfg)
-    expected=torch.zeros_like(weights)
-    for group in indices:
-        group=group[group<n]
-        rms=costs.detach()[group].square().mean().sqrt().clamp_min(cfg.scale_floor)
-        scale=rms if mode=='rms' else 1.
-        expected[group]=n*base[group]/(len(counts)*len(group)*scale)
-    torch.testing.assert_close(weights,expected)
-    assert not weights.requires_grad
-    assert report['group_count']==len(counts)
-    assert not report['values'].requires_grad
-    # Only the costs are differentiated; no hidden derivative through RMS/statistics.
-    gradient,=torch.autograd.grad((weights*costs).sum(),costs)
-    torch.testing.assert_close(gradient,expected)
+@pytest.mark.parametrize('n', [64, 65, 100, 512, 513])
+def test_group_coefficients_preserve_cvar_and_group_mean(n):
+    state = bank(n)
+    cfg = GroupBalanceConfig(enabled=True)
+    costs = torch.linspace(.1, 20, n, dtype=torch.float64)
+    weights = risk_weights(costs, TaskLossConfig())
+    seeds, report = group_gradient_coefficients(weights, state, cfg)
+    indices, counts = physics_group_layout(state, cfg)
+    expected = torch.zeros_like(seeds)
+    for group, selected in enumerate(indices):
+        selected = selected[selected < n]
+        expected[group, selected] = n * weights[selected] / selected.numel()
+    torch.testing.assert_close(seeds, expected)
+    assert not seeds.requires_grad
+    assert (seeds > 0).sum().item() == n
+    assert 'cost_rms' not in report['columns'] and 'scale' not in report['columns']
+    if bool((counts == counts[0]).all()):
+        torch.testing.assert_close(seeds.mean(0), weights)
 
 
-def test_identity_weights_when_disabled_and_when_equal_counts_no_normalization():
-    state=bank(512)
-    costs=torch.linspace(.1,12.,512,dtype=torch.float64)
-    base=risk_weights(costs,TaskLossConfig())
-    same,report=group_balanced_weights(costs,base,state,GroupBalanceConfig())
-    assert same is base and report is None
-    result,_=group_balanced_weights(costs,base,state,GroupBalanceConfig(enabled=True,scale_mode='none'))
-    torch.testing.assert_close(result,base,atol=0,rtol=0)
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
+def test_gradient_outlier_not_cost_is_normalized(dtype):
+    rows = torch.tensor([[1., 0.], [1., 0.], [1., 0.], [-1e9, 0.]], dtype=dtype)
+    result, report = normalize_group_rows(rows, 1e-12)
+    torch.testing.assert_close(result, torch.tensor([.5, 0.], dtype=dtype))
+    torch.testing.assert_close(report['values'][:, 1], torch.ones(4, dtype=torch.float64))
+    assert report['values'][-1, 2] < 1e-8
 
 
-def test_equal_group_coefficients_without_tail_and_unequal_counts():
-    state=bank(100)
-    costs=torch.linspace(.1,4.,100,dtype=torch.float64)
-    cfg=GroupBalanceConfig(enabled=True,scale_mode='none')
-    weights,_=group_balanced_weights(costs,torch.full_like(costs,.01),state,cfg)
-    indices,counts=physics_group_layout(state,cfg)
-    for group in indices:
-        group=group[group<100]
-        assert weights[group].sum().item()==pytest.approx(1/counts.numel())
+def test_small_groups_are_scaled_up_not_only_clipped():
+    rows = torch.tensor([[.01, 0.], [1., 0.], [2., 0.], [1e9, 0.]], dtype=torch.float64)
+    result, report = normalize_group_rows(rows, 1e-12)
+    torch.testing.assert_close(result, torch.tensor([1., 0.], dtype=rows.dtype))
+    assert report['values'][0, 2] == 100.
+    assert report['values'][3, 2] == 1e-9
 
 
-def test_scale_floor_zero_costs_and_large_finite_float32_scores():
-    state=bank(64,dtype=torch.float32)
-    for costs in [torch.zeros(64),torch.full((64,),1e25),torch.full((64,),1e37)]:
-        w,_=group_balanced_weights(costs,torch.full((64,),1/64),state,
-                                  GroupBalanceConfig(enabled=True))
-        assert torch.isfinite(w).all() and (w>0).all()
-        if costs.max()==0:
-            torch.testing.assert_close(w,torch.full((64,),1/64))
-        else:
-            assert (w*costs).sum().item()==pytest.approx(1.,rel=1e-6)
+@pytest.mark.parametrize('rows', [
+    [[0., 0.], [0., 0.]], [[0., 0.], [0., 0.], [3., 4.]],
+    [[1e-30, 0.], [1., 0.], [1., 0.]],
+    [[1e30, -1e30], [2e30, 0.], [0., 1e30]],
+])
+def test_zero_tiny_huge_groups_finite(rows):
+    value = torch.tensor(rows, dtype=torch.float32)
+    result, report = normalize_group_rows(value, 1e-12)
+    assert torch.isfinite(result).all() and torch.isfinite(report['values']).all()
+    assert not result.requires_grad
+    assert torch.equal(report['values'][value.abs().sum(-1) == 0, 1],
+                       torch.zeros_like(report['values'][value.abs().sum(-1) == 0, 1]))
 
 
-@pytest.mark.parametrize('bad',['nan','negative','tracked_weight','negative_cost'])
-def test_bad_input_rejected_before_backward(bad):
+def test_zero_groups_do_not_erase_other_groups_or_renormalize_vote_count():
+    result, report = normalize_group_rows(torch.tensor([[0.,0.],[0.,0.],[3.,4.]]),1e-12)
+    torch.testing.assert_close(result, torch.tensor([1.,4/3]))
+    assert torch.equal(report['values'][:, 3], torch.full((3,),5.,dtype=torch.float64))
+
+
+def test_large_float64_norm_avoids_square_overflow():
+    result, report = normalize_group_rows(torch.tensor([[1e200,0.],[0.,1e200]],dtype=torch.float64),1e-12)
+    assert torch.isfinite(result).all() and torch.isfinite(report['values']).all()
+
+
+@pytest.mark.parametrize('bad', [float('inf'),float('nan')])
+def test_nonfinite_gradient_is_not_sanitized(bad):
+    with pytest.raises(FloatingPointError): normalize_group_rows(torch.tensor([[bad,0.],[1.,0.]]),1e-12)
+
+
+@pytest.mark.parametrize('chunk', [1, 2, 3, 16])
+def test_exact_weighted_group_gradients_match_closed_form(chunk):
+    state=bank(128)
+    p=torch.nn.Parameter(torch.tensor([.1,.2],dtype=torch.float64))
+    unused=torch.nn.Parameter(torch.tensor([1.],dtype=p.dtype))
+    x=torch.randn(128,2,generator=torch.Generator().manual_seed(4),dtype=p.dtype)
+    costs=(x@p+1).square()
+    cfg=GroupBalanceConfig(enabled=True,vjp_chunk_size=chunk)
+    weights=risk_weights(costs,TaskLossConfig())
+    coefficients,_=group_gradient_coefficients(weights,state,cfg)
+    expected_rows=.1 * coefficients @ (2*(x@p.detach()+1)[:,None]*x)
+    expected,_=normalize_group_rows(expected_rows,cfg.gradient_epsilon)
+    with patch('torch.autograd.grad', wraps=torch.autograd.grad) as call:
+        gradients,report=backward_group_gradients(costs,coefficients,[p,unused],cfg,gradient_scale=.1)
+        assert call.call_count == (4+chunk-1)//chunk
+    torch.testing.assert_close(gradients[0],expected,atol=1e-13,rtol=1e-12)
+    assert gradients[1] is None and p.grad is None
+    assert report['group_count']==4
+
+
+def test_group_coefficients_do_not_depend_on_cost_offsets():
     state=bank(64)
-    costs=torch.ones(64,dtype=torch.float64)
-    weights=torch.full_like(costs,1/64)
-    if bad=='nan': costs[0]=float('nan')
-    if bad=='negative': weights[0]=-1
-    if bad=='tracked_weight': weights.requires_grad_(True)
-    if bad=='negative_cost': costs[0]=-1
-    with pytest.raises((ValueError,FloatingPointError)):
-        group_balanced_weights(costs,weights,state,GroupBalanceConfig(enabled=True))
-
-
-@pytest.mark.parametrize('field',['thrust_to_weight','torque_to_inertia',
-                                  'motor_time_rising','motor_time_falling'])
-def test_bad_physics_rejected(field):
-    state=bank(64)
-    val=getattr(state,field).clone(); val[0]=0
-    with pytest.raises((ValueError,FloatingPointError)):
-        physics_group_layout(replace(state,**{field:val}),GroupBalanceConfig(enabled=True))
-
-
-@pytest.mark.parametrize('decay',[0.,1.])
-def test_real_full_graph_one_vjp_original_flight_and_frozen_weight_gradient(decay):
-    torch.set_num_threads(1); torch.manual_seed(7)
-    policy=ResponseMotorPolicy(ResponsePolicyConfig(hidden_dim=8,memory_dim=8)).double()
-    sim=L2FSimulator(L2FParams()); state=bank(64); lc=TaskLossConfig()
-    kwargs=dict(horizon=8,window_steps=4,backprop_mode='full',time_decay=decay)
-    plain=collect_boundary_rollout(policy,sim,state,lc,**kwargs)
-    grouped=collect_boundary_rollout(policy,sim,state,lc,
-        group_config=GroupBalanceConfig(enabled=True),**kwargs)
-    assert torch.equal(plain.costs,grouped.costs)
-    assert torch.equal(plain.weights,grouped.weights)
-    assert torch.equal(plain.valid,grouped.valid)
-    for t in plain.boundaries:
-        for part in ('physical','policy'):
-            for f in fields(getattr(plain.boundaries[t],part)):
-                assert torch.equal(getattr(getattr(plain.boundaries[t],part),f.name),
-                    getattr(getattr(grouped.boundaries[t],part),f.name))
-    assert plain.metrics['task_objective']==grouped.metrics['task_objective']
-    expected=torch.autograd.grad(.1*(grouped.costs*grouped.optimization_weights).sum(),
-                                list(policy.parameters()),retain_graph=True)
-    rng=torch.get_rng_state().clone()
-    original=torch.autograd.grad
-    with patch('torch.autograd.grad',wraps=original) as grad:
-        backward_actor(policy,sim,grouped,lc)
-        assert grad.call_count==1
-        assert not grad.call_args.kwargs.get('is_grads_batched',False)
-        assert not grad.call_args.kwargs.get('retain_graph',False)
-    for p,g in zip(policy.parameters(),expected):
-        torch.testing.assert_close(p.grad,g,atol=1e-11,rtol=1e-10)
-    assert torch.equal(rng,torch.get_rng_state())
-
-
-def test_windowed_recomputation_reuses_frozen_group_scales():
-    torch.set_num_threads(1); torch.manual_seed(7)
-    policy=ResponseMotorPolicy(ResponsePolicyConfig(hidden_dim=8,memory_dim=8)).double()
-    sim=L2FSimulator(L2FParams()); state=bank(64); lc=TaskLossConfig()
+    p=torch.nn.Parameter(torch.tensor(.1,dtype=torch.float64))
+    weights=torch.full((64,),1/64,dtype=p.dtype)
     cfg=GroupBalanceConfig(enabled=True)
-    expected=[]
-    for mode in ['full','windowed']:
-        record=collect_boundary_rollout(policy,sim,state,lc,horizon=8,window_steps=4,
-            backprop_mode=mode,time_decay=1.,group_config=cfg)
-        backward_actor(policy,sim,record,lc)
-        expected.append([p.grad.clone() for p in policy.parameters()])
-    for a,b in zip(*expected): torch.testing.assert_close(a,b,atol=1e-10,rtol=1e-9)
+    seeds,_=group_gradient_coefficients(weights,state,cfg)
+    results=[]
+    for offset in (0.,1e6):
+        costs=offset + (torch.arange(64,dtype=p.dtype)+1)*p
+        results.append(backward_group_gradients(costs,seeds,[p],cfg,gradient_scale=.1)[0][0])
+    torch.testing.assert_close(*results,atol=0,rtol=0)
+
+
+@pytest.mark.parametrize('decay', [0.,1.])
+@pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
+def test_real_graph_batched_and_serial_agree_without_forward_change(decay,dtype):
+    torch.set_num_threads(1); torch.manual_seed(7)
+    policy=ResponseMotorPolicy(ResponsePolicyConfig(hidden_dim=8,memory_dim=8)).to(dtype=dtype)
+    sim=L2FSimulator(L2FParams())
+    state=bank(128,dtype=dtype); loss=TaskLossConfig()
+    results=[]; records=[]
+    for chunk in (1,3,16):
+        cfg=GroupBalanceConfig(enabled=True,vjp_chunk_size=chunk)
+        record=collect_boundary_rollout(policy,sim,state,loss,horizon=8,window_steps=4,
+            backprop_mode='full',time_decay=decay,group_config=cfg)
+        # Serial independent reference on the SAME retained graph.
+        expected=[]
+        for seed in record.group_coefficients:
+            gs=torch.autograd.grad(record.costs,list(policy.parameters()),grad_outputs=.1*seed,
+                                   retain_graph=True)
+            expected.append(torch.cat([g.flatten() for g in gs]))
+        expected,_=normalize_group_rows(torch.stack(expected),cfg.gradient_epsilon)
+        rng=torch.get_rng_state().clone(); snapshots=copy.deepcopy(record.boundaries)
+        info=backward_actor(policy,sim,record,loss)
+        actual=torch.cat([p.grad.flatten() for p in policy.parameters()])
+        tolerance=(dict(atol=1e-6,rtol=5e-5) if dtype==torch.float32 else dict(atol=1e-12,rtol=1e-10))
+        torch.testing.assert_close(actual,expected,**tolerance)
+        assert torch.equal(rng,torch.get_rng_state())
+        for t,boundary in record.boundaries.items():
+            for part in ('physical','policy'):
+                for f in fields(getattr(boundary,part)):
+                    assert torch.equal(getattr(getattr(boundary,part),f.name),
+                                       getattr(getattr(snapshots[t],part),f.name))
+        assert info['group_gradient']['group_count']==4
+        assert 'optimization_objective' not in record.metrics
+        results.append(actual.clone()); records.append(record)
+    for actual in results[1:]: torch.testing.assert_close(actual,results[0],**tolerance)
+    for record in records[1:]:
+        assert torch.equal(record.costs,records[0].costs)
+        assert torch.equal(record.weights,records[0].weights)
+        assert torch.equal(record.valid,records[0].valid)
 
 
 @pytest.mark.parametrize('options',[
     ['--group-min-scenarios','16'],['--group-max-groups','3'],
-    ['--group-scale-floor','0'],['--group-scale-floor','nan'],
+    ['--group-scale-mode','rms'],['--group-scale-floor','1'],
+    ['--group-gradient-epsilon','0'],['--group-gradient-epsilon','nan'],
+    ['--group-vjp-chunk-size','0'],['--group-vjp-chunk-size','65'],
     ['--group-balance','--scenarios','4'],['--contribution-clip','1'],
-    ['--contribution-vjp-chunk-size','64'],
+    ['--contribution-vjp-chunk-size','64'],['--group-balance','--agc','.01'],
+    ['--group-balance','--backprop-mode','windowed'],
 ])
-def test_invalid_config_and_removed_expensive_path_rejected(options):
+def test_invalid_old_or_conflicting_flags_rejected(options):
     with pytest.raises(SystemExit): parse_args(options)
 
 
@@ -228,7 +246,7 @@ def run(args):
     return train(args,pc,lc)
 
 
-def test_grouped_training_exact_resume_and_bound_configuration(tmp_path):
+def test_grouped_training_exact_resume_and_new_binding(tmp_path):
     a,b=tmp_path/'a',tmp_path/'b'
     run(args_for(a,2)); run(args_for(b,1))
     run(args_for(b,2,('--resume',str(b/'latest.pt'))))
@@ -238,57 +256,92 @@ def test_grouped_training_exact_resume_and_bound_configuration(tmp_path):
     for k,state in ca['optimizer']['state'].items():
         for key,v in state.items():
             torch.testing.assert_close(v,cb['optimizer']['state'][k][key],atol=0,rtol=0)
-    assert ca['binding']['group_balance']['enabled'] is True
+    assert 'gradient-median' in ca['binding']['group_balance']['version']
     row=json.loads((a/'history.jsonl').read_text().splitlines()[-1])
     assert row['group_balance']['group_count']==2
     assert row['group_balance']['values'][0][0]>=32
-    assert 'optimization_objective' in row and 'task_objective' in row
+    assert row['group_gradient']['group_count']==2
+    assert row['group_gradient']['vjp_calls']==1
+    assert 'optimization_objective' not in row
+    assert 'task_objective' in row
     with pytest.raises(ValueError,match='configuration'):
-        run(args_for(b,3,('--resume',str(b/'latest.pt'),'--group-scale-floor','2')))
+        run(args_for(b,3,('--resume',str(b/'latest.pt'),'--group-vjp-chunk-size','1')))
 
 
-def test_nonfinite_grouping_rolls_back_without_adam(tmp_path,monkeypatch):
+def test_nonfinite_group_gradient_restores_actor_adam_rng(tmp_path,monkeypatch):
     import response_training as module
-    run(args_for(tmp_path/'zero',0))
-    original=torch.load(tmp_path/'zero/latest.pt',weights_only=True)
+    run(args_for(tmp_path/'initial',1))
+    original=torch.load(tmp_path/'initial/latest.pt',weights_only=True)
+    from shutil import copytree
+    copytree(tmp_path/'initial',tmp_path/'fail')
+    real_backward=module.backward_actor
     calls=[]
-    def fail(*a,**kw): raise FloatingPointError('injected grouping failure')
-    monkeypatch.setattr(module,'collect_boundary_rollout',fail)
+    def fail(*a,**kw):
+        real_backward(*a,**kw)
+        raise FloatingPointError('injected group gradient failure')
+    monkeypatch.setattr(module,'backward_actor',fail)
     monkeypatch.setattr(torch.optim.Adam,'step',lambda *a,**kw:calls.append(True))
-    with pytest.raises(FloatingPointError): run(args_for(tmp_path/'fail',1))
+    with pytest.raises(FloatingPointError):
+        run(args_for(tmp_path/'fail',2,('--resume',str(tmp_path/'fail/latest.pt'))))
     checkpoint=torch.load(tmp_path/'fail/failure.pt',weights_only=True)
     assert checkpoint['model_sha256']==original['model_sha256']
-    assert checkpoint['optimizer']['state']=={}
-    assert checkpoint['progress']['updates']==0 and not calls
+    assert checkpoint['progress']['updates']==1 and not calls
+    assert torch.equal(checkpoint['rng']['torch'],original['rng']['torch'])
+    for pid,states in original['optimizer']['state'].items():
+        for k,v in states.items():
+            torch.testing.assert_close(v,checkpoint['optimizer']['state'][pid][k],rtol=0,atol=0)
+
+
+def test_failed_group_does_not_publish_partial_gradients():
+    p=torch.nn.Parameter(torch.tensor(0.,dtype=torch.float64)); p.grad=torch.tensor(7.,dtype=p.dtype)
+    costs=torch.stack((p+1,p.sqrt()))
+    with pytest.raises(FloatingPointError):
+        backward_group_gradients(costs,torch.eye(2,dtype=p.dtype),[p],
+            GroupBalanceConfig(enabled=True,vjp_chunk_size=1),gradient_scale=.1)
+    assert p.grad.item()==7.
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
-def test_cuda_vectorized_groups_and_one_backward():
-    state=bank(512,dtype=torch.float32,device='cuda')
-    costs=torch.linspace(.1,12.,512,device='cuda',requires_grad=True)
-    base=risk_weights(costs,TaskLossConfig())
-    weights,report=group_balanced_weights(costs,base,state,GroupBalanceConfig(enabled=True))
-    assert weights.device.type=='cuda' and report['values'].device.type=='cuda'
-    assert report['group_count']==16
-    (weights*costs).sum().backward()
-    torch.testing.assert_close(costs.grad,weights)
+def test_cuda_group_vjps_match_serial():
+    torch.manual_seed(7)
+    policy=ResponseMotorPolicy(ResponsePolicyConfig()).cuda()
+    sim=L2FSimulator(L2FParams()); state=bank(128,dtype=torch.float32,device='cuda'); loss=TaskLossConfig()
+    cfg=GroupBalanceConfig(enabled=True)
+    record=collect_boundary_rollout(policy,sim,state,loss,horizon=8,window_steps=4,
+        backprop_mode='full',time_decay=1.,group_config=cfg)
+    rows=[]
+    for seed in record.group_coefficients:
+        gs=torch.autograd.grad(record.costs,list(policy.parameters()),grad_outputs=.1*seed,retain_graph=True)
+        rows.append(torch.cat([g.flatten() for g in gs]))
+    expected,_=normalize_group_rows(torch.stack(rows),cfg.gradient_epsilon)
+    backward_actor(policy,sim,record,loss)
+    torch.testing.assert_close(torch.cat([p.grad.flatten() for p in policy.parameters()]),expected,atol=2e-6,rtol=2e-4)
 
 
-def test_group_scores_do_not_claim_a_per_scene_gradient_cap():
-    state=bank(32)
-    theta=torch.nn.Parameter(torch.tensor(0.,dtype=torch.float64))
-    sensitivity=torch.ones(32,dtype=torch.float64); sensitivity[0]=1e12
-    costs=1+theta*sensitivity
-    weights,_=group_balanced_weights(costs,torch.full_like(costs,1/32),state,
-                                    GroupBalanceConfig(enabled=True))
-    grad,=torch.autograd.grad((weights*costs).sum(),theta)
-    assert grad.item()>1e10  # Equal finite scores do not imply small derivatives.
-
-
-def test_standard_raptor_config_enables_group_scores():
+def test_standard_raptor_config_enables_gradients_not_scores():
     text=(Path(__file__).resolve().parents[1]/'configs/response_raptor_multi_airframe.args').read_text()
     args=parse_args(text.split())
     assert args.group_balance and args.group_min_scenarios==32
     assert args.group_max_groups==16 and args.scenarios==128
-    assert args.group_scale_mode=='rms'
-    assert not hasattr(args,'contribution_clip')
+    assert args.group_vjp_chunk_size==16
+    assert not hasattr(args,'group_scale_mode') and not hasattr(args,'contribution_clip')
+
+
+def test_equal_forward_costs_with_one_sensitive_physical_group():
+    state = bank(128)
+    cfg = GroupBalanceConfig(enabled=True)
+    p = torch.nn.Parameter(torch.tensor(0., dtype=torch.float64))
+    weights = torch.full((128,), 1/128, dtype=p.dtype)
+    seeds, _ = group_gradient_coefficients(weights, state, cfg)
+    derivatives = torch.where(seeds[-1] > 0, -1e9, 1.)
+    costs = 1 + p*derivatives
+    assert torch.equal(costs, torch.ones_like(costs))
+    gradients, report = backward_group_gradients(costs, seeds, [p], cfg, gradient_scale=.1)
+    torch.testing.assert_close(gradients[0], p.new_tensor(.05))
+    torch.testing.assert_close(report['values'][:,1], torch.full((4,), .1, dtype=p.dtype))
+
+
+def test_single_group_is_not_an_absolute_gradient_cap():
+    rows = torch.tensor([[1e9, 0.]], dtype=torch.float64)
+    result, _ = normalize_group_rows(rows, 1e-12)
+    torch.testing.assert_close(result, rows[0])

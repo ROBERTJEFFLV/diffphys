@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded tests of physics-group scores and single-backward cost, CPU or CUDA."""
+"""Bounded CPU/CUDA checks of physical-group gradient normalization and cost."""
 from __future__ import annotations
 import argparse
 from dataclasses import replace
@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 from env_l2f import L2FParams, L2FSimulator
 from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import TaskLossConfig, tensors_finite
-from response_groups import GroupBalanceConfig, group_balanced_weights
+from response_groups import GroupBalanceConfig, group_gradient_coefficients, normalize_group_rows
 from response_adjoints import collect_boundary_rollout, backward_actor
 from response_training import sample_training_scenarios, safe_global_clip, SOURCE_FILES
 
@@ -87,7 +87,7 @@ def fixture(device, hover):
     return policy, z
 
 
-def timed_update(device, hover, grouped):
+def timed_update(device, hover, grouped, chunk_size):
     gc.collect()
     policy, initial = fixture(device, hover)
     simulator, config = L2FSimulator(L2FParams()), TaskLossConfig()
@@ -95,18 +95,23 @@ def timed_update(device, hover, grouped):
     if device == 'cuda': torch.cuda.reset_peak_memory_stats()
     sync(device); t = time.perf_counter()
     record = collect_boundary_rollout(policy,simulator,initial,config,horizon=500,
-        window_steps=50,backprop_mode='full',time_decay=1.,group_config=GroupBalanceConfig(enabled=grouped))
+        window_steps=50,backprop_mode='full',time_decay=1.,group_config=GroupBalanceConfig(enabled=grouped, vjp_chunk_size=chunk_size))
     sync(device); forward = time.perf_counter()-t
     original = torch.autograd.grad
     t = time.perf_counter()
     with patch('torch.autograd.grad',wraps=original) as grad:
-        backward_actor(policy,simulator,record,config)
-        assert grad.call_count == 1
+        info = backward_actor(policy,simulator,record,config)
+        expected_calls = ((16 + chunk_size - 1)//chunk_size) if grouped else 1
+        assert grad.call_count == expected_calls
     sync(device); backward = time.perf_counter()-t
     if grouped:
         assert record.group_balance['group_count'] == 16
         assert bool((record.group_balance['values'][:,0] == 32).all())
     if hover: assert bool(record.valid.all()), 'constructed fixture did not fly H500'
+    if grouped:
+        values = info['group_gradient']['values']
+        eligible = values[:,0] >= 1e-12
+        torch.testing.assert_close(values[eligible,1],values[eligible,3],rtol=1e-6,atol=1e-10)
     safe_global_clip(policy.parameters(),10.)
     optimizer.step()
     assert tensors_finite(list(policy.parameters())+[v for s in optimizer.state.values()
@@ -115,21 +120,22 @@ def timed_update(device, hover, grouped):
         'actual_transitions':int(record.valid.sum()),'full_h500_scenes':int(record.valid.all(0).sum()),
         'group_count':16 if grouped else None,'scenes_per_group':32 if grouped else None,
         'forward_including_group_stats_seconds':forward,'backward_seconds':backward,
-        'backward_calls':1,'shadow_adam_finite':True,'raw_task_objective':record.metrics['task_objective'],
-        'optimization_objective':record.metrics.get('optimization_objective'),
+        'backward_calls':expected_calls,'group_vjp_count':16 if grouped else 1,'shadow_adam_finite':True,'raw_task_objective':record.metrics['task_objective'],
+        'group_gradient':(None if not grouped else {**info['group_gradient'],
+            'values':info['group_gradient']['values'].cpu().tolist()}),
         'cuda_peak_tensor_bytes':torch.cuda.max_memory_allocated() if device=='cuda' else None}
     return report, (record.weights.detach().cpu(),record.costs.detach().cpu(),record.valid.cpu())
 
 
 def grouping_microbenchmark(device):
     _, initial = fixture(device,False)
-    costs = torch.linspace(.1,15.,512,device=device); weights = torch.full_like(costs,1/512)
+    weights = torch.full((512,),1/512,device=device)
     config = GroupBalanceConfig(enabled=True)
-    for _ in range(3): group_balanced_weights(costs,weights,initial,config)
+    for _ in range(3): group_gradient_coefficients(weights,initial,config)
     times = []
     for _ in range(20):
         sync(device); t = time.perf_counter()
-        group_balanced_weights(costs,weights,initial,config)
+        group_gradient_coefficients(weights,initial,config)
         sync(device); times.append(time.perf_counter()-t)
     return {'batch':512,'groups':16,'repetitions':20,
             'median_seconds':statistics.median(times),'max_seconds':max(times)}
@@ -138,16 +144,18 @@ def grouping_microbenchmark(device):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device',choices=('cpu','cuda'),default='cpu')
-    p.add_argument('--output',type=Path,default=Path('group-verification.json'))
+    p.add_argument('--output',type=Path,default=Path('group-gradient-verification.json'))
     p.add_argument('--baseline-root',type=Path)
-    p.add_argument('--repeats',type=int,default=2)
+    p.add_argument('--repeats',type=int,default=1)
+    p.add_argument('--group-vjp-chunk-size',type=int,default=16)
     args = p.parse_args()
+    GroupBalanceConfig(vjp_chunk_size=args.group_vjp_chunk_size)
     if not 1 <= args.repeats <= 5: p.error('bounded verification permits 1-5 repetitions')
     if args.device=='cuda' and not torch.cuda.is_available(): p.error('CUDA unavailable')
     torch.set_num_threads(1)
     torch.backends.cuda.matmul.allow_tf32=False; torch.backends.cudnn.allow_tf32=False
     result = {'torch':str(torch.__version__),'device':args.device,'python':sys.version.split()[0],
-        'cpu_threads':1,'long_training':False,'real_17065_replayed':False,
+        'cpu_threads':1,'long_training':False,'real_incident_checkpoint_replayed':False,'group_vjp_chunk_size':args.group_vjp_chunk_size,
         'source_sha256':{name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in SOURCE_FILES}}
     if args.baseline_root: result['disabled_parent_equivalence'] = disabled_parent_equivalence(args.baseline_root.resolve())
     result['grouping_only'] = grouping_microbenchmark(args.device)
@@ -156,7 +164,7 @@ def main():
         reference = None
         for repeat in range(args.repeats):
             for grouped in (False,True):
-                report, tensors = timed_update(args.device,hover,grouped)
+                report, tensors = timed_update(args.device,hover,grouped,args.group_vjp_chunk_size)
                 if reference is None: reference = tensors
                 else: same(reference,tensors)
                 report['repeat'] = repeat

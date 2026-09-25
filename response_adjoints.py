@@ -19,7 +19,8 @@ from response_task import (
     tensors_finite,
 )
 
-from response_groups import GroupBalanceConfig, group_balanced_weights
+from response_groups import (GroupBalanceConfig, group_gradient_coefficients,
+                             backward_group_gradients)
 
 POLICY_NONDIFFERENTIABLE = ("calls", "last_action")
 
@@ -96,8 +97,9 @@ class BoundaryRecord:
     valid: torch.Tensor
     backprop_mode: str = "windowed"
     time_decay: float = 0.0
-    optimization_weights: torch.Tensor | None = None
+    group_coefficients: torch.Tensor | None = None
     group_balance: dict | None = None
+    group_config: GroupBalanceConfig | None = None
 
 
 def collect_boundary_rollout(
@@ -108,6 +110,9 @@ def collect_boundary_rollout(
         raise ValueError("horizon must be divisible by window_steps")
     if backprop_mode not in ("full", "windowed"):
         raise ValueError("unknown backprop mode")
+    group_config = group_config or GroupBalanceConfig()
+    if group_config.enabled and backprop_mode != "full":
+        raise ValueError("group gradient normalization requires full retained-graph BPTT")
     with torch.set_grad_enabled(backprop_mode == "full"):
         closed = initialize(policy, initial)
         boundaries = {0: snapshot(closed)}
@@ -126,26 +131,33 @@ def collect_boundary_rollout(
         if not bool(torch.isfinite(costs).all()):
             raise FloatingPointError("nonfinite continuous task costs")
         weights = risk_weights(costs, config)
-    optimization_weights, group_report = group_balanced_weights(
-        costs, weights, boundaries[0].physical, group_config or GroupBalanceConfig())
+    coefficients, group_report = group_gradient_coefficients(
+        weights, boundaries[0].physical, group_config)
     metrics = statistics.finish(costs.detach(), weights)
-    if group_report is not None:
-        metrics["optimization_objective"] = float((costs.detach()*optimization_weights).sum())
     return BoundaryRecord(
         boundaries, costs, weights, horizon, window_steps, config,
         metrics, torch.cat(valid_chunks), backprop_mode, time_decay,
-        None if group_report is None else optimization_weights, group_report,
+        coefficients, group_report, group_config,
     )
 
 
 def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
-    """Compute the weighted task VJP; no independent scene or group backwards."""
+    """Compute group-normalized gradients or the unchanged pooled baseline."""
     if config != record.loss_config:
         raise ValueError("recorded task objective changed")
     if not math.isfinite(gradient_scale) or gradient_scale <= 0:
         raise ValueError("gradient_scale must be positive and finite")
     parameters = [p for p in policy.parameters() if p.requires_grad]
-    weights = record.weights if record.optimization_weights is None else record.optimization_weights
+    weights = record.weights
+    if record.group_coefficients is not None:
+        if record.backprop_mode != "full" or record.group_config is None:
+            raise ValueError("group gradients require a full graph and bound group configuration")
+        gradients, report = backward_group_gradients(
+            record.costs, record.group_coefficients, parameters, record.group_config,
+            gradient_scale=gradient_scale)
+        for p, g in zip(parameters, gradients):
+            p.grad = g
+        return {"boundaries": [], "group_gradient": report}
     if record.backprop_mode == "full":
         objective = gradient_scale * (weights * record.costs).sum()
         if not bool(torch.isfinite(objective)):

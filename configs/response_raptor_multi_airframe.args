@@ -21,9 +21,9 @@
 --huber-delta 1
 --dead-cost 3
 --terminal-cost 200
---work-dir runs/raptor_group_score/seed7
+--work-dir runs/raptor_group_gradient/seed7
 --group-balance
 --group-max-groups 16
 --group-min-scenarios 32
---group-scale-mode rms
---group-scale-floor 1
+--group-gradient-epsilon 1e-12
+--group-vjp-chunk-size 16

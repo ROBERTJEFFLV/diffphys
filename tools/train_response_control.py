@@ -57,11 +57,12 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.0)
     parser.add_argument("--group-balance", action=argparse.BooleanOptionalAction, default=False,
-                        help="physics-group score normalization; one ordinary task backward")
+                        help="normalize physical-group parameter gradients before averaging")
     parser.add_argument("--group-max-groups", type=int, default=16)
     parser.add_argument("--group-min-scenarios", type=int, default=32)
-    parser.add_argument("--group-scale-mode", choices=("none", "rms"), default="rms")
-    parser.add_argument("--group-scale-floor", type=float, default=1.0)
+    parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)
+    parser.add_argument("--group-vjp-chunk-size", type=int, default=16,
+                        help="number of GROUP VJPs evaluated together; 1 is serial reference")
     parser.add_argument(
         "--gradient-scale",
         type=float,
@@ -120,6 +121,8 @@ def parse_args(argv=None):
         group_config = GroupBalanceConfig.from_args(args)
     except ValueError as error:
         parser.error(str(error))
+    if args.mode != "evaluate" and group_config.enabled and (args.backprop_mode != "full" or args.agc != 0):
+        parser.error("group gradient normalization requires --backprop-mode full --agc 0")
     if args.mode != "evaluate" and group_config.enabled and 4*args.scenarios < group_config.min_scenarios:
         parser.error("four TRAIN banks must contain at least group-min-scenarios unique scenes")
     if args.mode == "evaluate" and not args.checkpoint:

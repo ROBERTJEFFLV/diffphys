@@ -1,4 +1,4 @@
-"""Training-only physical-group score normalization, with no extra backward."""
+"""Training-only physical-group gradients, normalized before aggregation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +9,7 @@ import torch
 from env_l2f import L2FState
 
 
-GROUP_BALANCE_VERSION = "physical-group-score-rms-v1"
+GROUP_BALANCE_VERSION = "physical-group-gradient-median-v1"
 GROUP_FEATURE_NAMES = ("thrust_to_weight", "torque_to_inertia",
                        "motor_time_rising", "motor_time_falling")
 
@@ -19,8 +19,8 @@ class GroupBalanceConfig:
     enabled: bool = False
     max_groups: int = 16
     min_scenarios: int = 32
-    scale_mode: str = "rms"
-    scale_floor: float = 1.0
+    gradient_epsilon: float = 1e-12
+    vjp_chunk_size: int = 16
 
     def __post_init__(self):
         if (not isinstance(self.max_groups, int) or isinstance(self.max_groups, bool)
@@ -30,15 +30,16 @@ class GroupBalanceConfig:
         if (not isinstance(self.min_scenarios, int) or isinstance(self.min_scenarios, bool)
                 or self.min_scenarios < 32):
             raise ValueError("group-min-scenarios must be at least 32")
-        if self.scale_mode not in ("none", "rms"):
-            raise ValueError("group-scale-mode must be none or rms")
-        if not math.isfinite(self.scale_floor) or self.scale_floor <= 0:
-            raise ValueError("group-scale-floor must be finite and positive")
+        if not math.isfinite(self.gradient_epsilon) or self.gradient_epsilon <= 0:
+            raise ValueError("group-gradient-epsilon must be finite and positive")
+        if (not isinstance(self.vjp_chunk_size, int) or isinstance(self.vjp_chunk_size, bool)
+                or not 1 <= self.vjp_chunk_size <= 64):
+            raise ValueError("group-vjp-chunk-size must be an integer in [1,64]")
 
     @classmethod
     def from_args(cls, args):
         return cls(args.group_balance, args.group_max_groups, args.group_min_scenarios,
-                   args.group_scale_mode, args.group_scale_floor)
+                   args.group_gradient_epsilon, args.group_vjp_chunk_size)
 
 
 def _group_physics(initial: L2FState) -> torch.Tensor:
@@ -99,58 +100,131 @@ def physics_group_layout(initial: L2FState, config: GroupBalanceConfig):
 
 
 @torch.no_grad()
-def group_balanced_weights(costs, base_weights, initial, config: GroupBalanceConfig):
-    """Detached group scores -> one vector of coefficients -> ONE task VJP.
+def group_gradient_coefficients(base_weights, initial, config: GroupBalanceConfig):
+    """Build G vector-Jacobian seeds, never N per-scene seeds or cost scales.
 
-    Original weights include 1/N and pooled CVaR. With a_i=N*w_i, use
-        J_opt = (1/G) sum_g (1/n_g) sum_{i in g} a_i*C_i / stopgrad(s_g),
-        s_g = max(RMS_{i in g}(C_i), scale_floor), or 1 for scale_mode=none.
-    No group mean subtraction (which would cancel the objective), no gradient
-    norm computation, no per-scene clipping, and no new autograd graph here.
-    Equal counts and s_g=1 recover the original weights, including CVaR.
-    Group statistics include early failures, not only survivors.
+    Row g defines L_g = (N/n_g) sum_{i in g} w_i C_i, with the original
+    detached pooled CVaR weights w_i. Equal group sizes recover the original
+    objective when group gradients are averaged without normalization.
+    All initial scenes, including early failures, belong to exactly one row.
     """
     if not config.enabled:
-        return base_weights, None
-    if (costs.ndim != 1 or costs.shape != base_weights.shape or base_weights.requires_grad
-            or costs.numel() != initial.position.shape[0]):
-        raise ValueError("group weights require scalar scene costs and detached base weights")
-    if not bool((torch.isfinite(costs) & torch.isfinite(base_weights)
-                 & (costs >= 0) & (base_weights >= 0)).all()):
-        raise FloatingPointError("nonfinite or negative group costs/weights")
+        return None, None
+    n = initial.position.shape[0]
+    if (base_weights.shape != (n,) or base_weights.requires_grad
+            or base_weights.device != initial.position.device):
+        raise ValueError("group gradients need detached per-scene weights on the state device")
+    if not bool((torch.isfinite(base_weights) & (base_weights >= 0)).all()):
+        raise FloatingPointError("nonfinite or negative group risk weights")
     if not bool((base_weights > 0).any()):
-        raise ValueError("group weights require some positive base weight")
+        raise ValueError("group risk weights must include a positive value")
     indices, counts = physics_group_layout(initial, config)
-    n, groups = costs.numel(), counts.numel()
+    groups, width = indices.shape
     valid = indices < n
-    table = torch.cat((costs.detach(), costs.new_zeros(1)))[indices]
-    count = counts.to(costs.dtype)
-    # Stable FP32/FP64 RMS: do not square large unscaled costs.
-    peak = table.amax(1)
-    scaled = table / peak.clamp_min(torch.finfo(table.dtype).tiny)[:, None]
-    rms = peak * (scaled.square().sum(1) / count).sqrt()
-    scales = rms.clamp_min(config.scale_floor) if config.scale_mode == "rms" else torch.ones_like(rms)
-    factors = ((n / (groups * count)) / scales)[:, None].expand_as(table)
-    # Sorting the small integer membership table inverts it without atomic sums
-    # or data-dependent GPU nonzero; padded N indices are last and ignored.
     inverse = indices.reshape(-1).argsort(stable=True)[:n]
-    weights = base_weights.detach() * factors.reshape(-1)[inverse]
-    if not bool(torch.isfinite(weights).all()):
-        raise FloatingPointError("nonfinite normalized group weights")
-
+    group_ids = torch.arange(groups, device=indices.device).repeat_interleave(width)[inverse]
+    membership = group_ids[None, :] == torch.arange(groups, device=indices.device)[:, None]
+    coefficients = membership.to(base_weights.dtype) * base_weights[None, :]
+    coefficients = coefficients * (n / counts.to(base_weights.dtype))[:, None]
+    if not bool(torch.isfinite(coefficients).all()):
+        raise FloatingPointError("nonfinite group gradient coefficients")
     raw = _group_physics(initial)
     physics = torch.cat((raw, raw.new_zeros(1, 4)))[indices]
     low = physics.masked_fill(~valid[..., None], torch.inf).amin(1)
     high = physics.masked_fill(~valid[..., None], -torch.inf).amax(1)
-    risk = torch.cat((n * base_weights.detach(), costs.new_zeros(1)))[indices]
-    # Diagnostic values stay on-device; the trainer transfers this small table
-    # once when logging after the update. No loop over scenes or group VJPs.
-    columns = ["count", "cost_rms", "scale", "risk_multiplier_mean"]
+    columns = ["count"]
     columns += [key + suffix for key in GROUP_FEATURE_NAMES for suffix in ("_min", "_max")]
-    values = torch.cat((torch.stack((count, rms, scales, risk.sum(1)/count), 1),
+    values = torch.cat((counts.to(raw.dtype)[:, None],
                         torch.stack((low, high), -1).flatten(1)), 1)
     report = {"version": GROUP_BALANCE_VERSION, "group_count": groups,
-              "minimum_scenarios": config.min_scenarios, "scale_mode": config.scale_mode,
-              "columns": columns, "values": values}
-    return weights.detach(), report
+              "minimum_scenarios": config.min_scenarios, "columns": columns, "values": values}
+    return coefficients.detach(), report
 
+
+@torch.no_grad()
+def normalize_group_rows(rows: torch.Tensor, epsilon: float):
+    """Equalize whole-Actor group norms, then average; NOT cost normalization.
+
+    h_g already includes gradient_scale and CVaR. m is the lower median of
+    nonzero ||h_g|| (zero if all zero); q_g=m/max(||h_g||,epsilon).
+    Return mean_g(q_g*h_g). Zero groups stay zero and keep their 1/G share;
+    below-epsilon groups are not amplified all the way to m. No clipping,
+    layerwise normalization, reweighting by cost, or differentiation of q_g.
+    """
+    if rows.ndim != 2 or min(rows.shape) < 1 or rows.dtype not in (torch.float32, torch.float64):
+        raise ValueError("group rows must be a nonempty float32/float64 [G,P] tensor")
+    if not math.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("group gradient epsilon must be finite and positive")
+    if not bool(torch.isfinite(rows).all()):
+        raise FloatingPointError("nonfinite group gradient before normalization")
+    # Only G*P parameter data is promoted, not the H500 graph or batched adjoints.
+    work = rows.double()
+    def stable_norm(x):
+        peak = x.abs().amax(-1)
+        scaled = x / peak.clamp_min(torch.finfo(x.dtype).tiny)[..., None]
+        return peak * scaled.square().sum(-1).sqrt()
+    norms = stable_norm(work)
+    if not bool(torch.isfinite(norms).all()):
+        raise FloatingPointError("nonfinite group gradient norm")
+    positive = norms > 0
+    ordered = norms.masked_fill(~positive, torch.inf).sort().values
+    rank = ((positive.sum() - 1).clamp_min(0) // 2).reshape(1)
+    target = torch.where(positive.any(), ordered.gather(0, rank)[0], norms.new_zeros(()))
+    scales = torch.where(positive, target / norms.clamp_min(epsilon), torch.zeros_like(norms))
+    normalized = work * scales[:, None]
+    # Divide before summing to avoid an unnecessarily large intermediate sum.
+    result = (normalized / rows.shape[0]).sum(0).to(rows.dtype)
+    values = torch.stack((norms, stable_norm(normalized), scales, target.expand_as(norms)), 1)
+    if not bool(torch.isfinite(result).all() & torch.isfinite(values).all()):
+        raise FloatingPointError("nonfinite normalized group gradient")
+    return result, {"version": GROUP_BALANCE_VERSION,
+                    "columns": ["raw_gradient_norm", "normalized_gradient_norm", "multiplier", "target_norm"],
+                    "values": values}
+
+
+def backward_group_gradients(costs, coefficients, parameters, config: GroupBalanceConfig,
+                             *, gradient_scale: float):
+    """Compute G group VJPs on the SAME forward graph, then normalize and merge.
+
+    Chunk>1 batches group cotangents, not individual-scene cotangents. The last
+    chunk frees the graph. Chunk=1 is a serial reference, never a silent retry.
+    No parameter .grad is written until the caller receives all finite results.
+    """
+    if (costs.ndim != 1 or coefficients.ndim != 2 or coefficients.shape[1] != costs.numel()
+            or coefficients.shape[0] < 1 or coefficients.requires_grad or not parameters):
+        raise ValueError("invalid group VJP inputs")
+    if not math.isfinite(gradient_scale) or gradient_scale <= 0:
+        raise ValueError("gradient_scale must be finite and positive")
+    if not bool(torch.isfinite(costs).all() & torch.isfinite(coefficients).all()):
+        raise FloatingPointError("nonfinite group costs or coefficients")
+    groups = coefficients.shape[0]
+    chunks, used, calls = [], [False] * len(parameters), 0
+    for start in range(0, groups, config.vjp_chunk_size):
+        end = min(start + config.vjp_chunk_size, groups)
+        seeds = gradient_scale * coefficients[start:end]
+        if not bool(torch.isfinite(seeds).all()):
+            raise FloatingPointError("nonfinite group VJP seeds")
+        batched = end - start > 1
+        gradients = torch.autograd.grad(
+            costs, parameters, grad_outputs=seeds if batched else seeds[0],
+            is_grads_batched=batched, allow_unused=True, retain_graph=end < groups,
+        )
+        parts = []
+        for j, (parameter, gradient) in enumerate(zip(parameters, gradients)):
+            used[j] = used[j] or gradient is not None
+            if gradient is None:
+                part = parameter.new_zeros(end - start, parameter.numel())
+            else:
+                part = gradient.detach().reshape(end - start, -1)
+            parts.append(part)
+        chunks.append(torch.cat(parts, 1))
+        calls += 1
+    rows = torch.cat(chunks, 0)
+    combined, report = normalize_group_rows(rows, config.gradient_epsilon)
+    offsets, result = 0, []
+    for parameter, active in zip(parameters, used):
+        size = parameter.numel()
+        result.append(combined[offsets:offsets + size].reshape_as(parameter) if active else None)
+        offsets += size
+    report.update(group_count=groups, vjp_calls=calls, vjp_chunk_size=config.vjp_chunk_size)
+    return result, report
