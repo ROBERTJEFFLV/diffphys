@@ -19,6 +19,8 @@ from response_task import (
     tensors_finite,
 )
 
+from response_groups import GroupBalanceConfig, group_balanced_weights
+
 POLICY_NONDIFFERENTIABLE = ("calls", "last_action")
 
 
@@ -94,11 +96,13 @@ class BoundaryRecord:
     valid: torch.Tensor
     backprop_mode: str = "windowed"
     time_decay: float = 0.0
+    optimization_weights: torch.Tensor | None = None
+    group_balance: dict | None = None
 
 
 def collect_boundary_rollout(
     policy, simulator, initial, config, *, horizon=500, window_steps=50,
-    backprop_mode="windowed", time_decay=0.0,
+    backprop_mode="windowed", time_decay=0.0, group_config: GroupBalanceConfig | None = None,
 ):
     if horizon < 1 or window_steps < 1 or horizon % window_steps:
         raise ValueError("horizon must be divisible by window_steps")
@@ -122,121 +126,28 @@ def collect_boundary_rollout(
         if not bool(torch.isfinite(costs).all()):
             raise FloatingPointError("nonfinite continuous task costs")
         weights = risk_weights(costs, config)
+    optimization_weights, group_report = group_balanced_weights(
+        costs, weights, boundaries[0].physical, group_config or GroupBalanceConfig())
+    metrics = statistics.finish(costs.detach(), weights)
+    if group_report is not None:
+        metrics["optimization_objective"] = float((costs.detach()*optimization_weights).sum())
     return BoundaryRecord(
         boundaries, costs, weights, horizon, window_steps, config,
-        statistics.finish(costs.detach(), weights), torch.cat(valid_chunks), backprop_mode, time_decay
+        metrics, torch.cat(valid_chunks), backprop_mode, time_decay,
+        None if group_report is None else optimization_weights, group_report,
     )
 
 
-def _bounded_contribution_gradients(
-    costs: torch.Tensor, weights: torch.Tensor, parameters: list[torch.Tensor], *,
-    gradient_scale: float, max_norm: float, unit_size: int = 1,
-) -> tuple[list[torch.Tensor | None], dict]:
-    """Clip votes on ONE retained graph; never rerun/compact the forward batch.
-
-    For a unit U of n scenes, v_U = (N/n)*scale*sum_i(w_i*D C_i).
-    Return sum_U (n/N)*clip_norm(v_U, max_norm). Singleton units give an
-    individual bound max_norm/N; larger units ONLY bound their summed vote.
-    D is the configured (possibly time-decayed) VJP, not necessarily d/dtheta.
-    No clipping gives the original weighted sum, including pooled CVaR.
-    This reference implementation uses one reverse pass per unit.
-    """
-    if (costs.ndim != 1 or costs.numel() == 0 or weights.shape != costs.shape
-            or weights.requires_grad or not parameters):
-        raise ValueError("contribution clipping needs costs, detached weights and parameters")
-    if not math.isfinite(max_norm) or max_norm <= 0:
-        raise ValueError("contribution clip must be finite and positive")
-    if not math.isfinite(gradient_scale) or gradient_scale <= 0:
-        raise ValueError("gradient_scale must be finite and positive")
-    if not isinstance(unit_size, int) or isinstance(unit_size, bool) or unit_size < 1:
-        raise ValueError("contribution unit size must be a positive integer")
-    if not tensors_finite((costs, weights)) or bool((weights < 0).any()):
-        raise FloatingPointError("nonfinite or negative contribution weights/costs")
-    if not bool((weights > 0).any()):
-        raise ValueError("contribution weights must include a positive weight")
-
-    count = costs.numel()
-    accumulated, pooled = [None] * len(parameters), [None] * len(parameters)
-    sizes, norms, scales = [], [], []
-    for start in range(0, count, unit_size):
-        end = min(start + unit_size, count)
-        n = end - start
-        objective = (weights[start:end] * costs[start:end]).sum()
-        if not bool(torch.isfinite(objective)):
-            raise FloatingPointError("nonfinite contribution objective")
-        gradients = torch.autograd.grad(
-            objective, parameters, allow_unused=True, retain_graph=end < count,
-        )
-        if not tensors_finite(gradients):
-            raise FloatingPointError("nonfinite contribution gradient before clipping")
-        squared = [g.detach().double().square().sum() for g in gradients if g is not None]
-        norm = float(torch.stack(squared).sum().sqrt()) if squared else 0.0
-        vote_norm = norm * (count / n) * gradient_scale
-        if not math.isfinite(vote_norm):
-            raise FloatingPointError("nonfinite contribution norm before clipping")
-        coefficient = 1.0 if vote_norm <= max_norm else max_norm / vote_norm
-        sizes.append(n)
-        norms.append(vote_norm)
-        scales.append(coefficient)
-        # FP64 reduction avoids FP32 sum-of-squares overflow and records the
-        # raw pooled gradient even when cancellation makes it small.
-        for j, gradient in enumerate(gradients):
-            if gradient is None:
-                continue
-            value = gradient.detach().double() * gradient_scale
-            if accumulated[j] is None:
-                accumulated[j] = value * coefficient
-                pooled[j] = value.clone()
-            else:
-                accumulated[j].add_(value, alpha=coefficient)
-                pooled[j].add_(value)
-        del gradients, objective
-
-    def norm_of(values):
-        terms = [v.double().square().sum() for v in values if v is not None]
-        return float(torch.stack(terms).sum().sqrt()) if terms else 0.0
-
-    result = [None if g is None else g.to(dtype=p.dtype)
-              for p, g in zip(parameters, accumulated)]
-    pooled_norm, aggregated_norm = norm_of(pooled), norm_of(result)
-    if not tensors_finite(result) or not all(map(math.isfinite, (pooled_norm, aggregated_norm))):
-        raise FloatingPointError("nonfinite aggregated contribution gradient")
-    return result, {
-        "version": "bounded-contribution-v1",
-        "unit_kind": "scene" if max(sizes) == 1 else "block",
-        "unit_count": len(sizes), "unit_sizes": sizes,
-        "clip_norm": max_norm, "vote_norms": norms, "clip_scales": scales,
-        "clipped_units": sum(x < 1.0 for x in scales),
-        "pooled_gradient_norm": pooled_norm,
-        "aggregated_gradient_norm": aggregated_norm,
-        "max_unit_contribution_bound": max_norm * (max(sizes) / count),
-    }
-
-
-def backward_actor(
-    policy, simulator, record, config, *, gradient_scale=0.1,
-    contribution_clip: float = 0.0, contribution_unit_size: int = 1,
-):
-    """Compute parameter and boundary VJPs together; publish grads only on success."""
+def backward_actor(policy, simulator, record, config, *, gradient_scale=0.1):
+    """Compute the weighted task VJP; no independent scene or group backwards."""
     if config != record.loss_config:
         raise ValueError("recorded task objective changed")
     if not math.isfinite(gradient_scale) or gradient_scale <= 0:
         raise ValueError("gradient_scale must be positive and finite")
-    if not math.isfinite(contribution_clip) or contribution_clip < 0:
-        raise ValueError("contribution clip must be finite and nonnegative")
-    if contribution_clip > 0 and record.backprop_mode != "full":
-        raise ValueError("contribution clipping requires full retained-graph BPTT")
     parameters = [p for p in policy.parameters() if p.requires_grad]
-    if contribution_clip > 0:
-        gradients, report = _bounded_contribution_gradients(
-            record.costs, record.weights, parameters, gradient_scale=gradient_scale,
-            max_norm=contribution_clip, unit_size=contribution_unit_size,
-        )
-        for p, g in zip(parameters, gradients):
-            p.grad = g
-        return {"boundaries": [], "aggregation": report}
+    weights = record.weights if record.optimization_weights is None else record.optimization_weights
     if record.backprop_mode == "full":
-        objective = gradient_scale * (record.weights * record.costs).sum()
+        objective = gradient_scale * (weights * record.costs).sum()
         if not bool(torch.isfinite(objective)):
             raise FloatingPointError("nonfinite full-horizon objective")
         gradients = torch.autograd.grad(objective, parameters, allow_unused=True)
@@ -256,7 +167,7 @@ def backward_actor(
             raise RuntimeError("inconsistent termination mask at step %d" % start)
         rows.append(compare_boundary(record.boundaries[end], trace.end, end))
         objective = (
-            record.weights * step_costs(trace, config, start=start, horizon=record.horizon).sum(0)
+            weights * step_costs(trace, config, start=start, horizon=record.horizon).sum(0)
         ).sum()
         for (group, name), costate in adjoint.items():
             z = getattr(getattr(trace.end, group), name)

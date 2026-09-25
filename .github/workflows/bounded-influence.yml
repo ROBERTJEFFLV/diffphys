@@ -1,4 +1,4 @@
-name: Bounded influence CPU verification
+name: Physics group score CPU verification
 on:
   push:
     branches: [codex/time-decay-bounded-influence-20260925]
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: bounded-influence-${{ github.ref }}
+  group: group-score-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   verify:
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          ref: 1564d25a210c139a94431fc6ae59d10cc0430ffe
+          ref: 17cfc62515cd2b500d0d00185c793bc68624af0c
           path: _baseline
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -31,20 +31,21 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install numpy pytest
-      - name: Existing and added regressions
-        run: python -m pytest -q tests
-      - name: Bounded production probes
-        run: python tools/verify_bounded_influence.py --baseline-root _baseline --output verification-results.json
-      - name: Preserve verification sources and reports
+      - name: Regression tests
+        run: python -m pytest -q tests --junitxml=group-tests.xml
+      - name: One-backward physics-group probes
+        run: python tools/verify_group_balance.py --baseline-root _baseline --output group-verification.json
+      - name: Preserve sources and measurements
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bounded-influence-${{ github.sha }}
+          name: physics-group-score-${{ github.sha }}
           retention-days: 7
           path: |
             *.py
             tools/*.py
             tests/*.py
             configs/*.args
-            docs/bounded_influence.md
-            verification-results.json
+            docs/physics_group_balance.md
+            group-verification.json
+            group-tests.xml

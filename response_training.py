@@ -31,6 +31,7 @@ from response_task import (
 )
 from response_adjoints import collect_boundary_rollout, backward_actor
 from response_execution import exit_class
+from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
 
 ROOT = Path(__file__).resolve().parent
 PROTOCOL_VERSION = "response-actor-only-reference-v3"
@@ -41,6 +42,7 @@ SOURCE_FILES = (
     "response_policy.py",
     "response_task.py",
     "response_adjoints.py",
+    "response_groups.py",
     "response_training.py",
     "response_execution.py",
     "env_l2f.py",
@@ -273,7 +275,7 @@ def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
         "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
-                     + ("+bounded-contribution" if args.contribution_clip > 0 else ""),
+                     + ("+physics-group-score" if args.group_balance else ""),
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -301,12 +303,12 @@ def binding(args, policy_config, loss_config):
                 "lr",
                 "gradient_clip",
                 "gradient_scale",
-                "contribution_clip",
-                "contribution_unit_size",
                 "agc",
                 "threads",
             )
         },
+        "group_balance": {"version": GROUP_BALANCE_VERSION,
+                          **asdict(GroupBalanceConfig.from_args(args))},
         "training_banks": TRAINING_BANKS,
         "torch_version": str(torch.__version__),
     }
@@ -393,6 +395,9 @@ def train(args, policy_config, loss_config):
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     simulator = L2FSimulator(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode))
+    group_config = GroupBalanceConfig.from_args(args)
+    if group_config.enabled and TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
+        raise ValueError("not enough unique TRAIN scenes for group balancing")
     run_binding = binding(args, policy_config, loss_config)
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -520,13 +525,12 @@ def train(args, policy_config, loss_config):
                     window_steps=args.window_steps,
                     backprop_mode=args.backprop_mode,
                     time_decay=args.time_decay,
+                    group_config=group_config,
                 )
                 _sync(device)
                 forward_done = time.monotonic()
                 backward = backward_actor(
                     policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
-                    contribution_clip=args.contribution_clip,
-                    contribution_unit_size=args.contribution_unit_size,
                 )
                 raw_norm = gradient_norm(policy.parameters()) if args.agc else None
                 adaptive_clip(policy.parameters(), args.agc)
@@ -555,7 +559,8 @@ def train(args, policy_config, loss_config):
                 "raw_gradient_norm": raw_norm,
                 "pre_global_clip_norm": pre_clip,
                 "gradient_scale": args.gradient_scale,
-                "gradient_aggregation": backward.get("aggregation"),
+                "group_balance": (None if record.group_balance is None else {
+                    **record.group_balance, "values": record.group_balance["values"].cpu().tolist()}),
                 "backprop_mode": args.backprop_mode,
                 "time_decay": args.time_decay,
                 "boundary_checks": len(backward["boundaries"]),

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from response_policy import ResponsePolicyConfig
 from response_task import TaskLossConfig
+from response_groups import GroupBalanceConfig
 from response_training import train, evaluate_checkpoint
 
 
@@ -55,14 +56,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.0)
-    parser.add_argument(
-        "--contribution-clip", type=float, default=0.0,
-        help="pre-merge cap on de-averaged weighted votes; 0 keeps the original path",
-    )
-    parser.add_argument(
-        "--contribution-unit-size", type=int, default=1,
-        help="1 caps each scene; >1 caps block sums only (faster approximation)",
-    )
+    parser.add_argument("--group-balance", action=argparse.BooleanOptionalAction, default=False,
+                        help="physics-group score normalization; one ordinary task backward")
+    parser.add_argument("--group-max-groups", type=int, default=16)
+    parser.add_argument("--group-min-scenarios", type=int, default=32)
+    parser.add_argument("--group-scale-mode", choices=("none", "rms"), default="rms")
+    parser.add_argument("--group-scale-floor", type=float, default=1.0)
     parser.add_argument(
         "--gradient-scale",
         type=float,
@@ -117,14 +116,12 @@ def parse_args(argv=None):
         parser.error("time-decay must be finite and nonnegative")
     if not math.isfinite(args.agc) or args.agc < 0:
         parser.error("agc must be finite and nonnegative")
-    if not math.isfinite(args.contribution_clip) or args.contribution_clip < 0:
-        parser.error("contribution-clip must be finite and nonnegative")
-    if args.contribution_unit_size < 1:
-        parser.error("contribution-unit-size must be positive")
-    if args.contribution_clip > 0 and args.backprop_mode != "full":
-        parser.error("contribution clipping requires --backprop-mode full")
-    if args.contribution_clip > 0 and args.agc != 0:
-        parser.error("disable AGC for the isolated contribution-clipping experiment")
+    try:
+        group_config = GroupBalanceConfig.from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.mode != "evaluate" and group_config.enabled and 4*args.scenarios < group_config.min_scenarios:
+        parser.error("four TRAIN banks must contain at least group-min-scenarios unique scenes")
     if args.mode == "evaluate" and not args.checkpoint:
         parser.error("evaluate requires --checkpoint")
     return args
