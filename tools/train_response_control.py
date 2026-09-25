@@ -56,8 +56,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.0)
-    parser.add_argument("--group-balance", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--group-balance", action="store_true", default=False,
                         help="normalize physical-group parameter gradients before averaging")
+    parser.add_argument("--no-group-balance", dest="group_balance", action="store_false",
+                        help="disable physical-group gradient normalization")
     parser.add_argument("--group-max-groups", type=int, default=16)
     parser.add_argument("--group-min-scenarios", type=int, default=32)
     parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)

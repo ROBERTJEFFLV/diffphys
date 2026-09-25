@@ -182,12 +182,34 @@ def normalize_group_rows(rows: torch.Tensor, epsilon: float):
                     "values": values}
 
 
+def _batched_group_vjp(costs, parameters, seeds, *, retain_graph):
+    """Vectorize the existing graph's VJP with modern vmap, preserving None."""
+    active = []
+
+    def vjp(seed):
+        gradients = torch.autograd.grad(
+            costs, parameters, grad_outputs=seed, allow_unused=True,
+            retain_graph=retain_graph,
+        )
+        # vmap runs this Python body once per chunk. Graph connectivity is
+        # independent of the cotangent values; only tensor outputs are batched.
+        active[:] = [gradient is not None for gradient in gradients]
+        tensors = tuple(gradient for gradient in gradients if gradient is not None)
+        # An all-unused graph still needs a tensor output for vmap. Discard this
+        # placeholder below: unused parameters must not acquire zero .grad/Adam.
+        return tensors if tensors else (seed.new_zeros(()),)
+
+    batched = iter(torch.vmap(vjp)(seeds))
+    return tuple(next(batched) if used else None for used in active)
+
+
 def backward_group_gradients(costs, coefficients, parameters, config: GroupBalanceConfig,
                              *, gradient_scale: float):
     """Compute G group VJPs on the SAME forward graph, then normalize and merge.
 
-    Chunk>1 batches group cotangents, not individual-scene cotangents. The last
-    chunk frees the graph. Chunk=1 is a serial reference, never a silent retry.
+    Chunk>1 uses modern vmap over group cotangents, not individual-scene
+    cotangents. The last chunk frees the graph. Chunk=1 is a serial reference,
+    never a silent retry.
     No parameter .grad is written until the caller receives all finite results.
     """
     if (costs.ndim != 1 or coefficients.ndim != 2 or coefficients.shape[1] != costs.numel()
@@ -204,11 +226,14 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
         seeds = gradient_scale * coefficients[start:end]
         if not bool(torch.isfinite(seeds).all()):
             raise FloatingPointError("nonfinite group VJP seeds")
-        batched = end - start > 1
-        gradients = torch.autograd.grad(
-            costs, parameters, grad_outputs=seeds if batched else seeds[0],
-            is_grads_batched=batched, allow_unused=True, retain_graph=end < groups,
-        )
+        if end - start > 1:
+            gradients = _batched_group_vjp(
+                costs, parameters, seeds, retain_graph=end < groups)
+        else:
+            gradients = torch.autograd.grad(
+                costs, parameters, grad_outputs=seeds[0], allow_unused=True,
+                retain_graph=end < groups,
+            )
         parts = []
         for j, (parameter, gradient) in enumerate(zip(parameters, gradients)):
             used[j] = used[j] or gradient is not None

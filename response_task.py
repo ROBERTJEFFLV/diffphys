@@ -262,11 +262,8 @@ def weighted_task_features(
     features = features * time_weights.sqrt()[:, None, None]
     with torch.no_grad():
         state = trajectory.initial
-        terminal = trajectory.valid & (
-            (trajectory.positions.abs() > state.position_limit[None, :, None]).any(-1)
-            | (trajectory.velocities.abs() > state.velocity_limit[None, :, None]).any(-1)
-            | (trajectory.omegas.abs() > state.omega_limit[None, :, None]).any(-1)
-        )
+        terminal = trajectory.valid & L2FSimulator.position_terminated(
+            trajectory.positions, state.position_limit)
         remaining = horizon - torch.arange(start + 1, start + steps + 1,
                                             device=features.device, dtype=features.dtype)
         # Book all missing steps once at failure, not at each window end.
@@ -381,7 +378,7 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
 
 @torch.no_grad()
 def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
-    """Score first termination with each airframe's own reference boundaries.
+    """Score first position-only termination with each airframe's own boundary.
 
     Only publish the matching profile, never apply a L2F box to RAPTOR scenes.
     The terminal transition is retained; subsequent entries are frozen padding.
@@ -395,13 +392,12 @@ def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
         raise ValueError("reference evaluation starts outside its termination set")
     name = "raptor" if code == 1 else "l2f"
     horizon = trajectory.positions.shape[0]
-    terminated = ((trajectory.positions.abs() > state.position_limit[None, :, None]).any(-1)
-                  | (trajectory.velocities.abs() > state.velocity_limit[None, :, None]).any(-1)
-                  | (trajectory.omegas.abs() > state.omega_limit[None, :, None]).any(-1))
+    terminated = L2FSimulator.position_terminated(trajectory.positions, state.position_limit)
     steps = torch.arange(1, horizon+1, device=terminated.device)[:, None]
     lengths = torch.where(terminated, steps, horizon).amin(dim=0)
     result = {
         "reference_protocol": name,
+        "episode_termination": "position-only",
         name + "_episode_length_mean": float(lengths.double().mean()),
         name + "_episode_length_std": float(lengths.double().std(unbiased=False)),
         name + "_share_terminated": float(terminated.any(0).double().mean()),

@@ -12,7 +12,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-ENVIRONMENT_VERSION = "l2f-raptor-reference-v1"
+ENVIRONMENT_VERSION = "l2f-raptor-position-only-v2"
 ACTION_CONVENTION = "absolute-normalized-motor-FR-BR-BL-FL-FLU-v1"
 RAPTOR_SOURCE = "e43ae4bcda4556321a63f4eb5dcc826cd637aa39"
 L2F_SOURCE = "d07592d5c5dea3c90954d2be6f04cfa68581ebe8"
@@ -42,6 +42,7 @@ def environment_contract(params: L2FParams) -> dict:
         "initialization": "raptor-paper-90deg-size-scaled" if params.protocol == "raptor" else "l2f-2024-default",
         "source": RAPTOR_SOURCE if params.protocol == "raptor" else L2F_SOURCE,
         "noise": "source-default-frozen-tape-v1",
+        "termination": "position-only-per-axis-strict-exceedance-v1",
     }
 
 
@@ -275,6 +276,9 @@ class L2FSimulator:
 
     @staticmethod
     def terminated(state: L2FState) -> torch.Tensor:
-        return ((state.position.abs() > state.position_limit[:, None]).any(-1)
-                | (state.velocity.abs() > state.velocity_limit[:, None]).any(-1)
-                | (state.omega.abs() > state.omega_limit[:, None]).any(-1))
+        return L2FSimulator.position_terminated(state.position, state.position_limit)
+
+    @staticmethod
+    def position_terminated(position: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
+        """Shared position-only boundary for states [B,3] and traces [H,B,3]."""
+        return (position.abs() > limit[..., None]).any(-1)

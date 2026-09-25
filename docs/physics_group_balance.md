@@ -3,8 +3,12 @@
 This supersedes cost-RMS normalization at `3ea9fe8` on the SAME experimental
 branch, `codex/time-decay-bounded-influence-20260925`. Cost normalization and
 its two CLI flags are removed, not left enabled beside gradient normalization.
-The original Actor, simulator, termination, sampling, task costs, pooled CVaR,
-Time Decay and raw EVAL metrics are unchanged.
+The gradient optimization preserves the Actor, physical integration, sampling,
+task-cost coefficients, pooled CVaR and Time Decay. This branch also includes
+position-only termination: only strict per-axis position-boundary exceedance
+ends a scene; velocity and angular velocity remain task costs and metrics.
+Terminal/dead cost bookkeeping and EVAL share the same position-boundary rule.
+Nonfinite states and gradients still trigger numerical failure handling.
 
 ## Exact update and zero convention
 
@@ -61,7 +65,7 @@ changed. These are group gradients, not the historical per-scene gradients.
 The existing full-batch forward graph is retained once. A detached [G,N]
 coefficient matrix supplies G VJPs; no [N,N] identity/per-scene Jacobian is
 constructed. Default `--group-vjp-chunk-size 16` processes all 16 GROUP signals
-in one batched autograd call for B512. This is NOT one ordinary backward's work:
+in one `torch.vmap`-vectorized VJP for B512. This is NOT one ordinary backward's work:
 it still carries 16 reverse signals. Chunk=1 provides a serial reference;
 chunk=4 gives four batched calls for 16 groups. Every chunk uses the same graph,
 so there is no isolated-scene rerun or changed compaction. The final chunk frees
@@ -77,7 +81,12 @@ stay on the device until the trainer logs the small tables.
 Grouped mode currently requires `--backprop-mode full --agc 0`; unsupported
 windowed/AGC combinations fail explicitly rather than falling back to costs.
 The ungrouped full/windowed paths are unchanged. H500/Time Decay are not truncated.
-`torch.autograd.grad(..., is_grads_batched=True)` can still have vmap fallbacks;
+The batched path uses modern `torch.vmap` around an ordinary existing-graph
+`torch.autograd.grad`, avoiding the legacy vmap backend selected by
+`is_grads_batched=True` in PyTorch 2.2. Unused parameters remain `None`, including
+the all-unused case; zero cotangents do not turn connected parameters into unused
+ones. No global autograd monkeypatch or extra forward pass is involved.
+Some operators (notably fused GRU backward in PyTorch 2.2) can still fall back;
 CUDA time and memory must be measured, not inferred from the call count.
 
 ## Configuration / checkpoint compatibility
@@ -96,10 +105,13 @@ Its output directory is `runs/raptor_group_gradient/seed7`. The bare CLI keeps
 `--no-group-balance` as its baseline. Old `--group-scale-mode` and
 `--group-scale-floor` are rejected. Per-scene `--contribution-*` flags remain
 absent. Config, algorithm version and source hash are bound into checkpoints.
+The modern-vmap optimization keeps the gradient-normalization algorithm and
+configuration unchanged, but changes the bound source hash.
 Old exact resume is deliberately rejected; do not alter checkpoint hashes.
 Compatible weights-only initialization resets Adam and is NOT an exact incident
-replay. The user's local position-only termination patch and mature 17206
-incident checkpoint are not on this public base and were not overwritten.
+replay. Position-only termination is included in this source version. Mature
+incident checkpoints and generated diagnostic results remain local and are not
+part of the source repository.
 
 `group_balance` logs only membership counts and physical ranges.
 `group_gradient` logs raw/normalized norm, multiplier and target for EVERY group,

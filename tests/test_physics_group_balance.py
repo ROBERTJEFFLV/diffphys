@@ -2,9 +2,11 @@
 from __future__ import annotations
 from dataclasses import fields, replace
 import copy
+import argparse
 import json
 from pathlib import Path
 import sys
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +21,16 @@ from response_groups import (GroupBalanceConfig, physics_group_layout,
 from response_adjoints import backward_actor, collect_boundary_rollout
 from response_training import train
 from tools.train_response_control import parse_args
+
+
+@pytest.mark.parametrize('options,expected', [
+    ([], False), (['--group-balance'], True), (['--no-group-balance'], False),
+    (['--group-balance', '--no-group-balance'], False),
+    (['--no-group-balance', '--group-balance'], True),
+])
+def test_group_switches_work_without_python39_argparse(monkeypatch, options, expected):
+    monkeypatch.delattr(argparse, 'BooleanOptionalAction', raising=False)
+    assert parse_args(options).group_balance is expected
 
 
 def bank(n=512, seed=7, dtype=torch.float64, device='cpu'):
@@ -166,6 +178,54 @@ def test_exact_weighted_group_gradients_match_closed_form(chunk):
     assert report['group_count']==4
 
 
+def test_group_vjp_avoids_legacy_activation_fallbacks():
+    # Both nonlinearities occur in the real Actor; their legacy batching rules
+    # caused the measured kernel-launch regression on PyTorch 2.2.
+    p = torch.nn.Parameter(torch.tensor([.1, -.3], dtype=torch.float64))
+    x = torch.arange(24, dtype=p.dtype).reshape(12, 2) / 24
+    costs = torch.nn.functional.silu(x @ p).tanh()
+    seeds = torch.eye(3, dtype=p.dtype).repeat_interleave(4, dim=1)
+    expected_rows = torch.stack([
+        torch.autograd.grad(costs, p, grad_outputs=.1*seed, retain_graph=True)[0]
+        for seed in seeds
+    ])
+    expected, _ = normalize_group_rows(expected_rows, 1e-12)
+    torch._C._debug_only_display_vmap_fallback_warnings(True)
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter('always')
+            gradients, _ = backward_group_gradients(
+                costs, seeds, [p], GroupBalanceConfig(enabled=True), gradient_scale=.1)
+    finally:
+        torch._C._debug_only_display_vmap_fallback_warnings(False)
+    torch.testing.assert_close(gradients[0], expected, atol=1e-13, rtol=1e-12)
+    assert not any('LegacyBatchedFallback' in str(w.message) for w in captured)
+
+
+@pytest.mark.parametrize('chunk', [1, 2, 3])
+def test_all_unused_group_parameters_keep_none_and_existing_adam_moments(chunk):
+    p = torch.nn.Parameter(torch.tensor([.2, .4], dtype=torch.float64))
+    optimizer = torch.optim.Adam([p], lr=3e-4)
+    p.square().sum().backward()
+    optimizer.step()
+    before = p.detach().clone()
+    moments = copy.deepcopy(optimizer.state_dict())
+    optimizer.zero_grad(set_to_none=True)
+    external = torch.ones(6, dtype=p.dtype, requires_grad=True)
+    costs = external.square()
+    seeds = torch.eye(3, dtype=p.dtype).repeat_interleave(2, dim=1)
+    gradients, report = backward_group_gradients(
+        costs, seeds, [p], GroupBalanceConfig(enabled=True, vjp_chunk_size=chunk),
+        gradient_scale=.1)
+    assert gradients == [None]
+    assert torch.count_nonzero(report['values']) == 0
+    p.grad = gradients[0]
+    optimizer.step()
+    assert torch.equal(p, before)
+    for key, value in moments['state'][0].items():
+        torch.testing.assert_close(optimizer.state_dict()['state'][0][key], value, atol=0, rtol=0)
+
+
 def test_group_coefficients_do_not_depend_on_cost_offsets():
     state=bank(64)
     p=torch.nn.Parameter(torch.tensor(.1,dtype=torch.float64))
@@ -292,12 +352,13 @@ def test_nonfinite_group_gradient_restores_actor_adam_rng(tmp_path,monkeypatch):
             torch.testing.assert_close(v,checkpoint['optimizer']['state'][pid][k],rtol=0,atol=0)
 
 
-def test_failed_group_does_not_publish_partial_gradients():
+@pytest.mark.parametrize('chunk', [1, 2])
+def test_failed_group_does_not_publish_partial_gradients(chunk):
     p=torch.nn.Parameter(torch.tensor(0.,dtype=torch.float64)); p.grad=torch.tensor(7.,dtype=p.dtype)
     costs=torch.stack((p+1,p.sqrt()))
     with pytest.raises(FloatingPointError):
         backward_group_gradients(costs,torch.eye(2,dtype=p.dtype),[p],
-            GroupBalanceConfig(enabled=True,vjp_chunk_size=1),gradient_scale=.1)
+            GroupBalanceConfig(enabled=True,vjp_chunk_size=chunk),gradient_scale=.1)
     assert p.grad.item()==7.
 
 
