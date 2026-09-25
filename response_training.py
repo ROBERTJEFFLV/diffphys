@@ -272,7 +272,8 @@ def adaptive_clip(parameters, limit):
 def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
-        "algorithm": "time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam",
+        "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
+                     + ("+bounded-contribution" if args.contribution_clip > 0 else ""),
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
@@ -300,6 +301,8 @@ def binding(args, policy_config, loss_config):
                 "lr",
                 "gradient_clip",
                 "gradient_scale",
+                "contribution_clip",
+                "contribution_unit_size",
                 "agc",
                 "threads",
             )
@@ -521,7 +524,9 @@ def train(args, policy_config, loss_config):
                 _sync(device)
                 forward_done = time.monotonic()
                 backward = backward_actor(
-                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale
+                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
+                    contribution_clip=args.contribution_clip,
+                    contribution_unit_size=args.contribution_unit_size,
                 )
                 raw_norm = gradient_norm(policy.parameters()) if args.agc else None
                 adaptive_clip(policy.parameters(), args.agc)
@@ -550,6 +555,7 @@ def train(args, policy_config, loss_config):
                 "raw_gradient_norm": raw_norm,
                 "pre_global_clip_norm": pre_clip,
                 "gradient_scale": args.gradient_scale,
+                "gradient_aggregation": backward.get("aggregation"),
                 "backprop_mode": args.backprop_mode,
                 "time_decay": args.time_decay,
                 "boundary_checks": len(backward["boundaries"]),

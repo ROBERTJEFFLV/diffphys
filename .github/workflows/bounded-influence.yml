@@ -18,6 +18,14 @@ jobs:
       MKL_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 1564d25a210c139a94431fc6ae59d10cc0430ffe
+          path: _baseline
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*.py
+            /tools/*.py
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -26,10 +34,7 @@ jobs:
       - name: Existing and added regressions
         run: python -m pytest -q tests
       - name: Bounded production probes
-        run: |
-          if test -f tools/verify_bounded_influence.py; then
-            python tools/verify_bounded_influence.py --output verification-results.json
-          fi
+        run: python tools/verify_bounded_influence.py --baseline-root _baseline --output verification-results.json
       - name: Preserve verification sources and reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -41,4 +46,5 @@ jobs:
             tools/*.py
             tests/*.py
             configs/*.args
+            docs/bounded_influence.md
             verification-results.json

@@ -56,6 +56,14 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.0)
     parser.add_argument(
+        "--contribution-clip", type=float, default=0.0,
+        help="pre-merge cap on de-averaged weighted votes; 0 keeps the original path",
+    )
+    parser.add_argument(
+        "--contribution-unit-size", type=int, default=1,
+        help="1 caps each scene; >1 caps block sums only (faster approximation)",
+    )
+    parser.add_argument(
         "--gradient-scale",
         type=float,
         default=0.1,
@@ -109,6 +117,14 @@ def parse_args(argv=None):
         parser.error("time-decay must be finite and nonnegative")
     if not math.isfinite(args.agc) or args.agc < 0:
         parser.error("agc must be finite and nonnegative")
+    if not math.isfinite(args.contribution_clip) or args.contribution_clip < 0:
+        parser.error("contribution-clip must be finite and nonnegative")
+    if args.contribution_unit_size < 1:
+        parser.error("contribution-unit-size must be positive")
+    if args.contribution_clip > 0 and args.backprop_mode != "full":
+        parser.error("contribution clipping requires --backprop-mode full")
+    if args.contribution_clip > 0 and args.agc != 0:
+        parser.error("disable AGC for the isolated contribution-clipping experiment")
     if args.mode == "evaluate" and not args.checkpoint:
         parser.error("evaluate requires --checkpoint")
     return args
