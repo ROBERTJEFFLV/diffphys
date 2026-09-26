@@ -18,6 +18,13 @@ jobs:
       MKL_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
+      - name: Archive tracked source for reproducible regression checks
+        run: git archive --format=tar HEAD > source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regression-source-${{ github.sha }}
+          retention-days: 3
+          path: source.tar
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
