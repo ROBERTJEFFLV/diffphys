@@ -1,7 +1,7 @@
 # Third-party notices
 
 The reference constants, X-frame equations, motor model, initialization and domain
-sampling in `env_l2f.py` are ported/adapted from:
+sampling in `env_raptor.py` are ported/adapted from:
 
 - `arplaboratory/learning-to-fly`, commit `d07592d5c5dea3c90954d2be6f04cfa68581ebe8`.
 - `rl-tools/rl-tools`, commit `e43ae4bcda4556321a63f4eb5dcc826cd637aa39`, as pinned by

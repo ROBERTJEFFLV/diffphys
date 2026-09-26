@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Response Actor-only training, bounded profiling and fixed development evaluation."""
+"""Single multi-airframe training/evaluation entry; no legacy simulator or optimizer arms."""
 from __future__ import annotations
 
 import argparse
@@ -15,122 +15,63 @@ sys.path.insert(0, str(ROOT))
 from response_policy import ResponsePolicyConfig
 from response_task import TaskLossConfig
 from response_groups import GroupBalanceConfig
+from response_noise import DisturbanceConfig
 from response_training import train, evaluate_checkpoint
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("train", "profile", "evaluate"), default="train")
+    parser = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars="@")
+    parser.convert_arg_line_to_args = lambda line: line.split()
+    parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument(
-        "--scenario-mode", choices=("l2f", "raptor"), default="raptor"
-    )
-    parser.add_argument(
-        "--scenarios", type=int, default=128, help="initial states per bank; TRAIN pools four banks"
-    )
-    parser.add_argument("--eval-scenarios", type=int, default=128, help="fixed EVAL states per bank, independent of TRAIN batch")
+    parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
+    parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
     parser.add_argument("--horizon", type=int, default=500)
-    parser.add_argument(
-        "--backprop-mode", choices=("full", "windowed"), default="full",
-        help="full retains the entire graph; windowed recomputes to save memory",
-    )
-    parser.add_argument("--window-steps", type=int, default=50)
-    parser.add_argument(
-        "--time-decay", type=float, default=1.0,
-        help="backward-only alpha in s^-1; each state edge uses exp(-alpha*dt); 0 restores exact BPTT",
-    )
-    parser.add_argument(
-        "--updates",
-        type=int,
-        default=50,
-        help="total update index to reach, including resumed updates",
-    )
-    parser.add_argument(
-        "--max-seconds",
-        type=float,
-        default=1800.0,
-        help="per invocation budget; finish current update",
-    )
+    parser.add_argument("--time-decay", type=float, default=1., help="backward-only decay s^-1; 0 gives exact BPTT")
+    parser.add_argument("--updates", type=int, default=50)
+    parser.add_argument("--max-seconds", type=float, default=1800.)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--gradient-clip", type=float, default=10.0)
-    parser.add_argument("--group-balance", action="store_true", default=False,
-                        help="normalize physical-group parameter gradients before averaging")
-    parser.add_argument("--no-group-balance", dest="group_balance", action="store_false",
-                        help="disable physical-group gradient normalization")
+    parser.add_argument("--gradient-clip", type=float, default=10.)
+    parser.add_argument("--gradient-scale", type=float, default=.1)
     parser.add_argument("--group-max-groups", type=int, default=16)
     parser.add_argument("--group-min-scenarios", type=int, default=32)
     parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)
-    parser.add_argument("--group-vjp-chunk-size", type=int, default=16,
-                        help="number of GROUP VJPs evaluated together; 1 is serial reference")
-    parser.add_argument(
-        "--group-gru-vmap-mode", choices=("fallback", "native", "verify", "sparse", "sparse-verify"), default="fallback",
-        help="opt-in native CUDA GRU backward batching; verify checks every invocation",
-    )
-    parser.add_argument(
-        "--gradient-scale",
-        type=float,
-        default=0.1,
-        help="fixed full-gradient multiplier, independent of window length",
-    )
-    parser.add_argument(
-        "--agc",
-        type=float,
-        default=0.0,
-        help="optional unitwise adaptive clipping (e.g. .01); 0 disables",
-    )
+    parser.add_argument("--group-vjp-chunk-size", type=int, default=16)
+    parser.add_argument("--disturbance-budget", type=float, default=.1, help="joint model-relative fraction, at most .10")
+    parser.add_argument("--disturbance-pool", nargs=5, type=float, default=(1,1,1,1,1),
+                        metavar="WEIGHT", help="weights for 0/25/50/75/100 percent of the joint budget")
     parser.add_argument("--development-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=50)
-    parser.add_argument("--work-dir", type=Path, default=Path("runs/raptor_reference/seed7"))
+    parser.add_argument("--work-dir", type=Path, default=Path("runs/raptor_multi_airframe/seed7"))
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)
-    initialize.add_argument(
-        "--init-checkpoint",
-        type=Path,
-        help="explicit weights-only initialization; fresh Adam and sampling",
-    )
-    parser.add_argument(
-        "--checkpoint", type=Path, help="checkpoint for fixed development evaluation"
-    )
+    initialize.add_argument("--init-checkpoint", type=Path, help="explicit weights-only start, fresh Adam")
+    parser.add_argument("--checkpoint", type=Path, help="checkpoint for evaluation")
     for config in (ResponsePolicyConfig(), TaskLossConfig()):
         for field in fields(config):
             default = getattr(config, field.name)
-            parser.add_argument(
-                "--" + field.name.replace("_", "-"), type=type(default), default=default
-            )
+            parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
-    for name in (
-        "threads",
-        "scenarios",
-        "eval_scenarios",
-        "horizon",
-        "window_steps",
-        "development_every",
-        "checkpoint_every",
-    ):
+    for name in ("threads", "scenarios", "eval_scenarios", "horizon", "development_every", "checkpoint_every"):
         if getattr(args, name) < 1:
-            parser.error(name + " must be positive")
-    if args.horizon % args.window_steps:
-        parser.error("horizon must be divisible by window-steps")
+            parser.error(name+" must be positive")
     if args.updates < 0:
         parser.error("updates must be nonnegative")
     for name in ("max_seconds", "lr", "gradient_clip", "gradient_scale"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
-            parser.error(name + " must be finite and positive")
+            parser.error(name+" must be finite and positive")
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
-    if not math.isfinite(args.agc) or args.agc < 0:
-        parser.error("agc must be finite and nonnegative")
     try:
-        group_config = GroupBalanceConfig.from_args(args)
+        groups = GroupBalanceConfig.from_args(args)
+        DisturbanceConfig.from_args(args)
     except ValueError as error:
         parser.error(str(error))
-    if args.mode != "evaluate" and group_config.enabled and (args.backprop_mode != "full" or args.agc != 0):
-        parser.error("group gradient normalization requires --backprop-mode full --agc 0")
-    if args.mode != "evaluate" and group_config.enabled and 4*args.scenarios < group_config.min_scenarios:
-        parser.error("four TRAIN banks must contain at least group-min-scenarios unique scenes")
+    if args.mode == "train" and 4*args.scenarios < groups.min_scenarios:
+        parser.error("four TRAIN banks must contain at least group-min-scenarios scenes")
     if args.mode == "evaluate" and not args.checkpoint:
         parser.error("evaluate requires --checkpoint")
     return args
@@ -141,14 +82,8 @@ def main(argv=None):
     if args.mode == "evaluate":
         result = evaluate_checkpoint(args)
     else:
-        if args.mode == "profile":
-            args.updates = min(args.updates, 1)
-        policy_config = ResponsePolicyConfig(
-            **{f.name: getattr(args, f.name) for f in fields(ResponsePolicyConfig)}
-        )
-        loss_config = TaskLossConfig(
-            **{f.name: getattr(args, f.name) for f in fields(TaskLossConfig)}
-        )
+        policy_config = ResponsePolicyConfig(**{f.name:getattr(args,f.name) for f in fields(ResponsePolicyConfig)})
+        loss_config = TaskLossConfig(**{f.name:getattr(args,f.name) for f in fields(TaskLossConfig)})
         result = train(args, policy_config, loss_config)
     print(json.dumps(result, indent=2, allow_nan=False))
 

@@ -1,6 +1,5 @@
 """Fixed failure bookkeeping; no rollout, physics or optimizer redesign."""
 from dataclasses import asdict, replace
-import copy
 from pathlib import Path
 import sys
 
@@ -8,11 +7,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from env_l2f import L2FParams, L2FSimulator
-from response_task import (TaskLossConfig, rollout, step_costs, scenario_costs,
-                           task_loss, risk_weights, task_loss_components,
-                           weighted_task_features, FlightStatistics)
-from response_adjoints import collect_boundary_rollout, backward_actor
+from response_task import TaskLossConfig, rollout, step_costs, scenario_costs, risk_weights, weighted_task_features
 from tools.train_response_control import parse_args
 from test_episode_termination import actor, CountingSimulator, scheduled, flat_grads
 
@@ -91,62 +86,6 @@ def test_constants_do_not_add_state_gradient_or_post_terminal_calls():
         else:
             torch.testing.assert_close(x, y, rtol=0, atol=0)
     assert len(simulator.ids) == calls == 29
-
-
-@pytest.mark.parametrize('mode', ['full', 'windowed'])
-def test_pooled_cvar_and_loss_components_include_failure_costs(mode):
-    h = 20; config = TaskLossConfig(); initial = scheduled([1, 4, 5, 6, 19, 20, 21], h)
-    policy = actor()
-    trace = rollout(policy, CountingSimulator(), initial, h)
-    costs = scenario_costs(trace, config)
-    weights = risk_weights(costs, config)
-    expected = costs.mean() + config.tail_weight * costs.topk(2).values.mean()
-    torch.testing.assert_close(task_loss(trace, config), expected)
-    record = collect_boundary_rollout(policy, CountingSimulator(), initial, config,
-                                     horizon=h, window_steps=5, backprop_mode=mode)
-    torch.testing.assert_close(record.costs, costs)
-    torch.testing.assert_close(record.weights, weights, rtol=0, atol=0)
-    report = task_loss_components(trace, config)
-    assert set(report) == {'position', 'velocity', 'omega', 'regularization', 'dead', 'terminal'}
-    assert sum(report.values()) == pytest.approx(float(expected.detach()))
-    penalty = weighted_task_features(trace, config)[..., 20:].square().sum(0)
-    assert report['dead'] == pytest.approx(float((weights*penalty[:, 0]).sum().detach()))
-    assert report['terminal'] == pytest.approx(float((weights*penalty[:, 1]).sum().detach()))
-    for name, value in report.items():
-        assert record.metrics['task_components'][name] == pytest.approx(value)
-    backward_actor(policy, CountingSimulator(), record, config)
-    assert torch.isfinite(flat_grads(policy)).all()
-
-
-@pytest.mark.parametrize('profile', ['l2f', 'raptor'])
-@pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
-def test_real_physics_full_windowed_and_frozen_padding_agree(profile, dtype):
-    h = 20; sim = L2FSimulator(L2FParams(protocol=profile))
-    initial = sim.reset(4, seed=7, dtype=dtype, horizon=h)
-    p = initial.position.clone(); v = initial.velocity.clone()
-    p[0] = 0; p[0, 0] = initial.position_limit[0] - .00001; v[0, 0] = 1
-    initial = replace(initial, position=p, velocity=v)
-    config = TaskLossConfig(); a = actor(dtype); b = copy.deepcopy(a)
-    records = []
-    for policy, mode in [(a, 'full'), (b, 'windowed')]:
-        record = collect_boundary_rollout(policy, sim, initial, config, horizon=h,
-                                         window_steps=5, backprop_mode=mode)
-        result = backward_actor(policy, sim, record, config)
-        assert all(check['exact'] for check in result['boundaries'])
-        records.append(record)
-    assert records[0].valid[:, 0].sum() == 1
-    assert torch.equal(records[0].valid, records[1].valid)
-    torch.testing.assert_close(records[0].costs, records[1].costs, rtol=0, atol=0)
-    tol = 2e-5 if dtype == torch.float32 else 1e-10
-    torch.testing.assert_close(flat_grads(a), flat_grads(b), rtol=tol, atol=tol)
-    trace = rollout(a, sim, initial, h)
-    penalty = weighted_task_features(trace, config)[..., 20:].square().sum((0, 2))
-    assert penalty[0].item() == pytest.approx((19*3+200)/20, rel=tol)
-    stats = FlightStatistics(initial, h, config); stats.add(trace, 0)
-    costs = scenario_costs(trace, config)
-    streamed = stats.finish(costs.detach(), risk_weights(costs, config))
-    for name, value in task_loss_components(trace, config).items():
-        assert streamed['task_components'][name] == pytest.approx(value, rel=tol, abs=tol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')

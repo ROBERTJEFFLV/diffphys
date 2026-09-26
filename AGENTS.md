@@ -31,49 +31,43 @@ The existing rule still applies: run training/validation only when explicitly re
 
 ## Project Structure & Module Organization
 
-The production response chain contains seven Python files:
+There is one RAPTOR-style multi-airframe training path. The production modules
+are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
+`response_task.py`, `response_adjoints.py`, `response_groups.py`,
+`response_training.py`, `response_execution.py`, and the single CLI
+`tools/train_response_control.py`. See README.md for responsibilities.
 
-- `tools/train_response_control.py`: train/profile/evaluate CLI.
-- `response_policy.py`: deployable response encoder, GRU and motor controller.
-- `response_task.py`: L2F/RAPTOR sampling, first-failure rollout, task/CVaR loss and metrics.
-- `response_adjoints.py`: full-graph Actor backpropagation with Time Decay and optional reverse-window recomputation.
-- `response_training.py`: Adam, fixed development evaluation, checkpoints and resume.
-- `response_execution.py`: exit classification.
-- `env_l2f.py`: native motor response and joint RK4 rigid-body physics.
+The sole training config is `configs/response_raptor_multi_airframe.args`.
+Full BPTT, Time Decay and physical-group gradient normalization are the retained
+algorithm. Do not reintroduce L2F single-airframe, reverse-window recomputation,
+AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
+network belongs to the production chain. Noise changes must remain outside the
+Actor and truth-based task loss, with known-command history (not hidden execution).
 
-The training configs are `configs/response_phase1_single_airframe.args` (L2F)
-and `configs/response_raptor_multi_airframe.args` (RAPTOR). Both default to
-`--time-decay 1`. Only the deployable Actor is trained; no auxiliary Metric MLP
-or contraction loss belongs to the production chain.
-Generated runs/checkpoints, audit evidence, physics provenance, applicable source
-and license notices, and local agent configuration are not disposable source.
-Historical code and standalone tests/checks are available at Git revision
-`76b3a02857e122fbfdef5ece5d0ae7dbf98a870b`, with a pre-cleanup local source snapshot.
-Do not reintroduce archived trainers into the production import chain.
+`docs/disturbance_budget.md` defines the joint <=10% model-relative allowance.
+Never equate static hover allocation or a reference error model with a verified
+recovery region of the learned Actor. Checkpoints remain deployment unauthorized.
+Keep noise tapes immutable and shared by stable scene IDs during compaction.
+
+Generated runs/checkpoints, applicable provenance and license notices, source
+audit evidence and local agent configuration are not disposable source. Historical
+reference material is not imported into production. Removed runtime paths remain
+recoverable from Git history.
 
 ## Build and Development Commands
 
-There is no build step. Use Python with PyTorch and NumPy; CUDA requires a
-compatible PyTorch CUDA installation, not a repository native extension.
-
-Run only when training is explicitly requested with a budget:
+Python 3.11+ with PyTorch 2.10 and NumPy; no native extension build is required.
+Run training only when explicitly requested with a budget:
 
 ```bash
-python3 tools/train_response_control.py $(cat configs/response_phase1_single_airframe.args)
+python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 ```
 
-An explicitly requested small CPU smoke can use:
-
-```bash
-python3 tools/train_response_control.py --device cpu --horizon 8 --window-steps 4 \
-  --scenarios 16 --updates 2 --work-dir runs/response_smoke
-```
-
-`--scenarios` is per bank; TRAIN pools four banks (default 4×128=512).
-Fixed EVAL pools two banks; EVAL and periodic checkpoint defaults are both 50 updates.
-`profile` uses the same trainer
-with at most one update. `--resume` requires matching source/config; do not modify
-checkpoint source hashes to bypass checks after cleanup.
+`--scenarios` is per bank; TRAIN pools four banks (default 4x128=512). Fixed EVAL
+pools two banks (default 2x128=256). The only CLI modes are train and evaluate.
+Exact resume requires identical source/config; never rewrite checkpoint hashes
+to bypass an environment/noise mismatch. Older protocol checkpoints require their
+original source. Deterministic unit checks use `python -m pytest -q tests`.
 
 ## Coding Style & Naming Conventions
 
@@ -81,20 +75,21 @@ Use Python 3 type hints, `from __future__ import annotations`, and four-space in
 
 ## Testing Guidelines
 
-Keep deterministic verification outside the production tree when requested to
-maintain the seven-file source layout. Historical tests require their matching
-source; removed experimental APIs are not production requirements.
-For physics, sampling or adjoint changes, compare against preserved source:
-complete sampled states and RNG, full rollouts, losses/CVaR weights, gradients,
-Adam updates, finite failure recovery and save/resume behavior. Preserve runtime
-boundary and gradient checks, fixed development evaluation and checkpoint guards.
-Use small deterministic checks by default; do not launch long training as a test.
-See `docs/response_control_v1.md` for the current protocol. Distinguish code and
-gradient correctness from learned performance and deployment safety.
+Keep deterministic pytest regressions in `tests/`. `tests/core_contract.json`
+contains pre-cleanup source-kernel hashes; never regenerate them merely to accept
+an accidental algorithm change. For intentional kernel changes, review the reason
+and independently validate numerical and gradient behavior before updating a contract.
+
+Validate joint bound inequalities, all torque axes, noisy acquisition-time delay,
+replay, first-failure semantics, full/grouped VJPs, Adam rollback and exact resume.
+Metric chunks must not detach physics, recurrent memory or delayed-velocity history.
+CPU tests do not validate CUDA throughput. Distinguish code correctness, numerical
+correctness, learned performance and deployment safety. Do not launch long training
+as a test. Deployment remains unauthorized until independently validated.
 
 ## Commit & Pull Request Guidelines
 
-This workspace does not include Git history, so no project-specific commit convention can be inferred. Use concise, imperative commit subjects such as `Add smoke config for CPU validation` or `Fix motor loss dtype handling`. Pull requests should describe the behavioral change, list commands run, mention whether CUDA was available, and note any changes to generated artifacts in `runs/` or `checkpoints/`.
+Use concise, imperative commit subjects describing the actual verified change. Pull requests should describe the behavioral change, list commands run, mention whether CUDA was available, and note any changes to generated artifacts in `runs/` or `checkpoints/`.
 
 ## Security & Configuration Tips
 

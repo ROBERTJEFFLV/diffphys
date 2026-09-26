@@ -17,15 +17,12 @@ CONTROL_FEATURE_DIM = 16
 class ResponsePolicyConfig:
     memory_dim: int = 64
     dt: float = 0.01
-    action_rate: float = 0.0  # Preserve the optional absolute-command slew projection.
 
     def __post_init__(self) -> None:
         if (not isinstance(self.memory_dim, int) or isinstance(self.memory_dim, bool)
                 or self.memory_dim < 1):
             raise ValueError("memory_dim must be a positive integer")
-        if not all(math.isfinite(x) for x in (self.dt, self.action_rate)):
-            raise ValueError("policy constants must be finite")
-        if self.dt <= 0 or self.action_rate < 0:
+        if not math.isfinite(self.dt) or self.dt <= 0:
             raise ValueError("invalid policy timestep or actuator constraints")
 
 
@@ -47,7 +44,7 @@ def body_vector(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
 class ResponseMotorPolicy(nn.Module):
     """One native GRU and one affine readout; hidden state is the only memory.
 
-    Observation: p(3), v(3), measured R(9), body omega(3), executed action(4).
+    Observation: p(3), v(3), measured R(9), body omega(3), previous command(4).
     No physical parameters, motor truth, learned encoder, explicit integral,
     response-difference cache, external controller or auxiliary network is used.
     Weights are fixed at deployment; memory updates from the FIRST observation.
@@ -85,7 +82,7 @@ class ResponseMotorPolicy(nn.Module):
             body_vector(rotation, observation[:, 3:6]) / 3.0,
             rotation[:, 2, :],  # R.T @ world-up, including the original sensor noise.
             observation[:, 15:18] / 10.0,
-            observation[:, 18:22],  # Command actually executed, not motor truth.
+            observation[:, 18:22],  # Known command, not hidden actuator execution or motor truth.
         ), -1)
 
     def forward(
@@ -103,11 +100,4 @@ class ResponseMotorPolicy(nn.Module):
         # Never skip call zero: current state must affect h_t and the first action.
         memory = self.response_memory(features, state.memory)
         proposed = torch.tanh(self.readout(torch.cat((features, memory), -1)))
-        action = proposed
-        if self.config.action_rate > 0:  # Same optional projection as the parent.
-            executed_previous = observation[:, 18:22]
-            radius = self.config.action_rate * self.config.dt
-            lower = (executed_previous - radius).clamp(-1.0, 1.0)
-            upper = (executed_previous + radius).clamp(-1.0, 1.0)
-            action = torch.maximum(lower, torch.minimum(upper, proposed))
-        return ResponsePolicyOutput(action, ResponsePolicyState(memory))
+        return ResponsePolicyOutput(proposed, ResponsePolicyState(memory))

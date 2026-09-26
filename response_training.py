@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 import copy
 import hashlib
 import json
@@ -17,7 +17,8 @@ import time
 import numpy as np
 import torch
 
-from env_l2f import L2FParams, L2FSimulator, L2FState, environment_contract
+from env_raptor import RaptorParams, RaptorSimulator, RaptorState, environment_contract, ACTION_CONVENTION
+from response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import (
     TaskLossConfig,
@@ -29,12 +30,12 @@ from response_task import (
     hard_risk_metrics,
     tensors_finite,
 )
-from response_adjoints import collect_boundary_rollout, backward_actor
+from response_adjoints import collect_rollout, backward_actor
 from response_execution import exit_class
 from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL_VERSION = "response-actor-only-reference-v3"
+PROTOCOL_VERSION = "raptor-multi-airframe-joint-budget-v4"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
@@ -45,7 +46,8 @@ SOURCE_FILES = (
     "response_groups.py",
     "response_training.py",
     "response_execution.py",
-    "env_l2f.py",
+    "env_raptor.py",
+    "response_noise.py",
     "tools/train_response_control.py",
 )
 
@@ -135,11 +137,13 @@ def require_reference_checkpoint(value):
     if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
         raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 direct-readout checkpoint or retrain")
     cfg = value["binding"]["protocol"]
-    params = L2FParams(**cfg["environment_params"])
+    params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
-            or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_l2f.py")):
+            or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_raptor.py")
+            or cfg.get("noise_source_sha256") != file_hash(ROOT / "response_noise.py")):
         raise ValueError("checkpoint environment/action contract mismatch")
-    if cfg["scenario_mode"] != params.protocol or value["policy_config"]["dt"] != params.dt:
+    DisturbanceConfig(**cfg["disturbances"])
+    if value["policy_config"]["dt"] != params.dt:
         raise ValueError("checkpoint sampler, policy and environment disagree")
     return params
 
@@ -189,35 +193,36 @@ def load_policy_checkpoint(path, device, dtype):
     return policy.to(device=device, dtype=dtype), value
 
 
-def sample_training_scenarios(
-    scenarios,
-    attempt_index,
-    *,
-    batches=TRAINING_BANKS,
-    dt=0.01,
-    device=torch.device("cpu"),
-    dtype=torch.float32,
-    scenario_mode="raptor",
-    horizon=500,
-):
-    if attempt_index < 0 or batches < 1:
+def pool_states(states):
+    # Validate before allocating: an already-noisy bank cannot be pooled twice.
+    if not states or any(s.noise_tape.shape[1] != 1 for s in states):
+        raise ValueError("pool clean initial banks before sampling disturbances")
+    result = RaptorState(**{f.name: torch.cat([getattr(s, f.name) for s in states])
+                            for f in fields(states[0])})
+    return replace(result, noise_row=torch.arange(len(result.mass), device=result.mass.device))
+
+
+def sample_pool(scenarios, seeds, *, dt=.01, device="cpu", dtype=torch.float32,
+                horizon=500, disturbances=DisturbanceConfig()):
+    states = [sample_scenarios(scenarios, seed=s, dt=dt, dtype=dtype, horizon=horizon,
+                              disturbances=DisturbanceConfig(budget=0)) for s in seeds]
+    initial = pool_states(states)
+    # Airframe/initial-state randomness does not change when noise settings change.
+    noise_seed = int.from_bytes(hashlib.sha256(repr(tuple(seeds)).encode()).digest()[:8], "little")
+    initial = attach_disturbances(initial, disturbances, seed=noise_seed, horizon=horizon)
+    return initial.to(device, dtype)
+
+
+def sample_training_scenarios(scenarios, attempt_index, *, dt=.01, device="cpu",
+                              dtype=torch.float32, horizon=500,
+                              disturbances=DisturbanceConfig()):
+    if attempt_index < 0:
         raise ValueError("invalid sampling index")
-    seeds = [TRAIN_SEED_BASE + batches * attempt_index + i for i in range(batches)]
+    seeds = [TRAIN_SEED_BASE + TRAINING_BANKS*attempt_index + i for i in range(TRAINING_BANKS)]
     if seeds[-1] >= min(DEVELOPMENT_SEEDS):
         raise ValueError("TRAIN seed range would enter reserved EVAL")
-    states = [
-        sample_scenarios(
-            scenarios, seed=s, dt=dt, device=device, dtype=dtype, scenario_mode=scenario_mode, horizon=horizon
-        )
-        for s in seeds
-    ]
-    return pool_states(states), seeds
-
-
-def pool_states(states):
-    return L2FState(
-        **{f.name: torch.cat([getattr(s, f.name) for s in states]) for f in fields(states[0])}
-    )
+    return sample_pool(scenarios, seeds, dt=dt, device=device, dtype=dtype,
+                       horizon=horizon, disturbances=disturbances), seeds
 
 
 @torch.no_grad()
@@ -245,35 +250,23 @@ def safe_global_clip(parameters, limit):
     return value
 
 
-@torch.no_grad()
-def adaptive_clip(parameters, limit):
-    if limit == 0:
-        return
-    for p in parameters:
-        if p.grad is None:
-            continue
-        axes = tuple(range(1, p.ndim)) if p.ndim > 1 else None
-        pn = p.double().norm(dim=axes, keepdim=True).clamp_min(0.001)
-        gn = p.grad.double().norm(dim=axes, keepdim=True).clamp_min(1e-6)
-        p.grad.mul_((limit * pn / gn).clamp_max(1).to(p.grad.dtype))
-
-
 def binding(args, policy_config, loss_config):
     return {
         "source_sha256": source_hash(),
         "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
-                     + ("+physics-group-gradient-median" if args.group_balance else ""),
+                     + "+physics-group-gradient-median",
         "protocol": {
             "version": PROTOCOL_VERSION,
             "architecture": ARCHITECTURE,
             "policy": asdict(policy_config),
             "loss": asdict(loss_config),
             "scenarios_per_bank": args.scenarios,
-            "scenario_mode": args.scenario_mode,
+            "disturbances": asdict(DisturbanceConfig.from_args(args)),
             "eval_scenarios_per_bank": args.eval_scenarios,
-            "environment_source_sha256": file_hash(ROOT / "env_l2f.py"),
-            "environment_params": asdict(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode)),
-            "environment": environment_contract(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode)),
+            "environment_source_sha256": file_hash(ROOT / "env_raptor.py"),
+            "noise_source_sha256": file_hash(ROOT / "response_noise.py"),
+            "environment_params": asdict(RaptorParams(dt=policy_config.dt)),
+            "environment": environment_contract(RaptorParams(dt=policy_config.dt)),
             "development_seeds": list(DEVELOPMENT_SEEDS),
             "deployment_authorized": False,
         },
@@ -284,13 +277,10 @@ def binding(args, policy_config, loss_config):
                 "device",
                 "dtype",
                 "horizon",
-                "backprop_mode",
-                "window_steps",
                 "time_decay",
                 "lr",
                 "gradient_clip",
                 "gradient_scale",
-                "agc",
                 "threads",
             )
         },
@@ -350,6 +340,7 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     report.update(reference_episode_metrics(trace))
     report["task_components"] = task_loss_components(trace, loss_config)
     report["loss_config"] = asdict(loss_config)
+    report["disturbances"] = disturbance_report(initial)
     risk = hard_risk_metrics(trace, loss_config)
     report["risk"] = risk
     return report
@@ -381,11 +372,10 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = L2FSimulator(L2FParams(dt=policy_config.dt, protocol=args.scenario_mode))
+    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt))
     group_config = GroupBalanceConfig.from_args(args)
-    if group_config.enabled and (args.backprop_mode != "full" or args.agc != 0):
-        raise ValueError("group gradient normalization requires full BPTT and AGC disabled")
-    if group_config.enabled and TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
+    disturbances = DisturbanceConfig.from_args(args)
+    if TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
         raise ValueError("not enough unique TRAIN scenes for group balancing")
     run_binding = binding(args, policy_config, loss_config)
     work = Path(args.work_dir)
@@ -419,10 +409,15 @@ def train(args, policy_config, loss_config):
         restore_rng(saved["rng"])
     elif args.init_checkpoint:
         saved = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
-        params = require_reference_checkpoint(saved)
-        if params != simulator.params or saved.get("policy_config") != asdict(policy_config):
-            raise ValueError("initialization policy/environment configuration mismatch")
-        migrate_actor_weights(policy, saved["model"])
+        # Explicit weights-only import checks the deployable interface, not an
+        # old training environment. No legacy simulator/optimizer is restored.
+        old_policy = saved.get("policy_config", {})
+        old_environment = saved.get("binding", {}).get("protocol", {}).get("environment", {})
+        if (saved.get("architecture") != ARCHITECTURE
+                or any(old_policy.get(k) != v for k, v in asdict(policy_config).items())
+                or old_environment.get("action_convention") != ACTION_CONVENTION):
+            raise ValueError("initialization Actor interface/motor semantics mismatch")
+        migrate_actor_weights(policy, saved.get("model", {}))
         if saved.get("model_sha256") != model_hash(policy):
             raise ValueError("checkpoint model digest mismatch")
         progress["initialization"] = {"file_sha256": file_hash(args.init_checkpoint), "weights_only": True}
@@ -437,20 +432,9 @@ def train(args, policy_config, loss_config):
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_handlers[signum] = signal.signal(signum, interrupted)
-    eval_initial = pool_states(
-        [
-            sample_scenarios(
-                args.eval_scenarios,
-                seed=s,
-                dt=policy_config.dt,
-                device=device,
-                dtype=dtype,
-                scenario_mode=args.scenario_mode,
-                horizon=args.horizon,
-            )
-            for s in DEVELOPMENT_SEEDS
-        ]
-    )
+    eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
+                               device=device, dtype=dtype, horizon=args.horizon,
+                               disturbances=disturbances)
 
     def save(name="latest.pt"):
         atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
@@ -501,18 +485,16 @@ def train(args, policy_config, loss_config):
                     dt=policy_config.dt,
                     device=device,
                     dtype=dtype,
-                    scenario_mode=args.scenario_mode,
+                    disturbances=disturbances,
                     horizon=args.horizon,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                record = collect_boundary_rollout(
+                record = collect_rollout(
                     policy,
                     simulator,
                     initial,
                     loss_config,
                     horizon=args.horizon,
-                    window_steps=args.window_steps,
-                    backprop_mode=args.backprop_mode,
                     time_decay=args.time_decay,
                     group_config=group_config,
                 )
@@ -521,11 +503,7 @@ def train(args, policy_config, loss_config):
                 backward = backward_actor(
                     policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
                 )
-                raw_norm = gradient_norm(policy.parameters()) if args.agc else None
-                adaptive_clip(policy.parameters(), args.agc)
-                pre_clip = safe_global_clip(policy.parameters(), args.gradient_clip)
-                if raw_norm is None:
-                    raw_norm = pre_clip
+                raw_norm = safe_global_clip(policy.parameters(), args.gradient_clip)
                 optimizer.step()
                 tensors = list(policy.parameters()) + [
                     v for s in optimizer.state.values() for v in s.values() if torch.is_tensor(v)
@@ -546,22 +524,15 @@ def train(args, policy_config, loss_config):
                 "train_seeds": seeds,
                 **record.metrics,
                 "raw_gradient_norm": raw_norm,
-                "pre_global_clip_norm": pre_clip,
+                "pre_global_clip_norm": raw_norm,
                 "gradient_scale": args.gradient_scale,
                 "group_balance": (None if record.group_balance is None else {
                     **record.group_balance, "values": record.group_balance["values"].cpu().tolist()}),
                 "group_gradient": (None if "group_gradient" not in backward else {
                     **backward["group_gradient"],
                     "values": backward["group_gradient"]["values"].cpu().tolist()}),
-                "backprop_mode": args.backprop_mode,
                 "time_decay": args.time_decay,
-                "boundary_checks": len(backward["boundaries"]),
-                "boundary_exact": (
-                    all(r["exact"] for r in backward["boundaries"]) if backward["boundaries"] else None
-                ),
-                "boundary_max_error": max(
-                    (r["max_error"] for r in backward["boundaries"]), default=None
-                ),
+                "disturbances": disturbance_report(initial),
                 "forward_seconds": forward_done - update_start,
                 "update_seconds": time.monotonic() - update_start,
                 "cuda_peak_bytes": (
@@ -613,28 +584,16 @@ def evaluate_checkpoint(args):
     dtype = getattr(torch, saved["binding"]["dtype"])
     policy, _ = load_policy_checkpoint(args.checkpoint, device, dtype)
     cfg = saved["binding"]["protocol"]
-    initial = pool_states(
-        [
-            sample_scenarios(
-                cfg["eval_scenarios_per_bank"],
-                seed=s,
-                dt=policy.config.dt,
-                device=device,
-                dtype=dtype,
-                scenario_mode=cfg["scenario_mode"],
-                horizon=saved["binding"]["horizon"],
-            )
-            for s in DEVELOPMENT_SEEDS
-        ]
-    )
+    initial = sample_pool(cfg["eval_scenarios_per_bank"], DEVELOPMENT_SEEDS,
+                          dt=policy.config.dt, device=device, dtype=dtype,
+                          horizon=saved["binding"]["horizon"],
+                          disturbances=DisturbanceConfig(**cfg["disturbances"]))
     report = evaluate(
         policy,
-        L2FSimulator(params),
+        RaptorSimulator(params),
         initial,
         saved["binding"]["horizon"],
-        # Older v3 checkpoints had no failure costs. Preserve their stored
-        # objective on evaluation rather than silently adopting new defaults.
-        TaskLossConfig(**{"dead_cost": 0.0, "terminal_cost": 0.0, **cfg["loss"]}),
+        TaskLossConfig(**cfg["loss"]),
     )
     report.update(
         checkpoint_source_sha256=checkpoint_source,

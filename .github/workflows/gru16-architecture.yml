@@ -1,4 +1,4 @@
-name: GRU16 architecture and preserved training contract
+name: Multi-airframe physics and joint disturbance budget
 on:
   push:
     branches: [codex/gru16-direct-readout-20260926]
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: gru16-architecture-${{ github.ref }}
+  group: multi-airframe-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   verify:
@@ -18,7 +18,7 @@ jobs:
       MKL_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Archive tracked source for reproducible regression checks
+      - name: Archive the exact tested source
         run: git archive --format=tar HEAD > source.tar
       - uses: actions/upload-artifact@v4
         with:
@@ -30,18 +30,15 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install numpy pytest
-      - name: Original regressions plus architecture and source-contract checks
-        run: python -m pytest -q tests --junitxml=gru16-tests.xml
-      - name: Bounded same-graph VJP audit (CPU is not CUDA validation)
-        run: python tools/verify_vjp_acceleration.py --device cpu --horizon 8 --scenarios 64 --output gru16-vjp-audit.json
-      - name: Preserve verification evidence
+      - name: Kernels, joint bounds, noisy gradients, failure handling and exact resume
+        run: python -m pytest -q tests --junitxml=multi-airframe-tests.xml
+      - name: Preserve verification evidence (CPU is not CUDA validation)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gru16-architecture-${{ github.sha }}
+          name: multi-airframe-tests-${{ github.sha }}
           retention-days: 7
           path: |
-            gru16-tests.xml
-            gru16-vjp-audit.json
-            tests/gru16_parent_contract.json
-            docs/gru16_direct_readout.md
+            multi-airframe-tests.xml
+            tests/core_contract.json
+            docs/disturbance_budget.md

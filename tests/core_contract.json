@@ -1,0 +1,46 @@
+{
+  "source_commit": "c15ca41824ecca400069636bdd9546d137b8f30d",
+  "normalization": "Canonical AST JSON without locations/function docstrings/empty type_params; L2F type names renamed to Raptor only",
+  "symbols": {
+    "env_raptor.py": {
+      "quaternion_rotation": "a7d69b133829965600b623328f89be4523f9015907bc524bb27677c3342445ca",
+      "RaptorSimulator.motor_command": "a32c04f349ecff2a2104180a122ffce24e60cfec5f2b6dc42dd4b947d066d991",
+      "RaptorSimulator.thrust": "2d666e4cc405365eba4e142b4510ea6c44b29cde5aa0eee10842aae9d74b2846",
+      "RaptorSimulator.body_torque": "4208835d91faf61663a3e26e3d9f1f98d5e10425253b3a5615981b1cf33e3bdb",
+      "RaptorSimulator.step.dynamics": "e2492852e4e3d38b5c90ea773491eb5ca8e0587e23f98e5a7b32a6a837d8963b",
+      "RaptorSimulator.position_terminated": "e547c7ef4c2416fda5289bf02e1b3622c61e5172420f0a7a437d9b103b8b0e11"
+    },
+    "response_task.py": {
+      "TaskLossConfig": "8f2612efb481551a24b0f88e86e2cb3c40359b13afef8b9d888d4e64a5989712",
+      "weighted_task_features": "149858f0167810064617d37e35a241e1f64a9b3c7c870f1de3bda8dca743285e",
+      "step_costs": "869eaa72e9562d4628f5629c468f4731aba1281b58669ab547fcf59e153f700d",
+      "scenario_costs": "00bfd473cbb9c36db2faaad8eab98dacdbc6e0731a579ddfd27c29d4b38e3595",
+      "risk_weights": "d7a1ce6f69efa83945b5b67d126966af08f9be2da2860005fbfb745a163cfe49",
+      "task_residual": "0e1a2f70bea007e8c9141674f76267b4e14ad748638efc96fe2fe6e4ee4e3690",
+      "task_loss": "cfbab28099bbc77f18e7a9de4eeabe5882779c76911fa56686387491366984df",
+      "warning_risk_steps": "f1a161c83870f2631b009a1dd0eb2b90d8d60492c47941e6b83a67a367c02b6b",
+      "task_loss_components": "9beaf56ba54eb79d5ec8c27b1c32d2a9911c484a51417debe9a1946ec083abe1",
+      "_GradientDecay": "b9e9dd454de78d26fa39453711ca781c61d95a067563359fe3a232b8a7776e79"
+    },
+    "response_groups.py": {
+      "_group_physics": "c2cec359339dc7b3ce79d85ecea3bd3f1154d17703abc59d8da140a9c9a4f582",
+      "physics_group_layout": "eeb7a9c46d1d2cc70be955f20f4aa8304e29b93e5b8348d25d3794efeb9ff26f",
+      "normalize_group_rows": "6c75fe44b463d5494253084bdf620582705bd88f333acacec7c17374ce9c7c17"
+    },
+    "response_policy.py": {
+      "body_vector": "697fd84932fd856432f7cf6debedaf69da2ff65394befbee2fd9d5c6fbfb33d8",
+      "ResponseMotorPolicy.__init__": "ba117a5e44273e98a96e7fdca45e7b4ff2f4ab15c7cf0f98de5e0693e9ecbb00",
+      "ResponseMotorPolicy.control_features": "fcf70531a9eda185018ca8be975de30dee57d1c719aaa6e3b7089c3891df17e2",
+      "ResponseMotorPolicy.initial_state": "61c79ac803ba441716010f5a288f2f8772aced97cd36e227df8a274881834650"
+    },
+    "response_training.py": {
+      "gradient_norm": "7f12afb98bf431275f73e1d1a3a26ece8ba8f2b218c4fda9933e76da722bf7ca",
+      "safe_global_clip": "45e161e7368c2a734c2ef9f842c57eb40c46883623698027e9993fcba463dcc2",
+      "capture_rng": "e9fd3b31f6df85c606d7987c9d4f2a7d7ad3a805eb5c8e606e1aae3590bb223a",
+      "restore_rng": "97ac6221ed478108ae7f5f2f9b73cc0ff4e6e4a7bee18674a1f6a75ff2426ab9",
+      "_atomic": "cb005fe0d16b9edc6991ad49bf47dbd21d8add6226e65221053a36de0f17694a",
+      "_recover_log": "bbb0be394a854a0b7931e8e7a6aa5518048ef6ed1610bfc6be8bf441c9cb17ab",
+      "migrate_named_adam": "3d303f4033ede053843e5f06fbf290b1b48a35116b6b347f9fa27dc23677f655"
+    }
+  }
+}

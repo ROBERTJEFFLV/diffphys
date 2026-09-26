@@ -1,4 +1,4 @@
-"""Teacher-free causal rollout, physical task objective, and scenario banks."""
+"""Causal multi-airframe rollout, unchanged physical task objective and metrics."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
@@ -7,14 +7,15 @@ from typing import Optional
 
 import torch
 
-from env_l2f import L2FParams, L2FSimulator, L2FState
+from env_raptor import RaptorParams, RaptorSimulator, RaptorState, IMMUTABLE_TAPES
+from response_noise import DisturbanceConfig, measured_observation
 from response_policy import (
     ResponseMotorPolicy, ResponsePolicyState,
 )
 
 
-# Shared by per-step gradient decay and exact reverse-window state covectors.
-PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action")
+# Differentiable closed-loop state edges covered by per-step gradient decay.
+PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action", "previous_velocity")
 POLICY_DYNAMIC = ("memory",)
 
 
@@ -50,7 +51,7 @@ class TaskLossConfig:
 
 @dataclass(frozen=True)
 class ResponseClosedLoopState:
-    physical: L2FState
+    physical: RaptorState
     policy: ResponsePolicyState
 
 
@@ -64,28 +65,15 @@ class TaskTrajectory:
     omegas: torch.Tensor
     action_deltas: torch.Tensor
     omega_deltas: torch.Tensor
-    initial: L2FState
+    initial: RaptorState
     valid: torch.Tensor  # [time, scene], including the first terminal transition
 
 
-def observation(physical: L2FState) -> torch.Tensor:
-    """Noisy deployable state only; one fixed noise sample per physical time step.
-
-    Re-observing a window boundary MUST NOT draw a second noise realization.
-    The simulator's true orientation is never changed by observation noise.
-    """
-    clean = torch.cat((physical.position, physical.velocity,
-                       physical.rotation.flatten(1), physical.omega), -1)
-    if physical.noise_tape.shape[1] == 1:
-        noise = physical.noise_tape[:, 0]
-    else:
-        rows = torch.arange(clean.shape[0], device=clean.device)
-        noise = physical.noise_tape[rows, physical.step_index]
-    measured = clean + noise
-    return torch.cat((measured, physical.previous_action), -1)
+def observation(physical: RaptorState) -> torch.Tensor:
+    return measured_observation(physical)
 
 
-def initialize(policy: ResponseMotorPolicy, physical: L2FState) -> ResponseClosedLoopState:
+def initialize(policy: ResponseMotorPolicy, physical: RaptorState) -> ResponseClosedLoopState:
     obs = observation(physical)
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
@@ -94,7 +82,8 @@ def _select_rows(state, indices: torch.Tensor):
     """Compact live rows without detaching their physical or recurrent graph."""
     if indices.numel() == getattr(state, fields(state)[0].name).shape[0]:
         return state
-    return type(state)(**{f.name: getattr(state, f.name).index_select(0, indices)
+    return type(state)(**{f.name: (getattr(state, f.name) if f.name in IMMUTABLE_TAPES
+                          else getattr(state, f.name).index_select(0, indices))
                           for f in fields(state)})
 
 
@@ -133,8 +122,8 @@ def _decay_closed_state(closed: ResponseClosedLoopState, rho: float) -> Response
 
 def rollout(
     policy: ResponseMotorPolicy,
-    simulator: L2FSimulator,
-    initial: L2FState | ResponseClosedLoopState,
+    simulator: RaptorSimulator,
+    initial: RaptorState | ResponseClosedLoopState,
     steps: int,
     *,
     time_decay: float = 0.0,
@@ -152,10 +141,7 @@ def rollout(
         raise ValueError("rollout must contain physical transitions")
     if abs(simulator.params.dt - policy.config.dt) > 1.0e-12:
         raise ValueError("training and deployment dt must agree")
-    closed = initialize(policy, initial) if isinstance(initial, L2FState) else initial
-    expected_code = int(simulator.params.protocol == "raptor")
-    if not bool((closed.physical.profile_code == expected_code).all()):
-        raise ValueError("sampler and simulator reference protocols disagree")
+    closed = initialize(policy, initial) if isinstance(initial, RaptorState) else initial
     if (closed.physical.noise_tape.shape[1] > 1
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
@@ -164,7 +150,7 @@ def rollout(
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
     # A terminal row stays frozen outside its boundary, so it cannot become live
-    # again when this rollout is resumed at the next reverse-window boundary.
+    # again when this rollout is resumed at the next metrics-chunk boundary.
     indices = (~simulator.terminated(closed.physical)).nonzero(as_tuple=True)[0]
     live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
                                    _select_rows(closed.policy, indices))
@@ -253,7 +239,7 @@ def weighted_task_features(
     features = features * time_weights.sqrt()[:, None, None]
     with torch.no_grad():
         state = trajectory.initial
-        terminal = trajectory.valid & L2FSimulator.position_terminated(
+        terminal = trajectory.valid & RaptorSimulator.position_terminated(
             trajectory.positions, state.position_limit)
         remaining = horizon - torch.arange(start + 1, start + steps + 1,
                                             device=features.device, dtype=features.dtype)
@@ -324,17 +310,12 @@ def task_loss(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tenso
 
 
 def sample_scenarios(
-    count: int, *, seed: int, dt: float = 0.01,
+    count: int, *, seed: int, dt: float = .01,
     device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
-    scenario_mode: str = "raptor", horizon: int = 500,
-) -> L2FState:
-    """Source-defined airframes, paper-first initial conditions and fixed noise.
-
-    A fresh episode sample uses an independent local seed. There is no 4x4
-    authority reweighting and no environment-default fallback in this path.
-    """
-    simulator = L2FSimulator(L2FParams(dt=dt, protocol=scenario_mode))
-    return simulator.reset(count, seed=seed, horizon=horizon, device=device, dtype=dtype)
+    horizon: int = 500, disturbances: DisturbanceConfig = DisturbanceConfig(),
+) -> RaptorState:
+    return RaptorSimulator(RaptorParams(dt)).reset(
+        count, seed=seed, horizon=horizon, device=device, dtype=dtype, disturbances=disturbances)
 
 
 def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> dict:
@@ -349,6 +330,8 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
     ]).all(dim=(0, 1))
     if hasattr(trajectory, "end") and trajectory.end is not None:
         for field in fields(trajectory.end.physical):
+            if field.name in IMMUTABLE_TAPES:
+                continue  # Original-pool tapes need not match a selected batch size.
             value = getattr(trajectory.end.physical, field.name)
             finite = finite & torch.isfinite(value).reshape(value.shape[0], -1).all(-1)
         finite = finite & torch.isfinite(trajectory.end.policy.memory).all(-1)
@@ -371,19 +354,16 @@ def trajectory_metrics(trajectory: TaskTrajectory, config: TaskLossConfig) -> di
 def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
     """Score first position-only termination with each airframe's own boundary.
 
-    Only publish the matching profile, never apply a L2F box to RAPTOR scenes.
+    Every scene uses its own size-scaled RAPTOR boundary.
     The terminal transition is retained; subsequent entries are frozen padding.
     The first violation remains a failure even on the final allowed transition.
     """
     state = trajectory.initial
-    code = int(state.profile_code[0])
-    if not bool((state.profile_code == code).all()):
-        raise ValueError("a reference evaluation bank cannot mix protocols")
-    if bool(L2FSimulator.terminated(state).any()):
+    if bool(RaptorSimulator.terminated(state).any()):
         raise ValueError("reference evaluation starts outside its termination set")
-    name = "raptor" if code == 1 else "l2f"
+    name = "raptor"
     horizon = trajectory.positions.shape[0]
-    terminated = L2FSimulator.position_terminated(trajectory.positions, state.position_limit)
+    terminated = RaptorSimulator.position_terminated(trajectory.positions, state.position_limit)
     steps = torch.arange(1, horizon+1, device=terminated.device)[:, None]
     lengths = torch.where(terminated, steps, horizon).amin(dim=0)
     result = {
@@ -395,9 +375,6 @@ def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
         "reference_position_limit_min_m": float(state.position_limit.min()),
         "reference_position_limit_max_m": float(state.position_limit.max()),
     }
-    if name == "l2f":
-        settled = (lengths == horizon) & (trajectory.positions[-1].norm(dim=-1) < 0.20)
-        result["l2f_settling_fraction_200mm"] = float(settled.double().mean())
     return result
 
 
@@ -437,7 +414,8 @@ class FlightStatistics:
         magnitudes = torch.stack([x.norm(dim=-1) for x in
                                   (trace.positions, trace.velocities, trace.omegas)])
         values = [magnitudes, trace.actions]
-        values += [getattr(s, f.name) for s in (trace.end.physical, trace.end.policy) for f in fields(s)]
+        values += [getattr(s, f.name) for s in (trace.end.physical, trace.end.policy) for f in fields(s)
+                   if f.name not in IMMUTABLE_TAPES]
         if not tensors_finite(values):
             raise FloatingPointError('nonfinite closed-loop state')
         self.valid_steps.add_(trace.valid.sum(0))

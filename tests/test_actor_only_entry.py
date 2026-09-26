@@ -30,7 +30,7 @@ run(args_for(path, updates=2, extra=('--resume', str(path/'latest.pt'))))
     assert result.returncode == 0, result.stderr
     saved = torch.load(tmp_path / 'run/latest.pt', weights_only=True)
     assert saved['next_update'] == 2
-    assert saved['binding']['algorithm'] == 'time-decayed-bptt-adam'
+    assert saved['binding']['algorithm'] == 'time-decayed-bptt-adam+physics-group-gradient-median'
     assert saved['optimizer']['state']
     rows = [json.loads(line) for line in (tmp_path / 'run/history.jsonl').read_text().splitlines()]
     assert [row['update'] for row in rows] == [1, 2]

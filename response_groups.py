@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from contextlib import contextmanager
 import math
-import threading
 
 import torch
 
-from env_l2f import L2FState
+from env_raptor import RaptorState
 
 
 GROUP_BALANCE_VERSION = "physical-group-gradient-median-v1"
@@ -18,12 +16,10 @@ GROUP_FEATURE_NAMES = ("thrust_to_weight", "torque_to_inertia",
 
 @dataclass(frozen=True)
 class GroupBalanceConfig:
-    enabled: bool = False
     max_groups: int = 16
     min_scenarios: int = 32
     gradient_epsilon: float = 1e-12
     vjp_chunk_size: int = 16
-    gru_vmap_mode: str = "fallback"
 
     def __post_init__(self):
         if (not isinstance(self.max_groups, int) or isinstance(self.max_groups, bool)
@@ -39,17 +35,14 @@ class GroupBalanceConfig:
                 or not 1 <= self.vjp_chunk_size <= 64):
             raise ValueError("group-vjp-chunk-size must be an integer in [1,64]")
 
-        if self.gru_vmap_mode not in ("fallback", "native", "verify", "sparse", "sparse-verify"):
-            raise ValueError("invalid group-gru-vmap-mode")
 
     @classmethod
     def from_args(cls, args):
-        return cls(args.group_balance, args.group_max_groups, args.group_min_scenarios,
-                   args.group_gradient_epsilon, args.group_vjp_chunk_size,
-                   getattr(args, "group_gru_vmap_mode", "fallback"))
+        return cls(args.group_max_groups, args.group_min_scenarios,
+                   args.group_gradient_epsilon, args.group_vjp_chunk_size)
 
 
-def _group_physics(initial: L2FState) -> torch.Tensor:
+def _group_physics(initial: RaptorState) -> torch.Tensor:
     # These are initial, fixed physical parameters, never Actor observations.
     # Mean rotor times equal each rotor time in the current reference sampler.
     return torch.stack((initial.thrust_to_weight, initial.torque_to_inertia,
@@ -58,7 +51,7 @@ def _group_physics(initial: L2FState) -> torch.Tensor:
 
 
 @torch.no_grad()
-def physics_group_layout(initial: L2FState, config: GroupBalanceConfig):
+def physics_group_layout(initial: RaptorState, config: GroupBalanceConfig):
     """Batched balanced k-d splits in physical space, not trajectory difficulty.
 
     Columns: log(TWR), log(TTI), log(rising time), log(falling time), normalized
@@ -115,8 +108,6 @@ def group_gradient_coefficients(base_weights, initial, config: GroupBalanceConfi
     objective when group gradients are averaged without normalization.
     All initial scenes, including early failures, belong to exactly one row.
     """
-    if not config.enabled:
-        return None, None
     n = initial.position.shape[0]
     if (base_weights.shape != (n,) or base_weights.requires_grad
             or base_weights.device != initial.position.device):
@@ -190,187 +181,7 @@ def normalize_group_rows(rows: torch.Tensor, epsilon: float):
 
 
 
-# Opt-in CUDA batching adapters; never replace the deployed GRU or forward graph.
-_RULE_LOCK = threading.RLock()
-_OP_NAME = "aten::_thnn_fused_gru_cell_backward"
-
-
-def _stack_native_backward(native, grad, workspace, has_bias, *, verify=False):
-    """[groups, scenes, hidden] -> one original elementwise CUDA invocation.
-
-    The workspace is the saved native [scenes, 5*hidden] gate state, not a
-    recomputation. Bias reductions retain the original [scenes, 3*hidden]
-    shape and order per group; NEVER reduce across the group dimension.
-    This helper also permits CPU stand-ins for shape/dispatch tests. Those
-    tests do not establish CUDA arithmetic equivalence or CUDA speed.
-    """
-    if (grad.ndim != 3 or workspace.ndim != 3 or grad.shape[:2] != workspace.shape[:2]
-            or workspace.shape[2] != 5 * grad.shape[2]
-            or grad.dtype != workspace.dtype or grad.device != workspace.device
-            or grad.dtype not in (torch.float32, torch.float64)):
-        raise ValueError("native GRU batching needs matching float32/64 [G,B,H], [G,B,5H]")
-    groups, scenes, hidden = grad.shape
-    if groups < 1 or scenes < 1 or hidden < 1:
-        raise ValueError("native GRU batching needs nonempty dimensions")
-    gi, gh, hx, _, _ = native(
-        grad.reshape(groups * scenes, hidden),
-        workspace.reshape(groups * scenes, 5 * hidden), False,
-    )
-    gi = gi.reshape(groups, scenes, 3 * hidden)
-    gh = gh.reshape(groups, scenes, 3 * hidden)
-    hx = hx.reshape(groups, scenes, hidden)
-    # Keep these small reductions identical to the legacy per-group operator.
-    bi = torch.stack([gi[g].sum(0) for g in range(groups)]) if has_bias else None
-    bh = torch.stack([gh[g].sum(0) for g in range(groups)]) if has_bias else None
-    result = (gi, gh, hx, bi, bh)
-    if verify:
-        references = [native(grad[g], workspace[g], has_bias) for g in range(groups)]
-        for i, actual in enumerate(result):
-            if actual is None:
-                equal = all(row[i] is None for row in references)
-            else:
-                expected = torch.stack([row[i] for row in references])
-                equal = torch.equal(actual, expected)
-            if not equal:
-                raise RuntimeError("native GRU vmap verification failed before Actor gradient publication")
-    return result
-
-
-def _sparse_native_backward(native, grad, workspace, has_bias, *, flags, verify=False):
-    """Exploit disjoint group support ONLY inside the row-local GRU kernel.
-
-    Keep all later [G,B,...] tensors and native parameter/bias reductions in
-    their original shapes. No scene slicing, no rerun, and no changed GEMM
-    reduction order. Validate the support assumption before publishing any
-    Actor gradients. Detection stays on-device until the scope ends.
-    """
-    if (grad.ndim != 3 or workspace.ndim != 2
-            or workspace.shape != (grad.shape[1], 5 * grad.shape[2])
-            or grad.device != workspace.device or grad.dtype != workspace.dtype
-            or grad.dtype not in (torch.float32, torch.float64)):
-        raise ValueError("sparse GRU batching needs [G,B,H] and shared [B,5H]")
-    groups, scenes, hidden = grad.shape
-    if groups < 1 or scenes < 1 or hidden < 1:
-        raise ValueError("sparse GRU dimensions must be nonempty")
-    support = (grad != 0).any(-1)
-    flags.append((support.sum(0) <= 1).all() & torch.isfinite(grad).all()
-                 & torch.isfinite(workspace).all())
-    owner = support.to(torch.int64).argmax(0)
-    selected = grad.gather(0, owner[None, :, None].expand(1, scenes, hidden))[0]
-    gi, gh, hx, _, _ = native(selected, workspace, False)
-    mask = (torch.arange(groups, device=grad.device)[:, None] == owner[None])[:, :, None]
-    gi = torch.where(mask, gi[None], 0.0)
-    gh = torch.where(mask, gh[None], 0.0)
-    hx = torch.where(mask, hx[None], 0.0)
-    bi = torch.stack([gi[g].sum(0) for g in range(groups)]) if has_bias else None
-    bh = torch.stack([gh[g].sum(0) for g in range(groups)]) if has_bias else None
-    result = (gi, gh, hx, bi, bh)
-    if verify:
-        refs = [native(grad[g], workspace, has_bias) for g in range(groups)]
-        for i, actual in enumerate(result):
-            equal = (all(row[i] is None for row in refs) if actual is None else
-                     torch.equal(actual, torch.stack([row[i] for row in refs])))
-            if not equal:
-                raise RuntimeError("sparse GRU vmap verification failed before Actor gradient publication")
-    return result
-
-
-
-def _make_batch_rule(native, *, verify, owner_thread=None, sparse=False, flags=None, allowed_graphs=None, stats=None):
-    """Narrow compatibility adapter for the current FuncTorchBatched dispatcher.
-
-    PyTorch 2.2 lacks the newer public register_vmap helper. Isolate the small
-    private-API dependency here, rather than monkeypatching autograd/GRUCell.
-    Inputs are unwrapped only at the current level. Nested vmap is rejected.
-    """
-    from torch._C import _functorch as ft
-
-    def rule(grad, workspace, has_bias):
-        level = ft.maybe_current_level()
-        if level is None:
-            raise RuntimeError("GRU batching rule invoked outside vmap")
-        gu, gd = ft._unwrap_batched(grad, level)
-        wu, wd = ft._unwrap_batched(workspace, level)
-        if ft.is_batchedtensor(gu) or ft.is_batchedtensor(wu):
-            raise RuntimeError("nested GRU vmap is not supported by this opt-in backend")
-        if gd is None and wd is None:
-            raise RuntimeError("GRU batching rule received no batched input")
-        groups = gu.shape[gd] if gd is not None else wu.shape[wd]
-        gu = gu.movedim(gd, 0) if gd is not None else gu.unsqueeze(0).expand(groups, *gu.shape)
-        shared_workspace = wu if wd is None else None
-        wu = wu.movedim(wd, 0) if wd is not None else wu.unsqueeze(0).expand(groups, *wu.shape)
-        with torch._C._ExcludeDispatchKeyGuard(
-            torch._C.DispatchKeySet(torch._C.DispatchKey.FuncTorchBatched)
-        ):
-            # A temporary registration is process-wide. Other threads retain
-            # ordinary per-group behavior instead of silently opting in.
-            if ((allowed_graphs is not None and torch._C._current_graph_task_id() not in allowed_graphs)
-                    or (allowed_graphs is None and owner_thread is not None
-                        and threading.get_ident() != owner_thread)):
-                columns = [native(gu[g], wu[g], has_bias) for g in range(groups)]
-                result = tuple(None if columns[0][i] is None else
-                               torch.stack([row[i] for row in columns]) for i in range(5))
-            elif sparse:
-                if stats is not None:
-                    stats['calls'] = stats.get('calls', 0) + 1
-                    stats['logical_rows'] = stats.get('logical_rows', 0) + gu.shape[0] * gu.shape[1]
-                    stats['native_rows'] = stats.get('native_rows', 0) + gu.shape[1]
-                if shared_workspace is None:
-                    raise RuntimeError("sparse GRU backend requires an unbatched saved workspace")
-                result = _sparse_native_backward(native, gu, shared_workspace, has_bias,
-                                                 flags=flags, verify=verify)
-            else:
-                if stats is not None:
-                    stats['calls'] = stats.get('calls', 0) + 1
-                    stats['logical_rows'] = stats.get('logical_rows', 0) + gu.shape[0] * gu.shape[1]
-                    stats['native_rows'] = stats.get('native_rows', 0) + gu.shape[0] * gu.shape[1]
-                result = _stack_native_backward(native, gu, wu, has_bias, verify=verify)
-        return tuple(None if x is None else ft._add_batch_dim(x, 0, level) for x in result)
-    return rule
-
-
-@contextmanager
-def native_gru_vmap(mode="fallback", costs=None, stats=None):
-    """Scoped operator registration, always removed on success or failure.
-
-    No override of an upstream batching rule. CPU ordinary GRU does not call
-    the CUDA fused operator; a CPU run is not a validation of this backend.
-    """
-    if mode not in ("fallback", "native", "verify", "sparse", "sparse-verify"):
-        raise ValueError("invalid group-gru-vmap-mode")
-    if mode == "fallback":
-        yield
-        return
-    with _RULE_LOCK:
-        if torch._C._dispatch_has_kernel_for_dispatch_key(_OP_NAME, "FuncTorchBatched"):
-            # An upstream/native rule or outer instance already owns dispatch.
-            # Fail closed rather than replacing unknown semantics.
-            raise RuntimeError("GRU already has a batching rule; use the unchanged fallback backend")
-        native = torch.ops.aten._thnn_fused_gru_cell_backward.default
-        library = torch.library.Library("aten", "IMPL", "FuncTorchBatched")
-        flags = []
-        allowed_graphs = set() if costs is not None else None
-        handle = None
-        try:
-            if costs is not None:
-                # CUDA autograd may execute on a worker thread. Tag the graph
-                # task via the cost hook instead of checking Python thread ID.
-                def tag_graph(gradient):
-                    allowed_graphs.add(torch._C._current_graph_task_id())
-                handle = costs.register_hook(tag_graph)
-            library.impl("_thnn_fused_gru_cell_backward", _make_batch_rule(
-                native, verify=mode in ("verify", "sparse-verify"), owner_thread=threading.get_ident(),
-                sparse=mode.startswith("sparse"), flags=flags, allowed_graphs=allowed_graphs, stats=stats))
-            yield
-            if flags and not bool(torch.stack(flags).all()):
-                raise RuntimeError("sparse GRU requires finite, disjoint per-scene group cotangents")
-        finally:
-            if handle is not None:
-                handle.remove()
-            library._destroy()
-
-
-def _batched_group_vjp(costs, parameters, seeds, *, retain_graph, gru_vmap_mode="fallback", gru_vmap_stats=None):
+def _batched_group_vjp(costs, parameters, seeds, *, retain_graph):
     """Vectorize the existing graph's VJP with modern vmap, preserving None."""
     active = []
 
@@ -387,11 +198,7 @@ def _batched_group_vjp(costs, parameters, seeds, *, retain_graph, gru_vmap_mode=
         # placeholder below: unused parameters must not acquire zero .grad/Adam.
         return tensors if tensors else (seed.new_zeros(()),)
 
-    if gru_vmap_mode == "fallback":
-        batched = iter(torch.vmap(vjp)(seeds))
-    else:
-        with native_gru_vmap(gru_vmap_mode, costs, gru_vmap_stats):
-            batched = iter(torch.vmap(vjp)(seeds))
+    batched = iter(torch.vmap(vjp)(seeds))
     return tuple(next(batched) if used else None for used in active)
 
 
@@ -413,7 +220,6 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
         raise FloatingPointError("nonfinite group costs or coefficients")
     groups = coefficients.shape[0]
     chunks, used, calls = [], [False] * len(parameters), 0
-    gru_stats = {}
     for start in range(0, groups, config.vjp_chunk_size):
         end = min(start + config.vjp_chunk_size, groups)
         seeds = gradient_scale * coefficients[start:end]
@@ -421,8 +227,7 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
             raise FloatingPointError("nonfinite group VJP seeds")
         if end - start > 1:
             gradients = _batched_group_vjp(
-                costs, parameters, seeds, retain_graph=end < groups,
-                gru_vmap_mode=config.gru_vmap_mode, gru_vmap_stats=gru_stats)
+                costs, parameters, seeds, retain_graph=end < groups)
         else:
             gradients = torch.autograd.grad(
                 costs, parameters, grad_outputs=seeds[0], allow_unused=True,
@@ -445,6 +250,5 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
         size = parameter.numel()
         result.append(combined[offsets:offsets + size].reshape_as(parameter) if active else None)
         offsets += size
-    report.update(group_count=groups, vjp_calls=calls, vjp_chunk_size=config.vjp_chunk_size,
-                  gru_vmap_mode=config.gru_vmap_mode, gru_vmap_stats=gru_stats)
+    report.update(group_count=groups, vjp_calls=calls, vjp_chunk_size=config.vjp_chunk_size)
     return result, report

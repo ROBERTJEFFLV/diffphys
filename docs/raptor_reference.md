@@ -1,214 +1,65 @@
-# Reference environment and motor contract (v3)
+# Physics provenance and deliberate differences
 
-This is the current environment contract. It supersedes the scene, motor and
-checkpoint semantics in `response_control_v1.md`. No historical runs are relabeled.
+Upstream references retained for reproducibility:
 
-## Source pins and precedence
+- `arplaboratory/learning-to-fly` at `d07592d5c5dea3c90954d2be6f04cfa68581ebe8`.
+- `rl-tools/rl-tools` at `e43ae4bcda4556321a63f4eb5dcc826cd637aa39`, pinned by
+  `rl-tools/raptor` at `2c789dfcf16cc96fe697704492b3bf79dd2cc5a0`.
 
-- RAPTOR paper: Eschmann et al., *RAPTOR: A foundation policy for quadrotor control*,
-  Science Robotics 11, eaec1481 (2026), Materials and Methods, printed page 11.
-  DOI: https://doi.org/10.1126/scirobotics.aec1481
-- RAPTOR repository: https://github.com/rl-tools/raptor/tree/2c789dfcf16cc96fe697704492b3bf79dd2cc5a0
-- Its **pinned** implementation: https://github.com/rl-tools/rl-tools/tree/e43ae4bcda4556321a63f4eb5dcc826cd637aa39
-- 2024 L2F baseline: https://github.com/arplaboratory/learning-to-fly/tree/d07592d5c5dea3c90954d2be6f04cfa68581ebe8
+Relevant upstream files are `src/foundation_policy/pre_training/sample_dynamics_parameters.cpp`,
+`include/rl_tools/rl/environments/l2f/operations_generic/10_sample_initial_parameters.h`,
+`30_sample_initial_state.h`, `40_observe.h`, `60_dynamics.h`,
+`70_post_integration.h`, `parameters/default.h`, and the Crazyflie dynamics
+registry. License attribution remains in `THIRD_PARTY_NOTICES.md`.
 
-Use the RAPTOR **paper** where initialization conflicts with current source.
-The source's `sample_orientation(limit,...)` ignores `limit`; v3 explicitly uses
-pi/2 instead of copying the accidental 1-radian limit. The posttraining helper
-restores a legacy +/-0.5 m initialization; v3 instead uses the paper's +/-10*l_arm.
-There is no parameter whose value is merely logged but ignored.
+The sole runtime simulator is now `env_raptor.py`. The L2F fixed-airframe profile,
+profile selector and training entry were removed, not merely disabled. References
+to L2F here document inherited physics; they do not expose another training mode.
 
-The paper states 10% target-state guidance. In the RAPTOR profile this zeroes
-position, velocity and body rate and sets the quaternion to identity. The paper
-does not give a universal motor target value; rotor states and action-history
-initialization follow the source separately, not a manufactured hover command.
+The retained multi-airframe distribution samples mass by cubing a uniform sample
+between cbrt(.02) and cbrt(5) kg^(1/3), thrust/weight uniformly in [1.5,5],
+torque/inertia in [40,1200], rotor moment coefficient in [.005,.05], rise time in
+[.03,.10] s and fall time in [.03,.30] s. The four rotors share the sampled moment
+coefficient and rise/fall times. Thrust curves, geometry and inertia are coupled
+by the upstream sampling formulas, not independently randomized without units.
+The geometry multiplier uses the source Normal(-.1,.1) reciprocal transform.
 
-## Profiles
+The base normalized-motor thrust polynomial is (.00352526,.01437313,.09223048).
+Its scale is chosen to match sampled thrust/weight. Joint RK4 integrates position,
+world velocity, Hamilton-wxyz quaternion, body angular velocity and actual motor
+states, using asymmetric first-order motor time constants inside all four stages.
+The quaternion is normalized after the step; source numerical state bounds and
+motor saturation are retained. Actions are absolute [-1,1] commands, not
+hover-centered residuals. Axis convention is FLU, X-frame FR/BR/BL/FL.
 
-### `raptor`: multi-airframe
+Deliberate differences already present in parent source c15ca418 are preserved:
+random-axis attitude angles are uniform up to pi/2 (paper-first), rather than
+copying the pinned upstream sampling bug that ignores the angle limit; termination
+is position-only per-axis strict exceedance, not the original paper's additional
+velocity/omega thresholds. Initial position bounds are 10 times rotor radius and
+termination bounds 20 times radius. Initial velocities/omegas are sampled in
+[-1,1]; 10% guidance scenes zero the kinematics. Initial motor coordinates are
+uniform in [0,.5], independent of the guidance override.
 
-Initialization, per axis: position U[-10*l_arm,10*l_arm], velocity U[-1,1] m/s,
-body rate U[-1,1] rad/s. The rotation axis is uniform on the sphere; the rotation
-angle is uniform in [0,pi/2]. Kinematic guidance probability is 0.1. The center-to-
-rotor distance is `l_arm`, NOT the x/y coordinate of a rotor in an X frame.
+The current disturbance distribution is an intentional change: source unbounded
+constant force is replaced, four requested uncertainty mechanisms are enabled,
+and all share a bounded budget. See `disturbance_budget.md` for the equations and
+the explicit limits of the certificate. Sensor attitude is now an SO(3) error,
+not additive independent rotation-matrix elements. Hidden execution error does
+not overwrite the known previous command. The Actor, true dynamics equations,
+physical-group normalization, task/Huber/CVaR loss, Time Decay rule, Adam and
+failure handling are retained. `tests/core_contract.json` checks unchanged
+mathematical kernels against parent source, while independent numerical tests
+cover the new interfaces.
 
-Failure limits: position +/-20*l_arm, velocity +/-2 m/s, body rate +/-35 rad/s;
-strict `>` comparisons. No fixed 1 m box is applied to every airframe.
+Removing source-specific random draws changes the old sampler's exact RNG
+sequence. New same-seed runs are internally deterministic and noise-independent
+for airframe/initial-state sampling, but are not claimed to reproduce old
+same-seed banks bit for bit. Old checkpoint resume/evaluation require their original source and
+are rejected by this protocol rather than silently migrated. The explicit
+weights-only `--init-checkpoint` can reuse an interface-compatible Actor, with
+fresh Adam and the new environment; it restores no legacy runtime.
 
-The source distribution is translated from
-`src/foundation_policy/pre_training/sample_dynamics_parameters.cpp` and
-`include/rl_tools/rl/environments/l2f/operations_generic/10_sample_initial_parameters.h`:
-
-- Sample cube-root mass uniformly between cube-root(0.02) and cube-root(5.0),
-  then cube it. Sample thrust-to-weight uniformly in [1.5,5.0].
-- Scale the source Crazyflie coefficients `(0.00352526,0.01437313,0.09223048)`
-  together so that max total thrust equals TWR*m*g. Motor states are in [0,1].
-- Sample the upstream torque-to-inertia root in [40,1200], preserve the base
-  inertia ratios, and apply the source mass/size deviation construction.
-  The source uses Normal(mean=-0.1,std=0.1) followed by a reciprocal mapping;
-  this is preserved, not replaced by a bounded uniform deviation.
-- Independently sample rising motor delay in [0.03,0.10] s and falling delay
-  in [0.03,0.30] s. Falling may be faster than rising. All four motors on one
-  sampled airframe share these constants, as in the default generator.
-- Sample torque coefficient in [0.005,0.05]. No old alpha/eta clipping or
-  4x4 authority stratification changes the resulting distribution.
-- Force standard deviation is `U(0,0.3*(TWR-1))*TWR*m/3`, followed by independent
-  zero-mean Gaussian forces per world axis. This is the source formula, including
-  its absence of an extra gravity factor. Force remains constant per episode.
-- Source-default observation noise and external-torque standard deviations are
-  zero. A configuration boolean named OBSERVATION_NOISE is not evidence of a
-  nonzero numerical standard deviation. Historical archived JSON files could
-  differ; this port targets the checked source generator, not an unverified archive.
-- Rotor state initialization is independently uniform in [0,0.5], equivalent to
-  normalized action range [-1,0]. Initial action history is mapped from those
-  rotor states, as in `30_sample_initial_state.h`.
-
-The source nominal mass is 0.0306 kg, rotor coordinates are (+/-.028,+/-.028,0),
-and principal inertia is `(9.416556729130406e-6, 9.644051701582312e-6,
-1.745951732253285e-5)` kg*m^2. The base body frame and axis inertia ratios are
-retained while scaling. The sampled torque/inertia root is not the same numeric
-quantity as a two-rotor maximum roll acceleration; do not silently equate them.
-
-### `l2f`: single Crazyflie baseline
-
-This profile uses the 2024 source defaults, **not** the newer RAPTOR nominal model:
-
-- Mass 0.027 kg; X rotor coordinates (+/-.028,+/-.028,0) m.
-- J=(3.85e-6,3.85e-6,5.9675e-6) kg*m^2; torque coefficient 0.005964552.
-- Physical RPM in [0,21702], thrust `3.16e-10*RPM^2`, time constant 0.15 s.
-- Initial RPM 10851 on all rotors; normalized action history zero. This produces
-  about 56% of body weight, NOT hover. No equilibrium recentering is applied.
-- Initial position each axis +/-0.2 m; velocity and body rate each axis +/-1.
-  Uniform quaternions are rejected outside a 90-degree rotation ball. Exact pi/2
-  is used for 90 degrees rather than the source's rounded `3.14/2`.
-  The original 10% guidance branch zeroes position/attitude only; velocity and
-  body rate remain randomized, unlike the RAPTOR paper protocol.
-- Failure boundaries: +/-0.6 m, +/-1000 m/s, +/-1000 rad/s.
-- Independent Gaussian observation noise: position .001 m, velocity .002 m/s,
-  **each of the nine rotation-matrix entries** .001, body rate .002 rad/s.
-  Rotation-entry noise is not an angle in radians and is never applied to truth.
-- Constant episode force std `.027*9.81/20` N and torque std `.027*9.81/10000` Nm
-  on each axis; world force and body torque. No extra environment action noise.
-
-Source: `src/config/parameters.h`, `simulator/parameters/init/default.h`,
-`simulator/parameters/dynamics/crazy_flie.h`, and `simulator/operations_generic.h`
-under `include/learning_to_fly/` where applicable.
-
-## Native motor and integration semantics
-
-Actor output `a` is clipped to [-1,1], then mapped to the source motor input:
-`u = u_min + (a+1)/2*(u_max-u_min)`.
-The lagged motor state obeys `dm/dt=(u-m)/tau`, with rising/falling tau selected
-at each RK4 stage. Thrust is `c0+c1*m+c2*m^2`. No per-airframe inverse-thrust map,
-hover offset, mass-dependent command centering or torque-authority normalization
-is inserted between Actor output and the motors.
-
-FLU X ordering is `[front-right,back-right,back-left,front-left]` with spin signs
-`[-,+,-,+]`. Body torque is computed from `r x F` and the source yaw coefficients.
-The state is advanced by joint RK4 of position, velocity, Hamilton quaternion,
-body rate and motors, with quaternion normalization and motor-range clipping
-only after the RK4 step. RAPTOR numerical p/v/omega clamps +/-100000 are distinct
-from its much smaller episode boundaries. The source quaternion double-cross
-rotation and Newton-Euler gyroscopic term are retained. No drag/map/collision
-physics has been added under the reference label.
-
-## Noise, adjoints and evaluation
-
-A local CPU generator creates each bank without changing optimizer RNG. Noise
-is pre-sampled for H+1 observations; true physical states and loss targets remain
-noise-free. The tape is indexed by the integer physical step, so re-observation
-of a window boundary uses exactly the same sample. Reverse-window recomputation
-has no fresh random draws and shares the immutable tape instead of cloning it
-at every boundary. Noise/force samples are fixed in paired EVAL, independent of
-TRAIN batch size. Float32/float64 and device placement are preserved.
-
-Only the matching reference metric prefix is published. `l2f_*` cannot be
-computed on a RAPTOR bank with the wrong box. A bank starting outside its own
-reference limits is rejected. Reference episode length counts transitions up
-to and including the first failure. TRAIN and EVAL stop each aircraft there;
-other aircraft continue to their own first failure or the horizon cap. No failed
-row is reset or passed back into Actor/RK4. Frozen storage padding is marked by
-`TaskTrajectory.valid` and excluded from costs and statistics. BPTT remains
-complete on each executed prefix; reverse windows verify the same validity mask.
-L2F's 200 mm settling statistic retains its source final-distance convention.
-
-## Failure cost accounting
-
-For each scene with first failure at transition X and horizon cap H, add
-`(dead_cost*(H-X) + terminal_cost)/H`. Defaults are 3 and 200 in **raw**
-units. A scene reaching H without crossing has zero extra cost; crossing on H
-still incurs `200/H`. Both L2F and RAPTOR profiles use this explicitly configured
-DiffPhys objective; these coefficients are not claimed to reproduce either
-source reward or its discounted return.
-
-The total is booked once on the valid crossing transition. No penalty is attached
-to frozen padding and no additional physical step is executed. Absolute time
-indices retain exactly the same cost when H50 windows are recomputed. The extra
-cost is not Huber-transformed or multiplied by the last-100-step steady bonus.
-For H=500 and X=19, the added cost is `(481*3+200)/500 = 3.286`.
-
-Mean/CVaR weights are selected from each scene's state/action cost **plus** its
-failure cost. The score-only constants have no direct parameter gradient at a
-fixed termination pattern, but can change which existing scene gradients get
-the additional CVaR weight. Full and windowed BPTT still differentiate every
-executed transition. No soft boundary loss, likelihood-ratio gradient, Critic,
-new clipping rule or optimizer change is introduced.
-
-`task_components.dead` and `task_components.terminal` report the weighted
-contributions in both TRAIN and EVAL. Other component definitions remain unchanged and their sum includes this
-new component. `--dead-cost` and `--terminal-cost` configure the raw values;
-nonfinite/negative values are rejected, and setting both to zero disables them.
-They are persisted by the existing loss binding. Old v3 checkpoint loss dictionaries
-without the fields are evaluated with both set to zero; an EVAL `loss_config`
-records the actual values. This does not relax exact resume or motor compatibility.
-
-The 3:200 ratio follows the requested 1.5:100 ratio, not a theorem that prevents
-all early-termination incentives. In particular, existing state costs and the
-steady-window emphasis can exceed this accounting. Increased survival and
-better control must be verified together in a separate training experiment.
-
-## Checkpoints and remaining experimental differences
-
-Schema `response-actor-only-reference-v3` and architecture
-`response-conditioned-absolute-motor-policy-v3` intentionally reject older
-checkpoints at **all** public load paths, including weights-only initialization.
-The environment contract and source hash are bound separately, so metric-only
-rescoring cannot quietly swap a different physical environment. Exact resume
-still requires full source/config identity, named Adam state and RNG. EVAL count
-is independently bound through `--eval-scenarios`.
-
-This revision implements the five requested environment/motor changes. It does
-not replace Actor-only BPTT with teacher distillation or silently change the
-Huber/CVaR terms or weights. Only post-termination padding is excluded; the
-original fixed-horizon normalization and steady window remain. The failure
-accounting described above adds constants to the stopped episode score without
-adding post-failure physics or differentiating discrete events. Its coefficient
-choice is a first-run setting, not validated convergence or an ordering guarantee.
-Absolute-yaw objectives, Langevin reference tracking,
-1000 frozen published teacher airframes and the seven held-out real models are
-not reproduced. The current control features are still the original response-
-conditioned features, not RAPTOR's network. Matching these environment conditions
-therefore does not by itself establish full task/experiment equivalence or equal
-adaptation performance. In particular, yaw recovery requires separate objective
-and observation work before a zero-yaw performance claim.
-
-The Python and C++ RNG streams are not byte-identical; distribution equality is
-not equality of the original 1000 sampled parameter files. Fresh TRAIN airframes
-are drawn per update, while fixed EVAL seeds are held out. No archived datasets
-or real flight results have been relabeled, and no deployment is authorized.
-
-## Verification
-
-`tests/test_reference_environment.py` checks initial-state support and guidance,
-per-airframe limits, X torque signs, non-universal hover, parameter relationships,
-noise statistics and RNG isolation, independent NumPy RK4 agreement, finite-
-difference action Jacobians, full/windowed BPTT and Adam agreement, and metric
-failure semantics. `tests/test_reference_training.py` checks bounded updates,
-exact resume, separate EVAL count, stored-protocol evaluation, legacy-checkpoint
-rejection and failure rollback. These are correctness checks, not performance
-experiments. CUDA throughput and real-flight adaptation require separate tests.
-
-`tests/test_failure_costs.py` checks the numeric schedule, final-step failure vs
-timeout, window additivity, unchanged gradients with fixed CVaR weights, failure
-selection and component reconciliation. `tests/test_failure_cost_compatibility.py`
-checks new/legacy checkpoint loss semantics and exact resumed updates.
+Historical material in `reference/`, `物理配置/` and `docs/images/` is retained as
+provenance, not imported or invoked by the training chain. Other Git branches are
+untouched. Former runtime code and documentation remain in Git history.
