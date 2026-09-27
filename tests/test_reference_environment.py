@@ -37,7 +37,7 @@ def _numpy_step(s, action):
 @pytest.mark.parametrize('noisy',[False,True])
 def test_rk4_matches_independent_numpy(noisy):
     sim=RaptorSimulator();s=sim.reset(1,seed=230,horizon=25,dtype=torch.float64,
-             disturbances=DisturbanceConfig(budget=.1 if noisy else 0,pool=(0,0,0,0,1)))
+             disturbances=DisturbanceConfig(enabled=noisy))
     for i in range(25):
         a=s.motor.new_tensor([[.15*math.sin(i),.12,-.2,.35]])
         reference=_numpy_step(s,executed_command(s,a))
@@ -49,7 +49,7 @@ def test_rk4_matches_independent_numpy(noisy):
 @pytest.mark.parametrize('noisy',[False,True])
 def test_actual_motor_action_jacobian_matches_finite_differences(noisy):
     sim=RaptorSimulator();s=sim.reset(2,seed=7,horizon=2,dtype=torch.float64,
-                         disturbances=DisturbanceConfig(budget=.1 if noisy else 0))
+                         disturbances=DisturbanceConfig(enabled=noisy))
     action=s.motor.new_full(s.motor.shape,.15).requires_grad_()
     def output(u):
         out=sim.step(s,u)

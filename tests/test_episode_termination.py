@@ -33,14 +33,16 @@ class CountingSimulator(RaptorSimulator):
         position=torch.cat((state.position[:,:1]+1,state.position[:,1:]),-1)
         return replace(state,position=position,velocity=state.velocity+.02*action[:,:3],
                        omega=.95*state.omega+.1*action[:,:3],motor=.9*state.motor+.1*(action+1)/2,
-                       previous_action=action,previous_velocity=state.velocity,step_index=state.step_index+1)
+                       previous_action=action,
+                       previous_velocity=torch.cat((state.velocity[:,None],state.previous_velocity[:,:-1]),1),
+                       step_index=state.step_index+1)
 
 
 def scheduled(lengths,horizon,dtype=torch.float64):
     s=RaptorSimulator().reset(len(lengths),seed=7,dtype=dtype,horizon=horizon,
-                             disturbances=DisturbanceConfig(budget=0))
+                             disturbances=DisturbanceConfig.clean())
     return replace(s,position=torch.zeros_like(s.position),velocity=torch.zeros_like(s.velocity),
-                   previous_velocity=torch.zeros_like(s.velocity),omega=torch.zeros_like(s.omega),
+                   previous_velocity=torch.zeros_like(s.previous_velocity),omega=torch.zeros_like(s.omega),
                    position_limit=s.mass.new_tensor(lengths)-.5,
                    mass=torch.arange(1,len(lengths)+1,dtype=dtype))
 

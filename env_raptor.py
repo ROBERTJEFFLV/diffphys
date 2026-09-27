@@ -1,6 +1,6 @@
 """Multi-airframe RAPTOR dynamics: absolute motor commands, joint RK4, FLU X frame.
 
-Only this physical family is supported. Observation/actuation uncertainty is
+Only this physical family is supported. Measurement uncertainty is
 isolated in response_noise; true-state costs and rigid-body equations stay clean.
 """
 from __future__ import annotations
@@ -11,9 +11,9 @@ import torch
 import torch.nn.functional as F
 
 from response_noise import (DisturbanceConfig, attach_disturbances, executed_command,
-                            NOISE_VERSION)
+                            NOISE_VERSION, VELOCITY_HISTORY_STEPS)
 
-ENVIRONMENT_VERSION = "raptor-multi-airframe-bounded-v3"
+ENVIRONMENT_VERSION = "raptor-multi-airframe-gaussian-v4"
 ACTION_CONVENTION = "absolute-normalized-motor-FR-BR-BL-FL-FLU-v1"
 IMMUTABLE_TAPES = ("noise_tape", "rotation_tape")
 RAPTOR_SOURCE = "e43ae4bcda4556321a63f4eb5dcc826cd637aa39"
@@ -33,7 +33,7 @@ def environment_contract(params: RaptorParams) -> dict:
             "action_convention": ACTION_CONVENTION,
             "integrator": "joint-rk4-quaternion-normalization",
             "initialization": "raptor-paper-90deg-size-scaled", "source": RAPTOR_SOURCE,
-            "noise": NOISE_VERSION, "action_history": "command-not-hidden-execution",
+            "noise": NOISE_VERSION, "action_history": "known-command-zero-reset-v2",
             "termination": "position-only-per-axis-strict-exceedance-v1"}
 
 
@@ -56,7 +56,7 @@ class RaptorState:
     motor: torch.Tensor
     previous_action: torch.Tensor  # Last known command, NOT hidden execution noise.
     external_force: torch.Tensor  # Episode-constant world force.
-    external_torque: torch.Tensor # Episode-constant body torque.
+    external_torque: torch.Tensor # Zero in this protocol; retained in the rigid-body kernel.
     mass: torch.Tensor
     inertia: torch.Tensor
     rotor_positions: torch.Tensor
@@ -72,13 +72,13 @@ class RaptorState:
     initial_position_limit: torch.Tensor
     position_limit: torch.Tensor
     guidance: torch.Tensor
-    noise_tape: torch.Tensor      # Immutable ORIGINAL pool [N,H+1,16], or [N,1,16].
+    noise_tape: torch.Tensor      # Immutable ORIGINAL pool [N,H+1,12], or [N,1,12].
     rotation_tape: torch.Tensor   # Precomputed SO(3) errors: no trigonometric kernels in step.
     noise_row: torch.Tensor       # Stable row ID: compacting live states never copies the tape.
-    noise_bounds: torch.Tensor
-    noise_fraction: torch.Tensor
+    noise_std: torch.Tensor       # Hidden diagnostic metadata, not an observation.
+    force_std: torch.Tensor
     velocity_delay: torch.Tensor
-    previous_velocity: torch.Tensor  # Differentiable world-velocity history, one control step.
+    previous_velocity: torch.Tensor  # [N,3,3]: world v[t-1], v[t-2], v[t-3], differentiable.
     step_index: torch.Tensor
 
     @property
@@ -149,22 +149,24 @@ class RaptorSimulator:
         velocity[guidance] = 0
         omega[guidance] = 0
         q[guidance] = q.new_tensor((1,0,0,0))
+        # The sampled motor state is hidden. Do not encode it in command history.
         motor = uniform(0., .5, (n,4))
         zero = torch.zeros((n,3), dtype=dtype)
         state = RaptorState(
             position=position, velocity=velocity, orientation=q, omega=omega, motor=motor,
-            previous_action=2*motor-1, external_force=zero, external_torque=zero,
+            previous_action=torch.zeros_like(motor), external_force=zero, external_torque=zero,
             mass=mass, inertia=inertia, rotor_positions=rotor_positions,
             thrust_coefficients=coefficients, rotor_torque_constant=km,
             motor_time_rising=rising, motor_time_falling=falling,
             motor_min=constant(0), motor_max=constant(1), arm_length=math.sqrt(2)*xy,
             thrust_to_weight=tw, torque_to_inertia=tti,
             initial_position_limit=initial_limit, position_limit=2*initial_limit,
-            guidance=guidance.to(dtype), noise_tape=torch.zeros(n,1,16,dtype=dtype),
+            guidance=guidance.to(dtype), noise_tape=torch.zeros(n,1,12,dtype=dtype),
             rotation_tape=torch.eye(3,dtype=dtype).expand(n,1,3,3).clone(),
-            noise_row=torch.arange(n), noise_bounds=torch.zeros(n,16,dtype=dtype),
-            noise_fraction=torch.zeros(n,8,dtype=dtype), velocity_delay=constant(0),
-            previous_velocity=velocity, step_index=torch.zeros(n,dtype=torch.long))
+            noise_row=torch.arange(n), noise_std=torch.zeros(n,12,dtype=dtype),
+            force_std=constant(0), velocity_delay=constant(0),
+            previous_velocity=velocity[:, None, :].expand(n, VELOCITY_HISTORY_STEPS, 3).clone(),
+            step_index=torch.zeros(n,dtype=torch.long))
         state = attach_disturbances(state, disturbances, seed=seed ^ 0x5A17C9E3, horizon=horizon)
         return state.to(device, dtype)
 
@@ -216,7 +218,9 @@ class RaptorSimulator:
         p,v,w = (x.clamp(-100000,100000) for x in (p,v,w))
         m = torch.maximum(state.motor_min[:, None], torch.minimum(state.motor_max[:, None],m))
         return replace(state, position=p, velocity=v, orientation=q, omega=w, motor=m,
-                       previous_action=command, previous_velocity=state.velocity,
+                       previous_action=command,
+                       previous_velocity=torch.cat((state.velocity[:, None, :],
+                                                    state.previous_velocity[:, :-1, :]), 1),
                        step_index=state.step_index+1)
 
     @staticmethod

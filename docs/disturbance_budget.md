@@ -1,248 +1,170 @@
-# Joint bounded disturbance protocol
+# Gaussian measurement and RAPTOR force protocol
 
-This is the implemented protocol, not an experimental roadmap. All equations
-below describe `response_noise.py` and the sole multi-airframe training path.
-The normalizer is **two-sided static hover actuator reserve plus an explicitly
-specified reference error model**. No region of attraction of the learned
-recurrent Actor has been established. Consequently “10%” must not be described
-as 10% of a proven closed-loop recovery basin or a deployment safety guarantee.
+The filename is retained for existing links. The former joint <=10% uniform
+budget is **removed**. This document describes the current, single TRAIN/EVAL
+protocol, not a claim about a learned region of attraction.
 
-## Classification and percentage sampling
+## Final configuration and time semantics
 
-| Physics-dependent per aircraft | Common across aircraft in the same pool |
-|---|---|
-| Episode-constant world force | Position measurement error, metres |
-| Episode-constant body torque, three distinct axes | World-velocity measurement error, m/s |
-| Normalized motor-command execution error | SO(3) attitude measurement error, radians |
-| | Body angular-velocity measurement error, rad/s |
-| | Velocity observation delay, seconds |
+At 100 Hz, independent acquired-sample Gaussian standard deviations are:
 
-Command normalization does not remove differing thrust-curve derivatives and
-actuator margins. A fixed action-noise amplitude cannot certify the same relative
-physical load for all aircraft. This corrects the earlier proposed fixed action
-sigma. Likewise, a single torque-to-inertia scalar does not certify yaw authority.
+| Signal | sigma per scalar axis | Coordinates |
+|---|---:|---|
+| Position | 0.001 m | World |
+| Linear velocity | 0.002 m/s | World, then delayed |
+| Attitude | 0.001 rad | Three-dimensional rotation vector |
+| Angular velocity | 0.002 rad/s | Body |
 
-The pool has five weights for severity levels `0, .25, .50, .75, 1`. The weights
-are normalized by `torch.multinomial`. For each episode, sample a level `s`, set
-`b = s * disturbance_budget`, and sample a simplex `w` over the eight components
-(force, torque, action, position, velocity, attitude, omega, delay). Implement the
-simplex by independent exponential samples `-log(U)` divided by their sum.
-Component fractions are `rho_k = b*w_k`; hence `sum(rho_k) <= .10` deterministically.
-A small floating-point safety margin is applied before casting to FP32.
-Default equal pool weights yield 20% fully clean episodes and 20% at each other
-**total** budget. Pool membership is not a physical group and is not exposed to
-the policy; every physical group sees the same sampling law.
+Each episode also samples a constant external world-force vector using the pinned
+RAPTOR formula and a constant velocity latency from Uniform(0.010,0.030) seconds.
+No external-torque noise, motor-command noise or transient-force schedule is enabled.
+The existing external_torque state field stays zero to preserve the rigid-body kernel.
 
-Both classes use the same function:
+These sigmas are **discrete 100 Hz measurement values**, not noise densities.
+The L2F code reference is `arplaboratory/learning-to-fly` at
+`d07592d5c5dea3c90954d2be6f04cfa68581ebe8`, `src/config/parameters.h`:
+position/orientation/linear_velocity/angular_velocity scales are
+0.001/0.001/0.002/0.002. Its `OrientationRotationMatrix` observation adds noise to
+nine matrix entries. Our SO(3) model is an intentional modeling choice, not an
+exact reproduction of that covariance or an empirically calibrated sensor model.
 
-`sample_bounded(bound, generator, steps=None) = bound * Uniform[-1,1]`.
+RAPTOR reports that 10-30 ms delayed linear velocity reproduces certain z-axis
+oscillations. That diagnosis does not establish a uniform latency law or prove
+that training on it is stable. The uniform range is an explicit experiment design.
+No 7-sigma/10%-reserve safety interpretation remains.
 
-The bound is an SI or command-space capacity multiplied by its normalized
-fraction. Force and torque have one vector per episode. Measurement and action
-errors have one bounded vector per timestep. Delay is a nonnegative fraction of
-its capacity and stays fixed during an episode. There is no Gaussian tail, jitter,
-dropout, hidden bias process, different simulator, or additional training branch.
-Airframe randomness and nuisance randomness use independent local CPU generators.
-For reproducible comparisons, the same bank seeds preserve airframe/initial-state
-samples when the disturbance configuration changes.
+## External force: source-faithful numerical law
 
-## Exact actuator reserve
-
-For rotor i, write thrust as `f_i(m) = c0_i + c1_i*m + c2_i*m^2`, where the retained
-RAPTOR motor coordinate is [0,1]. Nonzero minimum thrust c0 is included. Let B map
-rotor thrust to collective force and body torque:
+Let m be the sampled mass in kg and TWR its thrust-to-weight ratio. Draw
 
 ```
-B = [  1       1       1       1    ]
-    [  y0      y1      y2      y3   ]
-    [ -x0     -x1     -x2     -x3   ]
-    [ -km0    +km1    -km2    +km3  ]
-Q = inverse(B)
-f_hover = Q @ [m*g, 0, 0, 0]
-h_i = min(f_hover_i - f_min_i, f_max_i - f_hover_i)
+r ~ Uniform(0, 0.3 * max(TWR - 1, 0))
+sigma_F = r * TWR * m / 3
+F_ext,j ~ Normal(0, sigma_F^2), independently for j=x,y,z.
 ```
 
-Every sampled aircraft must have finite, positive h_i. Otherwise sampling fails
-explicitly; it never silently creates an impossible hover task. All capacity
-calculations use FP64 at reset. The existing float32/float64 rollout is unchanged.
+Keep F_ext constant during the episode and add F_ext/m to the world acceleration.
+The source formula does not multiply by gravity; this implementation deliberately
+copies its numerical convention instead of silently correcting or reinterpreting it.
+For m<=5 and TWR<=5, sigma_F<=10 in the simulator's force units. This bounds sigma,
+**not samples**. There is no clipping, rejection of large finite forces, or guarantee
+that every sampled combination is recoverable. Division by 3 does not truncate a
+Gaussian. Source-faithful distribution does not mean identical C++/PyTorch RNG bits.
 
-### External force
+Official pin: `rl-tools/rl-tools@e43ae4bcda4556321a63f4eb5dcc826cd637aa39`, referenced
+by the `rl-tools/raptor` submodule. Source locations:
 
-Let `C_F = min_i h_i / abs(Q_i0)`. Sample each world-force component with bound
-`rho_F*C_F/sqrt(3)`, so `||F_ext|| <= rho_F*C_F`.
-For static position holding, the required collective is
-`T_req = ||m*g*e_z - F_ext||`. The reverse triangle inequality gives
-`abs(T_req-m*g) <= ||F_ext||`, so this load uses at most `rho_F*h_i` of every
-rotor's reserve. Required tilt is implicit in this static trim, not an assumption
-that the aircraft can counter a horizontal force without tilting.
+- `src/foundation_policy/pre_training/sample_dynamics_parameters.cpp`: sets
+  `disturbance_force_max=0.3` and the airframe support.
+- `include/rl_tools/rl/environments/l2f/operations_generic/10_sample_initial_parameters.h`:
+  samples the multiplier and computes `multiplier*TWR*mass/3`.
+- `.../30_sample_initial_state.h`: samples three Gaussian force components.
+- `.../60_dynamics.h`: applies `state.force / mass`.
+- `.../70_post_integration.h`: copies each force component to the next state.
 
-The prior episode-constant Gaussian force is replaced by this bounded draw.
-Keeping that unbounded force while constraining only the four newly requested
-mechanisms would not bound the overall training disturbance.
+RAPTOR first creates a finite teacher/airframe population. DiffPhys continues to
+resample multi-airframe training banks, so matching the conditional force law is
+not a claim to reproduce RAPTOR's teacher population, training algorithm or logs.
 
-### External torque
+## Causal measurement model
 
-For body axis j, define
-
-`C_tau_j = min_i h_i / (3*abs(Q_i,j+1))`, ignoring zero denominator entries.
-
-Sample `tau_ext_j` in `[-rho_tau*C_tau_j, +rho_tau*C_tau_j]`. Then
-
-`abs(sum_j Q_i,j+1*tau_ext_j) <= rho_tau*h_i`.
-
-The factor 3 explicitly covers simultaneous roll, pitch and yaw box corners.
-The torque is added to the true rotational dynamics, never to gyro observations.
-It stays fixed in body coordinates throughout the episode and is hidden from
-the Actor. Yaw uses its actual km coefficients rather than roll/pitch TTI.
-
-### Action execution error
-
-For normalized command u in [-1,1], `m(u) = m_min + (u+1)*(m_max-m_min)/2`.
-Its maximum thrust sensitivity over the valid motor range is
-
-`L_i = (m_max-m_min)/2 * (c1_i + 2*c2_i*m_max)`.
-
-Define `C_u_i = h_i/L_i` and sample
-`delta_u_i in [-rho_u*C_u_i, +rho_u*C_u_i]`.
-Monotonicity, the mean-value theorem and the non-expansiveness of clipping imply
-`abs(f(m(clip(u+delta_u)))-f(m(u))) <= rho_u*h_i` for any command in [-1,1].
-The bound is for the commanded thrust map; it is not an assertion that a
-transient motor state or arbitrary aggressive maneuver is at static equilibrium.
-
-Execution order is known command -> bounded error -> clip [-1,1] -> motor mapping
--> existing asymmetric first-order motor response -> joint RK4.
-`previous_action` and action smoothness costs contain the **known command**, not
-the corrupted execution or motor truth. Otherwise unobservable actuator error
-would leak into the deployable observation. Noise is not TD3/SAC exploration.
-
-Combined force, torque and commanded thrust error use no more than
-`(rho_F + rho_tau + rho_u)*h_i`. This is a joint bound, including vector corners,
-not independent per-axis maximum-thrust percentages.
-
-## Common sensor envelope and reference error model
-
-Sensors do not intrinsically become less accurate because an aircraft is heavier.
-Their sampling law is therefore independent of individual aircraft identity.
-To enforce a conservative common allowance, calculate capacities for every
-vehicle, take the most restrictive one over the **entire pooled bank**, and then
-sample percentages with the same law for every aircraft. These common capacities
-can vary across differently sampled banks; they are not per-aircraft scalings or
-a claim to a global bound over all possible vehicles. Given a fixed pooled bank,
-permutation of vehicle identities does not change the common envelope.
-
-Converting sensor errors to a bounded actuator-load surrogate requires a
-controller/error model. The explicit model used here has
-
-`T = .30 s`, `k_p = 1/T^2`, `k_v = 2/T`.
-
-T is the largest motor-response time constant in the retained parameter support.
-These reference gains define the normalizer. They are **not identified gains of
-the learned Actor**, not new gains in its deployment path, and not a stability
-proof. Let J contain the three principal inertias.
-
-Position box capacity:
-
-`C_p = min_aircraft C_F / (m*k_p*sqrt(3))`.
-
-Velocity box capacity:
-
-`C_v = min_aircraft C_F / (m*k_v*sqrt(3))`.
-
-Gyro box capacity:
-
-`C_omega = 1 / max_aircraft,i sum_j abs(Q_i,j+1)*J_j*k_v/h_i`.
-
-Attitude box capacity:
+For each acquired control-time sample:
 
 ```
-A_theta = max_i sum_j abs(Q_i,j+1)*J_j*k_p/h_i
-          + sqrt(3)*F_max_total/C_F
-C_theta = 1 / max_aircraft A_theta
+p_m(t) = p(t) + eps_p(t)
+v_m(t) = v(t) + eps_v(t)
+R_m(t) = R(t) @ exp(skew(delta_theta(t)))
+omega_m(t) = omega(t) + eps_omega(t)
 ```
 
-The attitude expression budgets both reference angular correction and thrust
-orientation error. A rotation-vector box has norm at most sqrt(3) times its
-per-axis bound. `R_measured = R_true @ exp(skew(delta_theta))` remains on SO(3).
-This deliberately replaces the old off-manifold matrix-element corruption;
-it is not claimed to reproduce the original L2F measurement-noise distribution.
-Exp matrices are precomputed once on CPU, not at each physics timestep.
+Only the velocity measurement is delayed. For d in [0,0.030] seconds, dt=0.010,
+let q=d/dt, k=floor(q), j=min(k+1,3), lambda=q-k:
 
-Each sensor's bound is its common capacity times rho. In the reference model,
-the position/velocity virtual forces, gyro/attitude virtual torques and thrust
-orientation error together consume at most the sum of their rho values in the
-same rotor-reserve norm. No loss or termination threshold uses noisy measurements.
-A learned network can amplify sensor errors more than this reference model;
-parameter bounds alone do not exclude that behavior.
+```
+v_obs(t) = (1-lambda)*v_m(t-k) + lambda*v_m(t-j)
+```
 
-## Fractional velocity delay
+The samples are current plus three previous acquired world-frame velocities.
+Exactly 30 ms uses slot 3; it does not access a fifth sample. All negative-time
+history slots hold the first acquired measurement, including the same first
+noise sample. Old noise is never redrawn. Current noisy attitude converts the
+delayed world vector to body coordinates only inside the unchanged Actor features.
 
-A fixed 10-30 ms delay is **not** automatically “10% harmless”. Instead use the
-retained physical model to bound the stale-velocity error. With
+For fractional latency, interpolation also filters the white measurement noise:
+when the two samples are distinct, variance is
+`((1-lambda)^2 + lambda^2) * sigma_v^2`. Do not add compensating fresh noise;
+0.002 m/s is the acquisition sigma, not a promised post-interpolation sigma.
+The held pre-reset samples are correlated by construction. This discrete model
+is not a complete sensor/firmware simulation or an ideal continuous delay.
 
-`A_max = g + F_max_total/m + disturbance_budget*C_F/m`,
+The state field `previous_velocity` stores true world velocities with shape
+[N,3,3], ordered t-1,t-2,t-3; original acquisition noise is looked up from the
+immutable tape. Their sum is the stored-measurement equivalent. All history
+transitions stay differentiable and use the existing per-control-step Time Decay.
+No detach occurs at 50-step metric boundaries or when selecting live rows.
 
-world acceleration is bounded in the ideal continuous model. A delay d has
-`||v_t-v_(t-d)|| <= A_max*d`. Its reference correction load is at most
-`m*k_v*A_max*d/C_F`.
+## Actor information boundary
 
-The common delay capacity is
+The observation is assembled by an explicit whitelist, not by flattening state:
 
-`C_d = min(.03 s, min_aircraft C_F/(m*k_v*A_max))`.
+```
+[p_measured(3), v_delayed_measured(3), R_measured(9),
+ omega_measured(3), previous_known_command(4)]
+```
 
-The .03 s ceiling is the fastest motor time constant in the retained support.
-Sample `d = rho_d*C_d`. Because rho_d <= .10, **d <= 3 ms**, not 1-3 control
-steps. The actual shared budget generally makes it smaller. At dt=10 ms, the
-implemented delay is the causal fractional-delay approximation
+The Actor never receives motor truth, force, airframe parameters, noise samples,
+noise standard deviations, latency, group IDs, boundary limits or future tape
+entries as features. It may infer dynamics from legitimate past observations and
+its own commands. Gradients through the simulator during training do not create
+a privileged input at deployment.
 
-`v_obs_t = (1-lambda)*(v_t+eps_t) + lambda*(v_(t-1)+eps_(t-1))`,
+A reset leak is fixed: `previous_action=2*motor-1` exposed sampled motor truth.
+Now the initial known-command field is a fixed zero placeholder independent of
+motor state. It is not the actual motor speed or a computed hover command. After
+the first action, it stores the command actually issued by the Actor. Deployment
+must initialize the same placeholder when no pre-activation command is available.
+The first action-change penalty intentionally uses that placeholder too.
 
-where `lambda=d/dt <= .3`. It interpolates adjacent acquired noisy **world-frame**
-velocity measurements. It is not a full simulation of continuous sensor/firmware
-latency; linear interpolation is the stated discrete model. There is no new noise
-draw when an old measurement is reused. The interpolation's measurement-noise
-bound remains within the original box because its weights are nonnegative and
-sum to one. At reset, the previous sample is held at the first measurement.
-Only velocity is delayed; position, attitude, gyro and known command remain current.
-The current attitude is used to convert the delayed world velocity to body axes.
+`response_policy.py` is unchanged. Loss, terminal masks, risk metrics and failure
+costs still use true state. Physical grouping uses simulator parameters **only in
+the training gradient aggregation**, not in the policy observation.
 
-The stored previous velocity is differentiable and included in the Time Decay
-state edges. It is never detached at a 50-step metrics chunk. When a scene fails,
-its state, memory, measurement history and time index freeze.
+## Reproducibility and training integration
 
-## Sum bound, implementation and interpretation
+Force, sensor and delay draws use separate CPU generators; airframe/initial-state
+sampling has its own stream. Changing a sensor sigma does not change sampled
+force, latency or airframe. The source RNG sequence differs from the previous
+uniform-budget protocol. Tapes are sampled at reset and shared with stable row
+IDs, including across first-failure compaction. No random draw occurs in observe
+or step. Terminated states, history and noise indices freeze.
 
-In the defined static allocation/reference-error model,
+TRAIN and the one fixed EVAL call the same sampler and DisturbanceConfig. TRAIN
+bank seeds change by update; EVAL seeds and all tapes stay fixed. EVAL uses saved
+checkpoint settings. The zero-noise switch is for numerical regressions, not a
+second evaluation benchmark. New environment/noise versions reject old exact
+resume/evaluation. Explicit weights-only import is permitted for interface-compatible
+Actors but restores no optimizer, simulator or old sampler.
 
-`total normalized additional load <= sum_k rho_k <= disturbance_budget <= .10`.
+Gaussian tails and delayed feedback can still cause nonfinite gradients or failed
+recoveries. Existing finite checks, global clipping, physical-group normalization
+and transactional Adam remain; they are numerical protections, not flight guarantees.
+No new objective, curriculum, hidden safety controller or loss-based update veto is added.
 
-This is meaningful, unit-consistent and testable. It does not imply that an
-untrained policy survives, that a saturated aggressive state has 90% spare
-control authority, or that every sampled initial condition lies in a recoverable
-region. Actual recurrent-policy recoverability depends on the checkpoint,
-hidden state, timing and initial condition. No checkpoint in this repository is
-automatically authorized for flight on the basis of these tests.
+## Audit of transient forces (no additional mechanism added)
 
-All random tapes are immutable. Stable original-bank row IDs allow live-scene
-compaction without copying the full tapes. Pool before sampling the common
-sensor envelope, then transfer the bank once. Full BPTT/group VJPs reuse the
-same random realization. TRAIN changes bank seeds each update; EVAL keeps the
-same seeds/tapes. Noise config, implementation hashes and version are checkpointed.
-Old protocol resume/evaluation are rejected. Explicit compatible Actor-weight
-import restores neither the old environment nor its optimizer. There is no new Critic, estimator or safety-controller
-network in the deployable policy.
+The official pinned pretraining environment uses `StateRandomForce`; force is
+sampled at reset and copied unchanged by `70_post_integration.h`. The posttraining
+`helper.h` gathers ordinary simulator trajectories via `evaluate` and labels their
+observations; it does not inject time-scheduled impulses. The Langevin state in
+`70_post_integration.h` is a moving **reference**, not a force process. No pulse
+schedule was found in this audited official training path. A caller can externally
+modify state.force, but that capability alone is not evidence of training with it.
 
-## Reproducible calculation example
+RAPTOR's real-world tool hits, fan disturbances and payload demonstrations test
+its learned policy. We do not translate these demos into an invented training
+pulse distribution. Transient disturbances are deliberately left for a separate
+design discussion, as requested.
 
-For the retained config's first TRAIN pool (seeds 31000007..31000010, 512 scenes,
-H500, FP32), the sampled mass range is 0.0200485..4.98567 kg. The unscaled common
-sensor capacities are 0.256210 m, 0.427017 m/s, 0.0699168 rad per attitude-vector
-axis, 0.323507 rad/s; common delay capacity is 0.0207091 s. These are **100%-unit
-capacities**, multiplied by each component's allocated fraction, not default
-noise standard deviations. All draws use bounded uniform distributions.
-
-The resulting largest allocated per-axis bounds in this pool are 0.0147822 m,
-0.0237802 m/s, 0.00381827 rad and 0.0133386 rad/s. Maximum sampled delay is
-1.41263 ms; maximum allocated command bound is 0.0181205 in [-1,1] coordinates.
-Maximum total fraction is 0.099999629 after numerical headroom. Other seeds yield
-other actual ranges but satisfy the same mathematical inequalities. These
-calculations are not trained-policy performance results.
+This protocol also does not model bias/drift, packet loss, time-varying wind,
+unequal motor faults or full firmware latency. Omitting torque and command noise
+is a scope decision, not a claim they are equivalent to dynamics randomization.

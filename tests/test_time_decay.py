@@ -71,11 +71,11 @@ def test_invalid_decay(alpha):
 def test_delay_and_recurrent_graph_survive_fifty_step_metrics_boundary(alpha):
     from response_noise import DisturbanceConfig
     s=RaptorSimulator().reset(64,seed=34,horizon=70,dtype=torch.float64,
-                             disturbances=DisturbanceConfig(pool=(0,0,0,0,1)))
+                             disturbances=DisturbanceConfig())
     p=actor();other=copy.deepcopy(p);sim=RaptorSimulator();loss=task.TaskLossConfig()
     with torch.no_grad():
         s=replace(s,position=torch.zeros_like(s.position),velocity=torch.zeros_like(s.velocity),
-                  previous_velocity=torch.zeros_like(s.velocity),omega=torch.zeros_like(s.omega))
+                  previous_velocity=torch.zeros_like(s.previous_velocity),omega=torch.zeros_like(s.omega))
     trace=task.rollout(other,sim,s,70,time_decay=alpha)
     assert trace.valid[50:].any() and s.velocity_delay.max()>0
     direct=task.step_costs(trace,loss).sum(0)

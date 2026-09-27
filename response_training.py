@@ -35,7 +35,7 @@ from response_execution import exit_class
 from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL_VERSION = "raptor-multi-airframe-joint-budget-v4"
+PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v5"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
@@ -205,7 +205,7 @@ def pool_states(states):
 def sample_pool(scenarios, seeds, *, dt=.01, device="cpu", dtype=torch.float32,
                 horizon=500, disturbances=DisturbanceConfig()):
     states = [sample_scenarios(scenarios, seed=s, dt=dt, dtype=dtype, horizon=horizon,
-                              disturbances=DisturbanceConfig(budget=0)) for s in seeds]
+                              disturbances=DisturbanceConfig.clean()) for s in seeds]
     initial = pool_states(states)
     # Airframe/initial-state randomness does not change when noise settings change.
     noise_seed = int.from_bytes(hashlib.sha256(repr(tuple(seeds)).encode()).digest()[:8], "little")
