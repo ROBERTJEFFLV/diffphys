@@ -16,10 +16,14 @@
 --huber-delta 1
 --dead-cost 3
 --terminal-cost 200
---work-dir runs/raptor_multi_airframe/seed7
+--work-dir runs/raptor_gaussian/seed7
 --group-max-groups 16
 --group-min-scenarios 32
 --group-gradient-epsilon 1e-12
 --group-vjp-chunk-size 16
---disturbance-budget 0.1
---disturbance-pool 1 1 1 1 1
+--position-noise-std 0.001
+--velocity-noise-std 0.002
+--attitude-noise-std 0.001
+--omega-noise-std 0.002
+--velocity-delay-min 0.010
+--velocity-delay-max 0.030

@@ -31,15 +31,16 @@ def test_noise_checkpoint_resume_matches_uninterrupted_and_fixed_eval(tmp_path):
     for i,state in sa['optimizer']['state'].items():
         for k,v in state.items():torch.testing.assert_close(v,sb['optimizer']['state'][i][k],rtol=0,atol=0)
     assert torch.equal(sa['rng']['torch'],sb['rng']['torch'])
-    args=args_for(tmp_path/'eval',extra=('--disturbance-budget','0'));args.checkpoint=b/'latest.pt'
+    args=args_for(tmp_path/'eval',extra=('--disable-disturbances',));args.checkpoint=b/'latest.pt'
     actual=evaluate_checkpoint(args)
     expected=json.loads((b/'evaluation.jsonl').read_text().splitlines()[-1])
     assert actual['task_objective']==expected['task_objective']
     assert actual['disturbances']==expected['disturbances']  # Stored settings win.
     assert actual['scenario_count']==8
-    assert actual['disturbances']['maximum_total_fraction']<=.1
-    for override in [('--disturbance-budget','.05'),('--disturbance-pool','0','0','0','0','1'),
-                     ('--time-decay','0'),('--terminal-cost','100')]:
+    assert actual['disturbances']['force_std_N'][1]>0
+    assert actual['disturbances']['velocity_delay_s'][0]>=.010
+    for override in [('--disable-disturbances',),('--position-noise-std','.005'),
+                     ('--velocity-delay-max','.02'),('--time-decay','0'),('--terminal-cost','100')]:
         with pytest.raises(ValueError,match='configuration'):
             run(args_for(b,4,('--resume',str(b/'latest.pt'),*override)))
 
@@ -76,7 +77,8 @@ def test_noise_and_environment_contract_tampering_rejected(tmp_path):
 @pytest.mark.parametrize('flags',[
     ['--scenario-mode','l2f'],['--backprop-mode','windowed'],['--window-steps','50'],
     ['--agc','.01'],['--action-rate','1'],['--group-gru-vmap-mode','native'],
-    ['--no-group-balance'],['--mode','profile']])
+    ['--no-group-balance'],['--mode','profile'],['--disturbance-budget','.1'],
+    ['--disturbance-pool','1','1','1','1','1']])
 def test_removed_paths_are_rejected_instead_of_silently_ignored(flags):
     with pytest.raises(SystemExit):parse_args(flags)
 
@@ -96,8 +98,9 @@ def test_only_retained_config_matches_current_cli():
     assert [p.name for p in configs]==['response_raptor_multi_airframe.args']
     args=parse_args(['@'+str(configs[0])])
     assert args.scenarios==128 and args.eval_scenarios==128 and args.horizon==500
-    assert args.time_decay==1 and args.disturbance_budget==.1
-    assert tuple(args.disturbance_pool)==(1,1,1,1,1)
+    assert args.time_decay==1 and not args.disable_disturbances
+    assert (args.position_noise_std,args.velocity_noise_std,args.attitude_noise_std,args.omega_noise_std)==(.001,.002,.001,.002)
+    assert (args.velocity_delay_min,args.velocity_delay_max)==(.010,.030)
 
 
 def test_explicit_parent_actor_weight_import_uses_fresh_new_protocol(tmp_path):
@@ -113,6 +116,14 @@ def test_explicit_parent_actor_weight_import_uses_fresh_new_protocol(tmp_path):
     imported=torch.load(tmp_path/'import/latest.pt',weights_only=True)
     assert imported['model_sha256']==saved['model_sha256']
     assert imported['optimizer']['state']=={} and imported['progress']['updates']==0
-    assert imported['schema']!='response-actor-only-reference-v3'
+    assert imported['schema']=='raptor-multi-airframe-gaussian-v5'
     assert imported['progress']['initialization']['weights_only']
-    assert imported['binding']['protocol']['disturbances']['budget']==.1
+    assert imported['binding']['protocol']['disturbances']['enabled']
+
+
+def test_previous_bounded_protocol_is_rejected_even_with_matching_actor(tmp_path):
+    run(args_for(tmp_path/'source',0))
+    saved=torch.load(tmp_path/'source/latest.pt',weights_only=True)
+    saved['schema']='raptor-multi-airframe-joint-budget-v4'
+    with pytest.raises(ValueError,match='motor semantics'):
+        require_reference_checkpoint(saved)

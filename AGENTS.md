@@ -44,10 +44,14 @@ AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
 
-`docs/disturbance_budget.md` defines the joint <=10% model-relative allowance.
-Never equate static hover allocation or a reference error model with a verified
-recovery region of the learned Actor. Checkpoints remain deployment unauthorized.
-Keep noise tapes immutable and shared by stable scene IDs during compaction.
+`docs/disturbance_budget.md` now defines the Gaussian protocol; its legacy
+filename is retained. The old shared 10% budget is removed. TRAIN and the one
+fixed EVAL use RAPTOR constant Gaussian force, independent measurement Gaussians
+and uniform 10-30 ms velocity latency. No torque/command noise or transient-force
+schedule is added. These settings are not learned-stability or safety guarantees.
+Initial command history is a fixed zero placeholder, never sampled motor truth.
+Keep noise tapes immutable and shared by stable scene IDs during compaction;
+keep all three previous world-velocity slots differentiable through Time Decay.
 
 Generated runs/checkpoints, applicable provenance and license notices, source
 audit evidence and local agent configuration are not disposable source. Historical
@@ -80,12 +84,13 @@ contains pre-cleanup source-kernel hashes; never regenerate them merely to accep
 an accidental algorithm change. For intentional kernel changes, review the reason
 and independently validate numerical and gradient behavior before updating a contract.
 
-Validate joint bound inequalities, all torque axes, noisy acquisition-time delay,
-replay, first-failure semantics, full/grouped VJPs, Adam rollback and exact resume.
-Metric chunks must not detach physics, recurrent memory or delayed-velocity history.
-CPU tests do not validate CUDA throughput. Distinguish code correctness, numerical
-correctness, learned performance and deployment safety. Do not launch long training
-as a test. Deployment remains unauthorized until independently validated.
+Validate the source force law, Gaussian sampling, Actor input noninterference,
+noisy acquisition-time delay, replay, first-failure semantics, full/grouped VJPs,
+Adam rollback and exact resume. Metric chunks must not detach physics, recurrent
+memory or delayed-velocity history. CPU tests do not validate CUDA throughput.
+Distinguish code correctness, numerical correctness, learned performance and
+deployment safety. Do not launch long training as a test. Deployment remains
+unauthorized until independently validated.
 
 ## Commit & Pull Request Guidelines
 
@@ -118,7 +123,7 @@ Project execution boundaries apply even when a skill suggests delegation or expe
 
 - `optimize-for-gpu`
   Use for CUDA/PyTorch performance, GPU memory, kernel launch, synchronization,
-  host-device transfer, rollout throughput, or GPU bottleneck problems.
+  host-device transfer, rollout throughput, or GPU bottlenecks.
   Profile before optimization and verify numerical equivalence after optimization.
 
 - `code-review-and-quality`
