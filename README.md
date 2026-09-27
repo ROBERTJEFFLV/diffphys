@@ -25,6 +25,23 @@ It limits a run to 50 updates / 1800 seconds, whichever occurs first.
 `--scenarios` and `--eval-scenarios` are **per bank**, not totals.
 No training is launched by importing modules.
 
+The 2048-scene noisy training run uses the same source and config with these
+explicit overrides (seed 7, random Actor initialization and fresh Adam):
+
+```bash
+python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
+    --scenarios 512 --updates 1000000000 --max-seconds 1000000000 \
+    --work-dir runs/gru16_noise_b2048/seed7
+```
+
+This pools 4 x 512 = **2048 TRAIN** scenes per update and keeps **256 fixed EVAL**
+scenes, H500, the joint disturbance budget, and evaluation/checkpoint intervals of
+50 updates. The large limits make this a manually stopped run; numerical failures
+still stop through the trainer's existing recovery path. Use a new work directory
+for random initialization, or the documented `--resume` path for exact continuation.
+Checkpoints, logs, visualization exports and local credentials are not source
+artifacts and are not included in this repository.
+
 Resume with the identical config plus `--resume PATH`. The update limit and
 wall-clock budget can be extended. Exact resume requires matching source,
 objective, environment, disturbances and optimizer configuration. Exact resume and evaluation of checkpoints
@@ -125,4 +142,5 @@ docstrings and the L2F -> Raptor type rename. It is not regenerated to make a
 changed algorithm pass. [Physics provenance](docs/raptor_reference.md) and
 [third-party notices](THIRD_PARTY_NOTICES.md) are retained. `reference/`,
 `物理配置/` and historical images are provenance/assets, not additional runtime
-entry points. Removed code remains in Git history; other Git branches are untouched.
+entry points. The production training path is maintained on `master`; removed
+experimental code remains available in Git history.

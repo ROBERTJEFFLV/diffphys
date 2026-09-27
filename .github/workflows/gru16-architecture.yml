@@ -1,7 +1,9 @@
 name: Multi-airframe physics and joint disturbance budget
 on:
   push:
-    branches: [codex/gru16-direct-readout-20260926]
+    branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 permissions:
   contents: read
