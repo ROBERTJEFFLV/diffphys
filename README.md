@@ -35,6 +35,23 @@ Use an empty directory for fresh Actor/Adam initialization. Extend `--updates`
 and `--max-seconds` explicitly for a longer run. Numerical failures still use
 transactional rollback. Generated checkpoints/logs/visualizations are not bundled.
 
+The independent [60-second surface-force EVAL and switchable replay UI](docs/long_hover_eval.md)
+are also retained. This stress test uses a 4 m arena, a concentric 3 m target cube,
+target changes every 10 s, and 0.1 s surface-force pulses every second at 20% of
+vehicle weight. It is separate from the trainer's fixed EVAL and never selects
+training checkpoints.
+
+```bash
+python tools/evaluate_response_long.py @configs/response_long_eval.args \
+    --checkpoint runs/pulsed_recovery/seed7/best.pt \
+    --work-dir runs/long_hover_eval/seed20260927
+python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
+```
+
+New evaluations require a checkpoint compatible with the current protocol.
+Existing exported replays remain viewable; reproduce older trajectories with
+their archived evaluator sources rather than rewriting checkpoint bindings.
+
 ## One disturbance protocol for TRAIN and EVAL
 
 | Component | Distribution | Lifetime |

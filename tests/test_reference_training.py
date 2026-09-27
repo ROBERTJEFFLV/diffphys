@@ -91,16 +91,22 @@ def test_checkpoint_rejects_changed_noise_implementation(tmp_path):
         require_reference_checkpoint(saved)
 
 
-def test_only_retained_config_matches_current_cli():
+def test_retained_training_and_eval_configs_match_their_clis(tmp_path):
     from pathlib import Path
+    from tools.evaluate_response_long import parse_args as parse_eval_args
     root=Path(__file__).resolve().parents[1]
-    configs=list((root/'configs').glob('*.args'))
-    assert [p.name for p in configs]==['response_raptor_multi_airframe.args']
-    args=parse_args(['@'+str(configs[0])])
+    configs={p.name:p for p in (root/'configs').glob('*.args')}
+    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args'}
+    args=parse_args(['@'+str(configs['response_raptor_multi_airframe.args'])])
     assert args.scenarios==128 and args.eval_scenarios==128 and args.horizon==500
     assert args.time_decay==1 and not args.disable_disturbances
     assert (args.position_noise_std,args.velocity_noise_std,args.attitude_noise_std,args.omega_noise_std)==(.001,.002,.001,.002)
     assert (args.velocity_delay_min,args.velocity_delay_max)==(.010,.030)
+    evaluation=parse_eval_args(['@'+str(configs['response_long_eval.args']),
+                               '--checkpoint',str(tmp_path/'actor.pt'),
+                               '--work-dir',str(tmp_path/'eval')])
+    assert evaluation.duration_seconds==60 and evaluation.target_period_seconds==10
+    assert evaluation.pulse_seconds==.1 and evaluation.force_fraction==.2
 
 
 def test_explicit_parent_actor_weight_import_uses_fresh_new_protocol(tmp_path):

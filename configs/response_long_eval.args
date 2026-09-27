@@ -1,0 +1,17 @@
+--device cpu
+--dtype float32
+--threads 1
+--duration-seconds 60
+--target-period-seconds 10
+--force-period-seconds 1
+--pulse-seconds 0.1
+--force-fraction 0.2
+--arena-side 4
+--target-margin 0.5
+--seed 20260927
+--surface-padding-ratio 0.12
+--surface-half-height-ratio 0.10
+--hover-radius 0.2
+--hover-speed 0.2
+--hover-omega 0.5
+--hover-tail-seconds 2
