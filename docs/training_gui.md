@@ -1,0 +1,135 @@
+# Read-only training monitor and saved-flight replay
+
+This GUI extends the uploaded long-EVAL Pygame workflow, not the training loop.
+`tools/monitor_response_training.py` is a separate process that reads existing
+small log records and opens `tools/play_response_long.py` only on request.
+The existing 3D projection, aircraft inset, surface-force arrow, timeline and
+playback controls remain in that player.
+
+## Start the monitor (training may already be running)
+
+Use a graphical desktop Python. GUI dependencies are optional; they do not need
+to be installed in the training environment:
+
+```bash
+python -m pip install -r requirements-gui.txt
+python tools/monitor_response_training.py \
+    --run-dir runs/pulsed_recovery_b2048/seed7
+```
+
+A missing directory or log is a waiting state. The monitor does not create the
+training directory, start training, load a checkpoint or infer the trainer's PID.
+No trainer restart, new work directory or checkpoint migration is needed for
+this GUI-only change. All files listed in `response_training.SOURCE_FILES` are
+unchanged, as are training configs, Actor input and environment/noise versions.
+
+The window shows task objective, position/velocity/omega RMS, the recorded
+post-group/pre-global-clip gradient norm, update duration, recorded CUDA peak
+allocation, motor saturation and fixed-EVAL first-exit fraction. TRAIN and EVAL
+keep their actual update numbers: EVAL is not interpolated to look freshly
+measured between scheduled evaluations. A long-EVAL replay is not substituted
+for these fixed-EVAL metrics.
+
+Space or **Pause reader** pauses GUI polling, NOT training. **Log y** / L toggles
+positive-only logarithmic objective/gradient charts. Closing either GUI window
+does not signal the trainer. The window is resizable. **Last saved status** is
+explicitly a historical `summary.json` value; log age is not a liveness check.
+Long EVAL/checkpoint writes can produce a quiet interval without a training crash.
+
+## Open your existing exported replay
+
+```bash
+python tools/monitor_response_training.py \
+    --run-dir runs/pulsed_recovery_b2048/seed7 \
+    --replay runs/long_hover_eval/seed20260927/playback/playlist.json
+```
+
+Select an entry and click **Open replay** (or Enter). The uploaded 3D player opens
+as a separate window, at a 20 FPS render cap; its simulated-time playback still
+uses the saved 100 Hz samples. No policy or simulator is imported. A second
+player is not launched while the first is open. The window shows the **recorded
+checkpoint update**, not the current training update, and never automatically
+switches model or flight while you inspect it.
+
+For multiple exported evaluations, use `--replay-root runs/long_hover_eval` and
+**Refresh list** / R. The scan checks that directory and its immediate children
+for `playlist.json` or `playback/playlist.json`. It is bounded to 128 directory
+entries and 64 replays and does not recursively traverse all checkpoints. Pass
+`--replay` repeatedly for exact files outside that layout. Replay scanning is
+manual after startup, not performed on every training-log refresh.
+
+The existing player now pages its two aircraft columns (13 per page), so many
+arena exits do not overlap the telemetry. Export includes all arena exits and
+**up to** the requested number of completed flights, sampled by mass rank. Zero
+completed flights no longer prevents replaying available arena exits. Selection
+does not include nonfinite-failure scenes; it preserves the original player's
+arena-exit/completion scope. Counts, duration and force labels use saved metadata
+instead of hard-coded `13 exits + 13 completed` / `60 s` labels.
+
+## When only saved long-EVAL tensor files exist
+
+Conversion is a separate, explicit command, with a Python that has PyTorch:
+
+```bash
+python tools/play_response_long.py \
+    --run-dir runs/long_hover_eval/seed20260927 --export-only
+```
+
+This reads the finished EVAL's `trajectory.pt`, `schedule.pt`, `initial_state.pt`,
+`manifest.json` and `summary.json` and exports NumPy arrays. It loads those tensors
+on CPU, but still costs CPU time, disk I/O and RAM. The monitor does **not** start
+this conversion, re-export on checkpoint updates, or invoke the long evaluator.
+Export only after the EVAL output is complete; do not overwrite a playlist while
+a new player is opening it. A running player has already loaded its own copy.
+
+When only a checkpoint exists, there is no recorded flight to play. Use the
+existing `tools/evaluate_response_long.py` explicitly after training or on a
+separate machine, then export it. **Even CPU EVAL competes for CPU/RAM on the
+training host**, so it is not scheduled in the background by this feature.
+The long-EVAL force/target/arena protocol remains exactly as uploaded and is
+not the same distribution as training's random-arm Gaussian pulses.
+
+## Resource isolation and limits
+
+- No changes to TRAIN, scheduled EVAL, rollout, loss, sampling, logging frequency,
+  GPU-to-CPU transfers or optimizer. There is no trainer-side queue/callback.
+- Default log polling is once per second (never faster). Each log reads at most
+  256 KiB per poll plus small file-position anchors. Unchanged logs require only
+  file metadata checks, not rereading their contents. A cold start reads only
+  the tail; the UI explicitly says when an older prefix is omitted.
+- Each curve retains at most 2000 reduced records, adjustable via `--max-points`
+  in [100,10000]. Large nested diagnostic tables are not cached. Pixel envelopes
+  retain minimum/maximum samples rather than averaging away gradient spikes.
+- Partial final JSONL records wait for a newline. Malformed complete records are
+  counted and ignored. Atomic resume rewrites, ordinary truncation and rollback
+  clear stale future curve entries. No locks or writes are made to training logs.
+- GUI event handling is capped at 10 Hz; charts repaint on polling/input rather
+  than rendering an animation every frame. The renderer uses a software display,
+  not a CUDA/OpenGL context. Launched replay processes have CUDA hidden and BLAS
+  thread counts set to one. No `latest.pt` polling occurs.
+
+This removes direct training-path overhead; it does **not** assert zero total
+machine overhead. A desktop compositor, CPU renderer and file reads still use
+resources. For the strongest isolation, run the GUI on another computer using
+copies/synced versions of the three small log/summary files and exported JSON/NPZ
+pairs. A graphical desktop is required; a headless SSH shell alone is insufficient.
+`--poll-seconds 2` reduces the read/redraw rate further. No network listener,
+authentication layer or remote command execution is added.
+
+## Verification
+
+`tests/test_training_monitor.py` exercises append/partial-line/rotation handling,
+cache/read limits, spike retention, old-summary semantics, manual CPU-only replay
+launch, limited scanning, and blocked Torch/trainer imports. SDL dummy-display
+smoke tests render both windows without a GPU or Actor. CI installs Pygame so
+these GUI tests cannot silently skip; smoke screenshots use synthetic fixture
+data, not claimed flight results. Existing physical/gradient/resume tests remain.
+
+Optional bounded headless check (requires Pygame):
+
+```bash
+SDL_VIDEODRIVER=dummy python tools/monitor_response_training.py \
+    --run-dir /path/to/run --screenshot /tmp/monitor.png
+```
+
+CPU correctness and import isolation do not measure throughput on your GPU host.

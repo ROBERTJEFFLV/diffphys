@@ -52,6 +52,26 @@ New evaluations require a checkpoint compatible with the current protocol.
 Existing exported replays remain viewable; reproduce older trajectories with
 their archived evaluator sources rather than rewriting checkpoint bindings.
 
+## Online metrics without live training rendering
+
+The optional [read-only Pygame dashboard](docs/training_gui.md) follows existing
+TRAIN/EVAL JSONL logs and manually opens the saved-flight player. It never loads
+checkpoints, runs extra EVAL, or changes the training process/source binding.
+Already-running training does not need to restart for this GUI-only addition.
+
+```bash
+python -m pip install -r requirements-gui.txt
+python tools/monitor_response_training.py \
+    --run-dir runs/pulsed_recovery_b2048/seed7 \
+    --replay-root runs/long_hover_eval
+```
+
+Only exported `playback/playlist.json` + `.npz` pairs are opened. To convert an
+existing finished long EVAL, run `tools/play_response_long.py --run-dir PATH
+--export-only` separately. The dashboard never launches export or simulation.
+Polling is bounded and read-only; shared CPU/disk/display resources still have
+some overhead. Run it on another machine with synced files for best isolation.
+
 ## One disturbance protocol for TRAIN and EVAL
 
 | Component | Distribution | Lifetime |
