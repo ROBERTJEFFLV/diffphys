@@ -11,11 +11,11 @@ import torch
 import torch.nn.functional as F
 
 from response_noise import (DisturbanceConfig, attach_disturbances, executed_command,
-                            NOISE_VERSION, VELOCITY_HISTORY_STEPS)
+                            NOISE_VERSION, VELOCITY_HISTORY_STEPS, pulse_at)
 
-ENVIRONMENT_VERSION = "raptor-multi-airframe-gaussian-v4"
+ENVIRONMENT_VERSION = "raptor-multi-airframe-pulsed-recovery-v5"
 ACTION_CONVENTION = "absolute-normalized-motor-FR-BR-BL-FL-FLU-v1"
-IMMUTABLE_TAPES = ("noise_tape", "rotation_tape")
+IMMUTABLE_TAPES = ("noise_tape", "rotation_tape", "pulse_tape", "pulse_active_tape")
 RAPTOR_SOURCE = "e43ae4bcda4556321a63f4eb5dcc826cd637aa39"
 
 
@@ -32,7 +32,10 @@ def environment_contract(params: RaptorParams) -> dict:
     return {"version": ENVIRONMENT_VERSION, "dt": params.dt,
             "action_convention": ACTION_CONVENTION,
             "integrator": "joint-rk4-quaternion-normalization",
-            "initialization": "raptor-paper-90deg-size-scaled", "source": RAPTOR_SOURCE,
+            "initialization": "recovery-120deg-v2.5-omega2.2-size-scaled-v2", "source": RAPTOR_SOURCE,
+            "initial_angle_max_rad": 2 * math.pi / 3,
+            "initial_velocity_max_per_axis_m_s": 2.5,
+            "initial_omega_max_per_axis_rad_s": 2.2,
             "noise": NOISE_VERSION, "action_history": "known-command-zero-reset-v2",
             "termination": "position-only-per-axis-strict-exceedance-v1"}
 
@@ -74,6 +77,8 @@ class RaptorState:
     guidance: torch.Tensor
     noise_tape: torch.Tensor      # Immutable ORIGINAL pool [N,H+1,12], or [N,1,12].
     rotation_tape: torch.Tensor   # Precomputed SO(3) errors: no trigonometric kernels in step.
+    pulse_tape: torch.Tensor      # Hidden immutable [N,H+1,6]: F_world, r_body (or [N,1,6]).
+    pulse_active_tape: torch.Tensor # Hidden immutable boolean schedule, diagnostics only.
     noise_row: torch.Tensor       # Stable row ID: compacting live states never copies the tape.
     noise_std: torch.Tensor       # Hidden diagnostic metadata, not an observation.
     force_std: torch.Tensor
@@ -140,10 +145,10 @@ class RaptorSimulator:
         initial_limit = 10 * math.sqrt(2) * xy
         guidance = uniform(0., 1.) < .1
         position = uniform(-1., 1., (n,3)) * initial_limit[:, None]
-        velocity = uniform(-1., 1., (n,3))
-        omega = uniform(-1., 1., (n,3))
+        velocity = uniform(-2.5, 2.5, (n,3))
+        omega = uniform(-2.2, 2.2, (n,3))
         axis = F.normalize(normal((n,3)), dim=-1)
-        half = uniform(0., math.pi/4, (n,1))
+        half = uniform(0., math.pi/3, (n,1))
         q = torch.cat((half.cos(), half.sin()*axis), -1)
         position[guidance] = 0
         velocity[guidance] = 0
@@ -163,6 +168,8 @@ class RaptorSimulator:
             initial_position_limit=initial_limit, position_limit=2*initial_limit,
             guidance=guidance.to(dtype), noise_tape=torch.zeros(n,1,12,dtype=dtype),
             rotation_tape=torch.eye(3,dtype=dtype).expand(n,1,3,3).clone(),
+            pulse_tape=torch.zeros(n,1,6,dtype=dtype),
+            pulse_active_tape=torch.zeros(n,1,dtype=torch.bool),
             noise_row=torch.arange(n), noise_std=torch.zeros(n,12,dtype=dtype),
             force_std=constant(0), velocity_delay=constant(0),
             previous_velocity=velocity[:, None, :].expand(n, VELOCITY_HISTORY_STEPS, 3).clone(),
@@ -192,14 +199,21 @@ class RaptorSimulator:
         command = action.clamp(-1, 1)
         setpoint = self.motor_command(state, executed_command(state, command))
         dt = self.params.dt
+        pulse_force, pulse_point = pulse_at(state)
+        # The force is world-fixed for this entire discrete control interval;
+        # the lever rotates with the body. Never use the noisy measured attitude.
+        total_force = state.external_force + pulse_force
         def dynamics(values):
             p, v, q, w, m = values
             thrust = self.thrust(state, m)
-            body_z = quaternion_rotation(q)[..., 2]
+            rotation = quaternion_rotation(q)
+            body_z = rotation[..., 2]
             acceleration = body_z * (thrust.sum(-1)/state.mass)[:, None]
             gravity = torch.tensor((0.,0.,-9.81), device=v.device, dtype=v.dtype)
-            acceleration = acceleration + gravity + state.external_force/state.mass[:, None]
-            torque = self.body_torque(state, thrust) + state.external_torque
+            acceleration = acceleration + gravity + total_force/state.mass[:, None]
+            force_body = (rotation.transpose(-1, -2) @ pulse_force.unsqueeze(-1)).squeeze(-1)
+            pulse_torque = torch.linalg.cross(pulse_point, force_body, dim=-1)
+            torque = self.body_torque(state, thrust) + state.external_torque + pulse_torque
             w_dot = (torque - torch.linalg.cross(w, state.inertia*w, dim=-1))/state.inertia
             qw, qv = q[:, :1], q[:, 1:]
             q_dot = .5 * torch.cat((-(qv*w).sum(-1, keepdim=True),

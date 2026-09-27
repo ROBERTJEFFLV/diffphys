@@ -7,7 +7,7 @@
       "RaptorSimulator.motor_command": "a32c04f349ecff2a2104180a122ffce24e60cfec5f2b6dc42dd4b947d066d991",
       "RaptorSimulator.thrust": "2d666e4cc405365eba4e142b4510ea6c44b29cde5aa0eee10842aae9d74b2846",
       "RaptorSimulator.body_torque": "4208835d91faf61663a3e26e3d9f1f98d5e10425253b3a5615981b1cf33e3bdb",
-      "RaptorSimulator.step.dynamics": "e2492852e4e3d38b5c90ea773491eb5ca8e0587e23f98e5a7b32a6a837d8963b",
+      "RaptorSimulator.step.dynamics": "d91d5d8a9cc943f41c982953579bb7b0cbcc474b8ea1ecc3f9ea01b21f108462",
       "RaptorSimulator.position_terminated": "e547c7ef4c2416fda5289bf02e1b3622c61e5172420f0a7a437d9b103b8b0e11"
     },
     "response_task.py": {
@@ -42,5 +42,15 @@
       "_recover_log": "bbb0be394a854a0b7931e8e7a6aa5518048ef6ed1610bfc6be8bf441c9cb17ab",
       "migrate_named_adam": "3d303f4033ede053843e5f06fbf290b1b48a35116b6b347f9fa27dc23677f655"
     }
-  }
+  },
+  "intentional_updates": [
+    {
+      "base_commit": "b134dffa362da45e1362183028acb9c7cf702fa0",
+      "file": "env_raptor.py",
+      "symbol": "RaptorSimulator.step.dynamics",
+      "previous_hash": "e2492852e4e3d38b5c90ea773491eb5ca8e0587e23f98e5a7b32a6a837d8963b",
+      "new_hash": "d91d5d8a9cc943f41c982953579bb7b0cbcc474b8ea1ecc3f9ea01b21f108462",
+      "reason": "Requested world-force pulse plus body r cross R(q)^T F at every RK4 stage; verified by independent NumPy RK4 and finite differences. All other protected kernel hashes are retained."
+    }
+  ]
 }
