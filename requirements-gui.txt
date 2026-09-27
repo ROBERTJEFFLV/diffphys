@@ -1,0 +1,3 @@
+# Optional viewer environment only. Not imported by training.
+numpy>=1.24
+pygame==2.6.1

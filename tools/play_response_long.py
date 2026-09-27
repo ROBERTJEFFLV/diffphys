@@ -15,13 +15,31 @@ from pathlib import Path
 import numpy as np
 
 
-def select_scenes(summary, completed_count=13):
+def select_scenes(summary, completed_count=13, *, allow_fewer=False):
     failed=sorted((r for r in summary['scenes'] if r['failure_reason']=='arena_exit'),key=lambda r:r['scene_id'])
     completed=sorted((r for r in summary['scenes'] if r['completed']),key=lambda r:(r['mass_kg'],r['scene_id']))
-    if completed_count<1 or len(completed)<completed_count:
+    if completed_count<1 or (not allow_fewer and len(completed)<completed_count):
         raise ValueError('not enough completed flights for the requested comparison')
-    ranks=np.rint(np.linspace(0,len(completed)-1,completed_count)).astype(int)
-    return failed+[completed[i] for i in ranks]
+    count=min(completed_count,len(completed))
+    ranks=np.rint(np.linspace(0,len(completed)-1,count)).astype(int)
+    selected=failed+[completed[i] for i in ranks]
+    if not selected:
+        raise ValueError('no arena-exit or completed flights available to replay')
+    return selected
+
+
+def visible_scene_indices(indices, page, per_page=13):
+    """Keep the uploaded two-column selector inside its existing panel."""
+    page=max(0,min(page,max(0,(len(indices)-1)//per_page)))
+    return indices[page*per_page:(page+1)*per_page]
+
+
+def stream_sha256(path):
+    digest=hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for block in iter(lambda:source.read(1024*1024),b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def export_replay(run_dir, completed_count=13):
@@ -29,7 +47,7 @@ def export_replay(run_dir, completed_count=13):
     run_dir=Path(run_dir)
     summary=json.loads((run_dir/'summary.json').read_text())
     manifest=json.loads((run_dir/'manifest.json').read_text())
-    scenes=select_scenes(summary,completed_count)
+    scenes=select_scenes(summary,completed_count,allow_fewer=True)
     rows=[r['scene_index'] for r in scenes]
     load=lambda name:torch.load(run_dir/name,map_location='cpu',weights_only=True)
     trace=load('trajectory.pt');schedule=load('schedule.pt');initial=load('initial_state.pt')
@@ -43,7 +61,7 @@ def export_replay(run_dir, completed_count=13):
     metadata=dict(manifest['config'],scenes=scenes,checkpoint_update=manifest['checkpoint_update'],
         model_sha256=manifest['model_sha256'],run_dir=str(run_dir.resolve()),
         selection='All arena exits; completed flights at equally spaced mass ranks, not ranked by tracking quality.',
-        trajectory_sha256=hashlib.sha256((run_dir/'trajectory.pt').read_bytes()).hexdigest())
+        trajectory_sha256=stream_sha256(run_dir/'trajectory.pt'))
     path.write_text(json.dumps(metadata,indent=2,allow_nan=False)+'\n')
     return path
 
@@ -58,7 +76,7 @@ class Playback:
     @property
     def end_seconds(self):
         failure=self.scene['failure_step']
-        return failure*self.meta['dt'] if failure else self.meta['duration_seconds']
+        return failure*self.meta['dt'] if failure is not None else self.meta['duration_seconds']
     @property
     def frame(self): return int(self.seconds/self.meta['dt']+1e-7)
 
@@ -97,25 +115,31 @@ class Camera:
         return np.stack((origin[0]+factor*horizontal,origin[1]-factor*vertical),-1)
 
 
-def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=None):
+def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=None, fps=30):
     import pygame as pg
+    if not 10<=fps<=60:
+        raise ValueError('replay fps must be in [10,60]')
     path=Path(path);meta=json.loads(path.read_text())
     with np.load(path.with_suffix('.npz'),allow_pickle=False) as archive:
-        data={k:archive[k] for k in archive.files}
+        data={k:archive[k] for k in ('position','orientation','velocity','omega',
+                                   'force_world','points_body','rotor_positions',
+                                   'surface_half_extents','targets')}
     state=Playback(meta);camera=Camera()
     if scene_id is not None:
         state.choose(next(i for i,r in enumerate(meta['scenes']) if r['scene_id']==scene_id))
     state.seek(seconds)
     pg.display.init();pg.font.init()
     screen=pg.display.set_mode((1500,950))
-    pg.display.set_caption('DiffPhys | 60s EVAL | 13 exits + 13 completed | switch aircraft')
-    font_path=pg.font.match_font('notosanscjksc,notosanscjk,droidsansfallback')
+    duration_label=f"{meta['duration_seconds']:g}"
+    pg.display.set_caption(f"DiffPhys | saved Actor #{meta['checkpoint_update']} | {duration_label}s | {len(meta['scenes'])} scenes")
+    font_path=pg.font.match_font('notosanscjksc,notosanscjk,microsoftyahei,pingfangsc,droidsansfallback')
     fonts={size:pg.font.Font(font_path,size) for size in (14,16,18,21,27)}
     clock=pg.time.Clock();running=True;dragging=False;seeking=False;frames=0
     bg=(15,21,31);panel=(22,31,44);line=(56,72,90);white=(230,239,247)
     muted=(157,178,196);red=(252,115,118);green=(91,220,166);blue=(100,175,244)
     gold=(255,207,93);pink=(244,128,220)
     controls=[];scene_buttons=[]
+    scene_pages=[0,0];last_scene=None
     timeline=pg.Rect(28,792,1442,18)
 
     def text(value,xy,size=18,color=white):
@@ -184,9 +208,14 @@ def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=N
         elif action=='faster':state.speed=min(8,state.speed*2)
         elif action=='camera':camera.__init__()
         elif action=='capture':pg.image.save(screen,str(path.parent/'capture.png'))
+        elif action.startswith('page:'):
+            _,col,delta=action.split(':')
+            col=int(col)
+            count=sum((not r['completed']) if col==0 else r['completed'] for r in meta['scenes'])
+            scene_pages[col]=max(0,min(scene_pages[col]+int(delta),max(0,(count-1)//13)))
 
     while running:
-        elapsed=min(clock.tick(30)/1000.,.1)
+        elapsed=min(clock.tick(fps)/1000.,.1)
         for event in pg.event.get():
             if event.type==pg.QUIT:running=False
             elif event.type==pg.KEYDOWN:
@@ -221,18 +250,20 @@ def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=N
         color=green if row['completed'] else red
         screen.fill(bg);controls=[];scene_buttons=[]
         pg.draw.rect(screen,panel,(1000,0,500,774))
-        text('一分钟悬停 · 换目标与表面脉冲', (24,16),27)
-        text(f"固定 Actor #{meta['checkpoint_update']}  |  原始轨迹回放  |  20% mg × 0.1 s / 每秒",(25,57),16,muted)
-        text(f"Scene {row['scene_id']}   {'完成 60 秒' if row['completed'] else '越界案例'}   {state.seconds:05.2f} / {state.end_seconds:.2f} s",(25,87),21,color)
+        text('长时飞行回放 · 换目标与表面脉冲', (24,16),27)
+        force_label=(f"{100*meta['force_fraction']:g}% mg × {meta['pulse_seconds']:g}s / {meta['force_period_seconds']:g}s"
+                     if 'force_fraction' in meta and 'pulse_seconds' in meta else '力参数以回放记录为准')
+        text(f"固定 Actor #{meta['checkpoint_update']}  |  已保存轨迹  |  {force_label}",(25,57),16,muted)
+        text(f"Scene {row['scene_id']}   {'完成 '+duration_label+' 秒' if row['completed'] else '越界案例'}   {state.seconds:05.2f} / {state.end_seconds:.2f} s",(25,87),21,color)
         screen.set_clip(pg.Rect(8,120,984,642))
         side=meta['arena_side'];center=np.array([0.,0.,side/2]);half=side/2
-        project=camera.project
+        project=lambda points:camera.project(points,center=center)
         for value in np.linspace(-half,half,9):
             stroke(project([[value,-half,0],[value,half,0]]),(34,46,61))
             stroke(project([[-half,value,0],[half,value,0]]),(34,46,61))
         box(center,[half]*3,project,(183,119,76))
         box(center,[half-meta['target_margin']]*3,project,(55,85,119))
-        trail=data['position'][:f+1:4,j]
+        trail=data['position'][:f+1:max(1,math.ceil((f+1)/800)),j]
         stroke(project(trail),(66,135,140),2)
         if f:stroke(project([trail[-1],p]),(66,135,140),2)
         for axis,axis_color in enumerate((red,green,blue)):
@@ -257,21 +288,28 @@ def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=N
         drone(j,f,close,True)
         screen.set_clip(None)
         text(f'近景放大 {scale/camera.zoom:.1f}× · 紫箭头仅表示方向',(34,708),14,muted)
-        text('橙：4m 场地   蓝：3m 目标区   金：当前目标',(365,719),16,muted)
+        text(f"橙：{side:g}m 场地   蓝：{side-2*meta['target_margin']:g}m 目标区   金：目标",(365,719),16,muted)
         text('拖动旋转视角 · 滚轮缩放 · C 复位',(365,744),16,muted)
         text('点击编号切换无人机', (1020,20),27)
         failed=[i for i,r in enumerate(meta['scenes']) if not r['completed']]
         completed=[i for i,r in enumerate(meta['scenes']) if r['completed']]
-        text(f'越界（全部 {len(failed)} 架）', (1020,70),18,red)
-        text(f'完成（按质量选 {len(completed)} 架）', (1252,70),18,green)
+        text(f'越界 {len(failed)} 架', (1020,70),18,red)
+        text(f'完成 {len(completed)} 架', (1252,70),18,green)
+        if last_scene!=j:
+            for col,indices in enumerate((failed,completed)):
+                if j in indices:scene_pages[col]=indices.index(j)//13
+            last_scene=j
         for col,indices in enumerate((failed,completed)):
-            for rank,i in enumerate(indices):
+            x=1016+col*235
+            button('<',(x+145,70,32,26),f'page:{col}:-1')
+            button('>',(x+184,70,32,26),f'page:{col}:1')
+            for rank,i in enumerate(visible_scene_indices(indices,scene_pages[col])):
                 r=meta['scenes'][i];rect=pg.Rect(1016+col*235,104+rank*32,223,28)
                 scene_buttons.append((rect,i))
                 pg.draw.rect(screen,(51,67,83) if i==j else (29,40,54),rect,border_radius=4)
                 if i==j:pg.draw.rect(screen,red if col==0 else green,rect,2,border_radius=4)
                 mass=f"{r['mass_kg']*1000:.0f}g" if r['mass_kg']<1 else f"{r['mass_kg']:.2f}kg"
-                finish=r['failure_step']*meta['dt'] if r['failure_step'] else meta['duration_seconds']
+                finish=r['failure_step']*meta['dt'] if r['failure_step'] is not None else meta['duration_seconds']
                 text(f"{r['scene_id']:3}   {mass:>6}   {finish:.2f}s",(rect.x+9,rect.y+2),16,red if col==0 else green)
         text(f"质量 {row['mass_kg']*1000:.2f} g    臂长 {row['arm_length_m']*100:.2f} cm",(1019,534),18)
         text(f"推重比 {row['thrust_to_weight']:.2f}    T/I {row['torque_to_inertia']:.1f}",(1019,564),16,muted)
@@ -281,7 +319,7 @@ def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=N
         step=min(f,len(data['force_world'])-1)
         force=0. if end else float(np.linalg.norm(data['force_world'][step,j]))
         text(f"{'脉冲 ON' if force else '脉冲 OFF'}   F={force:.4f} N",(1019,695),18,pink if force else muted)
-        status=('质心越界 · 停在首个越界帧' if not row['completed'] else '完整到达 60 秒') if end else '飞行中 · 记忆连续'
+        status=('质心越界 · 停在首个越界帧' if not row['completed'] else '完整到达 '+duration_label+' 秒') if end else '飞行中 · 记忆连续'
         text(status,(1019,733),18,color)
         # The full 60 s axis remains visible; post-failure padding is darkened.
         pg.draw.rect(screen,(49,64,79),timeline,border_radius=5)
@@ -289,9 +327,9 @@ def run_player(path, *, screenshot=None, scene_id=None, seconds=0., max_frames=N
         pg.draw.rect(screen,(69,100,116),(timeline.x,timeline.y,valid_width,timeline.height),border_radius=5)
         x=timeline.x+round(timeline.width*state.seconds/meta['duration_seconds'])
         pg.draw.circle(screen,gold,(x,timeline.centery),9)
-        for second in range(0,61,10):
+        for second in np.linspace(0,meta['duration_seconds'],7):
             x=timeline.x+round(timeline.width*second/meta['duration_seconds'])
-            pg.draw.line(screen,muted,(x,784),(x,812));text(f'{second}s',(x-10,763),14,muted)
+            pg.draw.line(screen,muted,(x,784),(x,812));text(f'{second:.2g}s',(x-10,763),14,muted)
         if not row['completed']:
             x=timeline.x+valid_width;pg.draw.line(screen,red,(x,782),(x,814),3)
         items=[('上一架','previous',110),('下一架','next',110),('播放' if state.paused else '暂停','pause',90),
@@ -322,11 +360,12 @@ def main():
     parser.add_argument('--scene-id',type=int)
     parser.add_argument('--seconds',type=float,default=0.)
     parser.add_argument('--max-frames',type=int,help='bounded UI smoke run')
+    parser.add_argument('--fps',type=int,default=30,help='software replay render cap, 10..60')
     args=parser.parse_args()
     path=export_replay(args.run_dir,args.completed_count) if args.run_dir else args.replay
     print('Replay:',path,flush=True)
     if not args.export_only:run_player(path,screenshot=args.screenshot,scene_id=args.scene_id,
-                                     seconds=args.seconds,max_frames=args.max_frames)
+                                     seconds=args.seconds,max_frames=args.max_frames,fps=args.fps)
 
 
 if __name__=='__main__':main()
