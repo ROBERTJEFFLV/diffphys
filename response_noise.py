@@ -16,16 +16,23 @@ import torch
 if TYPE_CHECKING:
     from env_raptor import RaptorState
 
-NOISE_VERSION = "raptor-force-gaussian-observation-delay-v2"
+NOISE_VERSION = "raptor-force-pulses-gaussian-observation-delay-v3"
 RAPTOR_FORCE_COEFFICIENT = 0.3
 CONTROL_DT = 0.01
 VELOCITY_HISTORY_STEPS = 3
 MEASUREMENT_DIM = 12
+# Pulse times are quantized to the existing 100 Hz control grid. Intervals are
+# onset-to-onset, not the quiet gap after a pulse. No overlap is possible.
+PULSE_DURATION_STEPS = 10
+PULSE_INTERVAL_MIN_STEPS = 80
+PULSE_INTERVAL_MAX_STEPS = 120
+PULSE_PHASE_STEPS = 100  # First onset uniformly in {0, ..., 99}.
 
 
 @dataclass(frozen=True)
 class DisturbanceConfig:
     enabled: bool = True
+    pulse_enabled: bool = True
     position_std: float = 0.001       # metres, per axis per acquired sample
     velocity_std: float = 0.002       # metres/second
     attitude_std: float = 0.001       # rotation-vector radians, NOT matrix entries
@@ -34,8 +41,8 @@ class DisturbanceConfig:
     velocity_delay_max: float = 0.030
 
     def __post_init__(self):
-        if not isinstance(self.enabled, bool):
-            raise ValueError("disturbance enabled must be boolean")
+        if not isinstance(self.enabled, bool) or not isinstance(self.pulse_enabled, bool):
+            raise ValueError("disturbance enabled and pulse_enabled must be boolean")
         for name in ("position_std", "velocity_std", "attitude_std", "omega_std",
                      "velocity_delay_min", "velocity_delay_max"):
             value = getattr(self, name)
@@ -52,6 +59,7 @@ class DisturbanceConfig:
     @classmethod
     def from_args(cls, args):
         return cls(enabled=not args.disable_disturbances,
+                   pulse_enabled=not args.disable_pulses,
                    position_std=args.position_noise_std, velocity_std=args.velocity_noise_std,
                    attitude_std=args.attitude_noise_std, omega_std=args.omega_noise_std,
                    velocity_delay_min=args.velocity_delay_min,
@@ -71,6 +79,53 @@ def raptor_force_std(mass: torch.Tensor, thrust_to_weight: torch.Tensor,
     """
     r = unit_uniform * RAPTOR_FORCE_COEFFICIENT * (thrust_to_weight - 1).clamp_min(0)
     return r * thrust_to_weight * mass / 3
+
+
+@torch.no_grad()
+def sample_pulses(state: RaptorState, sigma_force: torch.Tensor, *, seed: int,
+                  horizon: int, enabled: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independent event draws, stored once on CPU, never exposed to the Actor.
+
+    Each pulse has a constant world-frame Gaussian force and a body-fixed point
+    on one of the four COM-to-rotor arms. This is an explicit thin-frame model,
+    not an invented fuselage surface. Reuse the airframe's constant-force sigma,
+    NOT its realized force vector. The physical torque is computed during RK4.
+    """
+    n, dtype = len(state.mass), state.mass.dtype
+    steps = horizon + 1 if enabled else 1
+    tape = torch.zeros(n, steps, 6, dtype=dtype)
+    active = torch.zeros(n, steps, dtype=torch.bool)
+    if not enabled:
+        return tape, active
+    schedule_rng = _generator(seed, 0x915E1)
+    force_rng = _generator(seed, 0x915E2)
+    point_rng = _generator(seed, 0x915E3)
+    starts = torch.randint(PULSE_PHASE_STEPS, (n,), generator=schedule_rng)
+    rows = torch.arange(n)
+    offsets = torch.arange(PULSE_DURATION_STEPS)
+    while bool((starts < horizon).any()):
+        force = torch.randn(n, 3, generator=force_rng, dtype=dtype) * sigma_force[:, None]
+        arm = torch.randint(4, (n,), generator=point_rng)
+        fraction = torch.rand(n, 1, generator=point_rng, dtype=dtype)
+        point = fraction * state.rotor_positions[rows, arm]
+        values = torch.cat((force, point), -1)
+        times = starts[:, None] + offsets[None]
+        valid = times < horizon
+        row_grid = rows[:, None].expand_as(times)
+        tape[row_grid[valid], times[valid]] = values[:, None, :].expand(n, PULSE_DURATION_STEPS, 6)[valid]
+        active[row_grid[valid], times[valid]] = True
+        starts = starts + torch.randint(PULSE_INTERVAL_MIN_STEPS, PULSE_INTERVAL_MAX_STEPS + 1,
+                                        (n,), generator=schedule_rng)
+    # H is an observation-only sentinel. A pulse near H is cut by episode end,
+    # never shifted earlier, extended past termination, or renormalized.
+    return tape, active
+
+
+def pulse_at(state: RaptorState) -> tuple[torch.Tensor, torch.Tensor]:
+    """Current transition's hidden world force and body lever; no RNG/preview."""
+    index = state.step_index if state.pulse_tape.shape[1] > 1 else torch.zeros_like(state.step_index)
+    value = state.pulse_tape[state.noise_row, index]
+    return value[:, :3], value[:, 3:]
 
 
 @torch.no_grad()
@@ -110,11 +165,14 @@ def attach_disturbances(state: RaptorState, config: DisturbanceConfig, *, seed: 
         delay = (config.velocity_delay_min +
                  (config.velocity_delay_max - config.velocity_delay_min) *
                  torch.rand(n, generator=delay_rng, dtype=torch.float64)).to(dtype)
+    pulse_tape, pulse_active = sample_pulses(state, sigma_force, seed=seed, horizon=horizon,
+                                           enabled=config.enabled and config.pulse_enabled)
     rotation_tape = rotation_error(tape[:, :, 6:9].reshape(-1, 3)).reshape(n, tape.shape[1], 3, 3)
-    if not all(bool(torch.isfinite(x).all()) for x in (force, sigma_force, tape, delay, rotation_tape)):
+    if not all(bool(torch.isfinite(x).all()) for x in (force, sigma_force, tape, delay, rotation_tape, pulse_tape)):
         raise FloatingPointError("nonfinite sampled disturbance")
     return replace(state, external_force=force, external_torque=torch.zeros_like(force),
                    force_std=sigma_force, noise_std=std, noise_tape=tape,
+                   pulse_tape=pulse_tape, pulse_active_tape=pulse_active,
                    rotation_tape=rotation_tape, noise_row=rows, velocity_delay=delay,
                    previous_velocity=state.velocity[:, None, :].expand(n, VELOCITY_HISTORY_STEPS, 3).clone())
 
@@ -184,4 +242,14 @@ def disturbance_report(state: RaptorState) -> dict:
                                  ("attitude_rotvec_rad", slice(6, 9)), ("omega_rad_s", slice(9, 12)))},
             "velocity_delay_s": span(state.velocity_delay),
             "external_torque_noise": False, "motor_command_noise": False,
-            "transient_force_schedule": False}
+            "transient_force_schedule": state.pulse_tape.shape[1] > 1,
+            "pulse_protocol": {
+                "duration_s": PULSE_DURATION_STEPS * CONTROL_DT,
+                "onset_interval_s": [PULSE_INTERVAL_MIN_STEPS * CONTROL_DT,
+                                     PULSE_INTERVAL_MAX_STEPS * CONTROL_DT],
+                "first_onset_s": [0., (PULSE_PHASE_STEPS - 1) * CONTROL_DT],
+                "time_quantization_s": CONTROL_DT,
+                "force": "independent-world-Gaussian-same-airframe-force-std",
+                "point": "uniform-arm-then-uniform-COM-to-rotor-fraction",
+                "torque": "body-point-cross-R-transpose-world-force-at-every-RK4-stage",
+            }}

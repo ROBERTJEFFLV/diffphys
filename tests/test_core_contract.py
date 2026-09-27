@@ -1,4 +1,4 @@
-"""Unchanged mathematical kernels checked against the pre-cleanup source AST."""
+"""Protected kernel hashes, with explicitly recorded intentional RHS changes."""
 import ast
 import hashlib
 import json
@@ -37,7 +37,7 @@ def canonical_digest(node):
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def test_existing_physics_actor_loss_time_decay_and_adam_kernels_are_preserved():
+def test_reviewed_physics_actor_loss_time_decay_and_adam_kernels():
     contract=json.loads((ROOT/'tests/core_contract.json').read_text())
     for name,symbols in contract['symbols'].items():
         for qualified,expected in symbols.items():

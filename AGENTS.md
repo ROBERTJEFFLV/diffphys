@@ -44,14 +44,19 @@ AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
 
-`docs/disturbance_budget.md` now defines the Gaussian protocol; its legacy
-filename is retained. The old shared 10% budget is removed. TRAIN and the one
-fixed EVAL use RAPTOR constant Gaussian force, independent measurement Gaussians
-and uniform 10-30 ms velocity latency. No torque/command noise or transient-force
-schedule is added. These settings are not learned-stability or safety guarantees.
+`docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;
+its legacy filename is retained. The old shared 10% budget is removed. TRAIN and
+the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
+Gaussians, uniform 10-30 ms velocity latency, and the requested 0.1 s force-at-point
+pulses with randomized phase/0.8-1.2 s onset intervals. Pulse torque is computed
+from the body lever and true intermediate attitude at each RK4 stage, not a
+separate random torque process. Initial kinematics are 120 degrees, +/-2.5 m/s
+and +/-2.2 rad/s (velocity limits per axis); position/motor/guidance are retained.
+No additive command noise or recovery/safety guarantee is introduced.
 Initial command history is a fixed zero placeholder, never sampled motor truth.
-Keep noise tapes immutable and shared by stable scene IDs during compaction;
-keep all three previous world-velocity slots differentiable through Time Decay.
+Keep all noise AND pulse tapes immutable and shared by stable scene IDs during
+compaction; never expose force/point/schedule metadata to the Actor. Keep all
+three previous world-velocity slots differentiable through Time Decay.
 
 Generated runs/checkpoints, applicable provenance and license notices, source
 audit evidence and local agent configuration are not disposable source. Historical
@@ -83,14 +88,16 @@ Keep deterministic pytest regressions in `tests/`. `tests/core_contract.json`
 contains pre-cleanup source-kernel hashes; never regenerate them merely to accept
 an accidental algorithm change. For intentional kernel changes, review the reason
 and independently validate numerical and gradient behavior before updating a contract.
+The pulse RHS is the single documented intentional kernel-hash update; its old
+hash and rationale remain in the contract. Other protected hashes are retained.
 
-Validate the source force law, Gaussian sampling, Actor input noninterference,
-noisy acquisition-time delay, replay, first-failure semantics, full/grouped VJPs,
-Adam rollback and exact resume. Metric chunks must not detach physics, recurrent
-memory or delayed-velocity history. CPU tests do not validate CUDA throughput.
-Distinguish code correctness, numerical correctness, learned performance and
-deployment safety. Do not launch long training as a test. Deployment remains
-unauthorized until independently validated.
+Validate the source force law, pulse timing/geometry and force-at-point mechanics,
+Gaussian sampling, Actor input noninterference, noisy acquisition-time delay,
+replay, first-failure semantics, full/grouped VJPs, Adam rollback and exact resume.
+Metric chunks must not detach physics, recurrent memory or delayed-velocity
+history. CPU tests do not validate CUDA throughput. Distinguish code correctness,
+numerical correctness, learned performance and deployment safety. Do not launch
+long training as a test. Deployment remains unauthorized until independently validated.
 
 ## Commit & Pull Request Guidelines
 

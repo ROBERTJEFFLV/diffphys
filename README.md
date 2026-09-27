@@ -13,8 +13,8 @@ your CUDA runtime; no native extension build is required.
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/raptor_gaussian/seed7/best.pt \
-    --work-dir runs/raptor_gaussian/evaluation
+    --checkpoint runs/pulsed_recovery/seed7/best.pt \
+    --work-dir runs/pulsed_recovery/evaluation
 python -m pytest -q tests
 ```
 
@@ -24,28 +24,28 @@ Time Decay 1 s^-1, Adam 3e-4, gradient scale 0.1 and global clip 10.
 It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
 **per bank**, not totals. No training runs on import.
 
-The 2048-scene configuration uses the same source and protocol:
+For 2048 TRAIN scenes, initially retaining that bounded run budget:
 
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
-    --scenarios 512 --updates 1000000000 --max-seconds 1000000000 \
-    --work-dir runs/raptor_gaussian_b2048/seed7
+    --scenarios 512 --work-dir runs/pulsed_recovery_b2048/seed7
 ```
 
-The large limits describe a manually stopped run, not a recommendation to run
-without monitoring. Numerical failures still use transactional rollback.
-This command starts fresh with seed 7 and fresh Adam in an empty directory;
-checkpoints, training logs and local visualization exports are not bundled here.
+Use an empty directory for fresh Actor/Adam initialization. Extend `--updates`
+and `--max-seconds` explicitly for a longer run. Numerical failures still use
+transactional rollback. Generated checkpoints/logs/visualizations are not bundled.
 
 ## One disturbance protocol for TRAIN and EVAL
 
 | Component | Distribution | Lifetime |
 |---|---|---|
-| External world force | Pinned RAPTOR Gaussian law below | One vector per episode |
-| Position measurement | Independent Gaussian, sigma = 0.001 m per axis | Each acquired sample |
-| World-velocity measurement | Independent Gaussian, sigma = 0.002 m/s per axis | Each acquired sample |
+| Constant external world force | Pinned RAPTOR Gaussian law below | One vector per episode |
+| Force-at-point pulse | Independent Gaussian with the same airframe sigma_F | Constant world vector for 0.1 s |
+| Pulse application point | Random arm, uniform fraction from COM to rotor | New body-fixed point per pulse |
+| Position measurement | Gaussian, sigma = 0.001 m per axis | Each acquired sample |
+| World-velocity measurement | Gaussian, sigma = 0.002 m/s per axis | Each acquired sample |
 | Attitude measurement | Gaussian rotation vector, sigma = 0.001 rad per axis | Each acquired sample |
-| Body angular velocity | Independent Gaussian, sigma = 0.002 rad/s per axis | Each acquired sample |
+| Body angular velocity | Gaussian, sigma = 0.002 rad/s per axis | Each acquired sample |
 | Velocity measurement latency | Uniform [0.010, 0.030] seconds | Fixed per episode |
 
 For sampled mass m and thrust-to-weight ratio TWR:
@@ -53,31 +53,52 @@ For sampled mass m and thrust-to-weight ratio TWR:
 ```
 r ~ Uniform(0, 0.3 * max(TWR - 1, 0))
 sigma_F = r * TWR * m / 3
-F_x, F_y, F_z ~ Normal(0, sigma_F^2)
+F_const ~ Normal(0, sigma_F^2 I_3)
+F_pulse[k] ~ Normal(0, sigma_F^2 I_3)
 ```
 
-This reproduces the numerical force law in RAPTOR's pinned source. Do not add an
-extra g factor or interpret division by 3 as clipping. Gaussian samples are
-unbounded. There is **no shared 10% budget**, no added external-torque noise and
-no additive motor-command error. Existing randomized motor-response dynamics
-remain. The retained external-torque state field is zero in this protocol.
+The constant force numerical law is RAPTOR's; there is no extra g or clipping.
+Each pulse gets a new force vector, NOT a copy of F_const. Gaussian force
+components have no hard bound. During a pulse, F_total = F_const + F_pulse;
+otherwise F_total = F_const. There is no shared 10% budget, independently sampled
+external torque, or additive motor-command noise. Motor-response dynamics remain.
 
-TRAIN resamples airframes, initial states, force, latency and measurement tapes
-for each update. The **single** EVAL uses the same distribution, with its own
-fixed seeds, airframes and tapes. EVAL reads saved checkpoint settings, not new
-CLI noise flags. `--disable-disturbances` is a zero-noise regression fixture;
-it does not create another evaluator or turn off multi-airframe randomization.
+The first pulse onset is uniformly sampled at steps 0..99 (0.00-0.99 s).
+Subsequent onset intervals are uniform integer steps 80..120 (0.8-1.2 s).
+Each pulse lasts 10 transitions (0.1 s), unless episode end cuts it short.
+Each scene has an independent phase/schedule. The minimal body geometry uses
+existing COM-to-rotor arms, not a fictitious fuselage mesh. At each RK4 stage,
+`tau_body = r_body x (R_true.T @ F_pulse_world)` is added to rotor torque. Thus a
+pulse can push AND rotate the aircraft; its torque is not frozen as attitude changes.
 
-The four measurement scales use the L2F low-level code as a reference. The SO(3)
-attitude model is deliberately different from L2F's matrix-element corruption;
-the same numeric standard deviation is not a claim of equivalent covariance.
-Uniform 10-30 ms latency is our design choice motivated by RAPTOR's delayed-velocity
-diagnosis, not an identified hardware latency distribution or a stability proof.
-See [protocol and source audit](docs/disturbance_budget.md).
+TRAIN resamples airframes, initial states, constant force, pulses, latency and
+measurement tapes each update. The **single** fixed EVAL uses the same distribution
+with its own fixed seeds/tapes. EVAL reads saved checkpoint settings, not new CLI
+noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
+turns off all disturbances for regression. Neither undoes the harder reset below
+or creates another evaluator.
+
+Measurement scales are L2F-inspired. SO(3) rotation-vector noise is not identical
+to L2F's matrix-element corruption. Uniform 10-30 ms latency is a modeling choice
+motivated by RAPTOR's diagnosis, not an identified hardware law or stability proof.
+See [protocol, equations and source audit](docs/disturbance_budget.md).
+
+## Recovery initialization
+
+For non-guidance scenes, random-axis orientation angle is uniform in **0-120 degrees**, each world-velocity component in **[-2.5,2.5] m/s**, and each body
+angular-velocity component in **[-2.2,2.2] rad/s**. These velocity limits are per
+axis, not vector magnitudes. Position remains uniform within +/-10*arm_length per
+axis; motor coordinates remain independently uniform in [0,0.5].
+
+The 10% guidance draw still sets position, velocities and attitude to the target,
+but does not reset motors to hover. Position-only first failure remains strict
+per-axis exceedance of 20*arm_length. No filtering, automatic curriculum or larger
+boundary hides difficult initial states. These settings may include unrecoverable
+samples and require actual training evidence before making performance claims.
 
 ## Actor visibility and causal history
 
-The Actor still receives 22 values, in this order:
+The Actor still receives 22 values in this order:
 
 ```
 measured position (3), delayed measured world velocity (3),
@@ -85,79 +106,65 @@ current measured rotation matrix (9), current measured body angular velocity (3)
 last known motor command (4)
 ```
 
-The 16 control features feed `GRUCell(16,64)` and the affine readout
-`[features,memory] -> 4 -> tanh`: **16,068 trainable parameters**.
-"GRU16" is the input feature count, not the hidden-state dimension.
-Commands are absolute normalized values in [-1,1], FR/BR/BL/FL, FLU.
+The 16 features feed `GRUCell(16,64)` and `[features,memory] -> Linear(80,4) -> tanh`:
+**16,068 trainable parameters**. GRU16 denotes input size, not hidden dimension.
+Commands remain absolute [-1,1], FR/BR/BL/FL, FLU.
 
-The random initial motor state is **not** encoded in `previous_action` anymore.
-The initial history command is a fixed zero placeholder, independent of motor
-truth; following steps store the Actor's issued command. Actual motor state,
-airframe parameters, force, noise samples/scales, latency, group IDs and boundary
-metadata are not Actor inputs. The initial placeholder is not a hover estimate.
+Initial previous_action is a fixed zero placeholder, independent of random motor
+truth; following steps store the Actor's issued command. The Actor never receives
+pulse force, lever, schedule/mask, countdown, sigma, actual motor state, physical
+parameters, force truth, latent delay, group IDs or boundary metadata. Motion
+observed after a pulse is legitimate feedback, not a hidden answer.
 
-Latency uses current plus three past world-velocity samples and their **original
-acquisition noise**. Pre-reset history is held at the first noisy measurement.
-Interpolation handles both 0 and 30 ms without a future or fifth-frame read.
-The current measured attitude is used to express this world vector in body axes.
-Only velocity is delayed; position, attitude, gyro and known command stay current.
+Latency uses current plus three past world velocities with ORIGINAL acquisition
+noise. Pre-reset history holds the first noisy measurement. Only velocity is
+delayed; other measurements remain current. Current measured attitude converts
+the delayed world vector to body features. Noise/pulse tapes are precomputed on
+CPU and shared by stable original-row IDs during compaction; step/observe draw
+no RNG. No physics, GRU memory or velocity history detaches at 50-step metric
+boundaries. Posture-dependent pulse torque remains differentiable through RK4.
+Loss, termination and flight metrics use true physical state.
 
-Noise tapes and SO(3) matrices are precomputed on CPU with independent random
-streams and shared by stable row IDs during live-scene compaction. Forward steps
-never draw randomness. Delayed velocity history is differentiable and remains
-connected across the 50-step metrics chunks. No physics or GRU memory is detached.
-Losses, boundaries and metrics use physical truth, not noisy observations.
+## Checkpoints and retained training rules
 
-## Checkpoints and unchanged training rules
+Use a **new work directory**. Environment/noise versions and source bindings
+changed; older Gaussian-without-pulse or bounded-noise checkpoints cannot be
+silently resumed/evaluated under this environment. Their original source is
+required for exact original evaluation. Never rewrite checkpoint hashes.
 
-This is a **new environment/protocol**, not an exact continuation of bounded-noise
-training. Use a new work directory. Old bounded checkpoints are rejected for
-`--resume` and direct evaluation under this protocol; use their original source
-for their original evaluation. Do not rewrite hashes to bypass this restriction.
+`--init-checkpoint PATH` explicitly imports only interface-compatible Actor
+weights, with fresh Adam/new sampling. This is fine-tuning, not from-scratch
+training. The checkpoint serialization schema remains unchanged; the new
+environment and disturbance settings are stored in the existing strict binding.
+For new-protocol runs, exact resume still requires matching source/configuration;
+update/time budgets can be extended.
 
-`--init-checkpoint PATH` can explicitly import interface-compatible Actor weights
-only, with fresh Adam, fresh sampling and the new protocol. Such a run is
-fine-tuning from old weights, not a from-scratch comparison. The architecture,
-action convention, memory size, timestep and model digest must pass checks.
+Joint RK4 and motor laws are retained with the requested additional force/torque
+terms. Task/Huber/CVaR costs, position-only first-failure semantics, physical-group
+gradients, Adam and Time Decay are otherwise unchanged. Time Decay > 0 is a
+surrogate backward gradient; 0 is exact BPTT. No auxiliary controller is added.
 
-For a new-protocol run, `--resume PATH` requires identical source, environment,
-noise settings and optimizer configuration. Update/time budgets may be extended.
+## Provenance and verification
 
-Joint RK4, the size-scaled initial kinematics, position-only first-failure rule,
-Huber/task/CVaR costs, physical-group gradient aggregation, Time Decay and Adam
-are retained. Changing initial command history also intentionally changes the
-first action-change cost's reference; there is no change to the cost formula.
-Time Decay > 0 remains a surrogate backward gradient; 0 is exact BPTT.
+The official RAPTOR submodule pins rl-tools at
+`e43ae4bcda4556321a63f4eb5dcc826cd637aa39`. Its audited force is constant within
+episodes; its Langevin process changes reference trajectories. The pulses and
+expanded reset here are **requested DiffPhys extensions**, not claimed features
+of RAPTOR's original training or an exact reproduction of its benchmark.
 
-## Transient disturbances and scope
-
-The official RAPTOR submodule pins `rl-tools/rl-tools` at
-`e43ae4bcda4556321a63f4eb5dcc826cd637aa39`. Its audited training path samples force
-at reset and copies it unchanged after integration. The Langevin process changes
-the **reference trajectory**, not external force. Real-world poking and fan tests
-are not evidence of a training pulse schedule. No transient-force mechanism was
-copied or added in this change. See the source-path audit in the protocol document.
-
-Motor-command noise and external torque were omitted to keep this experiment
-small, **not** because parameter randomization mathematically subsumes them.
-Bias/drift, dropout, time-varying wind and complete firmware latency are not modeled.
-No setting here certifies learned recovery, successful Sim2Real or deployment.
+Tests cover pulse timing/geometry/Gaussian scale, analytic COM impulse, independent
+NumPy force-at-point RK4, attitude/action finite differences, privileged-input
+noninterference, pre-pulse causality, original-row compaction, terminal freezing,
+grouped full BPTT across metric boundaries and exact noisy checkpoint resume.
+Only the intentionally changed dynamics RHS kernel hash is updated with explicit
+old/new provenance; other core-contract hashes remain unchanged. CPU tests are
+not CUDA throughput, convergence, trained recovery or real-flight safety results.
 Checkpoints retain `deployment_authorized: false`.
 
-## Source and verification
-
-`env_raptor.py` owns physics; `response_noise.py` owns sampling and sensing;
-`response_policy.py` is the deployable Actor; `response_task.py` owns causal
-rollouts and true-state costs; `response_adjoints.py` and `response_groups.py`
-own the retained grouped full-BPTT update; `response_training.py` owns banks,
-Adam and checkpoint transactions; `tools/train_response_control.py` is the only CLI.
-
-Tests cover source-kernel contracts, independent NumPy RK4, action and delayed
-history finite differences, exact noisy resume, first-failure compaction,
-Actor input noninterference, original noise timestamps and H500 graph continuity.
-CUDA tests skip explicitly when unavailable. CPU tests and constructed hover
-fixtures do not establish GPU throughput or learned flight performance.
-
-`tests/core_contract.json` remains unchanged. [Physics provenance](docs/raptor_reference.md),
+`env_raptor.py` owns physics; `response_noise.py` sampling/sensing/pulse tapes;
+`response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
+`response_adjoints.py` and `response_groups.py` grouped full BPTT;
+`response_training.py` banks/Adam/checkpoints; `tools/train_response_control.py`
+is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
 [third-party notices](THIRD_PARTY_NOTICES.md), `reference/`, `物理配置/` and historical
-images are retained; they are not additional runtime entry points.
+images remain; they are not additional runtime entry points.

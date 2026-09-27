@@ -12,6 +12,9 @@ def _numpy_step(s, action):
     a = np.clip(action.detach().numpy()[0], -1,1)
     target = arr('motor_min')+(a+1)/2*(arr('motor_max')-arr('motor_min'))
     z = np.concatenate([arr('position'), arr('velocity'), arr('orientation'), arr('omega'), arr('motor')])
+    tape = s.pulse_tape.detach().numpy()
+    pulse = tape[int(arr('noise_row')), int(arr('step_index')) if tape.shape[1]>1 else 0]
+    force, point = pulse[:3], pulse[3:]
     def rhs(z):
         p,v,q,w,m = z[:3],z[3:6],z[6:10],z[10:13],z[13:17]
         th = (arr('thrust_coefficients')*np.stack([np.ones(4),m,m*m],-1)).sum(-1)
@@ -22,7 +25,11 @@ def _numpy_step(s, action):
         # Upstream rotate_vector_by_quaternion uses this double-cross form.
         t = 2*np.cross(q[1:],thrust)
         thrust_world = thrust + q[0]*t + np.cross(q[1:],t)
-        acc = thrust_world/arr('mass')+np.array([0,0,-9.81])+arr('external_force')/arr('mass')
+        acc = thrust_world/arr('mass')+np.array([0,0,-9.81])+(arr('external_force')+force)/arr('mass')
+        # Quaternion conjugate rotates the world force into body coordinates.
+        t_force = 2*np.cross(-q[1:],force)
+        body_force = force + q[0]*t_force + np.cross(-q[1:],t_force)
+        torque += np.cross(point,body_force)
         qdot = 0.5*np.concatenate([[-np.dot(q[1:],w)],q[0]*w+np.cross(q[1:],w)])
         wdot = (torque+arr('external_torque')-np.cross(w,arr('inertia')*w))/arr('inertia')
         tau = np.where(target>=m,arr('motor_time_rising'),arr('motor_time_falling'))
