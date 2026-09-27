@@ -1,3 +1,5 @@
 # Optional viewer environment only. Not imported by training.
+# Chinese replay labels also need a system CJK font.
+# Ubuntu: sudo apt-get install fonts-noto-cjk
 numpy>=1.24
 pygame==2.6.1
