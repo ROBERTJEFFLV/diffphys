@@ -90,10 +90,9 @@ motor state. Initial previous_action is a fixed zero placeholder, never a
 re-encoding of true motor state. All three prior velocity slots equal reset
 velocity; their original measurement noise is reused at startup.
 
-Position-only first failure remains at strict per-axis exceedance of
-20*arm_length. No enlargement of this boundary, rejection of difficult draws,
-curriculum, new loss or relaxation of failure costs accompanies the change.
-Some initial conditions/pulses may be unrecoverable. Numerical/gradient tests
+Position-only first failure is strict per-axis exceedance of 30*arm_length.
+Initial conditions and loss settings are unchanged. Some initial
+conditions/pulses may be unrecoverable. Numerical/gradient tests
 cannot establish trained survival under this distribution.
 
 ## Measurement protocol retained

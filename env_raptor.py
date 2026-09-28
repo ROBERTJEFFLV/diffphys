@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from response_noise import (DisturbanceConfig, attach_disturbances, executed_command,
                             NOISE_VERSION, VELOCITY_HISTORY_STEPS, pulse_at)
 
-ENVIRONMENT_VERSION = "raptor-multi-airframe-pulsed-recovery-v5"
+ENVIRONMENT_VERSION = "raptor-multi-airframe-pulsed-recovery-v6"
 ACTION_CONVENTION = "absolute-normalized-motor-FR-BR-BL-FL-FLU-v1"
 IMMUTABLE_TAPES = ("noise_tape", "rotation_tape", "pulse_tape", "pulse_active_tape")
 RAPTOR_SOURCE = "e43ae4bcda4556321a63f4eb5dcc826cd637aa39"
@@ -37,7 +37,7 @@ def environment_contract(params: RaptorParams) -> dict:
             "initial_velocity_max_per_axis_m_s": 2.5,
             "initial_omega_max_per_axis_rad_s": 2.2,
             "noise": NOISE_VERSION, "action_history": "known-command-zero-reset-v2",
-            "termination": "position-only-per-axis-strict-exceedance-v1"}
+            "termination": "position-only-per-axis-strict-exceedance-30-arm-v2"}
 
 
 def quaternion_rotation(q: torch.Tensor) -> torch.Tensor:
@@ -165,7 +165,7 @@ class RaptorSimulator:
             motor_time_rising=rising, motor_time_falling=falling,
             motor_min=constant(0), motor_max=constant(1), arm_length=math.sqrt(2)*xy,
             thrust_to_weight=tw, torque_to_inertia=tti,
-            initial_position_limit=initial_limit, position_limit=2*initial_limit,
+            initial_position_limit=initial_limit, position_limit=3*initial_limit,
             guidance=guidance.to(dtype), noise_tape=torch.zeros(n,1,12,dtype=dtype),
             rotation_tape=torch.eye(3,dtype=dtype).expand(n,1,3,3).clone(),
             pulse_tape=torch.zeros(n,1,6,dtype=dtype),

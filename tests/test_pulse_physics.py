@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from env_raptor import RaptorSimulator, IMMUTABLE_TAPES
+from env_raptor import RaptorSimulator, IMMUTABLE_TAPES, environment_contract, RaptorParams
 from response_noise import DisturbanceConfig, pulse_at, measured_observation
 
 
@@ -33,12 +33,18 @@ def test_harder_reset_distribution_and_guidance(dtype):
         assert abs(float(value[normal].double().std()) - limit/math.sqrt(3)) < .03
         assert not value[~normal].any()
     torch.testing.assert_close(s.initial_position_limit, 10*s.arm_length)
-    torch.testing.assert_close(s.position_limit, 20*s.arm_length)
+    torch.testing.assert_close(s.position_limit, 30*s.arm_length)
     assert (s.position.abs() <= s.initial_position_limit[:, None]).all()
     assert 0 <= s.motor.min() < s.motor.max() <= .5
     assert not s.previous_action.any()
     assert not s.position[~normal].any() and not angle[~normal].any()
     assert .08 < float((~normal).float().mean()) < .12
+
+
+def test_environment_contract_marks_the_30_arm_position_boundary():
+    contract = environment_contract(RaptorParams())
+    assert contract["version"] == "raptor-multi-airframe-pulsed-recovery-v6"
+    assert contract["termination"] == "position-only-per-axis-strict-exceedance-30-arm-v2"
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])

@@ -35,7 +35,7 @@ from response_execution import exit_class
 from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v5"
+PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v6"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)

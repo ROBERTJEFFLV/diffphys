@@ -59,8 +59,8 @@ the resulting torque. These pulses are a DiffPhys extension requested after the
 RAPTOR audit, NOT part of the audited upstream training method. The upstream
 Langevin reference trajectory is not an external-force process.
 
-Position-only per-axis strict first-failure termination is retained, at 20 times
-rotor radius. It differs from the original paper's additional velocity/omega
+Position-only per-axis strict first-failure termination uses a half-width of
+30 arm lengths. It differs from the original paper's additional velocity/omega
 thresholds. Task/Huber/CVaR losses, Time Decay, physical-group normalization and
 Adam are retained. Only the protected dynamics RHS hash is intentionally updated,
 with provenance; independent force-at-point numerical/gradient tests cover it.

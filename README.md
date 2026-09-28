@@ -128,9 +128,9 @@ axis, not vector magnitudes. Position remains uniform within +/-10*arm_length pe
 axis; motor coordinates remain independently uniform in [0,0.5].
 
 The 10% guidance draw still sets position, velocities and attitude to the target,
-but does not reset motors to hover. Position-only first failure remains strict
-per-axis exceedance of 20*arm_length. No filtering, automatic curriculum or larger
-boundary hides difficult initial states. These settings may include unrecoverable
+but does not reset motors to hover. Position-only first failure is strict
+per-axis exceedance of 30*arm_length. No filtering or automatic curriculum hides
+difficult initial states. These settings may include unrecoverable
 samples and require actual training evidence before making performance claims.
 
 ## Actor visibility and causal history

@@ -122,7 +122,7 @@ def test_explicit_parent_actor_weight_import_uses_fresh_new_protocol(tmp_path):
     imported=torch.load(tmp_path/'import/latest.pt',weights_only=True)
     assert imported['model_sha256']==saved['model_sha256']
     assert imported['optimizer']['state']=={} and imported['progress']['updates']==0
-    assert imported['schema']=='raptor-multi-airframe-gaussian-v5'
+    assert imported['schema']=='raptor-multi-airframe-gaussian-v6'
     assert imported['progress']['initialization']['weights_only']
     assert imported['binding']['protocol']['disturbances']['enabled']
 
