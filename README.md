@@ -52,6 +52,27 @@ New evaluations require a checkpoint compatible with the current protocol.
 Existing exported replays remain viewable; reproduce older trajectories with
 their archived evaluator sources rather than rewriting checkpoint bindings.
 
+## Uniform per-step training loss
+
+New training uses `--steady-weight 0`: every valid physical step has the same
+coefficient `1/H`. The former H500 final-100-step amplification (0.022 versus
+0.002) is disabled in both the dataclass default and the checked-in config.
+Passing a nonzero steady weight to new training fails before creating run files.
+The legacy fields and scoring kernel remain solely to reproduce stored evaluation
+settings; archived scores are not silently recalculated with a new objective.
+
+This change does **not** alter the 2048-scene sampling scheme, physical groups,
+CVaR scenario weighting, Time Decay, Actor, simulator, failure costs or GUI.
+Uniform time weighting is not uniform scenario weighting or an exact, undecayed
+BPTT gradient. Compare physical metrics, not raw old/new objective values.
+
+An old-source run cannot be exactly resumed with a different objective/source.
+Keep its checkpoint and checkout intact; use `--init-checkpoint PATH` with an
+empty work directory for an explicit weights-only fork (fresh Adam and sampling).
+For the unchanged 2048-scene CLI, keep `--scenarios 512` (four banks). Exact resume
+inside a new uniform-time run remains supported. See the
+[verification and training-design audit](docs/uniform_time_loss_audit.md).
+
 ## Online metrics without live training rendering
 
 The optional [read-only Pygame dashboard](docs/training_gui.md) follows existing
@@ -177,8 +198,9 @@ For new-protocol runs, exact resume still requires matching source/configuration
 update/time budgets can be extended.
 
 Joint RK4 and motor laws are retained with the requested additional force/torque
-terms. Task/Huber/CVaR costs, position-only first-failure semantics, physical-group
-gradients, Adam and Time Decay are otherwise unchanged. Time Decay > 0 is a
+terms. Apart from the uniform time-weight default documented above, Huber/CVaR costs,
+position-only first-failure semantics, physical-group gradients, Adam and Time
+Decay are unchanged. Time Decay > 0 is a
 surrogate backward gradient; 0 is exact BPTT. No auxiliary controller is added.
 
 ## Provenance and verification
@@ -193,8 +215,8 @@ Tests cover pulse timing/geometry/Gaussian scale, analytic COM impulse, independ
 NumPy force-at-point RK4, attitude/action finite differences, privileged-input
 noninterference, pre-pulse causality, original-row compaction, terminal freezing,
 grouped full BPTT across metric boundaries and exact noisy checkpoint resume.
-Only the intentionally changed dynamics RHS kernel hash is updated with explicit
-old/new provenance; other core-contract hashes remain unchanged. CPU tests are
+The intentional dynamics RHS and uniform-time default changes are recorded with
+old/new provenance in the core contract; all other protected hashes are retained. CPU tests are
 not CUDA throughput, convergence, trained recovery or real-flight safety results.
 Checkpoints retain `deployment_authorized: false`.
 
