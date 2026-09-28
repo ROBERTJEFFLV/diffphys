@@ -27,7 +27,7 @@ class TaskLossConfig:
     action_weight: float = 0.0001
     action_delta_weight: float = 0.01
     omega_delta_weight: float = 0.005
-    steady_weight: float = 2.0
+    steady_weight: float = 0.0  # Uniform time weights; nonzero retained for archived scoring.
     steady_steps: int = 100
     tail_weight: float = 0.5
     tail_fraction: float = 0.2

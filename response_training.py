@@ -353,6 +353,11 @@ def _sync(device):
 
 def train(args, policy_config, loss_config):
     """A finite loss increase never vetoes an update; numerical failures abort."""
+    if loss_config.steady_weight != 0.0:
+        raise ValueError(
+            "new training requires --steady-weight 0 (uniform per-step loss); "
+            "nonzero values are retained only for historical checkpoint scoring"
+        )
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()

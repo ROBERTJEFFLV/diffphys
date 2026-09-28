@@ -11,7 +11,7 @@
       "RaptorSimulator.position_terminated": "e547c7ef4c2416fda5289bf02e1b3622c61e5172420f0a7a437d9b103b8b0e11"
     },
     "response_task.py": {
-      "TaskLossConfig": "8f2612efb481551a24b0f88e86e2cb3c40359b13afef8b9d888d4e64a5989712",
+      "TaskLossConfig": "2cd53b5a41e8941c72422f50ee14c6aaefe2ffd221aabc0189448cd62d2711ab",
       "weighted_task_features": "149858f0167810064617d37e35a241e1f64a9b3c7c870f1de3bda8dca743285e",
       "step_costs": "869eaa72e9562d4628f5629c468f4731aba1281b58669ab547fcf59e153f700d",
       "scenario_costs": "00bfd473cbb9c36db2faaad8eab98dacdbc6e0731a579ddfd27c29d4b38e3595",
@@ -51,6 +51,14 @@
       "previous_hash": "e2492852e4e3d38b5c90ea773491eb5ca8e0587e23f98e5a7b32a6a837d8963b",
       "new_hash": "d91d5d8a9cc943f41c982953579bb7b0cbcc474b8ea1ecc3f9ea01b21f108462",
       "reason": "Requested world-force pulse plus body r cross R(q)^T F at every RK4 stage; verified by independent NumPy RK4 and finite differences. All other protected kernel hashes are retained."
+    },
+    {
+      "base_commit": "bb9c140f4a181a229fce9e0270bd002c2671729d",
+      "file": "response_task.py",
+      "symbol": "TaskLossConfig",
+      "previous_hash": "8f2612efb481551a24b0f88e86e2cb3c40359b13afef8b9d888d4e64a5989712",
+      "new_hash": "2cd53b5a41e8941c72422f50ee14c6aaefe2ffd221aabc0189448cd62d2711ab",
+      "reason": "Requested uniform per-step training: change only the steady_weight default from 2.0 to 0.0. Independent loss/gradient tests cover all steps, H500 boundaries and chunking. Explicit legacy configs retain the original scoring kernel. Physics, sampler, grouping and all other protected hashes are unchanged."
     }
   ]
 }
