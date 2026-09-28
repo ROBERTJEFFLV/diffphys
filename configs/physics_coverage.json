@@ -1,0 +1,41 @@
+{
+  "calibration": {
+    "batch_size": 4096,
+    "batches": 64,
+    "counts_by_tti_bin": [
+      65429,
+      65455,
+      65682,
+      65578
+    ],
+    "dtype": "float64",
+    "quantile": "linear_0.5",
+    "seed_base": 6500000000,
+    "source": "independent_original_clean_reset_no_actor_or_eval",
+    "torch_version": "2.10.0+cpu"
+  },
+  "environment_source_sha256": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+  "falling_edges": [
+    0.0975,
+    0.165,
+    0.2325
+  ],
+  "rising_edges": [
+    0.0475,
+    0.065,
+    0.0825
+  ],
+  "tti_edges": [
+    330.0,
+    620.0,
+    910.0
+  ],
+  "version": "physics-coverage128-conditional-yaw-v1",
+  "yaw_authority": "single_rotor_km_times_maximum_thrust_over_Jz",
+  "yaw_medians_by_tti_bin": [
+    21.404024319757262,
+    60.35507120524872,
+    97.80521691383186,
+    135.91492615242686
+  ]
+}

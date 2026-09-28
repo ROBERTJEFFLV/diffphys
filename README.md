@@ -18,17 +18,24 @@ python tools/train_response_control.py --mode evaluate \
 python -m pytest -q tests
 ```
 
-The checked-in config uses one GPU, 4 x 128 = **512 TRAIN** scenes per update,
+The checked-in config uses one GPU, 4 x 512 = **2048 TRAIN** scenes per update,
 2 x 128 = **256 fixed EVAL** scenes, H500 at 100 Hz, memory dimension 64,
 Time Decay 1 s^-1, Adam 3e-4, gradient scale 0.1 and global clip 10.
 It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
 **per bank**, not totals. No training runs on import.
 
-For 2048 TRAIN scenes, initially retaining that bounded run budget:
+TRAIN now uses [fixed physical coverage](docs/physics_coverage.md):
+TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 16 scenes each.
+Candidate aircraft retain the original physical coupling and initial conditions;
+noise is attached after selection. Fixed EVAL and the 16 gradient groups do not
+change. `history.jsonl` records exact cell counts under `training_sampling`.
+
+Bare CLI calls retain the original random sampler. To explicitly use that sampler
+with the checked-in config and the former smaller pool, use a NEW run directory:
 
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
-    --scenarios 512 --work-dir runs/pulsed_recovery_b2048/seed7
+    --train-sampling random --scenarios 128 --work-dir runs/random_sampling/seed7
 ```
 
 Use an empty directory for fresh Actor/Adam initialization. Extend `--updates`
@@ -61,7 +68,7 @@ Passing a nonzero steady weight to new training fails before creating run files.
 The legacy fields and scoring kernel remain solely to reproduce stored evaluation
 settings; archived scores are not silently recalculated with a new objective.
 
-This change does **not** alter the 2048-scene sampling scheme, physical groups,
+The uniform-time change itself did **not** alter sampling or physical groups,
 CVaR scenario weighting, Time Decay, Actor, simulator, failure costs or GUI.
 Uniform time weighting is not uniform scenario weighting or an exact, undecayed
 BPTT gradient. Compare physical metrics, not raw old/new objective values.
@@ -69,8 +76,8 @@ BPTT gradient. Compare physical metrics, not raw old/new objective values.
 An old-source run cannot be exactly resumed with a different objective/source.
 Keep its checkpoint and checkout intact; use `--init-checkpoint PATH` with an
 empty work directory for an explicit weights-only fork (fresh Adam and sampling).
-For the unchanged 2048-scene CLI, keep `--scenarios 512` (four banks). Exact resume
-inside a new uniform-time run remains supported. See the
+For 2048 scenes, keep `--scenarios 512` (four-bank size convention). Exact resume
+inside a new run remains supported with identical source and sampler settings. See the
 [verification and training-design audit](docs/uniform_time_loss_audit.md).
 
 ## Online metrics without live training rendering
@@ -130,9 +137,9 @@ existing COM-to-rotor arms, not a fictitious fuselage mesh. At each RK4 stage,
 pulse can push AND rotate the aircraft; its torque is not frozen as attitude changes.
 
 TRAIN resamples airframes, initial states, constant force, pulses, latency and
-measurement tapes each update. The **single** fixed EVAL uses the same distribution
-with its own fixed seeds/tapes. EVAL reads saved checkpoint settings, not new CLI
-noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
+measurement tapes each update. The **single** fixed EVAL retains original random
+airframe sampling and fixed seeds/tapes; the conditional disturbance laws above
+are shared. EVAL reads saved checkpoint settings, not new CLI noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
 turns off all disturbances for regression. Neither undoes the harder reset below
 or creates another evaluator.
 
@@ -223,7 +230,8 @@ Checkpoints retain `deployment_authorized: false`.
 `env_raptor.py` owns physics; `response_noise.py` sampling/sensing/pulse tapes;
 `response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
 `response_adjoints.py` and `response_groups.py` grouped full BPTT;
-`response_training.py` banks/Adam/checkpoints; `tools/train_response_control.py`
+`response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
+`tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
 [third-party notices](THIRD_PARTY_NOTICES.md), `reference/`, `物理配置/` and historical
 images remain; they are not additional runtime entry points.

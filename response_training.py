@@ -33,6 +33,7 @@ from response_task import (
 from response_adjoints import collect_rollout, backward_actor
 from response_execution import exit_class
 from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
+from response_sampling import sample_coverage, sampling_contract, validate_sampling
 
 ROOT = Path(__file__).resolve().parent
 PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v6"
@@ -44,6 +45,8 @@ SOURCE_FILES = (
     "response_task.py",
     "response_adjoints.py",
     "response_groups.py",
+    "response_sampling.py",
+    "configs/physics_coverage.json",
     "response_training.py",
     "response_execution.py",
     "env_raptor.py",
@@ -215,14 +218,26 @@ def sample_pool(scenarios, seeds, *, dt=.01, device="cpu", dtype=torch.float32,
 
 def sample_training_scenarios(scenarios, attempt_index, *, dt=.01, device="cpu",
                               dtype=torch.float32, horizon=500,
-                              disturbances=DisturbanceConfig()):
+                              disturbances=DisturbanceConfig(), sampling="random",
+                              sampling_report=None):
+    validate_sampling(sampling, TRAINING_BANKS*scenarios)
     if attempt_index < 0:
         raise ValueError("invalid sampling index")
     seeds = [TRAIN_SEED_BASE + TRAINING_BANKS*attempt_index + i for i in range(TRAINING_BANKS)]
     if seeds[-1] >= min(DEVELOPMENT_SEEDS):
         raise ValueError("TRAIN seed range would enter reserved EVAL")
-    return sample_pool(scenarios, seeds, dt=dt, device=device, dtype=dtype,
-                       horizon=horizon, disturbances=disturbances), seeds
+    if sampling == "random":
+        initial = sample_pool(scenarios, seeds, dt=dt, device=device, dtype=dtype,
+                              horizon=horizon, disturbances=disturbances)
+        report = {"mode": "random", "total_train": TRAINING_BANKS*scenarios}
+    else:
+        initial, report = sample_coverage(TRAINING_BANKS*scenarios, seeds, dt=dt, dtype=dtype)
+        # Exactly one full noise/pulse tape for the selected pool, never candidates.
+        noise_seed = int.from_bytes(hashlib.sha256(repr(tuple(seeds)).encode()).digest()[:8], "little")
+        initial = attach_disturbances(initial, disturbances, seed=noise_seed, horizon=horizon).to(device, dtype)
+    if sampling_report is not None:
+        sampling_report.update(report)
+    return initial, seeds
 
 
 @torch.no_grad()
@@ -287,6 +302,7 @@ def binding(args, policy_config, loss_config):
         "group_balance": {"version": GROUP_BALANCE_VERSION,
                           **asdict(GroupBalanceConfig.from_args(args))},
         "training_banks": TRAINING_BANKS,
+        "training_sampling": sampling_contract(getattr(args, "train_sampling", "random")),
         "torch_version": str(torch.__version__),
     }
 
@@ -358,6 +374,8 @@ def train(args, policy_config, loss_config):
             "new training requires --steady-weight 0 (uniform per-step loss); "
             "nonzero values are retained only for historical checkpoint scoring"
         )
+    sampling = getattr(args, "train_sampling", "random")
+    validate_sampling(sampling, TRAINING_BANKS*args.scenarios)
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
@@ -484,6 +502,7 @@ def train(args, policy_config, loss_config):
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             try:
+                sampling_report = {}
                 initial, seeds = sample_training_scenarios(
                     args.scenarios,
                     progress["updates"],
@@ -492,6 +511,8 @@ def train(args, policy_config, loss_config):
                     dtype=dtype,
                     disturbances=disturbances,
                     horizon=args.horizon,
+                    sampling=sampling,
+                    sampling_report=sampling_report,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 record = collect_rollout(
@@ -527,6 +548,7 @@ def train(args, policy_config, loss_config):
             row = {
                 "update": progress["updates"],
                 "train_seeds": seeds,
+                "training_sampling": sampling_report,
                 **record.metrics,
                 "raw_gradient_norm": raw_norm,
                 "pre_global_clip_norm": raw_norm,

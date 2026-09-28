@@ -34,7 +34,7 @@ The existing rule still applies: run training/validation only when explicitly re
 There is one RAPTOR-style multi-airframe training path. The production modules
 are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_groups.py`,
-`response_training.py`, `response_execution.py`, and the single CLI
+`response_training.py`, `response_execution.py`, `response_sampling.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
 The sole training config is `configs/response_raptor_multi_airframe.args`.
@@ -72,8 +72,12 @@ Run training only when explicitly requested with a budget:
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 ```
 
-`--scenarios` is per bank; TRAIN pools four banks (default 4x128=512). Fixed EVAL
-pools two banks (default 2x128=256). The only CLI modes are train and evaluate.
+`--scenarios` retains its four-bank size convention. The checked-in config uses
+coverage128 sampling, 4x512=2048 TRAIN scenes with 16 scenes per physical cell.
+Bare CLI defaults retain the original random 4x128=512 pool for compatibility.
+Fixed EVAL pools two original random banks (default 2x128=256). Sampling cells
+are not gradient groups. See docs/physics_coverage.md for frozen yaw calibration,
+candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only CLI modes are train and evaluate.
 Exact resume requires identical source/config; never rewrite checkpoint hashes
 to bypass an environment/noise mismatch. Older protocol checkpoints require their
 original source. Deterministic unit checks use `python -m pytest -q tests`.

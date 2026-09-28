@@ -2,7 +2,8 @@
 --device cuda
 --dtype float32
 --seed 7
---scenarios 128
+--scenarios 512
+--train-sampling coverage128
 --eval-scenarios 128
 --horizon 500
 --time-decay 1
