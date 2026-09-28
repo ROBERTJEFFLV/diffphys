@@ -17,6 +17,7 @@ from response_task import TaskLossConfig
 from response_groups import GroupBalanceConfig
 from response_noise import DisturbanceConfig
 from response_training import train, evaluate_checkpoint
+from response_sampling import validate_sampling
 
 
 def parse_args(argv=None):
@@ -28,6 +29,8 @@ def parse_args(argv=None):
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
+    parser.add_argument("--train-sampling", choices=("random", "coverage128"), default="random",
+                        help="TRAIN only: original random pool or fixed 4x4x4x2 physical coverage")
     parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
     parser.add_argument("--horizon", type=int, default=500)
     parser.add_argument("--time-decay", type=float, default=1., help="backward-only decay s^-1; 0 gives exact BPTT")
@@ -73,6 +76,8 @@ def parse_args(argv=None):
     try:
         groups = GroupBalanceConfig.from_args(args)
         DisturbanceConfig.from_args(args)
+        if args.mode == "train":
+            validate_sampling(args.train_sampling, 4*args.scenarios)
     except ValueError as error:
         parser.error(str(error))
     if args.mode == "train" and 4*args.scenarios < groups.min_scenarios:
