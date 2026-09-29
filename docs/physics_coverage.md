@@ -1,7 +1,8 @@
 # Fixed physical coverage for TRAIN
 
 Scope: change which valid initial scenes are sampled, not the controller, task
-loss, physics, disturbances, Time Decay, CVaR, gradient groups, or optimizer.
+loss, physics, disturbances, Time Decay, CVaR, or optimizer.
+The subsequent requested gradient change reuses these cells; see cell_clipping_audit.md.
 The existing random sampler remains available; fixed EVAL is always unchanged.
 
 ## Cells and pool size
@@ -22,10 +23,12 @@ Any positive multiple of 128 is supported as the total TRAIN size; incomplete
 quotas are rejected, not silently rounded. Bare CLI calls still default to the
 original random sampler, including small CPU tests and existing custom scripts.
 
-128 sampling cells are NOT 128 gradient groups. The unchanged
-`response_groups.py` still uses at most 16 groups (128 scenes each at N=2048),
-with its existing minimum group size and four features. This patch does not add
-yaw to gradient grouping or change gradient normalization/Adam/CVaR.
+Originally the 128 cells only controlled sampling. The later clipping change now
+also uses these SAME fixed IDs for 128 gradient groups. At N=2048 each contains
+16 initial scenes. The frozen yaw medians and original sampler are unchanged;
+`response_groups.py` no longer re-splits coverage pools into 16 adaptive groups.
+Legacy random-pool API calls can still request the adaptive layout, with the new
+shrink-only fixed cap. No batch median normalization remains.
 
 ## What yaw means
 

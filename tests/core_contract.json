@@ -24,8 +24,8 @@
     },
     "response_groups.py": {
       "_group_physics": "c2cec359339dc7b3ce79d85ecea3bd3f1154d17703abc59d8da140a9c9a4f582",
-      "physics_group_layout": "eeb7a9c46d1d2cc70be955f20f4aa8304e29b93e5b8348d25d3794efeb9ff26f",
-      "normalize_group_rows": "6c75fe44b463d5494253084bdf620582705bd88f333acacec7c17374ce9c7c17"
+      "physics_group_layout": "c005fc199bf8ecf75ec050c6d7e20f7934777681306f02b0d3db4e1037e8d5cf",
+      "normalize_group_rows": "3f1c3a3d9539f5d52261359fd04343660f9b3aac80694cd809297b68ba602a10"
     },
     "response_policy.py": {
       "body_vector": "697fd84932fd856432f7cf6debedaf69da2ff65394befbee2fd9d5c6fbfb33d8",
@@ -59,6 +59,22 @@
       "previous_hash": "8f2612efb481551a24b0f88e86e2cb3c40359b13afef8b9d888d4e64a5989712",
       "new_hash": "2cd53b5a41e8941c72422f50ee14c6aaefe2ffd221aabc0189448cd62d2711ab",
       "reason": "Requested uniform per-step training: change only the steady_weight default from 2.0 to 0.0. Independent loss/gradient tests cover all steps, H500 boundaries and chunking. Explicit legacy configs retain the original scoring kernel. Physics, sampler, grouping and all other protected hashes are unchanged."
+    },
+    {
+      "base_commit": "c9657de7771efa4a41576936e5e6610c2addf19e",
+      "file": "response_groups.py",
+      "symbol": "physics_group_layout",
+      "previous_hash": "eeb7a9c46d1d2cc70be955f20f4aa8304e29b93e5b8348d25d3794efeb9ff26f",
+      "new_hash": "c005fc199bf8ecf75ec050c6d7e20f7934777681306f02b0d3db4e1037e8d5cf",
+      "reason": "User-requested fixed coverage128 gradient groups and shrink-only fixed cap. Independent analytic gradient, quota/membership, zero/tiny/huge/outlier and replay tests validate the change. All other protected kernels unchanged."
+    },
+    {
+      "base_commit": "c9657de7771efa4a41576936e5e6610c2addf19e",
+      "file": "response_groups.py",
+      "symbol": "normalize_group_rows",
+      "previous_hash": "6c75fe44b463d5494253084bdf620582705bd88f333acacec7c17374ce9c7c17",
+      "new_hash": "3f1c3a3d9539f5d52261359fd04343660f9b3aac80694cd809297b68ba602a10",
+      "reason": "User-requested fixed coverage128 gradient groups and shrink-only fixed cap. Independent analytic gradient, quota/membership, zero/tiny/huge/outlier and replay tests validate the change. All other protected kernels unchanged."
     }
   ]
 }

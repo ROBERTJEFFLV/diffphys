@@ -1,4 +1,4 @@
-"""Training-only physical-group gradients, normalized before aggregation."""
+"""Training-only physical-cell gradients, capped (never amplified) before averaging."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,9 +7,10 @@ import math
 import torch
 
 from env_raptor import RaptorState
+from response_sampling import CELL_COUNT, physics_cell_ids, yaw_authority
 
 
-GROUP_BALANCE_VERSION = "physical-group-gradient-median-v1"
+GROUP_BALANCE_VERSION = "physical-group-fixed-cap-v2"
 GROUP_FEATURE_NAMES = ("thrust_to_weight", "torque_to_inertia",
                        "motor_time_rising", "motor_time_falling")
 
@@ -20,15 +21,23 @@ class GroupBalanceConfig:
     min_scenarios: int = 32
     gradient_epsilon: float = 1e-12
     vjp_chunk_size: int = 16
+    layout: str = "adaptive"  # Legacy random-pool partition; production uses coverage128.
+    clip_norm: float = 1.0  # Provisional fixed cap AFTER gradient_scale/CVaR, BEFORE averaging.
 
     def __post_init__(self):
+        if self.layout not in ("adaptive", "coverage128"):
+            raise ValueError("group layout must be adaptive or coverage128")
+        if self.layout == "coverage128" and self.max_groups != CELL_COUNT:
+            raise ValueError("coverage128 requires --group-max-groups 128, not adaptive regrouping")
+        if not math.isfinite(self.clip_norm) or self.clip_norm <= 0:
+            raise ValueError("group-clip-norm must be finite and positive")
         if (not isinstance(self.max_groups, int) or isinstance(self.max_groups, bool)
-                or not 1 <= self.max_groups <= 64
+                or not 1 <= self.max_groups <= 128
                 or self.max_groups & (self.max_groups - 1)):
-            raise ValueError("group-max-groups must be a power of two in [1,64]")
+            raise ValueError("group-max-groups must be a power of two in [1,128]")
         if (not isinstance(self.min_scenarios, int) or isinstance(self.min_scenarios, bool)
-                or self.min_scenarios < 32):
-            raise ValueError("group-min-scenarios must be at least 32")
+                or self.min_scenarios < (32 if self.layout == "adaptive" else 1)):
+            raise ValueError("group-min-scenarios must be at least 32 for adaptive, 1 for coverage128")
         if not math.isfinite(self.gradient_epsilon) or self.gradient_epsilon <= 0:
             raise ValueError("group-gradient-epsilon must be finite and positive")
         if (not isinstance(self.vjp_chunk_size, int) or isinstance(self.vjp_chunk_size, bool)
@@ -39,7 +48,9 @@ class GroupBalanceConfig:
     @classmethod
     def from_args(cls, args):
         return cls(args.group_max_groups, args.group_min_scenarios,
-                   args.group_gradient_epsilon, args.group_vjp_chunk_size)
+                   args.group_gradient_epsilon, args.group_vjp_chunk_size,
+                   "coverage128" if getattr(args, "train_sampling", "random") == "coverage128" else "adaptive",
+                   getattr(args, "group_clip_norm", 1.0))
 
 
 def _group_physics(initial: RaptorState) -> torch.Tensor:
@@ -52,7 +63,7 @@ def _group_physics(initial: RaptorState) -> torch.Tensor:
 
 @torch.no_grad()
 def physics_group_layout(initial: RaptorState, config: GroupBalanceConfig):
-    """Batched balanced k-d splits in physical space, not trajectory difficulty.
+    """Fixed coverage128 IDs, or legacy adaptive k-d splits for random pools.
 
     Columns: log(TWR), log(TTI), log(rising time), log(falling time), normalized
     by the log spans of the reference sampler. Split all current nodes in
@@ -62,8 +73,17 @@ def physics_group_layout(initial: RaptorState, config: GroupBalanceConfig):
     Returned row table pads with index N; the actual flight order is unchanged.
     IDs are batch-relative, so no EMA statistics are shared across changing IDs.
     """
-    raw = _group_physics(initial)
     n = initial.position.shape[0]
+    if config.layout == "coverage128":
+        # Reuse the SAME frozen TTI/rise/fall/yaw IDs as the sampler. Initial
+        # membership survives termination; never regroup by live survivors.
+        ids = physics_cell_ids(initial)
+        counts = torch.bincount(ids, minlength=CELL_COUNT)
+        if (n % CELL_COUNT or n // CELL_COUNT < config.min_scenarios
+                or not bool((counts == n // CELL_COUNT).all())):
+            raise ValueError("coverage128 gradient groups require equal nonempty quotas in all 128 cells")
+        return ids.argsort(stable=True).reshape(CELL_COUNT, n // CELL_COUNT), counts
+    raw = _group_physics(initial)
     if n < config.min_scenarios:
         raise ValueError(f"group balancing needs at least {config.min_scenarios} unique scenes")
     if raw.shape != (n, 4) or not bool((torch.isfinite(raw) & (raw > 0)).all()):
@@ -135,27 +155,33 @@ def group_gradient_coefficients(base_weights, initial, config: GroupBalanceConfi
     values = torch.cat((counts.to(raw.dtype)[:, None],
                         torch.stack((low, high), -1).flatten(1)), 1)
     report = {"version": GROUP_BALANCE_VERSION, "group_count": groups,
-              "minimum_scenarios": config.min_scenarios, "columns": columns, "values": values}
+              "minimum_scenarios": config.min_scenarios, "columns": columns, "values": values,
+              "layout": config.layout, "group_ids": list(range(groups)),
+              "scene_group_ids": group_ids.detach()}
+    if config.layout == "coverage128":
+        authority = yaw_authority(initial)[indices]
+        report["yaw_authority_min_max"] = torch.stack((authority.amin(1), authority.amax(1)), 1)
     return coefficients.detach(), report
 
 
 @torch.no_grad()
-def normalize_group_rows(rows: torch.Tensor, epsilon: float):
-    """Equalize whole-Actor group norms, then average; NOT cost normalization.
+def normalize_group_rows(rows: torch.Tensor, epsilon: float, *, max_norm: float = 1.0):
+    """Compatibility name for SHRINK-ONLY clipping followed by the group mean.
 
-    h_g already includes gradient_scale and CVaR. m is the lower median of
-    nonzero ||h_g|| (zero if all zero); q_g=m/max(||h_g||,epsilon).
-    Return mean_g(q_g*h_g). Zero groups stay zero and keep their 1/G share;
-    below-epsilon groups are not amplified all the way to m. No clipping,
-    layerwise normalization, reweighting by cost, or differentiation of q_g.
+    Rows already include pooled CVaR and gradient_scale. The cap is fixed in the
+    run binding, not a batch statistic. Zero/small rows keep scale 1, zero rows
+    retain their 1/G share. `normalized_gradient_norm`/`target_norm` remain log
+    aliases for the clipped norm/fixed cap, not a median-normalization operation.
     """
     if rows.ndim != 2 or min(rows.shape) < 1 or rows.dtype not in (torch.float32, torch.float64):
         raise ValueError("group rows must be a nonempty float32/float64 [G,P] tensor")
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError("group gradient epsilon must be finite and positive")
+    if not math.isfinite(max_norm) or max_norm <= 0:
+        raise ValueError("group-clip-norm must be finite and positive")
     if not bool(torch.isfinite(rows).all()):
-        raise FloatingPointError("nonfinite group gradient before normalization")
-    # Only G*P parameter data is promoted, not the H500 graph or batched adjoints.
+        raise FloatingPointError("nonfinite group gradient before clipping")
+    # Only G*P parameter data is promoted, never the H500 graph/adjoints.
     work = rows.double()
     def stable_norm(x):
         peak = x.abs().amax(-1)
@@ -164,21 +190,18 @@ def normalize_group_rows(rows: torch.Tensor, epsilon: float):
     norms = stable_norm(work)
     if not bool(torch.isfinite(norms).all()):
         raise FloatingPointError("nonfinite group gradient norm")
-    positive = norms > 0
-    ordered = norms.masked_fill(~positive, torch.inf).sort().values
-    rank = ((positive.sum() - 1).clamp_min(0) // 2).reshape(1)
-    target = torch.where(positive.any(), ordered.gather(0, rank)[0], norms.new_zeros(()))
-    scales = torch.where(positive, target / norms.clamp_min(epsilon), torch.zeros_like(norms))
-    normalized = work * scales[:, None]
-    # Divide before summing to avoid an unnecessarily large intermediate sum.
-    result = (normalized / rows.shape[0]).sum(0).to(rows.dtype)
-    values = torch.stack((norms, stable_norm(normalized), scales, target.expand_as(norms)), 1)
+    # Guard the denominator only; do not perturb any norm below the cap.
+    scales = torch.where(norms > max_norm,
+                         max_norm / norms.clamp_min(torch.finfo(work.dtype).tiny),
+                         torch.ones_like(norms))
+    clipped = work * scales[:, None]
+    result = (clipped / rows.shape[0]).sum(0).to(rows.dtype)
+    values = torch.stack((norms, stable_norm(clipped), scales, torch.full_like(norms, max_norm)), 1)
     if not bool(torch.isfinite(result).all() & torch.isfinite(values).all()):
-        raise FloatingPointError("nonfinite normalized group gradient")
-    return result, {"version": GROUP_BALANCE_VERSION,
+        raise FloatingPointError("nonfinite clipped group gradient")
+    return result, {"version": GROUP_BALANCE_VERSION, "clip_norm": max_norm,
                     "columns": ["raw_gradient_norm", "normalized_gradient_norm", "multiplier", "target_norm"],
                     "values": values}
-
 
 
 def _batched_group_vjp(costs, parameters, seeds, *, retain_graph):
@@ -204,7 +227,7 @@ def _batched_group_vjp(costs, parameters, seeds, *, retain_graph):
 
 def backward_group_gradients(costs, coefficients, parameters, config: GroupBalanceConfig,
                              *, gradient_scale: float):
-    """Compute G group VJPs on the SAME forward graph, then normalize and merge.
+    """Compute G group VJPs on the SAME forward graph, then clip and merge.
 
     Chunk>1 uses modern vmap over group cotangents, not individual-scene
     cotangents. The last chunk frees the graph. Chunk=1 is a serial reference,
@@ -244,7 +267,7 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
         chunks.append(torch.cat(parts, 1))
         calls += 1
     rows = torch.cat(chunks, 0)
-    combined, report = normalize_group_rows(rows, config.gradient_epsilon)
+    combined, report = normalize_group_rows(rows, config.gradient_epsilon, max_norm=config.clip_norm)
     offsets, result = 0, []
     for parameter, active in zip(parameters, used):
         size = parameter.numel()

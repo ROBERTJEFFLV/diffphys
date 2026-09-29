@@ -14,7 +14,7 @@ def test_production_config_selects_2048_coverage_without_changing_eval():
     args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args')])
     assert getattr(args, 'train_sampling', None) == 'coverage128'
     assert args.scenarios == 512 and args.eval_scenarios == 128
-    assert args.steady_weight == 0 and args.group_max_groups == 16
+    assert args.steady_weight == 0 and args.group_max_groups == 128
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -169,7 +169,7 @@ def test_original_random_and_eval_pools_do_not_change():
     assert parse_args(['--scenarios','8']).train_sampling == 'random'
 
 
-def test_coverage_cells_do_not_become_gradient_groups():
+def test_legacy_adaptive_api_still_available_but_production_uses_fixed_cells():
     from response_groups import GroupBalanceConfig, physics_group_layout
     state, _ = sample_training_scenarios(512,0,horizon=1,sampling='coverage128')
     _, counts = physics_group_layout(state, GroupBalanceConfig())
@@ -221,7 +221,7 @@ def test_coverage_resume_repeats_actor_adam_and_next_selected_pool(tmp_path):
     from test_reference_training import args_for, run
     from response_training import evaluate_checkpoint
     def args(path,updates,extra=()):
-        return args_for(path,updates,('--scenarios','32','--horizon','2','--train-sampling','coverage128',*extra))
+        return args_for(path,updates,('--scenarios','32','--horizon','2','--train-sampling','coverage128','--group-max-groups','128','--group-min-scenarios','1',*extra))
     full, split = tmp_path/'full',tmp_path/'split'
     run(args(full,2)); run(args(split,1))
     run(args(split,2,('--resume',str(split/'latest.pt'))))
@@ -245,7 +245,7 @@ def test_coverage_resume_repeats_actor_adam_and_next_selected_pool(tmp_path):
     assert result['scenario_count'] == 8
     assert result['task_objective'] == expected['task_objective']
     with pytest.raises(ValueError,match='configuration'):
-        run(args(split,3,('--resume',str(split/'latest.pt'),'--train-sampling','random')))
+        run(args(split,3,('--resume',str(split/'latest.pt'),'--train-sampling','random','--group-max-groups','16','--group-min-scenarios','32')))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')

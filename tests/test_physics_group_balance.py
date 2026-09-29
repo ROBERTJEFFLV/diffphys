@@ -103,11 +103,11 @@ def test_gradient_outlier_not_cost_is_normalized(dtype):
     assert report['values'][-1, 2] < 1e-8
 
 
-def test_small_groups_are_scaled_up_not_only_clipped():
+def test_small_groups_are_never_scaled_up():
     rows = torch.tensor([[.01, 0.], [1., 0.], [2., 0.], [1e9, 0.]], dtype=torch.float64)
     result, report = normalize_group_rows(rows, 1e-12)
-    torch.testing.assert_close(result, torch.tensor([1., 0.], dtype=rows.dtype))
-    assert report['values'][0, 2] == 100.
+    torch.testing.assert_close(result, torch.tensor([.7525, 0.], dtype=rows.dtype))
+    assert report['values'][0, 2] == 1.
     assert report['values'][3, 2] == 1e-9
 
 
@@ -127,8 +127,8 @@ def test_zero_tiny_huge_groups_finite(rows):
 
 def test_zero_groups_do_not_erase_other_groups_or_renormalize_vote_count():
     result, report = normalize_group_rows(torch.tensor([[0.,0.],[0.,0.],[3.,4.]]),1e-12)
-    torch.testing.assert_close(result, torch.tensor([1.,4/3]))
-    assert torch.equal(report['values'][:, 3], torch.full((3,),5.,dtype=torch.float64))
+    torch.testing.assert_close(result, torch.tensor([.2, .8/3]))
+    assert torch.equal(report['values'][:, 3], torch.full((3,),1.,dtype=torch.float64))
 
 
 def test_large_float64_norm_avoids_square_overflow():
@@ -201,7 +201,8 @@ def test_all_unused_group_parameters_keep_none_and_existing_adam_moments(chunk):
         costs, seeds, [p], GroupBalanceConfig( vjp_chunk_size=chunk),
         gradient_scale=.1)
     assert gradients == [None]
-    assert torch.count_nonzero(report['values']) == 0
+    assert torch.count_nonzero(report['values'][:,:2]) == 0
+    assert torch.equal(report['values'][:,2:], torch.ones_like(report['values'][:,2:]))
     p.grad = gradients[0]
     optimizer.step()
     assert torch.equal(p, before)
@@ -242,11 +243,11 @@ def test_equal_forward_costs_with_one_sensitive_physical_group():
     costs = 1 + p*derivatives
     assert torch.equal(costs, torch.ones_like(costs))
     gradients, report = backward_group_gradients(costs, seeds, [p], cfg, gradient_scale=.1)
-    torch.testing.assert_close(gradients[0], p.new_tensor(.05))
-    torch.testing.assert_close(report['values'][:,1], torch.full((4,), .1, dtype=p.dtype))
+    torch.testing.assert_close(gradients[0], p.new_tensor((.1+.1+.1-1)/4))
+    torch.testing.assert_close(report['values'][:,1], torch.tensor([.1,.1,.1,1.], dtype=p.dtype))
 
 
-def test_single_group_is_not_an_absolute_gradient_cap():
+def test_single_group_obeys_absolute_gradient_cap():
     rows = torch.tensor([[1e9, 0.]], dtype=torch.float64)
     result, _ = normalize_group_rows(rows, 1e-12)
-    torch.testing.assert_close(result, rows[0])
+    torch.testing.assert_close(result, torch.tensor([1.,0.], dtype=rows.dtype))

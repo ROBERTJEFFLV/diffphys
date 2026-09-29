@@ -39,11 +39,11 @@ def test_defaults_and_production_config_use_uniform_time_weights():
     args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args'),
                        '--scenarios', '512'])
     assert args.steady_weight == 0.0
-    # The per-bank CLI and existing grouping options must not become a new
-    # 32-cell sampler as an incidental part of this time-weighting change.
+    # Per-bank convention stays intact; the later requested fixed-cell gradient
+    # groups now match the coverage sampler. This must not reweight time.
     assert args.scenarios == 512
-    assert args.group_max_groups == 16
-    assert args.group_min_scenarios == 32
+    assert args.group_max_groups == 128
+    assert args.group_min_scenarios == 16
 
 
 @pytest.mark.parametrize('horizon', [1, 8, 100, 101, 500, 751])

@@ -18,6 +18,7 @@ from response_groups import GroupBalanceConfig
 from response_noise import DisturbanceConfig
 from response_training import train, evaluate_checkpoint
 from response_sampling import validate_sampling
+from response_audit import AuditConfig
 
 
 def parse_args(argv=None):
@@ -39,8 +40,12 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.)
     parser.add_argument("--gradient-scale", type=float, default=.1)
-    parser.add_argument("--group-max-groups", type=int, default=16)
-    parser.add_argument("--group-min-scenarios", type=int, default=32)
+    parser.add_argument("--group-max-groups", type=int, default=None,
+                        help="128 for coverage128; adaptive maximum (default 16) for legacy random pools")
+    parser.add_argument("--group-min-scenarios", type=int, default=None,
+                        help="minimum per group: default 16 for coverage128, 32 for adaptive")
+    parser.add_argument("--group-clip-norm", type=float, default=1.,
+                        help="fixed whole-Actor group cap AFTER gradient-scale/CVaR; never amplify")
     parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)
     parser.add_argument("--group-vjp-chunk-size", type=int, default=16)
     parser.add_argument("--disable-disturbances", action="store_true", help="zero-noise regression fixture")
@@ -62,7 +67,14 @@ def parse_args(argv=None):
         for field in fields(config):
             default = getattr(config, field.name)
             parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
+    for field in fields(AuditConfig):
+        default = getattr(AuditConfig(), field.name)
+        parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
+    if args.group_max_groups is None:
+        args.group_max_groups = 128 if args.train_sampling == "coverage128" else 16
+    if args.group_min_scenarios is None:
+        args.group_min_scenarios = 16 if args.train_sampling == "coverage128" else 32
     for name in ("threads", "scenarios", "eval_scenarios", "horizon", "development_every", "checkpoint_every"):
         if getattr(args, name) < 1:
             parser.error(name+" must be positive")
@@ -74,12 +86,16 @@ def parse_args(argv=None):
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
     try:
-        groups = GroupBalanceConfig.from_args(args)
+        groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)
+        AuditConfig.from_args(args)
         if args.mode == "train":
             validate_sampling(args.train_sampling, 4*args.scenarios)
     except ValueError as error:
         parser.error(str(error))
+    if (args.mode == "train" and groups.layout == "coverage128"
+            and args.scenarios * 4 < 128 * groups.min_scenarios):
+        parser.error("coverage128 requires at least group-min-scenarios scenes in EACH cell")
     if args.mode == "train" and 4*args.scenarios < groups.min_scenarios:
         parser.error("four TRAIN banks must contain at least group-min-scenarios scenes")
     if args.mode == "evaluate" and not args.checkpoint:
