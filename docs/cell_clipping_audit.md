@@ -42,11 +42,13 @@ mean have norm <= cap up to floating rounding. This does NOT bound Adam's
 parameter step, remove within-cell directional dominance, or repair unstable
 forward feedback. In particular, a raw 1e8 gradient can still occur inside BPTT.
 
-`--group-vjp-chunk-size 16` gives eight VJP calls on one retained forward graph.
-The final call frees the graph. We do not split forward batches, detach GRU or
-physics state, use 2048 per-scene VJPs, or silently retry a different backend.
-The total backward computation increases versus 16 groups; chunking bounds
-concurrent adjoint width, not total runtime. CUDA throughput remains unverified.
+The later performance update uses `--group-backward probe` by default: one native
+backward traversal plus layer-local group accumulation, with the same clipping
+rule. See `group_gradient_probe.md`. The original `--group-backward vjp` reference
+still gives eight VJP calls at `--group-vjp-chunk-size 16`; this chunk option is
+ignored by the probe. Neither backend splits forward batches, detaches physics/
+GRU state, changes the sampled scenes, or silently retries another backend.
+CUDA throughput remains a separate profiling requirement.
 
 ## Configuration and compatibility
 
@@ -113,7 +115,8 @@ Use the matching source, PyTorch version, device/backend and batch shape:
     python tools/replay_response_update.py RUN/audit/updates/u...pt
     python tools/replay_response_update.py RUN/audit/updates/u...pt --mode adam
 
-`full` regenerates the SAME TRAIN pool, full rollout, 128 clipped gradients,
+`full` regenerates the SAME TRAIN pool, full rollout, 128 clipped gradients using
+the saved backward backend,
 global clipping and Adam update, then compares stored gradients/Actor/moments/RNG.
 `adam` uses the recorded gradient to isolate the optimizer step. Neither modifies
 the original checkpoint or run. A CUDA capsule does not silently replay on CPU.

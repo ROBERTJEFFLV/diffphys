@@ -127,6 +127,7 @@ def rollout(
     steps: int,
     *,
     time_decay: float = 0.0,
+    actor_probe=None,
 ) -> TaskTrajectory:
     """Unchanged flight; optional backward-only decay at every control step.
 
@@ -167,6 +168,8 @@ def rollout(
         active = torch.zeros_like(before.step_index, dtype=torch.bool)
         if indices.numel():
             active[indices] = True  # The upcoming crossing transition counts.
+            if actor_probe is not None:
+                actor_probe.begin_step(indices)  # Training-only original-row metadata, not Actor input.
             output = policy(current_observation.index_select(0, indices), live.policy)
             physical = simulator.step(live.physical, output.action)
             closed = ResponseClosedLoopState(

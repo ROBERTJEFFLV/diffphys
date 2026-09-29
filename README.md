@@ -31,9 +31,12 @@ noise is attached after selection. Fixed EVAL does not change. The 128 fixed
 sampling cells are now also the 128 gradient groups: 16 initial scenes each,
 including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
 after CVaR/gradient-scale, never amplified, then averaged. Groups are processed
-in chunks of 16 (8 VJP calls), not 128 adjoints at once. This increases backward
-work relative to the former 16 groups; CUDA throughput is not yet measured.
-See [clipping and update evidence](docs/cell_clipping_audit.md).
+using a training-only native GRU/Linear gradient probe in one backward graph
+traversal. The former eight-chunk VJP path is an explicit reference backend only.
+This preserves per-group clipping, not an approximation of the group norms.
+See [one-pass probes and profiling](docs/group_gradient_probe.md) and
+[clipping and update evidence](docs/cell_clipping_audit.md). CUDA throughput must
+be measured on the target GPU; fewer traversals do not promise a specific latency.
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
 with the checked-in config and the former smaller pool, use a NEW run directory:
@@ -237,6 +240,7 @@ Checkpoints retain `deployment_authorized: false`.
 `response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
 `response_adjoints.py` and `response_groups.py` grouped full BPTT;
 `response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
+`response_grad_probe.py` one-traversal layer-local group derivatives;
 `response_audit.py` bounded Actor/Adam/RNG update evidence;
 `tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
