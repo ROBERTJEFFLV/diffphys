@@ -46,6 +46,7 @@ SOURCE_FILES = (
     "response_task.py",
     "response_adjoints.py",
     "response_groups.py",
+    "response_grad_probe.py",
     "response_sampling.py",
     "response_audit.py",
     "configs/physics_coverage.json",
@@ -548,6 +549,8 @@ def train(args, policy_config, loss_config):
                 backward = backward_actor(
                     policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
                 )
+                _sync(device)
+                backward_done = time.monotonic()
                 raw_norm = safe_global_clip(policy.parameters(), args.gradient_clip)
                 # Clone after all gradient transformations, before Adam can act.
                 gradients_for_audit = {name: None if p.grad is None else p.grad.detach().clone()
@@ -561,6 +564,8 @@ def train(args, policy_config, loss_config):
                 changes = parameter_changes(policy, before[0])
                 if not math.isfinite(changes["l2"]):
                     raise FloatingPointError("nonfinite actual Actor parameter-step norm")
+                _sync(device)
+                optimizer_done = time.monotonic()
             except Exception as error:
                 # Preserve the attempted state BEFORE restoring Actor/Adam/RNG.
                 try:
@@ -594,6 +599,7 @@ def train(args, policy_config, loss_config):
                 optimizer.zero_grad(set_to_none=True)
                 raise
             _sync(device)
+            audit_done = time.monotonic()
             progress["updates"] += 1
             progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
             row = {
@@ -613,6 +619,9 @@ def train(args, policy_config, loss_config):
                 "time_decay": args.time_decay,
                 "disturbances": disturbance_report(initial),
                 "forward_seconds": forward_done - update_start,
+                "backward_seconds": backward_done - forward_done,
+                "optimizer_seconds": optimizer_done - backward_done,
+                "audit_seconds": audit_done - optimizer_done,
                 "update_seconds": time.monotonic() - update_start,
                 "cuda_peak_bytes": (
                     torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0

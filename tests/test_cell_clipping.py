@@ -117,6 +117,6 @@ def test_cuda_fixed_cells_and_eight_chunk_gru_backward():
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
     rec=collect_rollout(policy,RaptorSimulator(),initial,TaskLossConfig(),horizon=5,group_config=cell_config())
     report=backward_actor(policy,RaptorSimulator(),rec,TaskLossConfig())['group_gradient']
-    assert report['vjp_calls']==8 and report['group_count']==128
+    assert report['vjp_calls']==1 and report['group_count']==128
     assert bool((report['values'][:,2]<=1).all())
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in policy.parameters())

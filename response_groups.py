@@ -23,8 +23,11 @@ class GroupBalanceConfig:
     vjp_chunk_size: int = 16
     layout: str = "adaptive"  # Legacy random-pool partition; production uses coverage128.
     clip_norm: float = 1.0  # Provisional fixed cap AFTER gradient_scale/CVaR, BEFORE averaging.
+    backward_backend: str = "probe"  # One native traversal; vjp is an explicit reference only.
 
     def __post_init__(self):
+        if self.backward_backend not in ("probe", "vjp"):
+            raise ValueError("group-backward must be probe or vjp")
         if self.layout not in ("adaptive", "coverage128"):
             raise ValueError("group layout must be adaptive or coverage128")
         if self.layout == "coverage128" and self.max_groups != CELL_COUNT:
@@ -50,7 +53,8 @@ class GroupBalanceConfig:
         return cls(args.group_max_groups, args.group_min_scenarios,
                    args.group_gradient_epsilon, args.group_vjp_chunk_size,
                    "coverage128" if getattr(args, "train_sampling", "random") == "coverage128" else "adaptive",
-                   getattr(args, "group_clip_norm", 1.0))
+                   getattr(args, "group_clip_norm", 1.0),
+                   getattr(args, "group_backward", "probe"))
 
 
 def _group_physics(initial: RaptorState) -> torch.Tensor:
@@ -273,5 +277,6 @@ def backward_group_gradients(costs, coefficients, parameters, config: GroupBalan
         size = parameter.numel()
         result.append(combined[offsets:offsets + size].reshape_as(parameter) if active else None)
         offsets += size
-    report.update(group_count=groups, vjp_calls=calls, vjp_chunk_size=config.vjp_chunk_size)
+    report.update(backend="vjp", graph_traversals=calls, group_count=groups,
+                  vjp_calls=calls, vjp_chunk_size=config.vjp_chunk_size)
     return result, report

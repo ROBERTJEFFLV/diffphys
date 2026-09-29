@@ -23,6 +23,7 @@
 --group-min-scenarios 16
 --group-clip-norm 1.0
 --group-gradient-epsilon 1e-12
+--group-backward probe
 --group-vjp-chunk-size 16
 --position-noise-std 0.001
 --velocity-noise-std 0.002

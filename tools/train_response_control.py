@@ -47,7 +47,10 @@ def parse_args(argv=None):
     parser.add_argument("--group-clip-norm", type=float, default=1.,
                         help="fixed whole-Actor group cap AFTER gradient-scale/CVaR; never amplify")
     parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)
-    parser.add_argument("--group-vjp-chunk-size", type=int, default=16)
+    parser.add_argument("--group-backward", choices=("probe", "vjp"), default="probe",
+                        help="one-pass native Actor gradient probe; vjp is an explicit verification reference")
+    parser.add_argument("--group-vjp-chunk-size", type=int, default=16,
+                        help="used only by the vjp reference, not by the one-pass probe")
     parser.add_argument("--disable-disturbances", action="store_true", help="zero-noise regression fixture")
     parser.add_argument("--disable-pulses", action="store_true", help="disable only pulses for regression; retain harder initial states")
     parser.add_argument("--position-noise-std", type=float, default=.001, help="metres per acquired sample per axis")

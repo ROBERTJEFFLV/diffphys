@@ -36,7 +36,8 @@ def test_capsules_replay_rollout_gradient_and_adam_exactly(tmp_path):
         saved = path.read_bytes()
         value = torch.load(path,weights_only=True)
         assert value['groups']['layout']['group_ids'] == list(range(128))
-        assert value['groups']['gradient']['vjp_calls'] == 8
+        assert value['groups']['gradient']['vjp_calls'] == 1
+        assert value['groups']['gradient']['backend'] == 'probe'
         assert value['groups']['gradient']['values'][:,2].max() <= 1.
         for mode in ('adam','full'):
             result = replay(path, mode)

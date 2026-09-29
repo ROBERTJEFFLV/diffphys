@@ -35,12 +35,14 @@ There is one RAPTOR-style multi-airframe training path. The production modules
 are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_groups.py`,
 `response_training.py`, `response_execution.py`, `response_sampling.py`,
-`response_audit.py`, and the single CLI
+`response_audit.py`, `response_grad_probe.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
 The sole training config is `configs/response_raptor_multi_airframe.args`.
 Full BPTT, Time Decay and physical-cell shrink-only gradient clipping are the retained
-algorithm. Do not reintroduce L2F single-airframe, reverse-window recomputation,
+algorithm. Production uses one native-backward group probe; the older grouped
+VJP backend remains an explicit numerical reference, never an automatic fallback.
+See docs/group_gradient_probe.md. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
