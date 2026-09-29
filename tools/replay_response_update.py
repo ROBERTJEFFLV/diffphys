@@ -17,8 +17,9 @@ from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from response_groups import GroupBalanceConfig
 from response_task import TaskLossConfig
 from response_noise import DisturbanceConfig
-from env_raptor import RaptorSimulator, RaptorParams
+from env_raptor import RaptorParams
 from response_adjoints import collect_rollout, backward_actor
+from response_acceleration import make_simulator
 from response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
                                restore_rng, capture_rng, sample_training_scenarios,
                                safe_global_clip, atomic_json)
@@ -80,7 +81,8 @@ def replay(path, mode='full'):
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
-        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt))
+        simulator = make_simulator(RaptorParams(dt=policy.config.dt),
+                                   cfg.get("execution", {}).get("physics_backend", "eager"))
         loss = TaskLossConfig(**cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
         record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],

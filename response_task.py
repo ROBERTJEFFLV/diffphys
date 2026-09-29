@@ -58,7 +58,7 @@ class ResponseClosedLoopState:
 @dataclass(frozen=True)
 class TaskTrajectory:
     end: ResponseClosedLoopState
-    observations: torch.Tensor
+    observations: torch.Tensor | None  # Optional diagnostics; TRAIN does not consume this tape.
     actions: torch.Tensor
     positions: torch.Tensor
     velocities: torch.Tensor
@@ -128,6 +128,7 @@ def rollout(
     *,
     time_decay: float = 0.0,
     actor_probe=None,
+    record_observations: bool = True,
 ) -> TaskTrajectory:
     """Unchanged flight; optional backward-only decay at every control step.
 
@@ -136,6 +137,8 @@ def rollout(
     """
     if not math.isfinite(time_decay) or time_decay < 0:
         raise ValueError("time_decay must be finite and non-negative")
+    if not isinstance(record_observations, bool):
+        raise ValueError("record_observations must be boolean")
     rho = math.exp(-time_decay * simulator.params.dt)
     decay = time_decay > 0 and torch.is_grad_enabled()
     if steps < 1:
@@ -147,7 +150,7 @@ def rollout(
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
     initial_physical = closed.physical
-    observations = [observation(closed.physical)]
+    observations = [observation(closed.physical)] if record_observations else []
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
     # A terminal row stays frozen outside its boundary, so it cannot become live
@@ -156,17 +159,19 @@ def rollout(
     live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
                                    _select_rows(closed.policy, indices))
     for step in range(steps):
-        current_observation = observations[-1]
+        current_observation = observations[-1] if observations else None
         if decay and indices.numel():
             # Full and compact tensors are parallel aliases, not serial gates.
             # Cover observation, physics, GRU/history and delta-cost paths once.
             closed = _decay_closed_state(closed, rho)
             live = _decay_closed_state(live, rho)
-            current_observation = observation(closed.physical)
+            current_observation = None  # Acquire once, AFTER the unchanged decay gates.
         before = closed.physical
         action = before.previous_action
         active = torch.zeros_like(before.step_index, dtype=torch.bool)
         if indices.numel():
+            if current_observation is None:
+                current_observation = observation(closed.physical)
             active[indices] = True  # The upcoming crossing transition counts.
             if actor_probe is not None:
                 actor_probe.begin_step(indices)  # Training-only original-row metadata, not Actor input.
@@ -191,9 +196,11 @@ def rollout(
         omegas.append(physical.omega)
         action_deltas.append(action - before.previous_action)
         omega_deltas.append(physical.omega - before.omega)
-        observations.append(observation(physical))
+        if record_observations:
+            observations.append(observation(physical))
     return TaskTrajectory(
-        closed, torch.stack(observations), torch.stack(actions), torch.stack(positions),
+        closed, torch.stack(observations) if record_observations else None,
+        torch.stack(actions), torch.stack(positions),
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
         torch.stack(omega_deltas), initial_physical, torch.stack(valid),
     )
@@ -413,7 +420,7 @@ class FlightStatistics:
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
     @torch.no_grad()
-    def add(self, trace, start):
+    def add(self, trace, start, *, feature_squares=None):
         magnitudes = torch.stack([x.norm(dim=-1) for x in
                                   (trace.positions, trace.velocities, trace.omegas)])
         values = [magnitudes, trace.actions]
@@ -425,7 +432,14 @@ class FlightStatistics:
         self.squares.add_((magnitudes.square() * trace.valid[None]).sum(1))
         self.saturation.add_(((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2)
                               * trace.valid).sum(0))
-        features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
+        if feature_squares is None:
+            features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
+        else:
+            if (feature_squares.shape != (*trace.valid.shape, 22)
+                    or feature_squares.device != trace.actions.device
+                    or feature_squares.dtype != trace.actions.dtype):
+                raise ValueError("reused task feature squares must match the trajectory")
+            features = feature_squares.detach()
         for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9),
                                      slice(9, 20), slice(20, 21), slice(21, 22))):
             self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))

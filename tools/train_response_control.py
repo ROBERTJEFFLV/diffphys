@@ -28,6 +28,8 @@ def parse_args(argv=None):
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--physics-backend", choices=("eager", "compile"), default="eager",
+                        help="compile only RK4 via Inductor; opt-in, benchmark on the target device first")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
     parser.add_argument("--train-sampling", choices=("random", "coverage128"), default="random",

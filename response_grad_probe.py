@@ -184,8 +184,9 @@ class GroupGradientProbe:
 
     def _affine_partial(self, prefix, x, delta, slots):
         a, d = self._pack(x, slots), self._pack(delta, slots)
-        self.views[prefix+".weight"].add_(torch.bmm(d.transpose(1,2), a).double())
-        self.views[prefix+".bias"].add_(d.sum(1).double())
+        # Mixed-dtype add casts directly into the FP64 accumulator.
+        self.views[prefix+".weight"].add_(torch.bmm(d.transpose(1,2), a))
+        self.views[prefix+".bias"].add_(d.sum(1))
 
     def _linear_partial(self, x, delta, slots):
         self._affine_partial("readout", x, delta, slots)
@@ -194,10 +195,10 @@ class GroupGradientProbe:
         di, dh = gru_gate_deltas(self.policy.response_memory, x, h, delta)
         a, b = self._pack(x, slots), self._pack(h, slots)
         i, r = self._pack(di, slots), self._pack(dh, slots)
-        self.views["response_memory.weight_ih"].add_(torch.bmm(i.transpose(1,2),a).double())
-        self.views["response_memory.weight_hh"].add_(torch.bmm(r.transpose(1,2),b).double())
-        self.views["response_memory.bias_ih"].add_(i.sum(1).double())
-        self.views["response_memory.bias_hh"].add_(r.sum(1).double())
+        self.views["response_memory.weight_ih"].add_(torch.bmm(i.transpose(1,2),a))
+        self.views["response_memory.weight_hh"].add_(torch.bmm(r.transpose(1,2),b))
+        self.views["response_memory.bias_ih"].add_(i.sum(1))
+        self.views["response_memory.bias_hh"].add_(r.sum(1))
 
     def close(self) -> None:
         self._armed = False

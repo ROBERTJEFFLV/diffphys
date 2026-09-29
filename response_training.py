@@ -32,6 +32,7 @@ from response_task import (
 )
 from response_adjoints import collect_rollout, backward_actor
 from response_execution import exit_class
+from response_acceleration import execution_contract, make_simulator
 from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
 from response_sampling import sample_coverage, sampling_contract, validate_sampling
 from response_audit import AuditConfig, UpdateAudit, parameter_changes, json_report
@@ -52,6 +53,7 @@ SOURCE_FILES = (
     "configs/physics_coverage.json",
     "response_training.py",
     "response_execution.py",
+    "response_acceleration.py",
     "env_raptor.py",
     "response_noise.py",
     "tools/train_response_control.py",
@@ -305,6 +307,7 @@ def binding(args, policy_config, loss_config):
         },
         "group_balance": {"version": GROUP_BALANCE_VERSION,
                           **asdict(GroupBalanceConfig.from_args(args))},
+        "execution": execution_contract(getattr(args, "physics_backend", "eager")),
         "update_audit": asdict(AuditConfig.from_args(args)),
         "training_banks": TRAINING_BANKS,
         "training_sampling": sampling_contract(getattr(args, "train_sampling", "random")),
@@ -400,7 +403,8 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt))
+    simulator = make_simulator(RaptorParams(dt=policy_config.dt),
+                               getattr(args, "physics_backend", "eager"))
     group_config = GroupBalanceConfig.from_args(args)
     disturbances = DisturbanceConfig.from_args(args)
     audit_config = AuditConfig.from_args(args)
@@ -678,7 +682,7 @@ def evaluate_checkpoint(args):
                           disturbances=DisturbanceConfig(**cfg["disturbances"]))
     report = evaluate(
         policy,
-        RaptorSimulator(params),
+        make_simulator(params, saved["binding"].get("execution", {}).get("physics_backend", "eager")),
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),

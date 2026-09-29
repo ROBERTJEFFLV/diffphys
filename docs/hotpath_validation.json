@@ -1,0 +1,309 @@
+{
+  "base_commit": "83a75e272787524489925244f0aa6e1d1a078ce9",
+  "base_tree": "349845529a99f83efc63333690f31e7b877347d0",
+  "runtime_source_sha256": "d8eb6d4dcc6be7aabed12ead1733a96061b945ad76ec3282368540ecd020662f",
+  "environment": {
+    "python": "3.13.5",
+    "pytorch": "2.10.0+cpu",
+    "device": "cpu",
+    "threads": 1,
+    "cuda_available": false
+  },
+  "tests": {
+    "base": {
+      "passed": 307,
+      "skipped": 10
+    },
+    "final_default": {
+      "passed": 324,
+      "skipped": 16,
+      "seconds": 84.8
+    },
+    "real_inductor": {
+      "passed": 6,
+      "skipped": 0,
+      "seconds": 90.25
+    }
+  },
+  "default_eager_vs_base": {
+    "actor_seed": 7,
+    "python_seed": 7,
+    "numpy_seed": 7,
+    "sampling_attempt_index": 7,
+    "cold_iterations": 1,
+    "warm_iterations": 7,
+    "order": "base then optimized, serial; same fixed inputs; no concurrent tests",
+    "timing_scope": "rollout plus backward; excludes sampling, Adam and audit I/O",
+    "update_check": "one Adam step after fixed-gradient repeats; not training convergence",
+    "cases": [
+      {
+        "case": "n2048_h8_m64",
+        "physical_transitions": 16384,
+        "checks": {
+          "costs": true,
+          "raw_groups": true,
+          "group_report": true,
+          "gradient": true,
+          "metrics": true,
+          "actor": true,
+          "adam": true,
+          "rng": true
+        },
+        "base_median": 0.32434074899992993,
+        "optimized_median": 0.30916185099999893,
+        "speedup": 1.0490969307850697
+      },
+      {
+        "case": "n128_h50_m8",
+        "physical_transitions": 6321,
+        "checks": {
+          "costs": true,
+          "raw_groups": true,
+          "group_report": true,
+          "gradient": true,
+          "metrics": true,
+          "actor": true,
+          "adam": true,
+          "rng": true
+        },
+        "base_median": 0.5144145059998664,
+        "optimized_median": 0.47167462299989893,
+        "speedup": 1.0906130644216927
+      },
+      {
+        "case": "n128_h500_m8",
+        "physical_transitions": 11590,
+        "checks": {
+          "costs": true,
+          "raw_groups": true,
+          "group_report": true,
+          "gradient": true,
+          "metrics": true,
+          "actor": true,
+          "adam": true,
+          "rng": true
+        },
+        "base_median": 1.7792987719999473,
+        "optimized_median": 1.5198855580001691,
+        "speedup": 1.17067943874742
+      }
+    ]
+  },
+  "compiled_h500_preflight": {
+    "checks": [
+      {
+        "clipped_gradient_close": true,
+        "clipped_gradient_max_abs_error": 2.9802322387695312e-08,
+        "costs_close": true,
+        "costs_max_abs_error": 9.5367431640625e-07,
+        "gradient_relative_l2_error": 2.7897675571234784e-07,
+        "iteration": 0,
+        "norms_and_multipliers_close": true,
+        "norms_and_multipliers_max_abs_error": 0.00012718236585129716,
+        "passed": true,
+        "physical_transitions_equal": true,
+        "raw_groups_close": true,
+        "raw_groups_max_abs_error": 5.052713277109433e-05
+      },
+      {
+        "clipped_gradient_close": true,
+        "clipped_gradient_max_abs_error": 2.9802322387695312e-08,
+        "costs_close": true,
+        "costs_max_abs_error": 9.5367431640625e-07,
+        "gradient_relative_l2_error": 2.7897675571234784e-07,
+        "iteration": 1,
+        "norms_and_multipliers_close": true,
+        "norms_and_multipliers_max_abs_error": 0.00012718236585129716,
+        "passed": true,
+        "physical_transitions_equal": true,
+        "raw_groups_close": true,
+        "raw_groups_max_abs_error": 5.052713277109433e-05
+      },
+      {
+        "clipped_gradient_close": true,
+        "clipped_gradient_max_abs_error": 2.9802322387695312e-08,
+        "costs_close": true,
+        "costs_max_abs_error": 9.5367431640625e-07,
+        "gradient_relative_l2_error": 2.7897675571234784e-07,
+        "iteration": 2,
+        "norms_and_multipliers_close": true,
+        "norms_and_multipliers_max_abs_error": 0.00012718236585129716,
+        "passed": true,
+        "physical_transitions_equal": true,
+        "raw_groups_close": true,
+        "raw_groups_max_abs_error": 5.052713277109433e-05
+      },
+      {
+        "clipped_gradient_close": true,
+        "clipped_gradient_max_abs_error": 2.9802322387695312e-08,
+        "costs_close": true,
+        "costs_max_abs_error": 9.5367431640625e-07,
+        "gradient_relative_l2_error": 2.7897675571234784e-07,
+        "iteration": 3,
+        "norms_and_multipliers_close": true,
+        "norms_and_multipliers_max_abs_error": 0.00012718236585129716,
+        "passed": true,
+        "physical_transitions_equal": true,
+        "raw_groups_close": true,
+        "raw_groups_max_abs_error": 5.052713277109433e-05
+      }
+    ],
+    "device": "cpu",
+    "device_name": "CPU",
+    "dtype": "float32",
+    "execution": {
+      "compile": {
+        "compiler": {
+          "backend": "inductor",
+          "cudagraphs": false,
+          "dynamic": true,
+          "fullgraph": true,
+          "mode": "default"
+        },
+        "physics_backend": "compile",
+        "record_training_observations": false,
+        "reuse_task_feature_squares": true,
+        "version": "verified-hotpath-v1"
+      },
+      "eager": {
+        "compiler": null,
+        "physics_backend": "eager",
+        "record_training_observations": false,
+        "reuse_task_feature_squares": true,
+        "version": "verified-hotpath-v1"
+      }
+    },
+    "gradient_scale": 0.1,
+    "group_cap": 1.0,
+    "horizon": 500,
+    "passed": true,
+    "policy_config": {
+      "dt": 0.01,
+      "memory_dim": 8
+    },
+    "samples": {
+      "compile": [
+        {
+          "backward_seconds": 9.393890574000125,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 110.6159479129999,
+          "gradient_phase_seconds": 120.00983848700002,
+          "iteration": 0,
+          "physical_transitions": 11494,
+          "warmup": true
+        },
+        {
+          "backward_seconds": 0.5255683769998996,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.4315606630000275,
+          "gradient_phase_seconds": 0.957129039999927,
+          "iteration": 1,
+          "physical_transitions": 11494,
+          "warmup": false
+        },
+        {
+          "backward_seconds": 0.5467502939998212,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.45884527600014735,
+          "gradient_phase_seconds": 1.0055955699999686,
+          "iteration": 2,
+          "physical_transitions": 11494,
+          "warmup": false
+        },
+        {
+          "backward_seconds": 0.5197577179999371,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.42973427900005845,
+          "gradient_phase_seconds": 0.9494919969999955,
+          "iteration": 3,
+          "physical_transitions": 11494,
+          "warmup": false
+        }
+      ],
+      "eager": [
+        {
+          "backward_seconds": 1.178240980000055,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.6704062539999995,
+          "gradient_phase_seconds": 1.8486472340000546,
+          "iteration": 0,
+          "physical_transitions": 11494,
+          "warmup": true
+        },
+        {
+          "backward_seconds": 1.2547450419999677,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.6437517280000975,
+          "gradient_phase_seconds": 1.8984967700000652,
+          "iteration": 1,
+          "physical_transitions": 11494,
+          "warmup": false
+        },
+        {
+          "backward_seconds": 1.1905785310000283,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.6444357780001155,
+          "gradient_phase_seconds": 1.8350143090001438,
+          "iteration": 2,
+          "physical_transitions": 11494,
+          "warmup": false
+        },
+        {
+          "backward_seconds": 1.1912082750000081,
+          "cuda_peak_allocated_bytes": null,
+          "forward_seconds": 0.6425635729999613,
+          "gradient_phase_seconds": 1.8337718479999694,
+          "iteration": 3,
+          "physical_transitions": 11494,
+          "warmup": false
+        }
+      ]
+    },
+    "scenes": 128,
+    "scope": "Numerical gradient-phase preflight only. Excludes sampling, Adam and audit I/O; not training convergence or deployment safety.",
+    "source_sha256": "d8eb6d4dcc6be7aabed12ead1733a96061b945ad76ec3282368540ecd020662f",
+    "time_decay": 1.0,
+    "tolerance": {
+      "atol": 3e-05,
+      "rtol": 0.0005
+    },
+    "torch_version": "2.10.0+cpu",
+    "train_seeds": [
+      31000007,
+      31000008,
+      31000009,
+      31000010
+    ],
+    "warm_gradient_phase_speedup": 1.917206805260327,
+    "warm_medians": {
+      "compile": {
+        "backward_seconds": 0.5255683769998996,
+        "forward_seconds": 0.4315606630000275,
+        "gradient_phase_seconds": 0.957129039999927
+      },
+      "eager": {
+        "backward_seconds": 1.1912082750000081,
+        "forward_seconds": 0.6437517280000975,
+        "gradient_phase_seconds": 1.8350143090001438
+      }
+    }
+  },
+  "untouched_files_sha256": {
+    "env_raptor.py": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+    "response_policy.py": "31fb0c66db4746241d01d5e3b5a1a7fd74308b2db316e4e8ecdf7221c0d4e14d",
+    "response_noise.py": "c4f902498c9880f8fafef4ceca9c3c083685d28a18a520b6cdac61f6312c606a",
+    "response_groups.py": "73dcf24a55ff9f512aa95b28ee9bb9e08508cda7fdbc080a32fe4174875a03db",
+    "response_sampling.py": "8f6a87b95ac5b895fa9226884b80659a43ea9073e9cab6d24dd07c70f423387b",
+    "configs/physics_coverage.json": "e5fa63b62ea6b0e237ddf62824d332cce8054f9cc64b6d60b1f2879e3673b720",
+    "configs/response_raptor_multi_airframe.args": "438c3b689d2856d5725eced048c48e3db772b057b228a373df46b1ccb526fdff",
+    "tests/core_contract.json": "1c34ce2ecc97e0d4bae9e1a4fc3d592bd168444dfafd84f9531fcd9cd5e22a4a"
+  },
+  "limits": [
+    "No CUDA compilation, throughput or memory evidence was collected.",
+    "Benchmarks use a fresh random Actor, not a converged checkpoint.",
+    "N128/H500 eager comparison executed 11590 of 64000 possible transitions due to early termination.",
+    "Compiler first-call overhead and specialization are separate from warm timings.",
+    "Exact equality against base applies to default eager changes in the three measured CPU fixtures; compiler equivalence is tolerance-based.",
+    "No full training, learned-control improvement or deployment authorization."
+  ]
+}
