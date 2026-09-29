@@ -34,11 +34,12 @@ The existing rule still applies: run training/validation only when explicitly re
 There is one RAPTOR-style multi-airframe training path. The production modules
 are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
 `response_task.py`, `response_adjoints.py`, `response_groups.py`,
-`response_training.py`, `response_execution.py`, `response_sampling.py`, and the single CLI
+`response_training.py`, `response_execution.py`, `response_sampling.py`,
+`response_audit.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
 The sole training config is `configs/response_raptor_multi_airframe.args`.
-Full BPTT, Time Decay and physical-group gradient normalization are the retained
+Full BPTT, Time Decay and physical-cell shrink-only gradient clipping are the retained
 algorithm. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. Noise changes must remain outside the
@@ -75,8 +76,8 @@ python tools/train_response_control.py @configs/response_raptor_multi_airframe.a
 `--scenarios` retains its four-bank size convention. The checked-in config uses
 coverage128 sampling, 4x512=2048 TRAIN scenes with 16 scenes per physical cell.
 Bare CLI defaults retain the original random 4x128=512 pool for compatibility.
-Fixed EVAL pools two original random banks (default 2x128=256). Sampling cells
-are not gradient groups. See docs/physics_coverage.md for frozen yaw calibration,
+Fixed EVAL pools two original random banks (default 2x128=256). For production coverage128, sampling cells
+are also the 128 fixed gradient groups (16 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
 candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only CLI modes are train and evaluate.
 Exact resume requires identical source/config; never rewrite checkpoint hashes
 to bypass an environment/noise mismatch. Older protocol checkpoints require their
@@ -84,7 +85,7 @@ original source. Deterministic unit checks use `python -m pytest -q tests`.
 
 ## Coding Style & Naming Conventions
 
-Use Python 3 type hints, `from __future__ import annotations`, and four-space indentation. Keep module constants in `UPPER_SNAKE_CASE`, classes in `PascalCase`, and functions, variables, and CLI flags in `snake_case` or kebab-case for command-line options. Prefer small, explicit functions and dataclasses for simulator state and parameters. Tensors should preserve caller device and dtype unless conversion is intentional.
+Use Python 3 type hints, `from __future__ import annotations`, and four-space indentation. Keep module constants in `UPPER_SNAKE_CASE`, classes in `PascalCase`, and functions, variables, and CLI flags in `snake_case` or `kebab-case`. Prefer small, explicit functions and dataclasses for simulator state and parameters. Tensors should preserve caller device and dtype unless conversion is intentional.
 
 ## Testing Guidelines
 
@@ -93,7 +94,8 @@ contains pre-cleanup source-kernel hashes; never regenerate them merely to accep
 an accidental algorithm change. For intentional kernel changes, review the reason
 and independently validate numerical and gradient behavior before updating a contract.
 The pulse RHS is the single documented intentional kernel-hash update; its old
-hash and rationale remain in the contract. Other protected hashes are retained.
+hash and rationale remain in the contract. The later uniform-time default and fixed-cell/clipping changes also have explicit
+old/new hash entries and independent regression tests. Other protected hashes are retained.
 
 Validate the source force law, pulse timing/geometry and force-at-point mechanics,
 Gaussian sampling, Actor input noninterference, noisy acquisition-time delay,
@@ -152,7 +154,7 @@ For debugging or unexpected behavior:
 
 systematic-debugging
 → test-driven-development when a code change is needed
-→ hypothesis-testing when correctness spans an input domain
+→ hypothesis-testing when correctness spans the input domain
 → implementation
 → code-review-and-quality
 → verification-before-completion

@@ -2,7 +2,7 @@
 
 One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
 entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
-gradient normalization and persistent Adam. There is no critic, teacher,
+shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
 auxiliary network or single-airframe mode.
 
 ## Run
@@ -27,15 +27,21 @@ It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
 TRAIN now uses [fixed physical coverage](docs/physics_coverage.md):
 TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 16 scenes each.
 Candidate aircraft retain the original physical coupling and initial conditions;
-noise is attached after selection. Fixed EVAL and the 16 gradient groups do not
-change. `history.jsonl` records exact cell counts under `training_sampling`.
+noise is attached after selection. Fixed EVAL does not change. The 128 fixed
+sampling cells are now also the 128 gradient groups: 16 initial scenes each,
+including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
+after CVaR/gradient-scale, never amplified, then averaged. Groups are processed
+in chunks of 16 (8 VJP calls), not 128 adjoints at once. This increases backward
+work relative to the former 16 groups; CUDA throughput is not yet measured.
+See [clipping and update evidence](docs/cell_clipping_audit.md).
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
 with the checked-in config and the former smaller pool, use a NEW run directory:
 
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
-    --train-sampling random --scenarios 128 --work-dir runs/random_sampling/seed7
+    --train-sampling random --scenarios 128 --group-max-groups 16 \
+    --group-min-scenarios 32 --work-dir runs/random_sampling/seed7
 ```
 
 Use an empty directory for fresh Actor/Adam initialization. Extend `--updates`
@@ -206,8 +212,8 @@ update/time budgets can be extended.
 
 Joint RK4 and motor laws are retained with the requested additional force/torque
 terms. Apart from the uniform time-weight default documented above, Huber/CVaR costs,
-position-only first-failure semantics, physical-group gradients, Adam and Time
-Decay are unchanged. Time Decay > 0 is a
+position-only first-failure semantics, Adam and Time Decay are unchanged.
+Physical-group gradients now use fixed-cell membership and shrink-only caps. Time Decay > 0 is a
 surrogate backward gradient; 0 is exact BPTT. No auxiliary controller is added.
 
 ## Provenance and verification
@@ -222,8 +228,8 @@ Tests cover pulse timing/geometry/Gaussian scale, analytic COM impulse, independ
 NumPy force-at-point RK4, attitude/action finite differences, privileged-input
 noninterference, pre-pulse causality, original-row compaction, terminal freezing,
 grouped full BPTT across metric boundaries and exact noisy checkpoint resume.
-The intentional dynamics RHS and uniform-time default changes are recorded with
-old/new provenance in the core contract; all other protected hashes are retained. CPU tests are
+Intentional dynamics RHS, uniform-time default, and fixed-cell/clipping changes
+are recorded with old/new provenance in the core contract; other protected hashes are retained. CPU tests are
 not CUDA throughput, convergence, trained recovery or real-flight safety results.
 Checkpoints retain `deployment_authorized: false`.
 
@@ -231,6 +237,7 @@ Checkpoints retain `deployment_authorized: false`.
 `response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
 `response_adjoints.py` and `response_groups.py` grouped full BPTT;
 `response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
+`response_audit.py` bounded Actor/Adam/RNG update evidence;
 `tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
 [third-party notices](THIRD_PARTY_NOTICES.md), `reference/`, `物理配置/` and historical

@@ -19,8 +19,9 @@
 --dead-cost 3
 --terminal-cost 200
 --work-dir runs/pulsed_recovery/seed7
---group-max-groups 16
---group-min-scenarios 32
+--group-max-groups 128
+--group-min-scenarios 16
+--group-clip-norm 1.0
 --group-gradient-epsilon 1e-12
 --group-vjp-chunk-size 16
 --position-noise-std 0.001

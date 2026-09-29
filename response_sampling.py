@@ -1,6 +1,6 @@
 """TRAIN-only, fixed-quota physical coverage using unchanged clean reset draws.
 
-128 sampling cells are NOT gradient groups. No trajectory, Actor, or EVAL result
+These 128 cells may also define gradient groups. No trajectory, Actor, or EVAL result
 is used to choose a row. Noise/pulses are attached only to the selected pool by
 the caller. Old random sampling and fixed EVAL remain in response_training.
 """
