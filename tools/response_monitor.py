@@ -260,7 +260,16 @@ def replay_entry(path) -> ReplayEntry:
     if seconds is None or seconds <= 0 or dt is None or dt <= 0:
         raise ValueError("invalid replay duration/dt")
     # Read only metadata. Never decompress the NPZ during monitor polling.
-    if not path.with_suffix(".npz").is_file():
+    trajectory_file = meta.get("trajectory_file")
+    if trajectory_file is None:
+        data_path = path.with_suffix(".npz")
+    elif (not isinstance(trajectory_file, str)
+          or Path(trajectory_file).name != trajectory_file
+          or trajectory_file in ("", ".", "..")):
+        raise ValueError("invalid replay trajectory filename")
+    else:
+        data_path = path.parent / trajectory_file
+    if not data_path.is_file():
         raise ValueError("matching replay NPZ has not been exported")
     return ReplayEntry(path, meta.get("checkpoint_update", "?"), len(scenes), seconds,
                        str(meta.get("model_sha256", "unknown")))
@@ -304,7 +313,11 @@ def discover_replays(root, explicit=(), *, limit=64, directory_limit=128):
 def launch_replay(path, *, python=sys.executable, max_frames=None):
     """Only launch the saved-array renderer. Never --run-dir, export or EVAL."""
     entry = replay_entry(path)
-    player = Path(__file__).with_name("play_response_long.py")
+    meta = small_json(entry.path)
+    player_name = ("play_response_short.py"
+                   if meta.get("replay_type") == "short-eval-v1"
+                   else "play_response_long.py")
+    player = Path(__file__).with_name(player_name)
     command = [str(python), str(player), "--replay", str(entry.path), "--fps", "20"]
     if max_frames is not None:
         command += ["--max-frames", str(max_frames)]

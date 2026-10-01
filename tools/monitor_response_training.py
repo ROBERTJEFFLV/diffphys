@@ -79,6 +79,7 @@ def run_monitor(args):
     message = "Replays open only on request; never re-simulated by this dashboard."
     running, dirty, paused, logarithmic = True, True, False, False
     next_poll = 0.
+    next_replay_scan = time.monotonic() + 5.
     frames = 0
     buttons = []
     scene_buttons = []
@@ -165,7 +166,7 @@ def run_monitor(args):
             page = min(max(0, (len(replays) - 1) // 5), page + 1)
         elif action == "open":
             if not replays:
-                message = "No replay. Export saved long-EVAL files separately; see docs/training_gui.md."
+                message = "No replay. Save a fixed-EVAL trace or export a long-EVAL flight."
             elif replay_process is not None and replay_process.poll() is None:
                 message = "A replay window is already open. Close it before opening another."
             else:
@@ -182,6 +183,14 @@ def run_monitor(args):
             if not paused and now >= next_poll:
                 logs.poll()
                 next_poll = now + args.poll_seconds
+                dirty = True
+            if now >= next_replay_scan:
+                previous_path = replays[selected].path if replays else None
+                replays, scan_errors = discover_replays(root, args.replay)
+                selected = next((i for i, entry in enumerate(replays)
+                                 if entry.path == previous_path), 0)
+                page = min(page, max(0, (len(replays) - 1) // 5))
+                next_replay_scan = now + 5.
                 dirty = True
             if replay_process is not None and replay_process.poll() is not None:
                 message = ("Replay window closed." if replay_process.returncode == 0 else
@@ -216,7 +225,7 @@ def run_monitor(args):
             buttons, scene_buttons = [], []
             canvas.fill(BG)
             text("DiffPhys | Training monitor", 24, 14, 30)
-            text("READ ONLY  /  no inference  /  no new EVAL  /  no CUDA", 24, 54, 15, GREEN)
+            text("DASHBOARD READ ONLY  /  short replay export runs separately", 24, 54, 15, GREEN)
             text(str(args.run_dir.resolve()), 24, 80, 15, MUTED, 1440)
             train, evaluation = logs.train.latest, logs.eval.latest
             age = logs.age()
@@ -247,7 +256,7 @@ def run_monitor(args):
                 text(label, 1026, yy, 15, MUTED)
                 text(value, 1290, yy, 15, WHITE, 166)
             text("Saved-flight replay", 1026, 410, 20)
-            text("Uses your existing 3D player. No checkpoint read.", 1026, 441, 13, MUTED)
+            text("Opens saved 3D arrays. Dashboard never loads a checkpoint.", 1026, 441, 13, MUTED)
             for index in range(page * 5, min(len(replays), (page + 1) * 5)):
                 entry = replays[index]
                 yy = 469 + (index % 5) * 49
@@ -265,7 +274,8 @@ def run_monitor(args):
             button("Refresh list [R]", (1122, 724, 149, 32), "scan")
             button("Open replay", (1280, 724, 179, 32), "open")
             text(message, 1026, 770, 13, MUTED, 431)
-            text("Replay protocol/model may differ from fixed EVAL.", 1026, 797, 13, GOLD)
+            text("Check Actor/update; historical long EVAL may use another model.",
+                 1026, 797, 13, GOLD)
             text("It never replaces these logged training metrics.", 1026, 819, 13, MUTED)
             text("TRAIN log age: " + ("waiting for file" if age is None else f"{age:.0f}s") + " | Not a process heartbeat", 24, 869, 15, MUTED)
             text("Last saved status: " + logs.saved_status(), 24, 893, 15, MUTED, 880)

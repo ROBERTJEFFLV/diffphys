@@ -2,7 +2,7 @@
 
 Scope: change which valid initial scenes are sampled, not the controller, task
 loss, physics, disturbances, Time Decay, CVaR, or optimizer.
-The subsequent requested gradient change reuses these cells; see cell_clipping_audit.md.
+The group-gradient probe reuses these cells; see [group_gradient_probe.md](group_gradient_probe.md).
 The existing random sampler remains available; fixed EVAL is always unchanged.
 
 ## Cells and pool size

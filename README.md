@@ -34,8 +34,8 @@ after CVaR/gradient-scale, never amplified, then averaged. Groups are processed
 using a training-only native GRU/Linear gradient probe in one backward graph
 traversal. The former eight-chunk VJP path is an explicit reference backend only.
 This preserves per-group clipping, not an approximation of the group norms.
-See [one-pass probes and profiling](docs/group_gradient_probe.md) and
-[clipping and update evidence](docs/cell_clipping_audit.md). CUDA throughput must
+See [one-pass probes and profiling](docs/group_gradient_probe.md). Update evidence
+is retained locally by `response_audit.py`. CUDA throughput must
 be measured on the target GPU; fewer traversals do not promise a specific latency.
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
@@ -86,8 +86,7 @@ An old-source run cannot be exactly resumed with a different objective/source.
 Keep its checkpoint and checkout intact; use `--init-checkpoint PATH` with an
 empty work directory for an explicit weights-only fork (fresh Adam and sampling).
 For 2048 scenes, keep `--scenarios 512` (four-bank size convention). Exact resume
-inside a new run remains supported with identical source and sampler settings. See the
-[verification and training-design audit](docs/uniform_time_loss_audit.md).
+inside a new run remains supported with identical source and sampler settings.
 
 ## Online metrics without live training rendering
 
@@ -103,9 +102,25 @@ python tools/monitor_response_training.py \
     --replay-root runs/long_hover_eval
 ```
 
-Only exported `playback/playlist.json` + `.npz` pairs are opened. To convert an
-existing finished long EVAL, run `tools/play_response_long.py --run-dir PATH
---export-only` separately. The dashboard never launches export or simulation.
+The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
+`.npz` files. For the ordinary H500 fixed EVAL, enable the separate exporter:
+
+```bash
+python tools/short_eval_replay.py \
+    --run-dir runs/pulsed_recovery/seed7 --device cuda
+python tools/monitor_response_training.py \
+    --run-dir runs/pulsed_recovery/seed7
+```
+
+The exporter retains the latest complete fixed-EVAL trace, including the exact
+constant force and force-at-point pulses. It does one additional EVAL forward
+pass per new EVAL/checkpoint pair and does not update Actor or Adam. Its source
+must match the checkpoint. The monitor automatically discovers new short
+replays; opening one uses saved arrays without policy inference.
+
+To convert an existing finished long EVAL, run
+`tools/play_response_long.py --run-dir PATH --export-only` separately.
+The dashboard itself never launches export or simulation.
 Polling is bounded and read-only; shared CPU/disk/display resources still have
 some overhead. Run it on another machine with synced files for best isolation.
 
@@ -244,5 +259,7 @@ Checkpoints retain `deployment_authorized: false`.
 `response_audit.py` bounded Actor/Adam/RNG update evidence;
 `tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
-[third-party notices](THIRD_PARTY_NOTICES.md), `reference/`, `物理配置/` and historical
-images remain; they are not additional runtime entry points.
+[third-party notices](THIRD_PARTY_NOTICES.md) are retained. Retired source and
+alternative implementations are preserved in Git history, not the production
+tree. The current physics and training files use eager PyTorch; the experimental
+compiled hotpath backend is not included.
