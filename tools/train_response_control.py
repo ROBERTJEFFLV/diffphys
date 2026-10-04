@@ -69,11 +69,18 @@ def parse_args(argv=None):
     for config in (ResponsePolicyConfig(), TaskLossConfig()):
         for field in fields(config):
             default = getattr(config, field.name)
-            parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
+            options = ({"type": float, "nargs": len(default)} if isinstance(default, tuple)
+                       else {"type": type(default)})
+            parser.add_argument("--"+field.name.replace("_", "-"), default=default, **options)
     for field in fields(AuditConfig):
         default = getattr(AuditConfig(), field.name)
         parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
+    # Channel limits must retain a stable tuple representation in checkpoint
+    # bindings, whether supplied through CLI or inherited from the dataclass.
+    for field in fields(ResponsePolicyConfig):
+        if isinstance(getattr(ResponsePolicyConfig(), field.name), tuple):
+            setattr(args, field.name, tuple(getattr(args, field.name)))
     if args.group_max_groups is None:
         args.group_max_groups = 128 if args.train_sampling == "coverage128" else 16
     if args.group_min_scenarios is None:
@@ -92,6 +99,7 @@ def parse_args(argv=None):
         groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)
         AuditConfig.from_args(args)
+        ResponsePolicyConfig(**{f.name: getattr(args, f.name) for f in fields(ResponsePolicyConfig)})
         if args.mode == "train":
             validate_sampling(args.train_sampling, 4*args.scenarios)
     except ValueError as error:

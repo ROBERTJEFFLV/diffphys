@@ -47,7 +47,7 @@ def test_noise_forward_loss_and_masks_identical_for_all_decay_settings(dtype):
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 def test_grouped_full_graph_gradients_match_independent_group_vjps(alpha,dtype):
     s=RaptorSimulator().reset(64,horizon=12,dtype=dtype);p=actor(dtype);loss=task.TaskLossConfig()
-    with torch.no_grad():p.readout.weight[:,:16].normal_(0,.001)
+    with torch.no_grad():p.readout.weight.normal_(0,.001)
     r=collect_rollout(p,RaptorSimulator(),s,loss,horizon=12,time_decay=alpha)
     params=list(p.parameters());rows=[]
     for seed in r.group_coefficients:
@@ -57,8 +57,9 @@ def test_grouped_full_graph_gradients_match_independent_group_vjps(alpha,dtype):
     backward_actor(p,RaptorSimulator(),r,loss)
     tol=5e-5 if dtype==torch.float32 else 1e-10
     torch.testing.assert_close(flat_grads(p),expected,rtol=tol,atol=tol)
-    assert p.readout.weight.grad[:,:16].norm()>0
+    assert p.readout.weight.grad.norm()>0
     assert p.response_memory.weight_hh.grad.norm()>0
+    assert p.base_feedback.coefficients.raw.grad.norm()>0
 
 
 @pytest.mark.parametrize('alpha',[-1.,float('nan'),float('inf')])

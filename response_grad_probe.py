@@ -1,9 +1,9 @@
 """Training-only group derivatives from one native closed-loop backward traversal.
 
-The Actor's GRUCell/Linear forward and native state adjoints are NOT replaced.
+The Actor's native GRU and state/physics adjoints are NOT replaced.
 Tensor-output hooks observe each local adjoint, reconstruct only local parameter
 partials, and reduce them to fixed groups before summing across time. Applicable
-only to the current scene-independent GRUCell + affine readout Actor.
+only to the scene-independent geometric-feedback/bounded-residual Actor.
 """
 from __future__ import annotations
 
@@ -15,9 +15,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from response_policy import ResponseMotorPolicy
+from response_policy import (ResponseMotorPolicy, IncrementalResidualReadout,
+                             FeedbackCoefficients, gru_incremental_bounds)
 
-PROBE_VERSION = "native-gru-linear-group-probe-v1"
+PROBE_VERSION = "native-gru-geometric-residual-group-probe-v2"
 
 
 @torch.no_grad()
@@ -44,6 +45,57 @@ def gru_gate_deltas(
     return torch.cat((dr, dz, dn), -1), torch.cat((dr, dz, dn * r), -1)
 
 
+@torch.no_grad()
+def bounded_readout_pullback(policy, grad_weight, grad_bias):
+    """Pull G effective-affine partials back to raw readout AND GRU parameters.
+
+    The readout normalization depends on the GRU's input/recurrent matrices and
+    candidate recurrent bias. Ignoring these terms would silently drop part of
+    every physical group's derivative. All operations below are parameter-local;
+    no second trajectory traversal or per-scene parameter tensor is constructed.
+    """
+    layer, head = policy.response_memory, policy.readout
+    ir, iz, inn = layer.weight_ih.chunk(3, 0)
+    hr, hz, hn = layer.weight_hh.chunk(3, 0)
+    bn = layer.bias_hh.chunk(3, 0)[2]
+    norms = [torch.linalg.vector_norm(x) for x in (ir, iz, inn, hr, hz, hn)]
+    nr, nz, nnorm, rr, rz, rn = norms
+    row_bounds = hn.abs().sum(-1) + bn.abs()
+    b = row_bounds.amax()
+    lx, lh = gru_incremental_bounds(layer)
+    length = lx + lh
+    weight_norm = torch.linalg.vector_norm(head.weight, dim=-1)
+    alpha = head.amplitude/head.gain_limit
+    scale = 1 + alpha*weight_norm*length
+    tiny = torch.finfo(head.weight.dtype).tiny
+    # Keep the accumulated GxP values in FP64; constants reproduce the actual
+    # forward parameterization in the Actor dtype.
+    w = head.weight.double()
+    dot = (grad_weight*w[None]).sum(-1)
+    factor = -(dot*alpha.double()[None]*length.double()
+               / (scale.double().square()*weight_norm.double().clamp_min(tiny))[None])
+    raw_weight = grad_weight/scale.double()[None, :, None] + factor[..., None]*w[None]
+    grad_length = -(dot*(alpha*weight_norm/scale.square()).double()[None]).sum(-1)
+    # amax shares its subgradient equally across exact ties, including B=0.
+    ties = (row_bounds == b).to(head.weight.dtype)
+    ties = ties/ties.sum()
+    dbw = ties[:, None]*hn.sign()
+    dbb = ties*bn.sign()
+    def unit(x, norm):
+        return x/norm.clamp_min(tiny)
+    bound_wi = torch.cat((.25*b*unit(ir, nr), .5*unit(iz, nz), unit(inn, nnorm)), 0)
+    bound_wh = torch.cat((.25*b*unit(hr, rr), .5*unit(hz, rz),
+                           unit(hn, rn) + .25*(nr+rr)*dbw), 0)
+    bound_bh = torch.cat((torch.zeros_like(bn), torch.zeros_like(bn), .25*(nr+rr)*dbb), 0)
+    return {
+        "readout.weight": raw_weight,
+        "readout.bias": grad_bias,
+        "response_memory.weight_ih": grad_length[:, None, None]*bound_wi.double()[None],
+        "response_memory.weight_hh": grad_length[:, None, None]*bound_wh.double()[None],
+        "response_memory.bias_hh": grad_length[:, None]*bound_bh.double()[None],
+    }
+
+
 class GroupGradientProbe:
     """Observe once; directly accumulate GxP, never NxP or HxNxP derivatives.
 
@@ -55,26 +107,29 @@ class GroupGradientProbe:
     One scalar VJP uses the SUM of all group seeds. Row-independent physics,
     sensing, Actor features and detached CVaR make each row's adjoint belong
     solely to that scene's group. BatchNorm, cross-scene attention, coupled
-    multi-agent dynamics, parameter-dependent losses outside these two modules,
+    multi-agent dynamics, parameter-dependent losses outside these captured paths,
     higher-order differentiation and parameter sharing beyond this Actor are
     deliberately unsupported.
     """
     def __init__(self, policy: ResponseMotorPolicy, indices: torch.Tensor, counts: torch.Tensor):
         if type(policy) is not ResponseMotorPolicy:
             raise ValueError("group probe supports only the current ResponseMotorPolicy")
-        if type(policy.response_memory) is not nn.GRUCell or type(policy.readout) is not nn.Linear:
-            raise ValueError("group probe requires native GRUCell and Linear")
+        if (type(policy.response_memory) is not nn.GRUCell
+                or type(policy.readout) is not IncrementalResidualReadout
+                or type(policy.base_feedback.coefficients) is not FeedbackCoefficients):
+            raise ValueError("group probe requires the native GRU and structured feedback/residual modules")
         expected = {
             "response_memory.weight_ih", "response_memory.weight_hh",
             "response_memory.bias_ih", "response_memory.bias_hh",
-            "readout.weight", "readout.bias",
+            "readout.weight", "readout.bias", "base_feedback.coefficients.raw",
         }
         self.named = list(policy.named_parameters())
         if {name for name, _ in self.named} != expected or any(not p.requires_grad for _,p in self.named):
-            raise ValueError("group probe requires the six unchanged, trainable Actor parameter tensors")
+            raise ValueError("group probe requires all seven trainable geometric/residual Actor parameter tensors")
         self.policy = policy
         self.parameters = [p for _, p in self.named]
         self.versions = [(id(p), p._version) for p in self.parameters]
+        self.buffer_versions = [(id(b), b._version) for b in policy.buffers()]
         self.n = int(counts.sum())
         if indices.ndim != 2 or indices.shape[0] != counts.numel() or self.n < 1:
             raise ValueError("invalid probe group layout")
@@ -110,8 +165,8 @@ class GroupGradientProbe:
         self._armed = False
         self._used = False
         self._closed = False
-        self.captured = {"gru": 0, "linear": 0}
-        self.observed = {"gru": 0, "linear": 0}
+        self.captured = {"gru": 0, "linear": 0, "feedback": 0}
+        self.observed = {"gru": 0, "linear": 0, "feedback": 0}
 
     @contextmanager
     def capture(self) -> Iterator["GroupGradientProbe"]:
@@ -122,6 +177,7 @@ class GroupGradientProbe:
         self._module_handles = [
             self.policy.response_memory.register_forward_hook(self._gru_forward),
             self.policy.readout.register_forward_hook(self._linear_forward),
+            self.policy.base_feedback.coefficients.register_forward_hook(self._feedback_forward),
         ]
         try:
             yield self
@@ -160,8 +216,11 @@ class GroupGradientProbe:
                     values, slots = payload
                     if kind == "gru":
                         self._gru_partial(values[0], values[1], adjoint.detach(), slots)
-                    else:
+                    elif kind == "linear":
                         self._linear_partial(values[0], adjoint.detach(), slots)
+                    else:
+                        self.views["base_feedback.coefficients.raw"].add_(
+                            self._pack(adjoint.detach(), slots).sum(1).double())
                 self.observed[kind] += 1
             finally:
                 payload.clear()
@@ -175,7 +234,20 @@ class GroupGradientProbe:
         self._watch("gru", inputs, output)
 
     def _linear_forward(self, module, inputs, output) -> None:
-        self._watch("linear", inputs, output)
+        self._watch("linear", inputs[:1], output)
+
+    def _feedback_forward(self, module, inputs, output) -> None:
+        self._watch("feedback", (), output)
+
+    def _pullback_readout(self) -> None:
+        # Affine hooks accumulated effective weights, not raw parameters.
+        partials = bounded_readout_pullback(
+            self.policy, self.views["readout.weight"], self.views["readout.bias"])
+        for name, value in partials.items():
+            if name.startswith("readout."):
+                self.views[name].copy_(value)
+            else:
+                self.views[name].add_(value)
 
     def _pack(self, value, slots):
         packed = value.new_zeros(self.groups*self.width, value.shape[-1])
@@ -220,6 +292,8 @@ class GroupGradientProbe:
         try:
             if [(id(p),p._version) for p in parameters] != self.versions:
                 raise RuntimeError("Actor parameters changed between captured forward and backward")
+            if [(id(b), b._version) for b in self.policy.buffers()] != self.buffer_versions:
+                raise RuntimeError("Actor constraint buffers changed between forward and backward")
             if costs.shape != (self.n,) or coefficients.shape != (self.groups,self.n):
                 raise ValueError("group probe cost/coefficient shape mismatch")
             if coefficients.requires_grad or not math.isfinite(gradient_scale) or gradient_scale <= 0:
@@ -238,6 +312,7 @@ class GroupGradientProbe:
             self._armed = False
             if self.observed != self.captured or not self.captured["gru"]:
                 raise RuntimeError("incomplete group probe backward observation")
+            self._pullback_readout()
             combined, report = normalize_group_rows(self.rows, config.gradient_epsilon,
                                                       max_norm=config.clip_norm)
             result, offset = [], 0

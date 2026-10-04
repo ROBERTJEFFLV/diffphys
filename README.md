@@ -1,5 +1,15 @@
 # DiffPhys: multi-airframe recurrent motor control
 
+## Experimental geometric-feedback branch
+
+This branch replaces the free state/GRU readout with nonlinear geometric state
+feedback and an incrementally bounded GRU command residual. See
+[architecture, assumptions, limits and audit commands](docs/geometric_feedback.md).
+The normalized motor interface, physics, sampling, task loss and optimizer rules
+below are retained. No stability or real-flight certificate is claimed. Use a
+new work directory (for example `runs/geometric_feedback/seed7`); old affine
+Actor/Adam checkpoints are not compatible with this architecture.
+
 One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
 entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
 shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
@@ -195,9 +205,13 @@ current measured rotation matrix (9), current measured body angular velocity (3)
 last known motor command (4)
 ```
 
-The 16 features feed `GRUCell(16,64)` and `[features,memory] -> Linear(80,4) -> tanh`:
-**16,068 trainable parameters**. GRU16 denotes input size, not hidden dimension.
-Commands remain absolute [-1,1], FR/BR/BL/FL, FLU.
+The unchanged 16 features feed `GRUCell(16,64)` and a bounded recurrent residual
+readout. A separate measured-state path uses nonlinear reduced-attitude feedback
+with nine bounded coefficients. Their collective/roll/pitch/yaw motor-logit
+contributions are added, mixed and passed through final tanh: **16,013 trainable
+parameters**. GRU16 denotes input size, not hidden dimension. Commands remain
+absolute [-1,1], FR/BR/BL/FL, FLU. Yaw is rate-damped, not heading-tracked; no
+physical-parameter identification head or hidden truth input is added.
 
 Initial previous_action is a fixed zero placeholder, independent of random motor
 truth; following steps store the Actor's issued command. The Actor never receives

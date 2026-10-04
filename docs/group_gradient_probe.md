@@ -1,3 +1,12 @@
+> Geometric-feedback branch: the baseline mechanics below are retained, but
+> the supported Actor now has native GRU, effective residual-readout and
+> per-scene geometric-coefficient hooks. The effective readout normalization is
+> analytically pulled back into both raw readout and GRU parameters before the
+> unchanged group clipping. There are seven trainable parameter tensors and one
+> physical-graph traversal. See [the new parameterization and tests](geometric_feedback.md).
+> The old six-tensor/affine-only descriptions below document the baseline, not
+> the current branch's Actor whitelist.
+
 # One native backward traversal for exact physical-group gradients
 
 ## What changes, and what does not

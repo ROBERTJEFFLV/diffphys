@@ -127,10 +127,10 @@ def restore_rng(state):
 
 
 def migrate_actor_weights(policy, state):
-    """Load only this architecture; old response-MLP weights are not equivalent."""
+    """Load only this architecture; old affine state/GRU weights are not equivalent."""
     expected = policy.state_dict()
     if set(state) != set(expected):
-        raise ValueError("Actor keys do not match GRU16 direct readout; retrain old architectures")
+        raise ValueError("Actor keys do not match geometric feedback/residual; retrain old architectures")
     if any(
         state[n].shape != v.shape or not bool(torch.isfinite(state[n]).all())
         for n, v in expected.items()
@@ -142,8 +142,11 @@ def migrate_actor_weights(policy, state):
 def require_reference_checkpoint(value):
     """A shape match cannot certify old hover-centered or plus-frame semantics."""
     if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 direct-readout checkpoint or retrain")
+        raise ValueError("incompatible Actor architecture or motor semantics: use a geometric-feedback residual checkpoint or retrain")
     cfg = value["binding"]["protocol"]
+    if value.get("policy_config") != cfg.get("policy"):
+        raise ValueError("checkpoint policy configuration/constraint binding mismatch")
+    ResponsePolicyConfig(**value["policy_config"])
     params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
             or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_raptor.py")

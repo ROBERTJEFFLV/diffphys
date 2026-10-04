@@ -29,7 +29,7 @@
     },
     "response_policy.py": {
       "body_vector": "697fd84932fd856432f7cf6debedaf69da2ff65394befbee2fd9d5c6fbfb33d8",
-      "ResponseMotorPolicy.__init__": "ba117a5e44273e98a96e7fdca45e7b4ff2f4ab15c7cf0f98de5e0693e9ecbb00",
+      "ResponseMotorPolicy.__init__": "7a0d8af87e5b1f068736186fed672c2955a152df23c4205aa897206289dd449e",
       "ResponseMotorPolicy.control_features": "fcf70531a9eda185018ca8be975de30dee57d1c719aaa6e3b7089c3891df17e2",
       "ResponseMotorPolicy.initial_state": "61c79ac803ba441716010f5a288f2f8772aced97cd36e227df8a274881834650"
     },
@@ -75,6 +75,14 @@
       "previous_hash": "6c75fe44b463d5494253084bdf620582705bd88f333acacec7c17374ce9c7c17",
       "new_hash": "3f1c3a3d9539f5d52261359fd04343660f9b3aac80694cd809297b68ba602a10",
       "reason": "User-requested fixed coverage128 gradient groups and shrink-only fixed cap. Independent analytic gradient, quota/membership, zero/tiny/huge/outlier and replay tests validate the change. All other protected kernels unchanged."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.__init__",
+      "previous_hash": "ba117a5e44273e98a96e7fdca45e7b4ff2f4ab15c7cf0f98de5e0693e9ecbb00",
+      "new_hash": "7a0d8af87e5b1f068736186fed672c2955a152df23c4205aa897206289dd449e",
+      "reason": "User-requested Actor-only change: explicit nonlinear reduced-attitude feedback plus a bounded GRU command residual, with unchanged 22D observations/16D features/native GRU state. Geometry, exact parameter finite differences, native grouped VJPs and the full residual-normalization chain rule are independently tested. All physics, loss, sampler, group-clipping, Time Decay and Adam kernel hashes remain unchanged. Ranges are experimental; no flight/stability certificate."
     }
   ]
 }

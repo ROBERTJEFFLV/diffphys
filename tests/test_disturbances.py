@@ -228,7 +228,13 @@ def test_actual_h500_default_width_graph_with_delayed_measurements():
     p=ResponseMotorPolicy().double()
     with torch.no_grad():
         p.readout.weight.zero_()
-        p.readout.bias.copy_(torch.atanh(2*motor[0]-1))
+        p.readout.bias.zero_()
+        # Set only the common operating-point bias in this single-airframe
+        # fixture; sampled motor truth is still never an Actor observation.
+        hover_logit = torch.atanh(2*motor[0,0]-1)
+        coefficients = p.base_feedback.coefficients
+        fraction = (hover_logit-coefficients.lower[-1])/(coefficients.upper[-1]-coefficients.lower[-1])
+        coefficients.raw[-1].copy_(torch.logit(fraction))
     record=collect_rollout(p,sim,s,TaskLossConfig(),horizon=500,time_decay=1.)
     assert record.metrics['physical_transitions']==32*500
     backward_actor(p,sim,record,TaskLossConfig())
