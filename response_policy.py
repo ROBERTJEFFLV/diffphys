@@ -1,4 +1,4 @@
-"""Minimal recurrent motor policy with a direct state-to-action readout."""
+"""Minimal recurrent motor policy with a hidden-only motor readout."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-ARCHITECTURE = "gru16-direct-readout-absolute-motor-policy-v4"
+ARCHITECTURE = "gru16-hidden-only-readout-absolute-motor-policy-v1"
 OBSERVATION_DIM = 22
 CONTROL_FEATURE_DIM = 16
 
@@ -42,7 +42,7 @@ def body_vector(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
 
 
 class ResponseMotorPolicy(nn.Module):
-    """One native GRU and one affine readout; hidden state is the only memory.
+    """One native GRU and one hidden-only readout; no direct feature shortcut.
 
     Observation: p(3), v(3), measured R(9), body omega(3), previous command(4).
     No physical parameters, motor truth, learned encoder, explicit integral,
@@ -55,12 +55,10 @@ class ResponseMotorPolicy(nn.Module):
         self.config = config
         # Keep the native GRU and attribute name used by the existing VJP tools.
         self.response_memory = nn.GRUCell(CONTROL_FEATURE_DIM, config.memory_dim)
-        self.readout = nn.Linear(CONTROL_FEATURE_DIM + config.memory_dim, 4)
-        # One weight matrix [W_c | W_h], not two controllers or two optimizers.
-        # Zero W_c is trainable immediately; nonzero W_h admits GRU gradients.
+        self.readout = nn.Linear(config.memory_dim, 4)
+        # Only W_h remains. Current observations affect the action through GRU.
         with torch.no_grad():
-            self.readout.weight[:, :CONTROL_FEATURE_DIM].zero_()
-            nn.init.xavier_uniform_(self.readout.weight[:, CONTROL_FEATURE_DIM:], gain=0.1)
+            nn.init.xavier_uniform_(self.readout.weight, gain=0.1)
             self.readout.bias.zero_()
 
     def initial_state(self, observation: torch.Tensor) -> ResponsePolicyState:
@@ -99,5 +97,5 @@ class ResponseMotorPolicy(nn.Module):
         features = self.control_features(observation)
         # Never skip call zero: current state must affect h_t and the first action.
         memory = self.response_memory(features, state.memory)
-        proposed = torch.tanh(self.readout(torch.cat((features, memory), -1)))
+        proposed = torch.tanh(self.readout(memory))
         return ResponsePolicyOutput(proposed, ResponsePolicyState(memory))

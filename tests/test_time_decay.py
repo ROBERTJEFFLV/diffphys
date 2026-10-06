@@ -5,6 +5,8 @@ import math
 import pytest
 import torch
 
+from loss_fixtures import test_loss
+
 from env_raptor import RaptorSimulator
 import response_task as task
 from response_adjoints import collect_rollout,backward_actor
@@ -40,14 +42,14 @@ def test_noise_forward_loss_and_masks_identical_for_all_decay_settings(dtype):
     for other in traces[1:]:
         for key in ('actions','observations','positions','velocities','omegas','valid'):
             assert torch.equal(getattr(traces[0],key),getattr(other,key))
-        assert torch.equal(task.task_loss(traces[0],task.TaskLossConfig()),task.task_loss(other,task.TaskLossConfig()))
+        assert torch.equal(task.task_loss(traces[0],test_loss()),task.task_loss(other,test_loss()))
 
 
 @pytest.mark.parametrize('alpha',[0.,1.])
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 def test_grouped_full_graph_gradients_match_independent_group_vjps(alpha,dtype):
-    s=RaptorSimulator().reset(64,horizon=12,dtype=dtype);p=actor(dtype);loss=task.TaskLossConfig()
-    with torch.no_grad():p.readout.weight[:,:16].normal_(0,.001)
+    s=RaptorSimulator().reset(64,horizon=12,dtype=dtype);p=actor(dtype);loss=test_loss()
+    with torch.no_grad():p.readout.weight.normal_(0,.001)
     r=collect_rollout(p,RaptorSimulator(),s,loss,horizon=12,time_decay=alpha)
     params=list(p.parameters());rows=[]
     for seed in r.group_coefficients:
@@ -57,7 +59,7 @@ def test_grouped_full_graph_gradients_match_independent_group_vjps(alpha,dtype):
     backward_actor(p,RaptorSimulator(),r,loss)
     tol=5e-5 if dtype==torch.float32 else 1e-10
     torch.testing.assert_close(flat_grads(p),expected,rtol=tol,atol=tol)
-    assert p.readout.weight.grad[:,:16].norm()>0
+    assert p.readout.weight.grad.norm()>0
     assert p.response_memory.weight_hh.grad.norm()>0
 
 
@@ -72,7 +74,7 @@ def test_delay_and_recurrent_graph_survive_fifty_step_metrics_boundary(alpha):
     from response_noise import DisturbanceConfig
     s=RaptorSimulator().reset(64,seed=34,horizon=70,dtype=torch.float64,
                              disturbances=DisturbanceConfig())
-    p=actor();other=copy.deepcopy(p);sim=RaptorSimulator();loss=task.TaskLossConfig()
+    p=actor();other=copy.deepcopy(p);sim=RaptorSimulator();loss=test_loss()
     with torch.no_grad():
         s=replace(s,position=torch.zeros_like(s.position),velocity=torch.zeros_like(s.velocity),
                   previous_velocity=torch.zeros_like(s.previous_velocity),omega=torch.zeros_like(s.omega))

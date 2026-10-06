@@ -3,7 +3,9 @@
 One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
 entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
 shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
-auxiliary network or single-airframe mode.
+auxiliary network or single-airframe mode. The sole production Actor is B:
+GRUCell(16,64) + hidden-only Linear(64,4). Wc is removed, with no mask or
+alternative direct-feature branch. Geometric feedback is not used.
 
 ## Run
 
@@ -13,8 +15,8 @@ your CUDA runtime; no native extension build is required.
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/pulsed_recovery/seed7/best.pt \
-    --work-dir runs/pulsed_recovery/evaluation
+    --checkpoint runs/attitude_delta_gru_only_no_cvar/seed7/best.pt \
+    --work-dir runs/attitude_delta_gru_only_no_cvar/evaluation
 python -m pytest -q tests
 ```
 
@@ -30,13 +32,18 @@ Candidate aircraft retain the original physical coupling and initial conditions;
 noise is attached after selection. Fixed EVAL does not change. The 128 fixed
 sampling cells are now also the 128 gradient groups: 16 initial scenes each,
 including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
-after CVaR/gradient-scale, never amplified, then averaged. Groups are processed
+after equal-scene weighting/gradient-scale, never amplified, then averaged. Groups are processed
 using a training-only native GRU/Linear gradient probe in one backward graph
 traversal. The former eight-chunk VJP path is an explicit reference backend only.
 This preserves per-group clipping, not an approximation of the group norms.
 See [one-pass probes and profiling](docs/group_gradient_probe.md). Update evidence
 is retained locally by `response_audit.py`. CUDA throughput must
 be measured on the target GPU; fewer traversals do not promise a specific latency.
+
+The main config explicitly compiles the original quaternion rotation inside RK4
+(`--rotation-backend compile`), retaining the Actor and other physics. See
+[measured CUDA optimizations and checkpoint boundaries](docs/gpu_efficiency.md)
+for the timing, numerical checks, rejected experiments and read-only profiler.
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
 with the checked-in config and the former smaller pool, use a NEW run directory:
@@ -59,7 +66,7 @@ training checkpoints.
 
 ```bash
 python tools/evaluate_response_long.py @configs/response_long_eval.args \
-    --checkpoint runs/pulsed_recovery/seed7/best.pt \
+    --checkpoint runs/attitude_delta_gru_only_no_cvar/seed7/best.pt \
     --work-dir runs/long_hover_eval/seed20260927
 python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
 ```
@@ -68,25 +75,34 @@ New evaluations require a checkpoint compatible with the current protocol.
 Existing exported replays remain viewable; reproduce older trajectories with
 their archived evaluator sources rather than rewriting checkpoint bindings.
 
-## Uniform per-step training loss
+## Adapted task loss, equal scene weights
 
-New training uses `--steady-weight 0`: every valid physical step has the same
-coefficient `1/H`. The former H500 final-100-step amplification (0.022 versus
-0.002) is disabled in both the dataclass default and the checked-in config.
-Passing a nonzero steady weight to new training fails before creating run files.
-The legacy fields and scoring kernel remain solely to reproduce stored evaluation
-settings; archived scores are not silently recalculated with a new objective.
+Every valid control step contributes true pre-action position smooth L2,
+`0.2 * (1 - cos(relative rotation from R_t to R_(t+1)))`, and smooth L2 of
+the final four-command difference. A constant necessary tilt is free; actual
+roll, pitch and yaw changes all count. This is a soft motion cost, not a test
+for instability, and is not divided by dt.
+The fixed smoothing scales are `epsilon_p=0.01 m` and `epsilon_a=0.01` in raw
+[-1,1] command units. Time normalization is always `1/H`; all initial scenes
+have weight `1/N`. Velocity/omega penalties, Huber, CVaR and tail weighting
+are removed from the task objective. Read-only velocity/omega/risk metrics remain.
 
-The uniform-time change itself did **not** alter sampling or physical groups,
-CVaR scenario weighting, Time Decay, Actor, simulator, failure costs or GUI.
-Uniform time weighting is not uniform scenario weighting or an exact, undecayed
-BPTT gradient. Compare physical metrics, not raw old/new objective values.
+A failed scene still pays `[3*(H-T)+200]/H` once, including failure on the last
+step. This is detached bookkeeping and supplies no direct avoidance gradient.
+Position, attitude_delta, action_delta, dead and terminal logs use the same cost as TRAIN
+and EVAL. See [the exact loss and checkpoint rules](docs/adapted_loss_no_cvar.md).
 
-An old-source run cannot be exactly resumed with a different objective/source.
-Keep its checkpoint and checkout intact; use `--init-checkpoint PATH` with an
-empty work directory for an explicit weights-only fork (fresh Adam and sampling).
-For 2048 scenes, keep `--scenarios 512` (four-bank size convention). Exact resume
-inside a new run remains supported with identical source and sampler settings.
+Removing Wc changes only the Actor's readout and architecture binding. The adapted
+loss, physics, sensor/pulse tapes, physical coverage, termination, Time Decay,
+group clipping and Adam retain their definitions. Equal scene weights do not make the
+Time-Decay/group-clipped update an exact unprocessed gradient. New and old task
+scores cannot be compared directly; use the retained physical flight metrics.
+
+An old-source/objective run cannot be exactly resumed with this source. Keep its
+checkpoint and checkout intact; `--init-checkpoint PATH` explicitly imports only
+same-architecture weights into a fresh Adam/sampling/best-score run. For 2048
+scenes, keep `--scenarios 512` (four-bank size convention). Exact resume inside
+this new run requires matching source, objective and sampler settings.
 
 ## Online metrics without live training rendering
 
@@ -107,9 +123,9 @@ The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
 
 ```bash
 python tools/short_eval_replay.py \
-    --run-dir runs/pulsed_recovery/seed7 --device cuda
+    --run-dir runs/attitude_delta_gru_only_no_cvar/seed7 --device cuda
 python tools/monitor_response_training.py \
-    --run-dir runs/pulsed_recovery/seed7
+    --run-dir runs/attitude_delta_gru_only_no_cvar/seed7
 ```
 
 The exporter retains the latest complete fixed-EVAL trace, including the exact
@@ -195,8 +211,10 @@ current measured rotation matrix (9), current measured body angular velocity (3)
 last known motor command (4)
 ```
 
-The 16 features feed `GRUCell(16,64)` and `[features,memory] -> Linear(80,4) -> tanh`:
-**16,068 trainable parameters**. GRU16 denotes input size, not hidden dimension.
+The 16 features feed `GRUCell(16,64)` and `memory -> Linear(64,4) -> tanh`:
+**16,004 trainable parameters**. GRU16 denotes input size, not hidden dimension.
+Current state feedback and action history reach the motors through the GRU; there
+is no Wc shortcut. The first observation updates memory before the first command.
 Commands remain absolute [-1,1], FR/BR/BL/FL, FLU.
 
 Initial previous_action is a fixed zero placeholder, independent of random motor
@@ -223,13 +241,17 @@ required for exact original evaluation. Never rewrite checkpoint hashes.
 
 `--init-checkpoint PATH` explicitly imports only interface-compatible Actor
 weights, with fresh Adam/new sampling. This is fine-tuning, not from-scratch
-training. The checkpoint serialization schema remains unchanged; the new
+training. A historical hidden-only B checkpoint can be imported explicitly this
+way; an A checkpoint with an 80-column readout is rejected. Neither historical
+source is treated as an exact resume of the new mainline. Fresh initialization
+uses the native 64-column layer's RNG sequence; use a B weight import to preserve
+an existing B Actor exactly. The checkpoint serialization schema remains unchanged; the new
 environment and disturbance settings are stored in the existing strict binding.
 For new-protocol runs, exact resume still requires matching source/configuration;
 update/time budgets can be extended.
 
 Joint RK4 and motor laws are retained with the requested additional force/torque
-terms. Apart from the uniform time-weight default documented above, Huber/CVaR costs,
+terms. The task objective is the adapted loss documented above;
 position-only first-failure semantics, Adam and Time Decay are unchanged.
 Physical-group gradients now use fixed-cell membership and shrink-only caps. Time Decay > 0 is a
 surrogate backward gradient; 0 is exact BPTT. No auxiliary controller is added.

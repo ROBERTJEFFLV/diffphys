@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from env_raptor import RaptorSimulator
 from response_policy import CONTROL_FEATURE_DIM, OBSERVATION_DIM, ResponseMotorPolicy, ResponsePolicyConfig, ResponsePolicyState
 from response_task import observation
-from tools.train_response_control import parse_args
+from loss_fixtures import parse_loss_args as parse_args
 from test_episode_termination import actor
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +24,11 @@ def test_only_one_native_gru_and_one_affine_readout():
     assert [type(m) for m in p.children()] == [torch.nn.GRUCell, torch.nn.Linear]
     assert p.response_memory.input_size == CONTROL_FEATURE_DIM == 16
     assert p.response_memory.hidden_size == 64
-    assert (p.readout.in_features, p.readout.out_features) == (80, 4)
-    assert sum(x.numel() for x in p.parameters()) == 16068
+    assert (p.readout.in_features, p.readout.out_features) == (64, 4)
+    assert sum(x.numel() for x in p.parameters()) == 16004
     assert {f.name for f in fields(ResponsePolicyState)} == {'memory'}
     assert {f.name for f in fields(ResponsePolicyConfig)} == {'memory_dim', 'dt'}
-    assert not p.readout.weight[:, :16].any()
-    assert p.readout.weight[:, 16:].abs().sum() > 0
+    assert p.readout.weight.abs().sum() > 0
     assert not p.readout.bias.any()
 
 
@@ -57,16 +56,14 @@ def test_observation_has_no_parameter_or_motor_truth_inputs():
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
-def test_combined_readout_equals_two_blocks_in_forward_and_backward(dtype):
+def test_hidden_only_readout_matches_explicit_forward_and_backward(dtype):
     torch.manual_seed(101)
     p = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(dtype=dtype)
-    with torch.no_grad(): p.readout.weight[:, :16].normal_(0, .05)
     x = observations(dtype=dtype).requires_grad_()
     old = torch.randn(len(x), 8, dtype=dtype, requires_grad=True)
     c = p.control_features(x); h = p.response_memory(c, old)
     combined = p(x, ResponsePolicyState(old)).action
-    split = torch.tanh(F.linear(c, p.readout.weight[:, :16])
-                      + F.linear(h, p.readout.weight[:, 16:], p.readout.bias))
+    split = torch.tanh(F.linear(h, p.readout.weight, p.readout.bias))
     tolerance = dict(rtol=2e-5, atol=2e-6) if dtype == torch.float32 else dict(rtol=1e-11, atol=1e-12)
     torch.testing.assert_close(combined, split, **tolerance)
     variables = [x, old, *p.parameters()]
@@ -75,7 +72,7 @@ def test_combined_readout_equals_two_blocks_in_forward_and_backward(dtype):
     for aa, bb in zip(a, b): torch.testing.assert_close(aa, bb, **tolerance)
 
 
-def test_first_observation_updates_hidden_and_trains_zero_wc():
+def test_first_observation_updates_hidden_and_trains_gru_and_wh():
     p = actor()
     obs = observations().requires_grad_()
     state = p.initial_state(obs)
@@ -85,8 +82,8 @@ def test_first_observation_updates_hidden_and_trains_zero_wc():
     torch.testing.assert_close(out.next_state.memory, expected_hidden, rtol=0, atol=0)
     assert out.next_state.memory.abs().sum() > 0
     out.action.square().sum().backward()
-    assert p.readout.weight.grad[:, :16].abs().sum() > 0
-    assert p.readout.weight.grad[:, 16:].abs().sum() > 0
+    assert p.readout.weight.shape == (4, p.config.memory_dim)
+    assert p.readout.weight.grad.abs().sum() > 0
     assert p.response_memory.weight_ih.grad.abs().sum() > 0
     assert obs.grad[:, :3].abs().sum() > 0
     # First output already depends on the current observation, without W_c.
@@ -94,15 +91,15 @@ def test_first_observation_updates_hidden_and_trains_zero_wc():
     assert not torch.equal(p(obs.detach()).action, p(shifted).action)
 
 
-def test_wc_gradient_has_the_expected_direct_outer_product():
+def test_wh_gradient_has_the_expected_hidden_outer_product():
     p = actor(); obs = observations()
     c = p.control_features(obs)
     h = p.response_memory(c, p.initial_state(obs).memory)
-    z = p.readout(torch.cat((c, h), -1))
+    z = p.readout(h)
     loss = torch.tanh(z).square().sum()
     delta = torch.autograd.grad(loss, z, retain_graph=True)[0]
     weight_grad = torch.autograd.grad(loss, p.readout.weight)[0]
-    torch.testing.assert_close(weight_grad[:, :16], delta.T @ c, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(weight_grad, delta.T @ h, rtol=1e-12, atol=1e-12)
 
 
 def test_hidden_retains_actual_action_history_when_current_input_is_equal():

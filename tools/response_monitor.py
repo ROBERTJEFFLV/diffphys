@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import time
 from typing import Any
@@ -199,6 +201,67 @@ def small_json(path: Path, limit: int = 2 * 1024 * 1024) -> dict:
     return value
 
 
+@dataclass(frozen=True)
+class TrainingStatus:
+    state: str
+    title: str
+    detail: str
+    update: int | None
+    error: str = ""
+    exit_code: int | None = None
+    pid: int | None = None
+
+
+def _live_training_pid(processes, run_dir):
+    """Check a registered Linux process identity; a reused PID is insufficient."""
+    marker = str(Path(run_dir).resolve()).encode()
+    for key in ("trainer", "training_supervisor"):
+        pid = processes.get(key)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            continue
+        try:
+            process = Path("/proc") / str(pid)
+            command = (process / "cmdline").read_bytes()
+            state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            if (state != "Z" and marker in command and
+                    (b"train_response_control.py" in command or b"training_supervisor.py" in command)):
+                return pid
+        except (OSError, IndexError):
+            pass
+    return None
+
+
+def _timestamp(value):
+    try:
+        return datetime.fromisoformat(value).timestamp() if isinstance(value, str) else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _error_tail(path):
+    """Read only a bounded end of stdout; do not surface metric JSON as an error."""
+    try:
+        with Path(path).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 32768))
+            text = stream.read(32768).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    index = text.rfind("Traceback (most recent call last):")
+    if index >= 0:
+        tail = text[index:].strip()
+        for line in tail.splitlines():
+            if line.startswith("{"):
+                try:
+                    if metric_row(json.loads(line)) is not None:
+                        return ""  # A successful update after this trace means it is old.
+                except (ValueError, RecursionError):
+                    pass
+        return tail
+    return "\n".join(line for line in text.splitlines()
+                     if not line.startswith("{") and ("Error:" in line or "Killed" in line))[-32768:]
+
+
 class TrainingLogs:
     def __init__(self, run_dir, *, max_rows=MAX_ROWS, max_bytes=MAX_READ_BYTES):
         self.run_dir = Path(run_dir)
@@ -211,6 +274,9 @@ class TrainingLogs:
     def poll(self):
         self.train.poll()
         self.eval.poll()
+        self._poll_summary()
+
+    def _poll_summary(self):
         path = self.run_dir / "summary.json"
         try:
             stat = path.stat()
@@ -238,6 +304,90 @@ class TrainingLogs:
         if current is not None and saved < current:
             return "older summary (run resumed)"
         return f"{self.summary.get('status', 'unknown')} at #{saved} (saved)"
+
+    def runtime_status(self):
+        """Combine current exit evidence and registered process identity, read-only."""
+        self._poll_summary()  # Exit monitoring remains active while curves are paused.
+        issues = []
+
+        def metadata(name):
+            try:
+                return small_json(self.run_dir / name, 256 * 1024)
+            except FileNotFoundError:
+                return {}
+            except (OSError, ValueError, RecursionError) as error:
+                issues.append(name + ": " + str(error))
+                return {}
+
+        processes = metadata("processes.json")
+        active = metadata("active_launch.json")
+        exited = metadata("training_exit.json")
+        summary = self.summary
+        update = self.train.latest.get("update", summary.get("updates"))
+        started = _timestamp(active.get("started_at_utc"))
+
+        def current(record, filename, finished=None):
+            saved = record.get("updates")
+            if isinstance(saved, int) and isinstance(update, int) and saved < update:
+                return False
+            if started is not None:
+                recorded = _timestamp(finished)
+                if recorded is None:
+                    try:
+                        recorded = (self.run_dir / filename).stat().st_mtime
+                    except OSError:
+                        return False
+                if recorded < started:
+                    return False
+            return True
+
+        if summary and not current(summary, "summary.json"):
+            summary = {}
+        exit_summary = exited.get("summary", {})
+        if not isinstance(exit_summary, dict):
+            exit_summary = {}
+        if exited and not current(exit_summary, "training_exit.json", exited.get("finished_at_utc")):
+            exited, exit_summary = {}, {}
+        code = exited.get("exit_code")
+        code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        saved = exit_summary or summary
+        reason = saved.get("status", "")
+        completed = [value for value in (update, saved.get("updates"))
+                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0]
+        complete = max(completed) if completed else None
+        description = f"Last completed update: #{complete}" if complete is not None else "No completed update recorded"
+        error = saved.get("error", "")
+        error = error[-32768:] if isinstance(error, str) else ""
+        if code is not None or reason in ("failed", "interrupted", "update_budget", "time_budget"):
+            detail = description + (" | " + reason if reason else "")
+            if code is not None:
+                detail += f" | exit code {code}"
+            if code is not None and code < 0:
+                try:
+                    detail += " (" + signal.Signals(-code).name + ")"
+                except ValueError:
+                    pass
+            if reason == "interrupted":
+                return TrainingStatus("interrupted", "INTERRUPTED", detail, complete, exit_code=code)
+            if reason == "failed" or (code is not None and code != 0):
+                return TrainingStatus("failed", "FAILED / CRASH", detail, complete,
+                                      error or _error_tail(self.run_dir / "training.stdout.log"), code)
+            return TrainingStatus("stopped", "STOPPED", detail, complete, exit_code=code)
+        live = _live_training_pid(processes, self.run_dir)
+        if live is not None:
+            return TrainingStatus("running", "RUNNING", description + f" | registered PID {live}",
+                                  complete, pid=live)
+        if issues or self.summary_error:
+            return TrainingStatus("unknown", "STATUS UNAVAILABLE", "Metadata read error: " +
+                                  "; ".join(issues + ([self.summary_error] if self.summary_error else [])), complete)
+        if processes.get("trainer") or processes.get("training_supervisor"):
+            return TrainingStatus("exited", "EXITED / NO EXIT RECORD", description +
+                                  " | registered training process not alive; no exit record", complete,
+                                  _error_tail(self.run_dir / "training.stdout.log"))
+        if complete is None:
+            return TrainingStatus("waiting", "WAITING", "Waiting for training logs and process metadata", None)
+        return TrainingStatus("unknown", "PROCESS STATE UNKNOWN", description +
+                              " | no process metadata; log age alone does not prove a crash", complete)
 
 
 @dataclass(frozen=True)

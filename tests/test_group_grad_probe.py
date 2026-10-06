@@ -1,4 +1,6 @@
 """Single traversal group probes must reproduce independent full group VJPs."""
+
+from loss_fixtures import test_loss
 from dataclasses import replace
 import copy
 from unittest.mock import patch
@@ -32,7 +34,7 @@ def test_one_graph_traversal_matches_every_group_and_leaves_actor_forward_unchan
     original = copy.deepcopy(policy)
     from env_raptor import RaptorSimulator
     simulator = RaptorSimulator()
-    loss = TaskLossConfig()
+    loss = test_loss()
     reference = collect_rollout(original, simulator, initial, loss, horizon=12,
                                  time_decay=decay, group_config=cfg("vjp", .08))
     record = collect_rollout(policy, simulator, initial, loss, horizon=12,
@@ -74,11 +76,11 @@ def test_probe_rejects_mutated_weights_before_replay_and_cleans_up():
     from env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,0,horizon=4,sampling="coverage128",dtype=torch.float64)
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
-    rec=collect_rollout(policy,RaptorSimulator(),initial,TaskLossConfig(),horizon=4,group_config=cfg())
+    rec=collect_rollout(policy,RaptorSimulator(),initial,test_loss(),horizon=4,group_config=cfg())
     with torch.no_grad():
         policy.readout.weight.add_(.1)
     with pytest.raises((ValueError,RuntimeError),match="changed|modified|version"):
-        backward_actor(policy,RaptorSimulator(),rec,TaskLossConfig())
+        backward_actor(policy,RaptorSimulator(),rec,test_loss())
     assert not policy.response_memory._forward_hooks
     assert not policy.readout._forward_hooks
 
@@ -94,7 +96,7 @@ def test_probe_raw_group_vectors_match_serial_vjp_with_recurrent_parameter_reuse
     config=GroupBalanceConfig(clip_norm=.07)
     a=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     b=copy.deepcopy(a)
-    loss=TaskLossConfig()
+    loss=test_loss()
     r=collect_rollout(a,RaptorSimulator(),initial,loss,horizon=6,group_config=config)
     s=collect_rollout(b,RaptorSimulator(),initial,loss,horizon=6,
                       group_config=replace(config,backward_backend="vjp"))
@@ -119,7 +121,7 @@ def test_long_horizon_probe_handles_delay_pulses_and_terminations_across_metric_
     initial,_=sample_training_scenarios(32,8,horizon=80,sampling="coverage128",dtype=torch.float64)
     a=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     b=copy.deepcopy(a)
-    loss=TaskLossConfig()
+    loss=test_loss()
     r=collect_rollout(a,RaptorSimulator(),initial,loss,horizon=80,time_decay=decay,group_config=cfg(cap=.1))
     s=collect_rollout(b,RaptorSimulator(),initial,loss,horizon=80,time_decay=decay,group_config=cfg("vjp",cap=.1))
     assert torch.equal(r.costs,s.costs)
@@ -139,14 +141,14 @@ def test_failing_probe_does_not_publish_partial_parameter_gradients(monkeypatch)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     for param in p.parameters():
         param.grad=torch.ones_like(param)*7
-    r=collect_rollout(p,RaptorSimulator(),initial,TaskLossConfig(),horizon=3,group_config=cfg())
+    r=collect_rollout(p,RaptorSimulator(),initial,test_loss(),horizon=3,group_config=cfg())
     original=GroupGradientProbe._linear_partial
     def poison(self,*args):
         original(self,*args)
         self.rows[0,0]=float("nan")
     monkeypatch.setattr(GroupGradientProbe,"_linear_partial",poison)
     with pytest.raises(FloatingPointError):
-        backward_actor(p,RaptorSimulator(),r,TaskLossConfig())
+        backward_actor(p,RaptorSimulator(),r,test_loss())
     assert all(torch.equal(param.grad,torch.ones_like(param)*7) for param in p.parameters())
     assert not r.probe._tensor_handles and not r.probe._payloads
     assert not p.response_memory._forward_hooks and not p.readout._forward_hooks
@@ -162,7 +164,7 @@ def test_forward_failure_removes_hooks_without_changing_actor(monkeypatch):
     sim=RaptorSimulator()
     monkeypatch.setattr(sim,"step",fail)
     with pytest.raises(RuntimeError,match="injected"):
-        collect_rollout(p,sim,initial,TaskLossConfig(),horizon=3,group_config=cfg())
+        collect_rollout(p,sim,initial,test_loss(),horizon=3,group_config=cfg())
     assert not p.response_memory._forward_hooks and not p.readout._forward_hooks
     assert all(torch.equal(state[k],v) for k,v in p.state_dict().items())
 
@@ -187,8 +189,8 @@ def test_repeated_capture_backward_does_not_leave_live_hooks_or_saved_inputs():
     initial,_=sample_training_scenarios(32,7,horizon=3,sampling="coverage128",dtype=torch.float64)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     for _ in range(3):
-        r=collect_rollout(p,RaptorSimulator(),initial,TaskLossConfig(),horizon=3,group_config=cfg())
-        backward_actor(p,RaptorSimulator(),r,TaskLossConfig())
+        r=collect_rollout(p,RaptorSimulator(),initial,test_loss(),horizon=3,group_config=cfg())
+        backward_actor(p,RaptorSimulator(),r,test_loss())
         assert not r.probe._tensor_handles and not r.probe._payloads
         assert not p.response_memory._forward_hooks and not p.readout._forward_hooks
 
@@ -203,7 +205,7 @@ def test_cuda_fused_gru_single_backward_matches_reference(dtype):
     torch.manual_seed(7)
     a=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(device="cuda",dtype=dtype)
     b=copy.deepcopy(a)
-    loss=TaskLossConfig()
+    loss=test_loss()
     r=collect_rollout(a,RaptorSimulator(),initial,loss,horizon=65,group_config=cfg(cap=.1))
     s=collect_rollout(b,RaptorSimulator(),initial,loss,horizon=65,group_config=cfg("vjp",cap=.1))
     assert torch.equal(r.costs,s.costs)
@@ -222,15 +224,15 @@ def test_cuda_fused_gru_single_backward_matches_reference(dtype):
 
 
 def test_cli_defaults_to_probe_reference_is_explicit_and_checkpoint_bound(tmp_path):
-    from tools.train_response_control import parse_args
+    from loss_fixtures import parse_loss_args as parse_args
     from response_training import binding, SOURCE_FILES
     default=parse_args(["--device","cpu"])
     ref=parse_args(["--device","cpu","--group-backward","vjp"])
     assert GroupBalanceConfig.from_args(default).backward_backend == "probe"
     assert GroupBalanceConfig.from_args(ref).backward_backend == "vjp"
     assert "response_grad_probe.py" in SOURCE_FILES
-    a=binding(default,ResponsePolicyConfig(),TaskLossConfig())
-    b=binding(ref,ResponsePolicyConfig(),TaskLossConfig())
+    a=binding(default,ResponsePolicyConfig(),test_loss())
+    b=binding(ref,ResponsePolicyConfig(),test_loss())
     assert a["group_balance"]["backward_backend"] != b["group_balance"]["backward_backend"]
 
 
@@ -255,8 +257,8 @@ def test_probe_does_not_call_reference_or_depend_on_chunk_size(monkeypatch):
     monkeypatch.setattr(response_adjoints,"backward_group_gradients",forbidden)
     grads=[]
     for chunk in (1,16,64):
-        r=collect_rollout(p,RaptorSimulator(),initial,TaskLossConfig(),horizon=4,group_config=cfg(chunk=chunk))
-        report=backward_actor(p,RaptorSimulator(),r,TaskLossConfig())["group_gradient"]
+        r=collect_rollout(p,RaptorSimulator(),initial,test_loss(),horizon=4,group_config=cfg(chunk=chunk))
+        report=backward_actor(p,RaptorSimulator(),r,test_loss())["group_gradient"]
         assert report["vjp_chunk_size"] is None
         grads.append(torch.cat([x.grad.flatten() for x in p.parameters()]).clone())
     assert all(torch.equal(grads[0],g) for g in grads[1:])
@@ -269,4 +271,4 @@ def test_probe_refuses_autocast_instead_of_silently_changing_group_derivatives()
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4))
     with torch.autocast("cpu",dtype=torch.bfloat16):
         with pytest.raises(ValueError,match="autocast"):
-            collect_rollout(p,RaptorSimulator(),initial,TaskLossConfig(),horizon=2,group_config=cfg())
+            collect_rollout(p,RaptorSimulator(),initial,test_loss(),horizon=2,group_config=cfg())

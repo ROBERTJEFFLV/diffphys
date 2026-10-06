@@ -1,4 +1,4 @@
-"""Causal multi-airframe rollout, unchanged physical task objective and metrics."""
+"""Causal rollout; position, true attitude-transition and command-change costs."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
@@ -17,34 +17,24 @@ from response_policy import (
 # Differentiable closed-loop state edges covered by per-step gradient decay.
 PHYSICAL_DYNAMIC = ("position", "velocity", "orientation", "omega", "motor", "previous_action", "previous_velocity")
 POLICY_DYNAMIC = ("memory",)
+TASK_OBJECTIVE_VERSION = "pre-position-so3-transition-action-delta-equal-scenes-v2"
+TASK_COMPONENTS = ("position", "attitude_delta", "action_delta", "dead", "terminal")
 
 
 @dataclass(frozen=True)
 class TaskLossConfig:
-    position_weight: float = 1.0
-    velocity_weight: float = 0.3
-    omega_weight: float = 0.1
-    action_weight: float = 0.0001
-    action_delta_weight: float = 0.01
-    omega_delta_weight: float = 0.005
-    steady_weight: float = 0.0  # Uniform time weights; nonzero retained for archived scoring.
-    steady_steps: int = 100
-    tail_weight: float = 0.5
-    tail_fraction: float = 0.2
-    huber_delta: float = 1.0
+    # No guessed smoothing defaults: each experiment supplies fixed scales.
+    epsilon_p: float
+    epsilon_a: float
+    lambda_R: float  # Fixed multiplier of 1-cos(relative rotation per control step).
     dead_cost: float = 3.0  # Raw cost per unflown step after failure.
     terminal_cost: float = 200.0  # Raw one-off cost, including failure at H.
 
     def __post_init__(self) -> None:
-        weights = [getattr(self, f.name) for f in fields(self) if f.name.endswith("weight")]
-        if any(not math.isfinite(w) or w < 0 for w in weights):
-            raise ValueError("task weights must be finite and non-negative")
-        if self.position_weight <= 0 or self.omega_weight <= 0:
-            raise ValueError("position holding and full angular velocity must be penalized")
-        if self.steady_steps < 1 or not 0 < self.tail_fraction <= 1:
-            raise ValueError("invalid steady window or CVaR tail fraction")
-        if not math.isfinite(self.huber_delta) or self.huber_delta < 0:
-            raise ValueError("Huber delta must be finite and non-negative (0 selects historical squares)")
+        for name in ("epsilon_p", "epsilon_a", "lambda_R"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(name + " must be finite and positive")
         if any(not math.isfinite(c) or c < 0 for c in (self.dead_cost, self.terminal_cost)):
             raise ValueError("failure costs must be finite and non-negative")
 
@@ -58,7 +48,7 @@ class ResponseClosedLoopState:
 @dataclass(frozen=True)
 class TaskTrajectory:
     end: ResponseClosedLoopState
-    observations: torch.Tensor
+    observations: torch.Tensor | None  # EVAL/replay retain these; training can omit storage.
     actions: torch.Tensor
     positions: torch.Tensor
     velocities: torch.Tensor
@@ -67,6 +57,9 @@ class TaskTrajectory:
     omega_deltas: torch.Tensor
     initial: RaptorState
     valid: torch.Tensor  # [time, scene], including the first terminal transition
+    pre_positions: torch.Tensor  # True p_t, before the command's physical transition.
+    pre_orientations: torch.Tensor  # True unit q_t=[w,x,y,z], not noisy observations.
+    post_orientations: torch.Tensor  # True q_(t+1), including the terminal transition.
 
 
 def observation(physical: RaptorState) -> torch.Tensor:
@@ -128,6 +121,7 @@ def rollout(
     *,
     time_decay: float = 0.0,
     actor_probe=None,
+    record_observations: bool = True,
 ) -> TaskTrajectory:
     """Unchanged flight; optional backward-only decay at every control step.
 
@@ -147,23 +141,28 @@ def rollout(
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
     initial_physical = closed.physical
-    observations = [observation(closed.physical)]
+    observations = [observation(closed.physical)] if record_observations else []
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
+    pre_positions, pre_orientations, post_orientations = [], [], []
     # A terminal row stays frozen outside its boundary, so it cannot become live
     # again when this rollout is resumed at the next metrics-chunk boundary.
     indices = (~simulator.terminated(closed.physical)).nonzero(as_tuple=True)[0]
     live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
                                    _select_rows(closed.policy, indices))
     for step in range(steps):
-        current_observation = observations[-1]
+        current_observation = observations[-1] if record_observations else None
         if decay and indices.numel():
             # Full and compact tensors are parallel aliases, not serial gates.
             # Cover observation, physics, GRU/history and delta-cost paths once.
             closed = _decay_closed_state(closed, rho)
             live = _decay_closed_state(live, rho)
             current_observation = observation(closed.physical)
+        elif indices.numel() and not record_observations:
+            current_observation = observation(closed.physical)
         before = closed.physical
+        pre_positions.append(before.position)
+        pre_orientations.append(before.orientation)
         action = before.previous_action
         active = torch.zeros_like(before.step_index, dtype=torch.bool)
         if indices.numel():
@@ -184,6 +183,7 @@ def rollout(
         # Frozen terminal rows are storage padding only: no further Actor, RK4,
         # memory or noise-index updates, and no costs/statistics for padded steps.
         physical = closed.physical
+        post_orientations.append(physical.orientation)
         valid.append(active)
         actions.append(action)
         positions.append(physical.position)
@@ -191,67 +191,86 @@ def rollout(
         omegas.append(physical.omega)
         action_deltas.append(action - before.previous_action)
         omega_deltas.append(physical.omega - before.omega)
-        observations.append(observation(physical))
+        if record_observations:
+            observations.append(observation(physical))
     return TaskTrajectory(
-        closed, torch.stack(observations), torch.stack(actions), torch.stack(positions),
+        closed, torch.stack(observations) if record_observations else None,
+        torch.stack(actions), torch.stack(positions),
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
         torch.stack(omega_deltas), initial_physical, torch.stack(valid),
+        torch.stack(pre_positions), torch.stack(pre_orientations), torch.stack(post_orientations),
     )
 
 
-def weighted_task_features(
+def smooth_l2(value: torch.Tensor, epsilon: float) -> torch.Tensor:
+    """Smooth L2 of a whole vector; rationalized to avoid small-error cancellation."""
+    squared = value.square().sum(-1)
+    # hypot computes sqrt(||x||^2+epsilon^2) without squaring epsilon into
+    # underflow/overflow. vector_norm's zero VJP also keeps zero-error gradients finite.
+    radius = torch.hypot(value.norm(dim=-1), value.new_full((), epsilon))
+    return squared / (radius + epsilon)
+
+
+def attitude_delta_cost(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
+    """1-cos(theta) for true unit-quaternion endpoints, with no absolute target.
+
+    Twice the squared vector part of conj(before)*after equals
+    (3-trace(R_before.T@R_after))/2, or ||R_after-R_before||_F^2/4.
+    Form it using after-before to avoid cancellation at tiny rotations and
+    to make identical endpoints exactly zero. Quaternion signs are equivalent.
+    No acos, division by dt, learnable metric or angular-velocity input is used.
+    """
+    w, x, y, z = before.unbind(-1)
+    dw, dx, dy, dz = (after-before).unbind(-1)
+    relative_vector = torch.stack((
+        (w*dx-x*dw) + (z*dy-y*dz),
+        (w*dy-y*dw) + (x*dz-z*dx),
+        (w*dz-z*dw) + (y*dx-x*dy),
+    ), -1)
+    return 2*relative_vector.square().sum(-1)
+
+
+def step_cost_components(
     trajectory: TaskTrajectory, config: TaskLossConfig, *, start: int = 0,
     horizon: Optional[int] = None,
-) -> torch.Tensor:
-    """Signed sqrt(2 Huber) residuals, with the original small-error curvature.
+) -> dict[str, torch.Tensor]:
+    """Direct additive costs, once per executed control, normalized by planned H.
 
-    Robustify physical errors before applying their weights. Global time indices
-    retain the full-flight mean and final steady window when used on short slices.
-    Delta=0 is available only to reproduce historical quadratic objectives.
-    Two constant residuals add ((H-X)*dead_cost + terminal_cost)/H at the
-    first failed transition. They bypass Huber and steady-window weighting;
-    no post-failure physics or gradient through the discrete failure time.
+    Position is pre-action truth; attitude uses true q_t and q_(t+1), not a
+    world-upright target. Commands are final tanh outputs. Failure and attitude
+    change include the last physical transition, including a crossing on H.
+    Normal recovery also rotates: this is a soft motion cost, not instability.
     """
-    def robust(value):
-        # Physical costs and their normalization are unchanged. Failure
-        # bookkeeping is added separately after applying these time weights.
-        value = torch.where(trajectory.valid[..., None], value, 0.0)
-        delta = config.huber_delta
-        if delta == 0:
-            return value
-        outer = value.sign() * (2 * delta * value.abs() - delta ** 2).clamp_min(delta ** 2).sqrt()
-        return torch.where(value.abs() <= delta, value, outer)
-
-    features = torch.cat((
-        math.sqrt(config.position_weight) * robust(trajectory.positions),
-        math.sqrt(config.velocity_weight) * robust(trajectory.velocities),
-        math.sqrt(config.omega_weight) * robust(trajectory.omegas),
-        math.sqrt(config.action_weight) * robust(0.5 * trajectory.actions),
-        math.sqrt(config.action_delta_weight) * robust(0.5 * trajectory.action_deltas),
-        math.sqrt(config.omega_delta_weight) * robust(trajectory.omega_deltas),
-    ), -1)
-    steps = features.shape[0]
+    steps = trajectory.valid.shape[0]
     horizon = steps if horizon is None else horizon
     if start < 0 or horizon < 1 or start + steps > horizon:
         raise ValueError("cost slice must lie inside the full horizon")
-    tail = min(config.steady_steps, horizon)
-    time_weights = features.new_full((steps,), 1.0 / horizon)
-    time_weights = time_weights + (
-        torch.arange(start, start + steps, device=features.device) >= horizon - tail
-    ).to(features) * (config.steady_weight / tail)
-    features = features * time_weights.sqrt()[:, None, None]
+    valid = trajectory.valid
+    # Mask BEFORE nonlinear math: frozen padding cannot create NaN*0 gradients.
+    position, before_q, after_q, delta, post_position, action = (
+        torch.where(valid[..., None], value, 0.)
+        for value in (trajectory.pre_positions, trajectory.pre_orientations,
+                      trajectory.post_orientations, trajectory.action_deltas,
+                      trajectory.positions, trajectory.actions)
+    )
+    components = {
+        "position": smooth_l2(position, config.epsilon_p) / horizon,
+        "attitude_delta": (config.lambda_R/horizon) * attitude_delta_cost(before_q, after_q),
+        "action_delta": smooth_l2(delta, config.epsilon_a) / horizon,
+    }
     with torch.no_grad():
         state = trajectory.initial
-        terminal = trajectory.valid & RaptorSimulator.position_terminated(
-            trajectory.positions, state.position_limit)
+        terminal = valid & RaptorSimulator.position_terminated(post_position, state.position_limit)
         remaining = horizon - torch.arange(start + 1, start + steps + 1,
-                                            device=features.device, dtype=features.dtype)
+                                            device=position.device, dtype=position.dtype)
         # Book all missing steps once at failure, not at each window end.
         # valid excludes frozen padding; reaching H without a violation costs zero.
-        failed = terminal.to(features)
-        failure = torch.stack((failed * remaining[:, None] * (config.dead_cost / horizon),
-                               failed * (config.terminal_cost / horizon)), -1)
-    return torch.cat((features, failure.sqrt()), -1)
+        failed = terminal.to(position)
+        components["dead"] = failed * remaining[:, None] * (config.dead_cost / horizon)
+        components["terminal"] = failed * (config.terminal_cost / horizon)
+    if not tensors_finite((position, before_q, after_q, delta, post_position, action, *components.values())):
+        raise FloatingPointError("nonfinite valid task state or cost")
+    return components
 
 
 def scenario_costs(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
@@ -259,8 +278,8 @@ def scenario_costs(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.
 
 
 def step_costs(trajectory, config, *, start=0, horizon=None) -> torch.Tensor:
-    """Additive [time, scenario] costs, without mean/CVaR scenario weights."""
-    return weighted_task_features(trajectory, config, start=start, horizon=horizon).square().sum(-1)
+    """Additive [time, scene] costs; never square costs into residuals."""
+    return sum(step_cost_components(trajectory, config, start=start, horizon=horizon).values())
 
 
 def warning_risk_steps(trajectory) -> dict[str, torch.Tensor]:
@@ -273,11 +292,15 @@ def warning_risk_steps(trajectory) -> dict[str, torch.Tensor]:
     }
 
 
-def hard_risk_metrics(trajectory, loss_config: TaskLossConfig) -> dict:
+def _warning_risk_score(values):
+    # Retain the old read-only warning report; these weights NEVER enter loss.
+    count = max(1, math.ceil(.2 * values.numel()))
+    return values.mean() + .5*values.topk(count).values.mean()
+
+
+def hard_risk_metrics(trajectory) -> dict:
     risks = {name: value.sum(0) for name, value in warning_risk_steps(trajectory).items()}
-    count = max(1, math.ceil(loss_config.tail_fraction * trajectory.actions.shape[1]))
-    risks = {name: float(value.mean() + loss_config.tail_weight * value.topk(count).values.mean())
-             for name, value in risks.items()}
+    risks = {name: float(_warning_risk_score(value)) for name, value in risks.items()}
     position = torch.cat((trajectory.initial.position[None], trajectory.positions)).detach().norm(dim=-1)
     velocity = torch.cat((trajectory.initial.velocity[None], trajectory.velocities)).detach().norm(dim=-1)
     return {"hard_risk_components": risks,
@@ -286,30 +309,15 @@ def hard_risk_metrics(trajectory, loss_config: TaskLossConfig) -> dict:
                                 "position": float(position.max()), "velocity": float(velocity.max())}}
 
 
-def risk_weights(costs: torch.Tensor, config: TaskLossConfig) -> torch.Tensor:
-    """Choose the pooled full-flight tail once; reuse these detached weights."""
+def uniform_scene_weights(costs: torch.Tensor) -> torch.Tensor:
+    """Exactly 1/N, independent of cost order, survival and failure constants."""
     if costs.ndim != 1 or costs.numel() == 0 or not bool(torch.isfinite(costs).all()):
-        raise ValueError("risk weights need finite per-scenario full-flight costs")
-    count = max(1, math.ceil(config.tail_fraction * costs.numel()))
-    weights = torch.full_like(costs, 1.0 / costs.numel())
-    weights[costs.detach().topk(count).indices] += config.tail_weight / count
-    return weights.detach()
-
-
-def task_residual(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
-    features = weighted_task_features(trajectory, config)
-    costs = features.square().sum(dim=(0, 2))
-    count = max(1, math.ceil(config.tail_fraction * costs.numel()))
-    selected = costs.detach().topk(count).indices
-    # .5 ||residual||^2 equals mean cost plus upper-tail CVaR cost.
-    return torch.cat((
-        (math.sqrt(2.0 / costs.numel()) * features).reshape(-1),
-        (math.sqrt(2.0 * config.tail_weight / count) * features[:, selected]).reshape(-1),
-    ))
+        raise ValueError("uniform weights need finite nonempty per-scene costs")
+    return torch.full_like(costs, 1.0 / costs.numel()).detach()
 
 
 def task_loss(trajectory: TaskTrajectory, config: TaskLossConfig) -> torch.Tensor:
-    return 0.5 * task_residual(trajectory, config).square().sum()
+    return scenario_costs(trajectory, config).mean()
 
 
 def sample_scenarios(
@@ -381,15 +389,10 @@ def reference_episode_metrics(trajectory: TaskTrajectory) -> dict:
     return result
 
 
-def task_loss_components(trajectory, config, *, start=0, horizon=None, weights=None):
-    """Additive attribution of the existing task objective, including its CVaR."""
-    features = weighted_task_features(trajectory, config, start=start, horizon=horizon).square()
-    if weights is None:
-        weights = risk_weights(features.sum(dim=(0, 2)), config)
-    return {name: float((weights * features[:, :, section].sum(dim=(0, 2))).sum().detach())
-            for name, section in (('position', slice(0, 3)), ('velocity', slice(3, 6)),
-                                  ('omega', slice(6, 9)), ('regularization', slice(9, 20)),
-                                  ('dead', slice(20, 21)), ('terminal', slice(21, 22)))}
+def task_loss_components(trajectory, config, *, start=0, horizon=None):
+    """Same five direct terms and same initial-scene mean as TRAIN and EVAL."""
+    return {name: float(value.sum(0).mean().detach()) for name, value in
+            step_cost_components(trajectory, config, start=start, horizon=horizon).items()}
 
 
 def tensors_finite(values):
@@ -409,11 +412,11 @@ class FlightStatistics:
         self.squares = initial.position.new_zeros(3, initial.position.shape[0])
         self.saturation = self.squares[0].clone()
         self.valid_steps = torch.zeros_like(initial.step_index)
-        self.components = initial.position.new_zeros(6, initial.position.shape[0])
+        self.components = initial.position.new_zeros(len(TASK_COMPONENTS), initial.position.shape[0])
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
     @torch.no_grad()
-    def add(self, trace, start):
+    def add(self, trace, start, *, components=None):
         magnitudes = torch.stack([x.norm(dim=-1) for x in
                                   (trace.positions, trace.velocities, trace.omegas)])
         values = [magnitudes, trace.actions]
@@ -425,10 +428,10 @@ class FlightStatistics:
         self.squares.add_((magnitudes.square() * trace.valid[None]).sum(1))
         self.saturation.add_(((trace.actions.abs() >= 1.0-1e-6).to(magnitudes.dtype).mean(2)
                               * trace.valid).sum(0))
-        features = weighted_task_features(trace, self.config, start=start, horizon=self.horizon).square()
-        for i, section in enumerate((slice(0, 3), slice(3, 6), slice(6, 9),
-                                     slice(9, 20), slice(20, 21), slice(21, 22))):
-            self.components[i].add_(features[:, :, section].sum(dim=(0, 2)))
+        if components is None:
+            components = step_cost_components(trace, self.config, start=start, horizon=self.horizon)
+        for i, name in enumerate(TASK_COMPONENTS):
+            self.components[i].add_(components[name].sum(0))
         for i, value in enumerate(warning_risk_steps(trace).values()):
             self.risks[i].add_(value.sum(0))
 
@@ -441,7 +444,7 @@ class FlightStatistics:
                       motor_saturation_fraction=float(self.saturation.sum()/count),
                       physical_transitions=int(self.valid_steps.sum()),
                       task_components={name: float((self.components[i]*weights).sum())
-                                       for i, name in enumerate(('position','velocity','omega','regularization','dead','terminal'))},
-                      omega_risk=float((self.risks[0]*risk_weights(self.risks[0], self.config)).sum()),
-                      saturation_risk=float((self.risks[1]*risk_weights(self.risks[1], self.config)).sum()))
+                                       for i, name in enumerate(TASK_COMPONENTS)},
+                      omega_risk=float(_warning_risk_score(self.risks[0])),
+                      saturation_risk=float(_warning_risk_score(self.risks[1])))
         return result

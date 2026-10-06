@@ -17,11 +17,13 @@ import time
 import numpy as np
 import torch
 
-from env_raptor import RaptorParams, RaptorSimulator, RaptorState, environment_contract, ACTION_CONVENTION
+from env_raptor import (RaptorParams, RaptorSimulator, RaptorState, environment_contract,
+                        rotation_backend_contract, ACTION_CONVENTION)
 from response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import (
     TaskLossConfig,
+    TASK_OBJECTIVE_VERSION,
     sample_scenarios,
     rollout,
     trajectory_metrics,
@@ -127,10 +129,10 @@ def restore_rng(state):
 
 
 def migrate_actor_weights(policy, state):
-    """Load only this architecture; old response-MLP weights are not equivalent."""
+    """Load only native B tensors; never silently discard an old W_c block."""
     expected = policy.state_dict()
     if set(state) != set(expected):
-        raise ValueError("Actor keys do not match GRU16 direct readout; retrain old architectures")
+        raise ValueError("Actor keys do not match GRU16 hidden-only readout")
     if any(
         state[n].shape != v.shape or not bool(torch.isfinite(state[n]).all())
         for n, v in expected.items()
@@ -142,8 +144,11 @@ def migrate_actor_weights(policy, state):
 def require_reference_checkpoint(value):
     """A shape match cannot certify old hover-centered or plus-frame semantics."""
     if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 direct-readout checkpoint or retrain")
+        raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 hidden-only checkpoint")
     cfg = value["binding"]["protocol"]
+    if cfg.get("task_objective") != TASK_OBJECTIVE_VERSION:
+        raise ValueError("checkpoint task objective mismatch: old losses require weights-only initialization")
+    TaskLossConfig(**cfg["loss"])
     params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
             or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_raptor.py")
@@ -279,6 +284,7 @@ def binding(args, policy_config, loss_config):
             "architecture": ARCHITECTURE,
             "policy": asdict(policy_config),
             "loss": asdict(loss_config),
+            "task_objective": TASK_OBJECTIVE_VERSION,
             "scenarios_per_bank": args.scenarios,
             "disturbances": asdict(DisturbanceConfig.from_args(args)),
             "eval_scenarios_per_bank": args.eval_scenarios,
@@ -309,6 +315,7 @@ def binding(args, policy_config, loss_config):
         "training_banks": TRAINING_BANKS,
         "training_sampling": sampling_contract(getattr(args, "train_sampling", "random")),
         "torch_version": str(torch.__version__),
+        "numerical_backend": rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
     }
 
 
@@ -362,7 +369,7 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     report["task_components"] = task_loss_components(trace, loss_config)
     report["loss_config"] = asdict(loss_config)
     report["disturbances"] = disturbance_report(initial)
-    risk = hard_risk_metrics(trace, loss_config)
+    risk = hard_risk_metrics(trace)
     report["risk"] = risk
     return report
 
@@ -374,11 +381,6 @@ def _sync(device):
 
 def train(args, policy_config, loss_config):
     """A finite loss increase never vetoes an update; numerical failures abort."""
-    if loss_config.steady_weight != 0.0:
-        raise ValueError(
-            "new training requires --steady-weight 0 (uniform per-step loss); "
-            "nonzero values are retained only for historical checkpoint scoring"
-        )
     sampling = getattr(args, "train_sampling", "random")
     validate_sampling(sampling, TRAINING_BANKS*args.scenarios)
     device = torch.device(
@@ -400,7 +402,8 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt))
+    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt),
+                                rotation_backend=getattr(args, "rotation_backend", "eager"))
     group_config = GroupBalanceConfig.from_args(args)
     disturbances = DisturbanceConfig.from_args(args)
     audit_config = AuditConfig.from_args(args)
@@ -678,7 +681,7 @@ def evaluate_checkpoint(args):
                           disturbances=DisturbanceConfig(**cfg["disturbances"]))
     report = evaluate(
         policy,
-        RaptorSimulator(params),
+        RaptorSimulator(params, rotation_backend=getattr(args, "rotation_backend", "eager")),
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),
@@ -687,6 +690,7 @@ def evaluate_checkpoint(args):
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,
         source_match=checkpoint_source == evaluator_source,
+        numerical_backend=rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
     )
     atomic_json(Path(args.work_dir) / "evaluation.json", report)
     return report

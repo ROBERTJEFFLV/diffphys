@@ -11,7 +11,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from response_task import sample_scenarios, TaskLossConfig, risk_weights
+from response_task import sample_scenarios, TaskLossConfig, uniform_scene_weights
 from response_groups import (GroupBalanceConfig, physics_group_layout,
     group_gradient_coefficients, normalize_group_rows, backward_group_gradients)
 
@@ -75,11 +75,11 @@ def test_mass_or_radius_alone_does_not_define_groups_and_equal_dynamics_not_spli
 
 
 @pytest.mark.parametrize('n', [64, 65, 100, 512, 513])
-def test_group_coefficients_preserve_cvar_and_group_mean(n):
+def test_group_coefficients_preserve_uniform_weights_and_group_mean(n):
     state = bank(n)
     cfg = GroupBalanceConfig()
     costs = torch.linspace(.1, 20, n, dtype=torch.float64)
-    weights = risk_weights(costs, TaskLossConfig())
+    weights = uniform_scene_weights(costs)
     seeds, report = group_gradient_coefficients(weights, state, cfg)
     indices, counts = physics_group_layout(state, cfg)
     expected = torch.zeros_like(seeds)
@@ -149,7 +149,7 @@ def test_exact_weighted_group_gradients_match_closed_form(chunk):
     x=torch.randn(128,2,generator=torch.Generator().manual_seed(4),dtype=p.dtype)
     costs=(x@p+1).square()
     cfg=GroupBalanceConfig(vjp_chunk_size=chunk)
-    weights=risk_weights(costs,TaskLossConfig())
+    weights=uniform_scene_weights(costs)
     coefficients,_=group_gradient_coefficients(weights,state,cfg)
     expected_rows=.1 * coefficients @ (2*(x@p.detach()+1)[:,None]*x)
     expected,_=normalize_group_rows(expected_rows,cfg.gradient_epsilon)

@@ -83,6 +83,10 @@ def run_monitor(args):
     frames = 0
     buttons = []
     scene_buttons = []
+    status = logs.runtime_status()
+    show_status = False
+    status_scroll = 0
+    alert_key = None
 
     def text(value, x, y, size=17, color=WHITE, width=None):
         value = str(value)
@@ -98,6 +102,44 @@ def run_monitor(args):
         pg.draw.rect(canvas, BLUE if active else LINE, rect, width=1, border_radius=6)
         surface = fonts[15].render(label, True, WHITE)
         canvas.blit(surface, surface.get_rect(center=rect.center))
+
+    def status_lines():
+        train, evaluation = logs.train.latest, logs.eval.latest
+        body = [status.title, status.detail, "",
+                "Last completed TRAIN: " + str(train.get("update", "--")),
+                "  task objective: " + fmt(train.get("task_objective")) +
+                " | gradient norm: " + fmt(train.get("pre_global_clip_norm")) +
+                " | update duration: " + fmt(train.get("update_seconds"), " s"),
+                "  position / velocity / omega RMS: " + fmt(train.get("position_rms"), " m") +
+                " / " + fmt(train.get("velocity_rms"), " m/s") +
+                " / " + fmt(train.get("omega_rms"), " rad/s"),
+                "Last fixed EVAL: " + str(evaluation.get("update", "--")) +
+                " | task objective: " + fmt(evaluation.get("task_objective")) +
+                " | first-exit fraction: " + fmt(evaluation.get("raptor_share_terminated")),
+                "", "Recorded error / traceback:"]
+        if status.error:
+            body.extend(status.error.expandtabs(4).splitlines())
+        else:
+            body.append("No error text recorded. Unknown exit causes are not inferred.")
+        body += ["", "Log file: " + str(args.run_dir / "training.stdout.log"),
+                 "This panel is read-only. Closing it does not restart or stop training."]
+        lines = []
+        # Preserve every character in long messages; the panel scrolls instead
+        # of replacing the error with an ellipsis.
+        for value in body:
+            if not value:
+                lines.append("")
+            while value:
+                left, right = 1, len(value)
+                while left < right:
+                    middle = (left + right + 1) // 2
+                    if fonts[15].size(value[:middle])[0] <= 1388:
+                        left = middle
+                    else:
+                        right = middle - 1
+                lines.append(value[:left])
+                value = value[left:]
+        return lines
 
     def chart(key, label, rect, use_eval=True, log=False):
         rect = pg.Rect(rect)
@@ -150,10 +192,14 @@ def run_monitor(args):
 
     def handle(action):
         nonlocal paused, logarithmic, page, selected, replays, scan_errors, message, replay_process
+        nonlocal show_status, status_scroll
         if action == "pause":
             paused = not paused  # Pauses this reader only; never signals the trainer.
         elif action == "log":
             logarithmic = not logarithmic
+        elif action == "status":
+            show_status = not show_status
+            status_scroll = 0
         elif action == "scan":
             old = replays[selected].path if replays else None
             replays, scan_errors = discover_replays(root, args.replay)
@@ -180,8 +226,17 @@ def run_monitor(args):
         while running:
             clock.tick(10)  # Event handling only; charts repaint on polling/input.
             now = time.monotonic()
-            if not paused and now >= next_poll:
-                logs.poll()
+            if now >= next_poll:
+                if not paused:
+                    logs.poll()
+                status = logs.runtime_status()
+                new_alert = (status.state, status.update, status.exit_code, status.error, status.detail)
+                if status.state in ("failed", "stopped", "interrupted", "exited"):
+                    if new_alert != alert_key:
+                        show_status, status_scroll = True, 0
+                        alert_key = new_alert
+                elif status.state == "running" and alert_key is not None:
+                    show_status, status_scroll, alert_key = False, 0, None
                 next_poll = now + args.poll_seconds
                 dirty = True
             if now >= next_replay_scan:
@@ -205,11 +260,21 @@ def run_monitor(args):
                     dirty = True
                 elif event.type == pg.KEYDOWN:
                     if event.key == pg.K_ESCAPE:
-                        running = False
+                        if show_status:
+                            show_status = False
+                        else:
+                            running = False
+                    if show_status and event.key in (pg.K_PAGEUP, pg.K_PAGEDOWN):
+                        status_scroll += -10 if event.key == pg.K_PAGEUP else 10
                     for key, action in ((pg.K_SPACE, "pause"), (pg.K_l, "log"),
-                                        (pg.K_r, "scan"), (pg.K_RETURN, "open")):
+                                        (pg.K_r, "scan"), (pg.K_e, "status")):
                         if event.key == key:
                             handle(action)
+                    if event.key == pg.K_RETURN and not show_status:
+                        handle("open")
+                    dirty = True
+                elif event.type == pg.MOUSEWHEEL and show_status:
+                    status_scroll -= event.y * 3
                     dirty = True
                 elif event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
                     xy = (event.pos[0] * 1500 / screen.get_width(), event.pos[1] * 950 / screen.get_height())
@@ -225,7 +290,7 @@ def run_monitor(args):
             buttons, scene_buttons = [], []
             canvas.fill(BG)
             text("DiffPhys | Training monitor", 24, 14, 30)
-            text("DASHBOARD READ ONLY  /  short replay export runs separately", 24, 54, 15, GREEN)
+            text("READ ONLY  |  Blue: TRAIN  |  Gold: fixed EVAL  |  Short replay export runs separately", 24, 54, 15, GREEN)
             text(str(args.run_dir.resolve()), 24, 80, 15, MUTED, 1440)
             train, evaluation = logs.train.latest, logs.eval.latest
             age = logs.age()
@@ -238,7 +303,11 @@ def run_monitor(args):
                 pg.draw.rect(canvas, PANEL, (x, 111, 355, 77), border_radius=7)
                 text(label, x + 14, 119, 15, MUTED)
                 text(value, x + 14, 145, 24, WHITE)
-            text("Blue: TRAIN   Gold dots: fixed EVAL (only when actually recorded)", 24, 204, 15, MUTED)
+            status_color = RED if status.state == "failed" else GREEN if status.state == "running" else GOLD
+            status_background = ((65, 26, 34) if status.state == "failed" else
+                                 (20, 52, 39) if status.state == "running" else (55, 44, 24))
+            pg.draw.rect(canvas, status_background, (24, 196, 1452, 30), border_radius=5)
+            text(status.title + " | " + status.detail, 36, 201, 15, status_color, 1428)
             specs = [("task_objective", "Task objective", True), ("position_rms", "Position RMS [m]", True),
                      ("velocity_rms", "Velocity RMS [m/s]", True), ("omega_rms", "Omega RMS [rad/s]", True),
                      ("pre_global_clip_norm", "Gradient norm (post-group, pre-clip)", False),
@@ -286,8 +355,25 @@ def run_monitor(args):
             if logs.train.prefix_skipped or logs.eval.prefix_skipped:
                 warning = "Recent file tail only (older prefix omitted). " + warning
             text(warning, 24, 922, 13, MUTED, 1444)
-            button("Resume reader" if paused else "Pause reader", (1026, 866, 202, 36), "pause", paused)
-            button("Log y: ON" if logarithmic else "Log y: OFF", (1240, 866, 219, 36), "log", logarithmic)
+            button("Resume reader" if paused else "Pause reader", (1026, 866, 138, 36), "pause", paused)
+            button("Log y: ON" if logarithmic else "Log y: OFF", (1172, 866, 128, 36), "log", logarithmic)
+            button("Status / error [E]", (1308, 866, 151, 36), "status", show_status)
+            if show_status:
+                # Block clicks through the overlay into replay/reader controls.
+                buttons, scene_buttons = [], []
+                pg.draw.rect(canvas, PANEL, (24, 246, 1452, 596), border_radius=8)
+                pg.draw.rect(canvas, status_color, (24, 246, 1452, 596), width=2, border_radius=8)
+                text("Training status and recorded error", 44, 263, 20, status_color)
+                button("Close panel [Esc / E]", (1250, 256, 206, 36), "status")
+                lines = status_lines()
+                visible_lines = 23
+                status_scroll = min(max(0, status_scroll), max(0, len(lines) - visible_lines))
+                canvas.set_clip(pg.Rect(44, 310, 1388, 480))
+                for i, line in enumerate(lines[status_scroll:status_scroll + visible_lines]):
+                    text(line, 44, 310 + i * 20, 15)
+                canvas.set_clip(None)
+                text(f"Lines {status_scroll + 1}-{min(len(lines), status_scroll + visible_lines)} / {len(lines)}"
+                     " | Mouse wheel / Page Up / Page Down to scroll", 44, 810, 13, MUTED)
             if screen.get_size() == canvas.get_size():
                 screen.blit(canvas, (0, 0))
             else:

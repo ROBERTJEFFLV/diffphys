@@ -1,5 +1,8 @@
 # Fixed physical coverage for TRAIN
 
+Adapted-loss branch: this sampler/group layout is unchanged. The task now uses
+equal scene weights; historical CVaR statements below describe the prior objective.
+
 Scope: change which valid initial scenes are sampled, not the controller, task
 loss, physics, disturbances, Time Decay, CVaR, or optimizer.
 The group-gradient probe reuses these cells; see [group_gradient_probe.md](group_gradient_probe.md).

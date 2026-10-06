@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
+from dataclasses import MISSING, fields
 import json
 import math
 from pathlib import Path
@@ -27,6 +27,8 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
+    parser.add_argument("--rotation-backend", choices=("eager", "compile"), default="eager",
+                        help="compile only quaternion-to-rotation; RK4 and Actor stay unchanged")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
@@ -45,7 +47,7 @@ def parse_args(argv=None):
     parser.add_argument("--group-min-scenarios", type=int, default=None,
                         help="minimum per group: default 16 for coverage128, 32 for adaptive")
     parser.add_argument("--group-clip-norm", type=float, default=1.,
-                        help="fixed whole-Actor group cap AFTER gradient-scale/CVaR; never amplify")
+                        help="fixed whole-Actor group cap AFTER gradient-scale/equal-scene weights; never amplify")
     parser.add_argument("--group-gradient-epsilon", type=float, default=1e-12)
     parser.add_argument("--group-backward", choices=("probe", "vjp"), default="probe",
                         help="one-pass native Actor gradient probe; vjp is an explicit verification reference")
@@ -61,15 +63,20 @@ def parse_args(argv=None):
     parser.add_argument("--velocity-delay-max", type=float, default=.030, help="episode latency upper bound, <=.030 seconds")
     parser.add_argument("--development-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=50)
-    parser.add_argument("--work-dir", type=Path, default=Path("runs/pulsed_recovery/seed7"))
+    parser.add_argument("--work-dir", type=Path, default=Path("runs/attitude_delta_gru_only_no_cvar/seed7"))
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)
-    initialize.add_argument("--init-checkpoint", type=Path, help="explicit weights-only start, fresh Adam")
+    initialize.add_argument("--init-checkpoint", type=Path,
+                            help="matching hidden-only B weights, fresh Adam; not exact resume")
     parser.add_argument("--checkpoint", type=Path, help="checkpoint for evaluation")
-    for config in (ResponsePolicyConfig(), TaskLossConfig()):
-        for field in fields(config):
-            default = getattr(config, field.name)
-            parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
+    config = ResponsePolicyConfig()
+    for field in fields(config):
+        default = getattr(config, field.name)
+        parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
+    for field in fields(TaskLossConfig):
+        default = None if field.default is MISSING else field.default
+        help_text = "coefficient of 1-cos(true attitude change per control step), without dt scaling" if field.name == "lambda_R" else None
+        parser.add_argument("--"+field.name.replace("_", "-"), type=float, default=default, help=help_text)
     for field in fields(AuditConfig):
         default = getattr(AuditConfig(), field.name)
         parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
@@ -89,6 +96,9 @@ def parse_args(argv=None):
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
     try:
+        if any(getattr(args, field.name) is None for field in fields(TaskLossConfig)):
+            raise ValueError("specify --epsilon-p, --epsilon-a and --lambda-R explicitly")
+        TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})
         groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)
         AuditConfig.from_args(args)

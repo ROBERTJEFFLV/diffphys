@@ -80,7 +80,8 @@ def replay(path, mode='full'):
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
-        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt))
+        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt),
+                                    rotation_backend=cfg.get("numerical_backend", {}).get("rotation", "eager"))
         loss = TaskLossConfig(**cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
         record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],

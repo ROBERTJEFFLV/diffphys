@@ -6,6 +6,8 @@ import math
 import pytest
 import torch
 
+from loss_fixtures import test_loss
+
 from env_raptor import RaptorSimulator
 from response_noise import (DisturbanceConfig, attach_disturbances, measured_observation,
                             executed_command, raptor_force_std, rotation_error)
@@ -147,7 +149,7 @@ def test_cost_and_termination_never_read_measurement_noise():
     p = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).double()
     trace = rollout(p, RaptorSimulator(), s, 8)
     changed = replace(trace, observations=trace.observations+10000)
-    assert torch.equal(step_costs(trace, TaskLossConfig()), step_costs(changed, TaskLossConfig()))
+    assert torch.equal(step_costs(trace, test_loss()), step_costs(changed, test_loss()))
     altered = replace(s, noise_tape=s.noise_tape+10000)
     assert torch.equal(RaptorSimulator.terminated(s), RaptorSimulator.terminated(altered))
 
@@ -206,7 +208,7 @@ def test_cuda_noisy_rollout_and_backward():
     s=RaptorSimulator().reset(32,seed=7,horizon=15,device='cuda')
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
     tr=rollout(p,RaptorSimulator(),s,15,time_decay=1.)
-    step_costs(tr,TaskLossConfig()).sum().backward()
+    step_costs(tr,test_loss()).sum().backward()
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in p.parameters())
 
 
@@ -229,8 +231,8 @@ def test_actual_h500_default_width_graph_with_delayed_measurements():
     with torch.no_grad():
         p.readout.weight.zero_()
         p.readout.bias.copy_(torch.atanh(2*motor[0]-1))
-    record=collect_rollout(p,sim,s,TaskLossConfig(),horizon=500,time_decay=1.)
+    record=collect_rollout(p,sim,s,test_loss(),horizon=500,time_decay=1.)
     assert record.metrics['physical_transitions']==32*500
-    backward_actor(p,sim,record,TaskLossConfig())
+    backward_actor(p,sim,record,test_loss())
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in p.parameters())
     assert p.readout.weight.grad.abs().sum()>0

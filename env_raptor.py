@@ -6,6 +6,7 @@ isolated in response_noise; true-state costs and rigid-body equations stay clean
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
+from functools import lru_cache
 import math
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,12 @@ ENVIRONMENT_VERSION = "raptor-multi-airframe-pulsed-recovery-v6"
 ACTION_CONVENTION = "absolute-normalized-motor-FR-BR-BL-FL-FLU-v1"
 IMMUTABLE_TAPES = ("noise_tape", "rotation_tape", "pulse_tape", "pulse_active_tape")
 RAPTOR_SOURCE = "e43ae4bcda4556321a63f4eb5dcc826cd637aa39"
+
+
+@lru_cache(maxsize=16)
+def _constant_vector(values: tuple, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Reuse read-only RK4 constants; avoid a tiny CPU-to-CUDA copy each stage."""
+    return torch.tensor(values, device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,22 @@ def quaternion_rotation(q: torch.Tensor) -> torch.Tensor:
         2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x),
         2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y),
     ), -1).reshape(*q.shape[:-1], 3, 3)
+
+
+def rotation_backend_contract(backend: str) -> dict:
+    if backend not in ("eager", "compile"):
+        raise ValueError("rotation backend must be eager or compile")
+    return {"rotation": backend, "version": "quaternion-rotation-nofma-v1",
+            "options": {"triton.cudagraphs": False, "emulate_precision_casts": True,
+                        "emulate_divison_rounding": True} if backend == "compile" else None}
+
+
+@lru_cache(maxsize=1)
+def _compiled_rotation():
+    # Compile only this elementwise expression. The rest of RK4, the Actor,
+    # termination/compaction and native backward probe remain ordinary PyTorch.
+    return torch.compile(quaternion_rotation, fullgraph=True, dynamic=True,
+                         options=rotation_backend_contract("compile")["options"])
 
 
 @dataclass(frozen=True)
@@ -99,8 +122,10 @@ class RaptorState:
 
 
 class RaptorSimulator:
-    def __init__(self, params: RaptorParams = RaptorParams()):
+    def __init__(self, params: RaptorParams = RaptorParams(), *, rotation_backend: str = "eager"):
         self.params = params
+        rotation_backend_contract(rotation_backend)
+        self._rotation = quaternion_rotation if rotation_backend == "eager" else _compiled_rotation()
 
     @torch.no_grad()
     def reset(self, batch_size: int, *, device="cpu", dtype=torch.float32,
@@ -189,7 +214,7 @@ class RaptorSimulator:
     @staticmethod
     def body_torque(state: RaptorState, thrust: torch.Tensor) -> torch.Tensor:
         x, y = state.rotor_positions[..., 0], state.rotor_positions[..., 1]
-        signs = torch.tensor((-1,1,-1,1), device=thrust.device, dtype=thrust.dtype)
+        signs = _constant_vector((-1,1,-1,1), thrust.device, thrust.dtype)
         return torch.stack(((y*thrust).sum(-1), -(x*thrust).sum(-1),
                             (signs*state.rotor_torque_constant*thrust).sum(-1)), -1)
 
@@ -206,10 +231,10 @@ class RaptorSimulator:
         def dynamics(values):
             p, v, q, w, m = values
             thrust = self.thrust(state, m)
-            rotation = quaternion_rotation(q)
+            rotation = self._rotation(q)
             body_z = rotation[..., 2]
             acceleration = body_z * (thrust.sum(-1)/state.mass)[:, None]
-            gravity = torch.tensor((0.,0.,-9.81), device=v.device, dtype=v.dtype)
+            gravity = _constant_vector((0.,0.,-9.81), v.device, v.dtype)
             acceleration = acceleration + gravity + total_force/state.mass[:, None]
             force_body = (rotation.transpose(-1, -2) @ pulse_force.unsqueeze(-1)).squeeze(-1)
             pulse_torque = torch.linalg.cross(pulse_point, force_body, dim=-1)

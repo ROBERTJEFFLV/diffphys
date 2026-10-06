@@ -18,7 +18,9 @@ python tools/monitor_response_training.py \
 ```
 
 A missing directory or log is a waiting state. The monitor does not create the
-training directory, start training, load a checkpoint or infer the trainer's PID.
+training directory, start training or load a checkpoint. It can verify the
+trainer/supervisor PID registered in `processes.json` against its Linux process
+identity and run directory; it never guesses a PID from log age.
 No trainer restart, new work directory or checkpoint migration is needed for
 this GUI-only change. All files listed in `response_training.SOURCE_FILES` are
 unchanged, as are training configs, Actor input and environment/noise versions.
@@ -35,6 +37,32 @@ positive-only logarithmic objective/gradient charts. Closing either GUI window
 does not signal the trainer. The window is resizable. **Last saved status** is
 explicitly a historical `summary.json` value; log age is not a liveness check.
 Long EVAL/checkpoint writes can produce a quiet interval without a training crash.
+
+## Training status and errors
+
+The persistent status bar distinguishes running, stopped, interrupted, failed,
+and unavailable status. On a new exit or failure, the details panel opens
+automatically with the last completed update, TRAIN/EVAL metrics, recorded
+exit reason/code, and original error text. Press **E** or **Status / error** to
+open or close it; scroll with the mouse wheel or Page Up / Page Down. Escape
+closes the panel first. Long messages wrap instead of disappearing behind an
+ellipsis. Pausing metric curves does not disable exit monitoring.
+
+The monitor reads `summary.json`, the launcher's `training_exit.json`,
+`active_launch.json` and `processes.json`. A new launch's timestamp and update
+progress prevent an old failure from being reported as a current crash.
+Errors absent from the structured records can be read from the last 32 KiB of
+`training.stdout.log`; an older traceback followed by successful updates is
+not reported as a new error. If a registered process vanishes without an exit
+record, the GUI says so explicitly. A signal exit is identified by its code;
+it is not automatically called an OOM. Legacy logs without process metadata
+are shown with unknown process state.
+
+These files are optional launcher metadata, not a new training contract. The
+GUI stays read-only and never changes checkpoints, restarts training, sends
+signals to the trainer or silently diagnoses an unknown exit. All changes are
+outside `response_training.SOURCE_FILES`; training's source binding remains
+unchanged. Closing the GUI does not stop training.
 
 ## Open your existing exported replay
 
@@ -170,6 +198,9 @@ authentication layer or remote command execution is added.
 
 ## Verification
 
+`tests/test_training_status.py` covers OOM text, normal/interrupted/signal exits,
+resumed runs, missing/partial metadata, bounded traceback reads, PID identity
+and a visible failure panel without changing run files.
 `tests/test_training_monitor.py` exercises append/partial-line/rotation handling,
 cache/read limits, spike retention, old-summary semantics, manual CPU-only replay
 launch, limited scanning, and blocked Torch/trainer imports. SDL dummy-display

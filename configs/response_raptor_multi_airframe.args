@@ -1,6 +1,7 @@
 --mode train
 --device cuda
 --dtype float32
+--rotation-backend compile
 --seed 7
 --scenarios 512
 --train-sampling coverage128
@@ -14,11 +15,12 @@
 --gradient-clip 10
 --development-every 50
 --checkpoint-every 50
---huber-delta 1
---steady-weight 0
+--epsilon-p 0.01
+--epsilon-a 0.01
+--lambda-R 0.2
 --dead-cost 3
 --terminal-cost 200
---work-dir runs/pulsed_recovery/seed7
+--work-dir runs/attitude_delta_gru_only_no_cvar/seed7
 --group-max-groups 128
 --group-min-scenarios 16
 --group-clip-norm 1.0

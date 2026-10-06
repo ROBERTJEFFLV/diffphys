@@ -1,4 +1,6 @@
 """Independent prefix/termination regressions; no obsolete recomputation backend."""
+
+from loss_fixtures import test_loss
 from dataclasses import replace
 import copy
 import pytest
@@ -7,7 +9,7 @@ import torch
 from env_raptor import RaptorSimulator
 from response_noise import DisturbanceConfig
 from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import ResponseClosedLoopState, TaskTrajectory, TaskLossConfig, initialize, observation, rollout, step_costs, risk_weights, reference_episode_metrics, _select_rows
+from response_task import ResponseClosedLoopState, TaskTrajectory, TaskLossConfig, initialize, observation, rollout, step_costs, uniform_scene_weights, reference_episode_metrics, _select_rows
 
 
 def select(state,index):
@@ -50,9 +52,12 @@ def scheduled(lengths,horizon,dtype=torch.float64):
 def manual_prefix(policy,simulator,initial,horizon):
     closed=initialize(policy,initial);obs=[observation(initial)]
     actions,positions,velocities,omegas,da,dw=[],[],[],[],[],[]
+    pre_positions,pre_orientations,post_orientations=[],[],[]
     for _ in range(horizon):
         before=closed.physical;output=policy(obs[-1],closed.policy)
+        pre_positions.append(before.position);pre_orientations.append(before.orientation)
         after=simulator.step(before,output.action)
+        post_orientations.append(after.orientation)
         closed=ResponseClosedLoopState(after,output.next_state)
         actions.append(output.action);positions.append(after.position)
         velocities.append(after.velocity);omegas.append(after.omega)
@@ -61,7 +66,8 @@ def manual_prefix(policy,simulator,initial,horizon):
         if bool(simulator.terminated(after).all()):break
     return TaskTrajectory(closed,torch.stack(obs),torch.stack(actions),torch.stack(positions),
                           torch.stack(velocities),torch.stack(omegas),torch.stack(da),torch.stack(dw),
-                          initial,torch.ones(len(actions),1,dtype=torch.bool,device=initial.mass.device))
+                          initial,torch.ones(len(actions),1,dtype=torch.bool,device=initial.mass.device),
+                          torch.stack(pre_positions),torch.stack(pre_orientations),torch.stack(post_orientations))
 
 
 @torch.no_grad()
@@ -81,14 +87,14 @@ def test_h500_first_crossing_and_no_post_terminal_calls():
 
 @pytest.mark.parametrize('lengths',[[1,3,4,7,8,9],[1,1],[2,3],[9,9]])
 def test_full_bptt_and_adam_equal_independent_prefixes(lengths):
-    h=8;initial=scheduled(lengths,h);loss=TaskLossConfig()
+    h=8;initial=scheduled(lengths,h);loss=test_loss()
     batched=actor();serial=copy.deepcopy(batched)
     trace=rollout(batched,CountingSimulator(),initial,h)
     cb=step_costs(trace,loss).sum(0)
     cs=torch.cat([step_costs(manual_prefix(serial,CountingSimulator(),select(initial,slice(i,i+1)),h),
                              loss,horizon=h).sum(0) for i in range(len(lengths))])
     for model,costs in [(batched,cb),(serial,cs)]:
-        (.1*(risk_weights(costs,loss)*costs).sum()).backward()
+        (.1*(uniform_scene_weights(costs)*costs).sum()).backward()
     torch.testing.assert_close(cb,cs,rtol=1e-10,atol=1e-10)
     torch.testing.assert_close(flat_grads(batched),flat_grads(serial),rtol=1e-9,atol=1e-10)
     for model in (batched,serial):torch.optim.Adam(model.parameters(),lr=3e-4).step()
@@ -117,10 +123,10 @@ def test_noisy_compaction_preserves_other_aircraft_and_terminal_tape(dtype):
 
 def test_terminal_gradient_kept_padding_gradient_zero():
     initial=scheduled([1,3],8);model=actor();trace=rollout(model,CountingSimulator(),initial,8)
-    trace.velocities.retain_grad()
-    step_costs(trace,TaskLossConfig()).sum().backward()
-    assert trace.velocities.grad[0,0].abs().sum()>0
-    assert not trace.velocities.grad[1:,0].any()
+    trace.action_deltas.retain_grad()
+    step_costs(trace,test_loss()).sum().backward()
+    assert trace.action_deltas.grad[0,0].abs().sum()>0
+    assert not trace.action_deltas.grad[1:,0].any()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
@@ -128,5 +134,5 @@ def test_cuda_terminal_batch():
     initial=scheduled([1,3,9],8,torch.float32).to('cuda',torch.float32)
     p=actor(torch.float32).cuda();trace=rollout(p,CountingSimulator(),initial,8)
     assert trace.valid.sum(0).tolist()==[1,3,8]
-    step_costs(trace,TaskLossConfig()).sum().backward()
+    step_costs(trace,test_loss()).sum().backward()
     assert torch.isfinite(flat_grads(p)).all()

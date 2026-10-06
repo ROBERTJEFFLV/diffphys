@@ -6,21 +6,22 @@
       "quaternion_rotation": "a7d69b133829965600b623328f89be4523f9015907bc524bb27677c3342445ca",
       "RaptorSimulator.motor_command": "a32c04f349ecff2a2104180a122ffce24e60cfec5f2b6dc42dd4b947d066d991",
       "RaptorSimulator.thrust": "2d666e4cc405365eba4e142b4510ea6c44b29cde5aa0eee10842aae9d74b2846",
-      "RaptorSimulator.body_torque": "4208835d91faf61663a3e26e3d9f1f98d5e10425253b3a5615981b1cf33e3bdb",
-      "RaptorSimulator.step.dynamics": "d91d5d8a9cc943f41c982953579bb7b0cbcc474b8ea1ecc3f9ea01b21f108462",
+      "RaptorSimulator.body_torque": "a861fe8d5e3693cd1ec2c017f7e49b3b0e53e1d1618f0234ffca7666a8ae7e13",
+      "RaptorSimulator.step.dynamics": "93f5831084c356068722e67f20c10763c701f40424e1c603124a1dfd4dff4ed8",
       "RaptorSimulator.position_terminated": "e547c7ef4c2416fda5289bf02e1b3622c61e5172420f0a7a437d9b103b8b0e11"
     },
     "response_task.py": {
-      "TaskLossConfig": "2cd53b5a41e8941c72422f50ee14c6aaefe2ffd221aabc0189448cd62d2711ab",
-      "weighted_task_features": "149858f0167810064617d37e35a241e1f64a9b3c7c870f1de3bda8dca743285e",
-      "step_costs": "869eaa72e9562d4628f5629c468f4731aba1281b58669ab547fcf59e153f700d",
+      "TaskLossConfig": "7d4a33976d2db1200070ecac632f6e5566cdc80183381569aa99565775f5a3eb",
+      "step_costs": "db1bc0d028ad7cef3fe2f280e605db057baf8b66a8df3b93fa087c9b5e12a9ec",
       "scenario_costs": "00bfd473cbb9c36db2faaad8eab98dacdbc6e0731a579ddfd27c29d4b38e3595",
-      "risk_weights": "d7a1ce6f69efa83945b5b67d126966af08f9be2da2860005fbfb745a163cfe49",
-      "task_residual": "0e1a2f70bea007e8c9141674f76267b4e14ad748638efc96fe2fe6e4ee4e3690",
-      "task_loss": "cfbab28099bbc77f18e7a9de4eeabe5882779c76911fa56686387491366984df",
+      "task_loss": "f8562b51af68912e32d7aa979f0a3b730ca1d884c737e13a164a09605c63f2cb",
       "warning_risk_steps": "f1a161c83870f2631b009a1dd0eb2b90d8d60492c47941e6b83a67a367c02b6b",
-      "task_loss_components": "9beaf56ba54eb79d5ec8c27b1c32d2a9911c484a51417debe9a1946ec083abe1",
-      "_GradientDecay": "b9e9dd454de78d26fa39453711ca781c61d95a067563359fe3a232b8a7776e79"
+      "task_loss_components": "26c2b8ae2e01e77c50cb90e22f9a8b8fc298ea3e938de985a76bb9d25328a6ca",
+      "_GradientDecay": "b9e9dd454de78d26fa39453711ca781c61d95a067563359fe3a232b8a7776e79",
+      "smooth_l2": "53ff2620fbd6a0cf99aa83f812084848d2ceb0df85e8e8a2b6eb0440a80eb7c8",
+      "step_cost_components": "9c7f29f4db0e4290c9411edb521416fea8c3e6cadd524494d6bf2896b8e07dd4",
+      "uniform_scene_weights": "d2915667dda100836af9d8ddf7183fdc941f063e67b1646daf10bcfaad92113a",
+      "attitude_delta_cost": "bdd31f79bfe60e3ff554e644353ae45491df7e70a1ceca2c39d4e42c841e0323"
     },
     "response_groups.py": {
       "_group_physics": "c2cec359339dc7b3ce79d85ecea3bd3f1154d17703abc59d8da140a9c9a4f582",
@@ -29,9 +30,10 @@
     },
     "response_policy.py": {
       "body_vector": "697fd84932fd856432f7cf6debedaf69da2ff65394befbee2fd9d5c6fbfb33d8",
-      "ResponseMotorPolicy.__init__": "ba117a5e44273e98a96e7fdca45e7b4ff2f4ab15c7cf0f98de5e0693e9ecbb00",
+      "ResponseMotorPolicy.__init__": "76d1a462f1ebbe4b6b75a9209eae0e175b00d51b180ba23fc87b7e11fb7e83e7",
       "ResponseMotorPolicy.control_features": "fcf70531a9eda185018ca8be975de30dee57d1c719aaa6e3b7089c3891df17e2",
-      "ResponseMotorPolicy.initial_state": "61c79ac803ba441716010f5a288f2f8772aced97cd36e227df8a274881834650"
+      "ResponseMotorPolicy.initial_state": "61c79ac803ba441716010f5a288f2f8772aced97cd36e227df8a274881834650",
+      "ResponseMotorPolicy.forward": "05c735d1bff2d1c4ee9b18c2c7f2a0f2d781c3f076a180ba6050c8303f3215aa"
     },
     "response_training.py": {
       "gradient_norm": "7f12afb98bf431275f73e1d1a3a26ece8ba8f2b218c4fda9933e76da722bf7ca",
@@ -75,6 +77,145 @@
       "previous_hash": "6c75fe44b463d5494253084bdf620582705bd88f333acacec7c17374ce9c7c17",
       "new_hash": "3f1c3a3d9539f5d52261359fd04343660f9b3aac80694cd809297b68ba602a10",
       "reason": "User-requested fixed coverage128 gradient groups and shrink-only fixed cap. Independent analytic gradient, quota/membership, zero/tiny/huge/outlier and replay tests validate the change. All other protected kernels unchanged."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "TaskLossConfig",
+      "previous_hash": "2cd53b5a41e8941c72422f50ee14c6aaefe2ffd221aabc0189448cd62d2711ab",
+      "new_hash": "7d4a33976d2db1200070ecac632f6e5566cdc80183381569aa99565775f5a3eb",
+      "reason": "Explicit positive finite epsilon_p/epsilon_a/lambda_R; remove all obsolete task penalties, Huber, CVaR and tail-time settings. Keep discrete failure accounting."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "step_costs",
+      "previous_hash": "869eaa72e9562d4628f5629c468f4731aba1281b58669ab547fcf59e153f700d",
+      "new_hash": "db1bc0d028ad7cef3fe2f280e605db057baf8b66a8df3b93fa087c9b5e12a9ec",
+      "reason": "Sum direct position/tilt/action-delta/dead/terminal costs without feature squaring; pre-action truth, 1/H and valid control transitions."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "task_loss",
+      "previous_hash": "cfbab28099bbc77f18e7a9de4eeabe5882779c76911fa56686387491366984df",
+      "new_hash": "f8562b51af68912e32d7aa979f0a3b730ca1d884c737e13a164a09605c63f2cb",
+      "reason": "Initial-scene mean only, no CVaR or residual square interface."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "task_loss_components",
+      "previous_hash": "9beaf56ba54eb79d5ec8c27b1c32d2a9911c484a51417debe9a1946ec083abe1",
+      "new_hash": "26c2b8ae2e01e77c50cb90e22f9a8b8fc298ea3e938de985a76bb9d25328a6ca",
+      "reason": "Same five direct cost components and uniform initial-scene mean as TRAIN/EVAL."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "weighted_task_features",
+      "previous_hash": "149858f0167810064617d37e35a241e1f64a9b3c7c870f1de3bda8dca743285e",
+      "new_hash": null,
+      "replacement": "step_cost_components",
+      "reason": "Intentional removal for the requested direct-cost, equal-scene objective. No square-root residual compatibility wrapper or hidden CVaR is retained."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "task_residual",
+      "previous_hash": "0e1a2f70bea007e8c9141674f76267b4e14ad748638efc96fe2fe6e4ee4e3690",
+      "new_hash": null,
+      "replacement": "task_loss",
+      "reason": "Intentional removal for the requested direct-cost, equal-scene objective. No square-root residual compatibility wrapper or hidden CVaR is retained."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "risk_weights",
+      "previous_hash": "d7a1ce6f69efa83945b5b67d126966af08f9be2da2860005fbfb745a163cfe49",
+      "new_hash": null,
+      "replacement": "uniform_scene_weights",
+      "reason": "Intentional removal for the requested direct-cost, equal-scene objective. No square-root residual compatibility wrapper or hidden CVaR is retained."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "smooth_l2",
+      "previous_hash": null,
+      "new_hash": "53ff2620fbd6a0cf99aa83f812084848d2ceb0df85e8e8a2b6eb0440a80eb7c8",
+      "reason": "New loss-only interface protected by independent hand calculations, analytic/finite-difference derivatives, timing/failure/mask/chunk/group regressions. Equivalent hypot denominator prevents epsilon-square underflow/overflow; zero-input extreme-scale and ordinary finite-difference regressions validate it without clamping."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "step_cost_components",
+      "previous_hash": null,
+      "new_hash": "7ca0928e82274052f544fd053122117c8f8fa5a685fce345754675cacf57c7f5",
+      "reason": "New loss-only interface protected by independent hand calculations, analytic/finite-difference derivatives, timing/failure/mask/chunk/group regressions."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_task.py",
+      "symbol": "uniform_scene_weights",
+      "previous_hash": null,
+      "new_hash": "d2915667dda100836af9d8ddf7183fdc941f063e67b1646daf10bcfaad92113a",
+      "reason": "New loss-only interface protected by independent hand calculations, analytic/finite-difference derivatives, timing/failure/mask/chunk/group regressions."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.__init__",
+      "previous_hash": "ba117a5e44273e98a96e7fdca45e7b4ff2f4ab15c7cf0f98de5e0693e9ecbb00",
+      "new_hash": "76d1a462f1ebbe4b6b75a9209eae0e175b00d51b180ba23fc87b7e11fb7e83e7",
+      "reason": "User-selected native B: physically remove Wc, use Linear(memory_dim,4) on current GRU hidden. Keep features, GRU, observation, physics, task, Time Decay, group clipping and Adam semantics. Verify hidden-only forward/backward, all-parameter grouped VJPs, history and strict checkpoint migration. Fresh initialization uses the native hidden-only readout RNG sequence."
+    },
+    {
+      "base_commit": "e45739e1b290df67592ccbcc3799cdaed4764846",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.forward",
+      "previous_hash": "be4d121231a3a09477c250eeb40e61a9fcd1b0a2b0d6ff90c9fab41798f0e840",
+      "new_hash": "05c735d1bff2d1c4ee9b18c2c7f2a0f2d781c3f076a180ba6050c8303f3215aa",
+      "reason": "User-selected native B: physically remove Wc, use Linear(memory_dim,4) on current GRU hidden. Keep features, GRU, observation, physics, task, Time Decay, group clipping and Adam semantics. Verify hidden-only forward/backward, all-parameter grouped VJPs, history and strict checkpoint migration. Fresh initialization uses the native hidden-only readout RNG sequence."
+    },
+    {
+      "base_source_sha256": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+      "file": "env_raptor.py",
+      "symbol": "RaptorSimulator.body_torque",
+      "previous_hash": "4208835d91faf61663a3e26e3d9f1f98d5e10425253b3a5615981b1cf33e3bdb",
+      "new_hash": "a861fe8d5e3693cd1ec2c017f7e49b3b0e53e1d1618f0234ffca7666a8ae7e13",
+      "reason": "Replace repeated tensor construction with read-only constant cache, preserving values and arithmetic order. Mature CUDA H500 costs/all raw group gradients/clipped gradients bitwise matched; independent RK4 derivative and cache regressions retain the physical equations."
+    },
+    {
+      "base_source_sha256": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+      "file": "env_raptor.py",
+      "symbol": "RaptorSimulator.step.dynamics",
+      "previous_hash": "d91d5d8a9cc943f41c982953579bb7b0cbcc474b8ea1ecc3f9ea01b21f108462",
+      "new_hash": "ff2edd46b8a3224f70998f6ea50ac0b50bec81d0f0915e4fd9fb834cc81caaf0",
+      "reason": "Replace repeated tensor construction with read-only constant cache, preserving values and arithmetic order. Mature CUDA H500 costs/all raw group gradients/clipped gradients bitwise matched; independent RK4 derivative and cache regressions retain the physical equations."
+    },
+    {
+      "base_source_sha256": "795f47550880319c5b58b63a6db5815d2fb9a49f91fb2181f748d5ad3fe49605",
+      "file": "env_raptor.py",
+      "symbol": "RaptorSimulator.step.dynamics",
+      "previous_hash": "ff2edd46b8a3224f70998f6ea50ac0b50bec81d0f0915e4fd9fb834cc81caaf0",
+      "new_hash": "93f5831084c356068722e67f20c10763c701f40424e1c603124a1dfd4dff4ed8",
+      "reason": "Route only quaternion_rotation(q) through an explicit eager/compile instance callable. Formula and other RK4 operators retained. Mature CUDA H500 costs/raw group derivatives matched bitwise; CPU/CUDA short-flight derivative tests passed after installing the missing optional CPU compiler setuptools dependency. Three CUDA shadow updates produced bitwise-identical Actor, Adam and RNG versus the archived original source."
+    },
+    {
+      "base_source_sha256": "0ad0a3d5c5e4c1c0fba36aecef070ce8031394bd01279e4b8a7985081f206a8a",
+      "file": "response_task.py",
+      "symbol": "step_cost_components",
+      "previous_hash": "7ca0928e82274052f544fd053122117c8f8fa5a685fce345754675cacf57c7f5",
+      "new_hash": "9c7f29f4db0e4290c9411edb521416fea8c3e6cadd524494d6bf2896b8e07dd4",
+      "reason": "User-requested loss-only replacement of world-upright tilt by lambda_R*(1-cos(relative true pre/post rotation)), keeping fixed .2 coefficient, position/action/failure costs, equal scenes, masks and H normalization. Independently checked three-axis hand values, endpoint derivatives, failure/chunk semantics and CPU/CUDA grouped gradients."
+    },
+    {
+      "base_source_sha256": "0ad0a3d5c5e4c1c0fba36aecef070ce8031394bd01279e4b8a7985081f206a8a",
+      "file": "response_task.py",
+      "symbol": "attitude_delta_cost",
+      "previous_hash": null,
+      "new_hash": "bdd31f79bfe60e3ff554e644353ae45491df7e70a1ceca2c39d4e42c841e0323",
+      "reason": "New loss-only unit-quaternion SO(3) transition cost; independent matrix/quaternion and finite-difference references, zero/tiny rotations, signs and CPU/CUDA gradients. No dt scaling, acos, normalization or absolute target."
     }
   ]
 }

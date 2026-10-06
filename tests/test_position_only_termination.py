@@ -1,3 +1,5 @@
+
+from loss_fixtures import test_loss
 from dataclasses import replace
 import torch
 from env_raptor import RaptorSimulator
@@ -11,7 +13,7 @@ def test_position_remains_the_only_episode_boundary():
               omega=torch.full_like(s.omega,35.1),position_limit=torch.full_like(s.position_limit,100))
     p=actor();trace=rollout(p,sim,s,8)
     assert trace.valid.all() and reference_episode_metrics(trace)['raptor_share_terminated']==0
-    step_costs(trace,TaskLossConfig()).sum().backward()
+    step_costs(trace,test_loss()).sum().backward()
     assert torch.isfinite(flat_grads(p)).all() and flat_grads(p).norm()>0
     pos=s.position.clone();pos[0,0]=s.position_limit[0];pos[1,0]=s.position_limit[1]+1e-5
     assert sim.terminated(replace(s,position=pos)).tolist()==[False,True]

@@ -14,7 +14,7 @@
     "source": "independent_original_clean_reset_no_actor_or_eval",
     "torch_version": "2.10.0+cpu"
   },
-  "environment_source_sha256": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+  "environment_source_sha256": "2dca14c7400b3a7ec0b12f0836cdcb0b53143c98317bae88d4bcd692d0c2f2ae",
   "falling_edges": [
     0.0975,
     0.165,
@@ -37,5 +37,19 @@
     60.35507120524872,
     97.80521691383186,
     135.91492615242686
+  ],
+  "environment_source_updates": [
+    {
+      "previous_sha256": "81956601d5f2e1287095122cef7421e6196b3cfed1d3f46cb1f0dbe12a71f8dc",
+      "new_sha256": "795f47550880319c5b58b63a6db5815d2fb9a49f91fb2181f748d5ad3fe49605",
+      "reset_canonical_sha256": "35385feea176af438c95743efda7dbbc81603b2cb1a86705040bcb84c8e6c7e4",
+      "reason": "Read-only per-device/dtype RK4 constant cache. Reset AST and every sampled state/tape field are bitwise unchanged in FP32/FP64; no recalibration of identical physical draws or yaw thresholds is required."
+    },
+    {
+      "previous_sha256": "795f47550880319c5b58b63a6db5815d2fb9a49f91fb2181f748d5ad3fe49605",
+      "new_sha256": "2dca14c7400b3a7ec0b12f0836cdcb0b53143c98317bae88d4bcd692d0c2f2ae",
+      "reset_canonical_sha256": "35385feea176af438c95743efda7dbbc81603b2cb1a86705040bcb84c8e6c7e4",
+      "reason": "Optional, bound quaternion-rotation compiler backend only. RK4 equations and reset draws are unchanged; existing yaw calibration retained after reset AST and FP32/FP64 field equivalence checks. Whole-RK4 compilation is not enabled."
+    }
   ]
 }

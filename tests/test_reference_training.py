@@ -4,7 +4,7 @@ import json
 import pytest
 import torch
 
-from tools.train_response_control import parse_args
+from loss_fixtures import parse_loss_args as parse_args
 from response_policy import ResponsePolicyConfig
 from response_task import TaskLossConfig
 from response_training import train,evaluate_checkpoint,require_reference_checkpoint

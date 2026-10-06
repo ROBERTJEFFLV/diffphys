@@ -61,7 +61,7 @@ Langevin reference trajectory is not an external-force process.
 
 Position-only per-axis strict first-failure termination uses a half-width of
 30 arm lengths. It differs from the original paper's additional velocity/omega
-thresholds. Task/Huber/CVaR losses, Time Decay, physical-group normalization and
+thresholds. The loss-only adapted branch replaces Task/Huber/CVaR scoring; Time Decay, physical-group normalization and
 Adam are retained. Only the protected dynamics RHS hash is intentionally updated,
 with provenance; independent force-at-point numerical/gradient tests cover it.
 
@@ -77,8 +77,9 @@ enabling pulses does not change the other random draws for matched seeds. New
 reset velocity/angle values intentionally differ from the former version. C++
 RAPTOR and Python are not claimed to produce bitwise-identical seeded samples.
 Pulse/sensor tapes use stable original-pool row IDs, stay immutable, and never
-become Actor inputs. Costs and boundaries use truth. The Actor architecture and
-its permitted observation schema are unchanged. See disturbance_budget.md for
+become Actor inputs. Costs and boundaries use truth. The permitted observation
+schema is unchanged; the production Actor now uses hidden-only B readout without
+Wc. This does not modify the RAPTOR physics or noise protocol. See disturbance_budget.md for
 timestamp semantics, exact schedule, geometry approximation and limitations.
 
 Environment/noise versions and source hashes reject old exact resume/evaluation.

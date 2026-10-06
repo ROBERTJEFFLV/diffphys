@@ -1,4 +1,6 @@
 """Fixed physical TRAIN coverage without modifying dynamics or fixed EVAL."""
+
+from loss_fixtures import test_loss
 from dataclasses import fields
 from pathlib import Path
 
@@ -6,7 +8,7 @@ import pytest
 import torch
 
 from response_training import sample_training_scenarios
-from tools.train_response_control import parse_args
+from loss_fixtures import parse_loss_args as parse_args
 
 
 def test_production_config_selects_2048_coverage_without_changing_eval():
@@ -14,7 +16,7 @@ def test_production_config_selects_2048_coverage_without_changing_eval():
     args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args')])
     assert getattr(args, 'train_sampling', None) == 'coverage128'
     assert args.scenarios == 512 and args.eval_scenarios == 128
-    assert args.steady_weight == 0 and args.group_max_groups == 128
+    assert args.group_max_groups == 128
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -210,7 +212,7 @@ def test_coverage_contract_is_frozen_and_bound_in_checkpoint(tmp_path):
     from response_policy import ResponsePolicyConfig
     from response_task import TaskLossConfig
     args = parse_args(['--device','cpu','--train-sampling','coverage128','--scenarios','512'])
-    contract = binding(args,ResponsePolicyConfig(),TaskLossConfig())
+    contract = binding(args,ResponsePolicyConfig(),test_loss())
     assert contract['training_sampling'] == sampling_contract('coverage128')
     assert 'response_sampling.py' in SOURCE_FILES and 'configs/physics_coverage.json' in SOURCE_FILES
     assert contract['training_sampling']['calibration']['seed_base'] == 6500000000
@@ -258,5 +260,5 @@ def test_coverage_cpu_draws_equal_cuda_transfer_and_short_backward():
     assert_state_equal(a,b.to('cpu',torch.float32))
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
     trace=rollout(policy,RaptorSimulator(),b,5,time_decay=1.)
-    task_loss(trace,TaskLossConfig()).backward()
+    task_loss(trace,test_loss()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in policy.parameters())

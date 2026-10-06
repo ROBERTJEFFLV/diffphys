@@ -44,7 +44,10 @@ algorithm. Production uses one native-backward group probe; the older grouped
 VJP backend remains an explicit numerical reference, never an automatic fallback.
 See docs/group_gradient_probe.md. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
-network belongs to the production chain. Noise changes must remain outside the
+network belongs to the production chain. The sole Actor is native B:
+GRUCell(16,64) followed by a hidden-only Linear(64,4); do not reintroduce the
+direct feature-to-readout Wc branch or an A/B production selector.
+Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
 
 `docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;

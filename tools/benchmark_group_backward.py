@@ -34,7 +34,7 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
-def measure(policy, initial, horizon, decay, cap, backend, chunk):
+def measure(policy, initial, horizon, decay, cap, backend, chunk, loss):
     device = initial.mass.device
     policy.zero_grad(set_to_none=True)
     gc.collect()
@@ -43,7 +43,7 @@ def measure(policy, initial, horizon, decay, cap, backend, chunk):
         torch.cuda.reset_peak_memory_stats(device)
     config = GroupBalanceConfig(max_groups=128, min_scenarios=1, layout="coverage128",
                                  clip_norm=cap, backward_backend=backend, vjp_chunk_size=chunk)
-    simulator, loss = RaptorSimulator(), TaskLossConfig()
+    simulator = RaptorSimulator()
     start = time.perf_counter()
     record = collect_rollout(policy, simulator, initial, loss, horizon=horizon,
                               time_decay=decay, group_config=config)
@@ -82,8 +82,12 @@ def main():
     parser.add_argument("--time-decay", type=float, default=1.)
     parser.add_argument("--clip-norm", type=float, default=1.)
     parser.add_argument("--vjp-chunk-size", type=int, default=16)
+    parser.add_argument("--epsilon-p", type=float, required=True)
+    parser.add_argument("--epsilon-a", type=float, required=True)
+    parser.add_argument("--lambda-R", type=float, required=True)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
+    loss = TaskLossConfig(args.epsilon_p, args.epsilon_a, args.lambda_R)
     if (args.scenes < 128 or args.scenes % 128 or args.horizon < 1
             or args.repeats < 1 or args.warmup < 0):
         parser.error("positive horizon/repeats, nonnegative warmup, scenes divisible by 128 required")
@@ -107,7 +111,7 @@ def main():
         for backend in (("vjp", "probe") if index % 2 == 0 else ("probe", "vjp")):
             result, gradient, costs, norms = measure(policy, initial, args.horizon,
                                                      args.time_decay, args.clip_norm,
-                                                     backend, args.vjp_chunk_size)
+                                                     backend, args.vjp_chunk_size, loss)
             print(json.dumps({"iteration": index, "warmup": index < args.warmup, **result}),
                   file=sys.stderr, flush=True)
             if index >= args.warmup:
@@ -132,6 +136,7 @@ def main():
         "device": str(device), "device_name": torch.cuda.get_device_name(device) if device.type=="cuda" else "CPU",
         "dtype": args.dtype, "scenes":args.scenes, "horizon":args.horizon,
         "policy_config":asdict(policy.config), "train_seeds":seeds,
+        "loss_config":asdict(loss),
         "time_decay":args.time_decay, "group_cap":args.clip_norm, "gradient_scale":.1,
         "samples":samples, "medians":medians, "checks":checks,
         "gradient_phase_speedup":medians["vjp"]["total_seconds"]/medians["probe"]["total_seconds"],

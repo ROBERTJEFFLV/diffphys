@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 import torch
 
-from response_task import TaskLossConfig, FlightStatistics, initialize, rollout, step_costs, risk_weights
+from response_task import (TaskLossConfig, FlightStatistics, initialize, rollout,
+                           step_cost_components, uniform_scene_weights)
 from response_groups import (GroupBalanceConfig, group_gradient_coefficients,
                              backward_group_gradients, physics_group_layout)
 from response_grad_probe import GroupGradientProbe
@@ -40,14 +41,15 @@ def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_dec
         with probe.capture() if probe is not None else nullcontext():
             for start in range(0, horizon, METRIC_CHUNK):
                 trace = rollout(policy, simulator, closed, min(METRIC_CHUNK, horizon-start),
-                                time_decay=time_decay, actor_probe=probe)
-                chunks.append(step_costs(trace, config, start=start, horizon=horizon))
-                statistics.add(trace, start)
+                                time_decay=time_decay, actor_probe=probe, record_observations=False)
+                components = step_cost_components(trace, config, start=start, horizon=horizon)
+                chunks.append(sum(components.values()))
+                statistics.add(trace, start, components=components)
                 closed = trace.end
         costs = torch.cat(chunks).sum(0)
         if not bool(torch.isfinite(costs).all()):
             raise FloatingPointError("nonfinite full-horizon costs")
-        weights = risk_weights(costs, config)
+        weights = uniform_scene_weights(costs)
         coefficients, report = group_gradient_coefficients(weights, initial, group_config)
         return RolloutRecord(costs, weights, statistics.finish(costs.detach(), weights),
                              coefficients, report, group_config, config, probe)

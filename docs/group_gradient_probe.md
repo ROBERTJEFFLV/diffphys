@@ -8,10 +8,12 @@ their local parameter contributions grouped by the existing physical-cell IDs.
 One scalar vector-Jacobian product traverses the original full H500 graph.
 No separate group VJP traversals or second flight rollout are performed.
 
-The deployment Actor (including `response_policy.py`) is unchanged byte for byte.
-Physics, sensors, pulses, 128-cell sampler/calibration, H500, Time Decay, CVaR,
+The sole deployment Actor is native B, GRUCell(16,64) plus hidden-only Linear(64,4).
+The probe observes this actual hidden input without changing the Actor or state
+adjoints; the Wc removal does not require another backward backend.
+Physics, sensors, pulses, 128-cell sampler/calibration, H500, Time Decay, equal-scene task weights,
 fixed shrink-only cap, global clipping and Adam are retained. `response_task`
-only gains an optional training observer: it passes the current original live
+uses the adapted pre-action task cost; its training observer passes the current original live
 row indices to the observer immediately before the unchanged Actor invocation.
 No group ID, physical parameter or privileged state enters the Actor.
 
@@ -23,7 +25,7 @@ does not accelerate or alter the probe.
 ## Why one scalar backward is sufficient here
 
 Let C_i denote each independent scene cost, and let the existing coefficient
-matrix A contain its original pooled mean+CVaR weights scaled by N/n_g, one
+matrix A contain uniform scene weights 1/N scaled by N/n_g, one
 nonzero group per scene. The required pre-clipping group derivative is
 
     h_g = gradient_scale * sum_i A[g,i] * dC_i/dtheta.
@@ -83,8 +85,8 @@ unique `index_copy_` writes, not floating atomic scatter sums. Grouped matrix
 multiplications reduce the 16 scene members directly. There is no full NxP
 per-scene derivative tensor, and no HxNxP derivative tape.
 
-The persistent accumulators are GxP in float64: 128 x 16068 x 8 bytes = about
-15.7 MiB for the production Actor, plus normal graph/activation storage and
+The persistent accumulators are GxP in float64: 128 x 16004 x 8 bytes = about
+15.6 MiB for the production Actor, plus normal graph/activation storage and
 small temporary packed tensors. Float32 local gate calculations/group matmuls
 remain float32; float64 accumulation does not promote the whole physics graph.
 Saved input aliases are detached only for the observer, not for native BPTT,

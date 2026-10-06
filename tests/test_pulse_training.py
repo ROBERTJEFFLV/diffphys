@@ -1,4 +1,6 @@
 """Pulse causality, live-row isolation, chunked full BPTT and checkpoint binding."""
+
+from loss_fixtures import test_loss
 from dataclasses import fields, replace
 import copy
 import json
@@ -62,7 +64,7 @@ def test_pulse_tapes_follow_original_scene_id_not_compacted_rank():
 
 @pytest.mark.parametrize('alpha',[0.,1.])
 def test_off_center_pulse_crosses_metric_boundary_without_gradient_detach(alpha):
-    s=fixture();sim=RaptorSimulator();loss=TaskLossConfig();torch.manual_seed(28)
+    s=fixture();sim=RaptorSimulator();loss=test_loss();torch.manual_seed(28)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).double();other=copy.deepcopy(p)
     direct=rollout(other,sim,s,70,time_decay=alpha)
     costs=step_costs(direct,loss).sum(0)
@@ -134,5 +136,5 @@ def test_cuda_off_center_pulse_rollout_and_backward():
     s=fixture(n=32).to('cuda',torch.float32)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
     tr=rollout(p,RaptorSimulator(),s,70,time_decay=1.)
-    step_costs(tr,TaskLossConfig()).sum().backward()
+    step_costs(tr,test_loss()).sum().backward()
     assert torch.isfinite(flat_grads(p)).all() and flat_grads(p).norm()>0

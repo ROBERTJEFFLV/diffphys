@@ -1,4 +1,6 @@
 """Independent contracts for fixed physical-cell, shrink-only Actor gradients."""
+
+from loss_fixtures import test_loss
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -9,7 +11,7 @@ from response_groups import (GroupBalanceConfig, normalize_group_rows,
                              physics_group_layout, group_gradient_coefficients,
                              backward_group_gradients)
 from response_sampling import sample_coverage, physics_cell_ids
-from response_task import TaskLossConfig, risk_weights
+from response_task import TaskLossConfig, uniform_scene_weights
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -47,7 +49,7 @@ def test_all_128_groups_exactly_match_existing_sampler_cells(dtype):
     assert counts.tolist() == [16]*128
     assert torch.equal(ids[indices], torch.arange(128)[:,None].expand(128,16))
     assert torch.equal(indices.flatten().sort().values, torch.arange(2048))
-    weights = risk_weights(torch.arange(2048, dtype=dtype), TaskLossConfig())
+    weights = uniform_scene_weights(torch.arange(2048, dtype=dtype))
     coefficients, report = group_gradient_coefficients(weights, initial, cell_config())
     torch.testing.assert_close(coefficients.mean(0), weights)
     assert report['group_ids'] == list(range(128))
@@ -67,7 +69,7 @@ def test_all_128_group_vjps_match_analytic_mean_clip_mean_and_use_eight_calls():
     unused = torch.nn.Parameter(torch.ones(1, dtype=torch.float64))
     x = torch.arange(256, dtype=torch.float64).reshape(128,2)/100
     costs = (x @ parameter + 1).square()
-    weights = risk_weights(costs, TaskLossConfig())
+    weights = uniform_scene_weights(costs)
     coeff, _ = group_gradient_coefficients(weights, initial, cfg)
     row = .1 * coeff @ (2*(x @ parameter.detach() + 1)[:,None]*x)
     expected = (row * torch.minimum(torch.ones(128), .3/row.norm(dim=1))[:,None]).mean(0)
@@ -92,7 +94,7 @@ def test_uncapped_128_cell_gru_gradients_recover_original_pooled_objective():
     b = copy.deepcopy(a)
     config = cell_config(clip_norm=1e9)
     simulator = RaptorSimulator()
-    loss_config = TaskLossConfig()
+    loss_config = test_loss()
     record = collect_rollout(a, simulator, initial, loss_config, horizon=6, time_decay=1., group_config=config)
     backward_actor(a, simulator, record, loss_config, gradient_scale=.1)
     trace = rollout(b, simulator, initial, 6, time_decay=1.)
@@ -115,8 +117,8 @@ def test_cuda_fixed_cells_and_eight_chunk_gru_backward():
     from env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,0,horizon=5,sampling='coverage128',device='cuda')
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
-    rec=collect_rollout(policy,RaptorSimulator(),initial,TaskLossConfig(),horizon=5,group_config=cell_config())
-    report=backward_actor(policy,RaptorSimulator(),rec,TaskLossConfig())['group_gradient']
+    rec=collect_rollout(policy,RaptorSimulator(),initial,test_loss(),horizon=5,group_config=cell_config())
+    report=backward_actor(policy,RaptorSimulator(),rec,test_loss())['group_gradient']
     assert report['vjp_calls']==1 and report['group_count']==128
     assert bool((report['values'][:,2]<=1).all())
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in policy.parameters())

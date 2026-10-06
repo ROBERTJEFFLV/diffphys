@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from loss_fixtures import test_loss
+
 from dataclasses import replace
 import json
 
@@ -25,7 +27,7 @@ def test_short_eval_capture_matches_the_regular_rollout_and_keeps_one_latest(tmp
     with torch.no_grad():
         expected = rollout(policy, simulator, initial, horizon)
     report, arrays = capture_short_eval(
-        policy, simulator, initial, horizon, TaskLossConfig(steady_steps=2)
+        policy, simulator, initial, horizon, test_loss()
     )
 
     np.testing.assert_array_equal(arrays["position"], torch.cat(
@@ -99,7 +101,7 @@ def test_short_eval_force_telemetry_uses_the_applied_transition_and_stops_at_ter
     simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt))
     initial = sample_scenarios(2, seed=37, horizon=horizon)
     _, arrays = capture_short_eval(
-        policy, simulator, initial, horizon, TaskLossConfig(steady_steps=20)
+        policy, simulator, initial, horizon, test_loss()
     )
     assert arrays["pulse_active"].any()
     scene, frame = np.argwhere(arrays["pulse_active"] & arrays["valid"])[0, ::-1]
@@ -133,7 +135,7 @@ def test_terminated_scene_stays_frozen_in_the_saved_short_trace():
     with torch.no_grad():
         expected = rollout(policy, simulator, initial, horizon)
     _, arrays = capture_short_eval(
-        policy, simulator, initial, horizon, TaskLossConfig(steady_steps=2)
+        policy, simulator, initial, horizon, test_loss()
     )
     np.testing.assert_array_equal(arrays["valid"], expected.valid.numpy())
     np.testing.assert_array_equal(arrays["position"], torch.cat(
