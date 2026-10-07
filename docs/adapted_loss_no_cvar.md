@@ -62,7 +62,7 @@ The user-selected experiment parameters are recorded in the argument file:
 |---|---:|---|
 | `epsilon_p` | 0.01 m | Whole three-dimensional position-vector smooth norm |
 | `epsilon_a` | 0.01 | Whole four-command difference-vector smooth norm in raw [-1,1] units |
-| `lambda_R` | 0.2 | Multiplier of per-control-step relative rotation `1 - cos(theta)` |
+| `lambda_R` | 25.0 | Multiplier of per-control-step relative rotation `1 - cos(theta)` |
 
 These finite positive constants are experimental starting settings, not validated
 stability bounds. They are frozen configuration values, not network parameters;
@@ -73,13 +73,17 @@ argument file supplies them. The test fixture values .5/.25/.4 remain independen
 arithmetic examples, not recommended training settings.
 
 No division by dt or dt squared is applied. At 100 Hz, a constant yaw rate of
-1 rad/s produces `0.2*(1-cos(0.01))`, approximately 1e-5. Retaining the existing
-coefficient does not establish that this incentive will suppress learned yaw
-spin; no learning-rate, sampling or coefficient change is hidden in this revision.
+1 rad/s produces `25*(1-cos(0.01))`, approximately 0.00125. The previous
+coefficient 0.2 gave approximately 0.00001 for the same motion. Equal relative
+rotation angles about roll, pitch or yaw have equal cost; normal recovery and
+disturbance rejection can require roll/pitch changes, so this is not evidence
+that every attitude change is undesirable. The larger fixed coefficient is an
+experimental setting and does not establish that learned yaw spin will disappear.
+Position/action smoothing, learning rate and sampling are unchanged.
 
 The checked-in argument file preserves 2048 TRAIN scenes, coverage128, H500,
 Time Decay 1, gradient_scale .1, group cap 1, global clip 10 and Adam lr 3e-4.
-It uses a fresh `runs/attitude_delta_gru_only_no_cvar/seed7` directory and supplies the three
+It uses a fresh `runs/attitude_delta_lambda25_gru_only_no_cvar/seed7` directory and supplies the three
 confirmed constants above. Training remains an explicit CLI operation, separately authorized by the user.
 
 `step_cost_components()` returns position, attitude_delta, action_delta, dead, terminal

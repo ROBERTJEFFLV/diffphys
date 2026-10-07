@@ -17,10 +17,10 @@
 --checkpoint-every 50
 --epsilon-p 0.01
 --epsilon-a 0.01
---lambda-R 0.2
+--lambda-R 25.0
 --dead-cost 3
 --terminal-cost 200
---work-dir runs/attitude_delta_gru_only_no_cvar/seed7
+--work-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7
 --group-max-groups 128
 --group-min-scenarios 16
 --group-clip-norm 1.0

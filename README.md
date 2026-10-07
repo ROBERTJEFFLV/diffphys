@@ -15,8 +15,8 @@ your CUDA runtime; no native extension build is required.
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/attitude_delta_gru_only_no_cvar/seed7/best.pt \
-    --work-dir runs/attitude_delta_gru_only_no_cvar/evaluation
+    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
+    --work-dir runs/attitude_delta_lambda25_gru_only_no_cvar/evaluation
 python -m pytest -q tests
 ```
 
@@ -66,7 +66,7 @@ training checkpoints.
 
 ```bash
 python tools/evaluate_response_long.py @configs/response_long_eval.args \
-    --checkpoint runs/attitude_delta_gru_only_no_cvar/seed7/best.pt \
+    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
     --work-dir runs/long_hover_eval/seed20260927
 python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
 ```
@@ -78,10 +78,13 @@ their archived evaluator sources rather than rewriting checkpoint bindings.
 ## Adapted task loss, equal scene weights
 
 Every valid control step contributes true pre-action position smooth L2,
-`0.2 * (1 - cos(relative rotation from R_t to R_(t+1)))`, and smooth L2 of
+`25.0 * (1 - cos(relative rotation from R_t to R_(t+1)))`, and smooth L2 of
 the final four-command difference. A constant necessary tilt is free; actual
 roll, pitch and yaw changes all count. This is a soft motion cost, not a test
 for instability, and is not divided by dt.
+The fixed coefficient 25.0 is the current experimental setting (previously 0.2),
+not a validated stability bound. Changing it requires a new run and best-score
+record; physical flight metrics remain comparable across coefficients.
 The fixed smoothing scales are `epsilon_p=0.01 m` and `epsilon_a=0.01` in raw
 [-1,1] command units. Time normalization is always `1/H`; all initial scenes
 have weight `1/N`. Velocity/omega penalties, Huber, CVaR and tail weighting
@@ -123,9 +126,9 @@ The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
 
 ```bash
 python tools/short_eval_replay.py \
-    --run-dir runs/attitude_delta_gru_only_no_cvar/seed7 --device cuda
+    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7 --device cuda
 python tools/monitor_response_training.py \
-    --run-dir runs/attitude_delta_gru_only_no_cvar/seed7
+    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7
 ```
 
 The exporter retains the latest complete fixed-EVAL trace, including the exact

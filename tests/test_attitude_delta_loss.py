@@ -49,14 +49,15 @@ def test_yaw_transition_is_penalized_without_an_absolute_heading_target():
 
 @pytest.mark.parametrize('axis', [0, 1, 2])
 @pytest.mark.parametrize('angle', [0., 1e-7, .01, .3, math.pi/2, math.pi])
-def test_relative_rotation_value_and_angle_gradient(axis, angle):
+@pytest.mark.parametrize('weight', [.2, 2., 10., 25.])
+def test_relative_rotation_value_and_angle_gradient(axis, angle, weight):
     theta = torch.tensor(angle, dtype=torch.float64, requires_grad=True)
     trace = fixture(rotation_q(0), rotation_q(theta, axis=axis))
-    loss = task.task_loss(trace, config())
-    expected = .4*math.sin(angle/2)**2
+    loss = task.task_loss(trace, replace(config(), lambda_R=weight))
+    expected = 2*weight*math.sin(angle/2)**2
     assert float(loss.detach()) == pytest.approx(expected, rel=1e-12, abs=1e-28)
     gradient, = torch.autograd.grad(loss, (theta,))
-    assert float(gradient) == pytest.approx(.2*math.sin(angle), rel=1e-12, abs=1e-16)
+    assert float(gradient) == pytest.approx(weight*math.sin(angle), rel=1e-12, abs=2e-15)
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])

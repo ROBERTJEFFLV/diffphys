@@ -17,7 +17,7 @@ from tools.train_response_control import parse_args
 from test_adapted_loss import trace_fixture
 
 
-CONFIRMED = dict(epsilon_p=.01, epsilon_a=.01, lambda_R=.2,
+CONFIRMED = dict(epsilon_p=.01, epsilon_a=.01, lambda_R=25.,
                  dead_cost=3., terminal_cost=200.)
 ARGUMENT_FILE = Path(__file__).resolve().parents[1] / 'configs/response_raptor_multi_airframe.args'
 
@@ -35,7 +35,7 @@ def test_confirmed_scales_match_independent_hand_values():
     trace.pre_orientations = torch.tensor([[[math.sqrt(.5), math.sqrt(.5), 0., 0.]]],
                                           dtype=torch.float64)
     components = task_loss_components(trace, TaskLossConfig(**CONFIRMED))
-    expected = dict(position=math.sqrt(.05**2 + .01**2) - .01, attitude_delta=.2,
+    expected = dict(position=math.sqrt(.05**2 + .01**2) - .01, attitude_delta=25.,
                     action_delta=math.sqrt(.1**2 + .01**2) - .01, dead=0., terminal=0.)
     assert components == pytest.approx(expected, rel=1e-13, abs=1e-14)
     assert float(scenario_costs(trace, TaskLossConfig(**CONFIRMED)).detach()) == pytest.approx(sum(expected.values()))
