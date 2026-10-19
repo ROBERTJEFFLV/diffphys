@@ -63,6 +63,10 @@ def main(argv=None):
     shutil.copyfile(args.checkpoint,frozen)
     device=torch.device(args.device);dtype=getattr(torch,args.dtype)
     policy,saved=load_policy_checkpoint(frozen,device,dtype)
+    if policy.config.goal_conditioning:
+        raise ValueError("this 60 s moving-goal evaluator is hover-only; evaluate an agile checkpoint "
+                         "with tools/train_response_control.py --mode evaluate --checkpoint PATH "
+                         "to reconstruct its saved three-point targets")
     policy.eval()
     before_hash=model_hash(policy)
     cfg=saved['binding']['protocol']

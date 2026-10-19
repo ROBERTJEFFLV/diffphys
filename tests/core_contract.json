@@ -30,10 +30,10 @@
     },
     "response_policy.py": {
       "body_vector": "697fd84932fd856432f7cf6debedaf69da2ff65394befbee2fd9d5c6fbfb33d8",
-      "ResponseMotorPolicy.__init__": "76d1a462f1ebbe4b6b75a9209eae0e175b00d51b180ba23fc87b7e11fb7e83e7",
-      "ResponseMotorPolicy.control_features": "fcf70531a9eda185018ca8be975de30dee57d1c719aaa6e3b7089c3891df17e2",
+      "ResponseMotorPolicy.__init__": "d8bb1345ebaa36dd607c55a2e8a048afc17b93f5d071393b34d4939f0a0b8171",
+      "ResponseMotorPolicy.control_features": "91f0835959570aa2c29f51eb023d29a40234c7614fc7efc4bb22c58b59c64c31",
       "ResponseMotorPolicy.initial_state": "61c79ac803ba441716010f5a288f2f8772aced97cd36e227df8a274881834650",
-      "ResponseMotorPolicy.forward": "05c735d1bff2d1c4ee9b18c2c7f2a0f2d781c3f076a180ba6050c8303f3215aa"
+      "ResponseMotorPolicy.forward": "2e0481496d7b08e640a1cdc7045efd1827e4a99c96daf8d5609a0f27ae57f041"
     },
     "response_training.py": {
       "gradient_norm": "7f12afb98bf431275f73e1d1a3a26ece8ba8f2b218c4fda9933e76da722bf7ca",
@@ -216,6 +216,30 @@
       "previous_hash": null,
       "new_hash": "bdd31f79bfe60e3ff554e644353ae45491df7e70a1ceca2c39d4e42c841e0323",
       "reason": "New loss-only unit-quaternion SO(3) transition cost; independent matrix/quaternion and finite-difference references, zero/tiny rotations, signs and CPU/CUDA gradients. No dt scaling, acos, normalization or absolute target."
+    },
+    {
+      "base_commit": "bf5b08d95e4cd99602f15e5b747ffd6012eed944",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.__init__",
+      "previous_hash": "76d1a462f1ebbe4b6b75a9209eae0e175b00d51b180ba23fc87b7e11fb7e83e7",
+      "new_hash": "d8bb1345ebaa36dd607c55a2e8a048afc17b93f5d071393b34d4939f0a0b8171",
+      "reason": "User-requested three-point goal conditioning: opt-in GRU16 to GRU36 input expansion with the same native GRU and hidden-only four-motor readout. Legacy hover features and six-parameter structure retained; structured hover import copies all original weights and zero-pads 20 added input columns. Independent recurrent FP32/FP64 migration equivalence, new-column gradients, physical finite differences, full-horizon chunk equivalence and native-probe versus VJP tests cover this intentional Actor interface change. Physics, original hover loss, Time Decay, physical-group clipping and Adam kernel hashes remain unchanged."
+    },
+    {
+      "base_commit": "bf5b08d95e4cd99602f15e5b747ffd6012eed944",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.control_features",
+      "previous_hash": "fcf70531a9eda185018ca8be975de30dee57d1c719aaa6e3b7089c3891df17e2",
+      "new_hash": "91f0835959570aa2c29f51eb023d29a40234c7614fc7efc4bb22c58b59c64c31",
+      "reason": "User-requested three-point goal conditioning: opt-in GRU16 to GRU36 input expansion with the same native GRU and hidden-only four-motor readout. Legacy hover features and six-parameter structure retained; structured hover import copies all original weights and zero-pads 20 added input columns. Independent recurrent FP32/FP64 migration equivalence, new-column gradients, physical finite differences, full-horizon chunk equivalence and native-probe versus VJP tests cover this intentional Actor interface change. Physics, original hover loss, Time Decay, physical-group clipping and Adam kernel hashes remain unchanged."
+    },
+    {
+      "base_commit": "bf5b08d95e4cd99602f15e5b747ffd6012eed944",
+      "file": "response_policy.py",
+      "symbol": "ResponseMotorPolicy.forward",
+      "previous_hash": "05c735d1bff2d1c4ee9b18c2c7f2a0f2d781c3f076a180ba6050c8303f3215aa",
+      "new_hash": "2e0481496d7b08e640a1cdc7045efd1827e4a99c96daf8d5609a0f27ae57f041",
+      "reason": "User-requested three-point goal conditioning: opt-in GRU16 to GRU36 input expansion with the same native GRU and hidden-only four-motor readout. Legacy hover features and six-parameter structure retained; structured hover import copies all original weights and zero-pads 20 added input columns. Independent recurrent FP32/FP64 migration equivalence, new-column gradients, physical finite differences, full-horizon chunk equivalence and native-probe versus VJP tests cover this intentional Actor interface change. Physics, original hover loss, Time Decay, physical-group clipping and Adam kernel hashes remain unchanged."
     }
   ]
 }

@@ -14,7 +14,8 @@ def test_mainline_keeps_only_the_original_gru_and_hidden_linear_readout():
     assert [type(module) for module in policy.children()] == [torch.nn.GRUCell, torch.nn.Linear]
     assert (policy.readout.in_features, policy.readout.out_features) == (64, 4)
     assert sum(parameter.numel() for parameter in policy.parameters()) == 16004
-    assert {field.name for field in fields(ResponsePolicyConfig)} == {'memory_dim', 'dt'}
+    assert {field.name for field in fields(ResponsePolicyConfig)} == {'memory_dim', 'dt', 'goal_conditioning'}
+    assert policy.config.goal_conditioning is False
     assert not hasattr(policy, 'base_feedback')
 
 

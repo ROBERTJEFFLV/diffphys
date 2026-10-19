@@ -27,7 +27,8 @@ def test_only_one_native_gru_and_one_affine_readout():
     assert (p.readout.in_features, p.readout.out_features) == (64, 4)
     assert sum(x.numel() for x in p.parameters()) == 16004
     assert {f.name for f in fields(ResponsePolicyState)} == {'memory'}
-    assert {f.name for f in fields(ResponsePolicyConfig)} == {'memory_dim', 'dt'}
+    assert {f.name for f in fields(ResponsePolicyConfig)} == {'memory_dim', 'dt', 'goal_conditioning'}
+    assert p.config.goal_conditioning is False
     assert p.readout.weight.abs().sum() > 0
     assert not p.readout.bias.any()
 

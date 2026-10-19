@@ -22,7 +22,13 @@ import torch
 from .env_raptor import (RaptorParams, RaptorState, environment_contract,
                         ACTION_CONVENTION)
 from .response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
-from .response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from .response_policy import (ARCHITECTURE, AGILE_ARCHITECTURE,
+                              ResponseMotorPolicy, ResponsePolicyConfig)
+from .agile_checkpoint import import_hover_checkpoint
+from .agile_curriculum import (agile_config_from_dict, load_agile_config,
+                               curriculum_difficulty)
+from .agile_mission import sample_agile_mission
+from .agile_objective import AgileLossConfig, AGILE_OBJECTIVE_VERSION
 from .response_task import (
     TaskLossConfig,
     TASK_OBJECTIVE_VERSION,
@@ -47,6 +53,17 @@ PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v6"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
+TEST_SEEDS = (34_000_007, 34_010_007)
+AGILE_TRAIN_SEED_BASE = 41_000_007
+AGILE_VALIDATION_SEED = 42_000_007
+AGILE_TEST_SEED = 44_000_007
+AGILE_SAMPLING_PROTOCOL = {
+    "version": "committed-update-cpu-mission-v1",
+    "train_seed_base": AGILE_TRAIN_SEED_BASE,
+    "validation_seed": AGILE_VALIDATION_SEED,
+    "test_seed": AGILE_TEST_SEED,
+    "eval_hover_fraction": 0.,
+}
 SOURCE_FILES = (
     "diffphys/__init__.py",
     "diffphys/response_policy.py",
@@ -64,6 +81,11 @@ SOURCE_FILES = (
     "diffphys/scene_prefetch.py",
     "diffphys/env_raptor.py",
     "diffphys/response_noise.py",
+    "diffphys/agile_mission.py",
+    "diffphys/agile_objective.py",
+    "diffphys/agile_checkpoint.py",
+    "diffphys/agile_curriculum.py",
+    "configs/agile_flight.json",
     "tools/train_response_control.py",
     "tools/replay_response_update.py",
 )
@@ -151,12 +173,30 @@ def migrate_actor_weights(policy, state):
 
 def require_reference_checkpoint(value):
     """A shape match cannot certify old hover-centered or plus-frame semantics."""
-    if value.get("schema") != PROTOCOL_VERSION or value.get("architecture") != ARCHITECTURE:
-        raise ValueError("incompatible Actor architecture or motor semantics: use a GRU16 hidden-only checkpoint")
+    if (value.get("schema") != PROTOCOL_VERSION
+            or value.get("architecture") not in (ARCHITECTURE, AGILE_ARCHITECTURE)):
+        raise ValueError("incompatible Actor architecture or motor semantics")
     cfg = value["binding"]["protocol"]
-    if cfg.get("task_objective") != TASK_OBJECTIVE_VERSION:
+    task = cfg.get("task", "hover")
+    if task not in ("hover", "agile"):
+        raise ValueError("unsupported checkpoint task configuration")
+    policy_config = ResponsePolicyConfig(**value["policy_config"])
+    architecture = AGILE_ARCHITECTURE if task == "agile" else ARCHITECTURE
+    if (cfg.get("version") != PROTOCOL_VERSION
+            or value["architecture"] != architecture or cfg.get("architecture") != architecture
+            or policy_config.goal_conditioning != (task == "agile")
+            or ResponsePolicyConfig(**cfg["policy"]) != policy_config):
+        raise ValueError("checkpoint task, Actor architecture or motor semantics mismatch")
+    objective = AGILE_OBJECTIVE_VERSION if task == "agile" else TASK_OBJECTIVE_VERSION
+    if cfg.get("task_objective") != objective:
         raise ValueError("checkpoint task objective mismatch: old losses require weights-only initialization")
-    TaskLossConfig(**cfg["loss"])
+    if task == "agile":
+        agile_config = agile_config_from_dict(cfg["agile"])
+        if (AgileLossConfig(**cfg["loss"]) != agile_config.loss
+                or cfg.get("mission_sampling") != AGILE_SAMPLING_PROTOCOL):
+            raise ValueError("checkpoint agile objective or sampling configuration mismatch")
+    else:
+        TaskLossConfig(**cfg["loss"])
     params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
             or cfg.get("environment_source_sha256") != file_hash(ROOT / "diffphys/env_raptor.py")
@@ -257,6 +297,33 @@ def sample_training_scenarios(scenarios, attempt_index, *, dt=.01, device="cpu",
     return initial, seeds
 
 
+def sample_training_mission(initial, update, config, *, horizon, device="cpu",
+                            dtype=torch.float32, sampling_report=None):
+    """Attach the current update's task after delivery of the CPU physical pool.
+
+    The worker prefetches physical parameters and immutable disturbance tapes
+    only.  Task amplitude is determined from the committed update, so resume,
+    failed-update rollback and update replay use the same continuous schedule.
+    Mission generation has its own seed and does not advance the training RNG.
+    """
+    if initial.position.device.type != "cpu":
+        raise ValueError("agile missions must be sampled on the delivered CPU physical pool")
+    difficulty = curriculum_difficulty(update, config)
+    seed = AGILE_TRAIN_SEED_BASE + update
+    if seed >= AGILE_VALIDATION_SEED:
+        raise ValueError("TRAIN mission seed range would enter reserved EVAL")
+    initial, mission = sample_agile_mission(
+        initial, config.mission, seed=seed, difficulty=difficulty, horizon=horizon)
+    if sampling_report is not None:
+        sampling_report["agile"] = {
+            "schedule_update": update,
+            "mission_seed": seed,
+            "requested_difficulty": difficulty,
+            "mission": mission.report,
+        }
+    return initial.to(device, dtype), mission.to(device, dtype)
+
+
 @torch.no_grad()
 def gradient_norm(parameters):
     grads = [p.grad for p in parameters if p.grad is not None]
@@ -282,17 +349,21 @@ def safe_global_clip(parameters, limit):
     return value
 
 
-def binding(args, policy_config, loss_config):
-    return {
+def binding(args, policy_config, loss_config, *, agile_config=None):
+    task = getattr(args, "task", "hover")
+    if task == "agile" and agile_config is None:
+        agile_config = load_agile_config(getattr(args, "agile_config", None))
+    result = {
         "source_sha256": source_hash(),
         "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
                      + "+physics-group-fixed-cap",
         "protocol": {
             "version": PROTOCOL_VERSION,
-            "architecture": ARCHITECTURE,
+            "architecture": AGILE_ARCHITECTURE if task == "agile" else ARCHITECTURE,
+            "task": task,
             "policy": asdict(policy_config),
             "loss": asdict(loss_config),
-            "task_objective": TASK_OBJECTIVE_VERSION,
+            "task_objective": AGILE_OBJECTIVE_VERSION if task == "agile" else TASK_OBJECTIVE_VERSION,
             "scenarios_per_bank": args.scenarios,
             "disturbances": asdict(DisturbanceConfig.from_args(args)),
             "eval_scenarios_per_bank": args.eval_scenarios,
@@ -301,6 +372,7 @@ def binding(args, policy_config, loss_config):
             "environment_params": asdict(RaptorParams(dt=policy_config.dt)),
             "environment": environment_contract(RaptorParams(dt=policy_config.dt)),
             "development_seeds": list(DEVELOPMENT_SEEDS),
+            "test_seeds": list(TEST_SEEDS),
             "deployment_authorized": False,
         },
         **{
@@ -331,12 +403,18 @@ def binding(args, policy_config, loss_config):
                       "worker_threads":args.threads, "interop_threads":torch.get_num_interop_threads(),
                       "gc":"defer-forward-backward", "compaction":"dynamic"},
     }
+    if task == "agile":
+        result["protocol"].update(
+            agile=agile_config.to_dict(),
+            mission_sampling=dict(AGILE_SAMPLING_PROTOCOL),
+        )
+    return result
 
 
 def _checkpoint(policy, optimizer, progress, run_binding):
     return {
         "schema": PROTOCOL_VERSION,
-        "architecture": ARCHITECTURE,
+        "architecture": policy.architecture,
         "policy_config": asdict(policy.config),
         "model": policy.state_dict(),
         "model_sha256": model_hash(policy),
@@ -374,7 +452,18 @@ def _append(path, row):
 
 
 @torch.no_grad()
-def evaluate(policy, simulator, initial, horizon, loss_config):
+def evaluate(policy, simulator, initial, horizon, loss_config, *, mission=None):
+    if mission is not None:
+        # collect_rollout uses the same continuous objective/reduction as TRAIN.
+        # no_grad disables the Actor probe and retains no backward graph.
+        record = collect_rollout(policy, simulator, initial, loss_config,
+                                 horizon=horizon, time_decay=0., mission=mission)
+        report = dict(record.metrics)
+        if not report["finite"]:
+            raise FloatingPointError("nonfinite fixed EVAL")
+        report["loss_config"] = asdict(loss_config)
+        report["disturbances"] = disturbance_report(initial)
+        return report
     trace = rollout(policy, simulator, initial, horizon)
     report = trajectory_metrics(trace, loss_config)
     if not report["finite"]:
@@ -395,6 +484,22 @@ def _sync(device):
 
 def train(args, policy_config, loss_config):
     """A finite loss increase never vetoes an update; numerical failures abort."""
+    task = getattr(args, "task", "hover")
+    if task not in ("hover", "agile"):
+        raise ValueError("task must be hover or agile")
+    if policy_config.goal_conditioning != (task == "agile"):
+        raise ValueError("Actor goal conditioning must match the selected task")
+    agile_config = None
+    if task == "agile":
+        agile_config = getattr(args, "agile_training_config", None)
+        if agile_config is None:
+            agile_config = load_agile_config(getattr(args, "agile_config", None))
+        if loss_config != agile_config.loss:
+            raise ValueError("agile loss must match the expanded agile configuration")
+        if agile_config.mission.hold_seconds >= args.horizon * policy_config.dt:
+            raise ValueError("agile horizon must exceed mission hold_seconds")
+    elif not isinstance(loss_config, TaskLossConfig):
+        raise ValueError("hover task requires the hover loss configuration")
     sampling = getattr(args, "train_sampling", "random")
     validate_sampling(sampling, TRAINING_BANKS*args.scenarios)
     device = torch.device(
@@ -425,7 +530,7 @@ def train(args, policy_config, loss_config):
         raise ValueError("not enough TRAIN scenes for the requested per-cell minimum")
     if TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
         raise ValueError("not enough unique TRAIN scenes for group balancing")
-    run_binding = binding(args, policy_config, loss_config)
+    run_binding = binding(args, policy_config, loss_config, agile_config=agile_config)
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
     if not args.resume and any(
@@ -456,19 +561,23 @@ def train(args, policy_config, loss_config):
             raise ValueError("inconsistent checkpoint sampling index")
         restore_rng(saved["rng"])
     elif args.init_checkpoint:
-        saved = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
-        # Explicit weights-only import checks the deployable interface, not an
-        # old training environment. No legacy simulator/optimizer is restored.
-        old_policy = saved.get("policy_config", {})
-        old_environment = saved.get("binding", {}).get("protocol", {}).get("environment", {})
-        if (saved.get("architecture") != ARCHITECTURE
-                or any(old_policy.get(k) != v for k, v in asdict(policy_config).items())
-                or old_environment.get("action_convention") != ACTION_CONVENTION):
-            raise ValueError("initialization Actor interface/motor semantics mismatch")
-        migrate_actor_weights(policy, saved.get("model", {}))
-        if saved.get("model_sha256") != model_hash(policy):
-            raise ValueError("checkpoint model digest mismatch")
-        progress["initialization"] = {"file_sha256": file_hash(args.init_checkpoint), "weights_only": True}
+        if task == "agile":
+            progress["initialization"] = import_hover_checkpoint(policy, args.init_checkpoint)
+        else:
+            saved = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+            # Explicit hover weights-only import retains the legacy interface
+            # check. Missing goal_conditioning denotes the original hover Actor.
+            old_policy = saved.get("policy_config", {})
+            old_environment = saved.get("binding", {}).get("protocol", {}).get("environment", {})
+            if (saved.get("architecture") != ARCHITECTURE
+                    or any(old_policy.get(k, False if k == "goal_conditioning" else None) != v
+                           for k, v in asdict(policy_config).items())
+                    or old_environment.get("action_convention") != ACTION_CONVENTION):
+                raise ValueError("initialization Actor interface/motor semantics mismatch")
+            migrate_actor_weights(policy, saved.get("model", {}))
+            if saved.get("model_sha256") != model_hash(policy):
+                raise ValueError("checkpoint model digest mismatch")
+            progress["initialization"] = {"file_sha256": file_hash(args.init_checkpoint), "weights_only": True}
     for name in ("history.jsonl", "evaluation.jsonl"):
         _recover_log(work / name, progress["updates"])
     audit = UpdateAudit(work, audit_config, evaluation_interval=args.development_every,
@@ -480,7 +589,7 @@ def train(args, policy_config, loss_config):
     elapsed_before = progress["elapsed_seconds"]
     entry_gc = gc.isenabled()
     sampler = None
-    record = backward = before = initial = None
+    record = backward = before = initial = mission = None
     gradients_for_audit = {}
     failure = None
     stop = []
@@ -491,7 +600,7 @@ def train(args, policy_config, loss_config):
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_handlers[signum] = signal.signal(signum, interrupted)
-    eval_initial = None
+    eval_initial = eval_mission = None
 
     def save(name="latest.pt"):
         atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
@@ -499,7 +608,12 @@ def train(args, policy_config, loss_config):
     def evaluation():
         rng = capture_rng()
         try:
-            report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config)
+            report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config,
+                              mission=eval_mission)
+            if agile_config is not None:
+                report.update(eval_split="validation", eval_difficulty=agile_config.fixed_eval_difficulty,
+                              eval_mission_seed=AGILE_VALIDATION_SEED,
+                              eval_hover_fraction=AGILE_SAMPLING_PROTOCOL["eval_hover_fraction"])
         finally:
             restore_rng(rng)
         _append(work / "evaluation.jsonl", {"update": progress["updates"], **report})
@@ -518,8 +632,17 @@ def train(args, policy_config, loss_config):
 
     try:
         eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
-                                   device=device, dtype=dtype, horizon=args.horizon,
+                                   device="cpu" if agile_config is not None else device,
+                                   dtype=dtype, horizon=args.horizon,
                                    disturbances=disturbances)
+        if agile_config is not None:
+            eval_initial, eval_mission = sample_agile_mission(
+                eval_initial, replace(agile_config.mission,
+                                      hover_fraction=AGILE_SAMPLING_PROTOCOL["eval_hover_fraction"]),
+                seed=AGILE_VALIDATION_SEED,
+                difficulty=agile_config.fixed_eval_difficulty, horizon=args.horizon)
+            eval_initial = eval_initial.to(device, dtype)
+            eval_mission = eval_mission.to(device, dtype)
         if (
             progress.get("last_evaluated_update") != progress["updates"]
             and progress["updates"] == 0
@@ -557,13 +680,21 @@ def train(args, policy_config, loss_config):
                     args.scenarios,
                     progress["updates"],
                     dt=policy_config.dt,
-                    device=device,
+                    device="cpu" if agile_config is not None else device,
                     dtype=dtype,
                     disturbances=disturbances,
                     horizon=args.horizon,
                     sampling=sampling,
                     sampling_report=sampling_report,
                 )
+                mission = None
+                if agile_config is not None:
+                    mission_started = time.monotonic()
+                    initial, mission = sample_training_mission(
+                        initial, progress["updates"], agile_config, horizon=args.horizon,
+                        device=device, dtype=dtype, sampling_report=sampling_report)
+                    _sync(device)
+                    sampler.last["agile_mission_and_upload_seconds"] = time.monotonic() - mission_started
                 optimizer.zero_grad(set_to_none=True)
                 with critical_gc():
                     record = collect_rollout(
@@ -574,6 +705,7 @@ def train(args, policy_config, loss_config):
                         horizon=args.horizon,
                         time_decay=args.time_decay,
                         group_config=group_config,
+                        **({"mission": mission} if mission is not None else {}),
                     )
                     _sync(device)
                     forward_done = time.monotonic()
@@ -666,7 +798,7 @@ def train(args, policy_config, loss_config):
             }
             _append(work / "history.jsonl", row)
             print(json.dumps(row, allow_nan=False), flush=True)
-            record = backward = before = initial = None
+            record = backward = before = initial = mission = None
             gradients_for_audit = {}
             optimizer.zero_grad(set_to_none=True)
             if progress["updates"] % args.development_every == 0:
@@ -682,7 +814,7 @@ def train(args, policy_config, loss_config):
     finally:
         if record is not None and record.probe is not None:
             record.probe.close()
-        record = backward = before = initial = None
+        record = backward = before = initial = mission = None
         gradients_for_audit = {}
         optimizer.zero_grad(set_to_none=True)
         cleanup = {}
@@ -720,7 +852,7 @@ def train(args, policy_config, loss_config):
 
 
 def evaluate_checkpoint(args):
-    """Rescore compatible Actor weights with current metrics; never relax resume."""
+    """Rebuild the saved task and its independent validation/test sampling split."""
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     params = require_reference_checkpoint(saved)
     checkpoint_source = saved["binding"]["source_sha256"]
@@ -734,24 +866,52 @@ def evaluate_checkpoint(args):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     dtype = getattr(torch, saved["binding"]["dtype"])
+    torch.set_num_threads(saved["binding"]["threads"])
     policy, _ = load_policy_checkpoint(args.checkpoint, device, dtype)
     cfg = saved["binding"]["protocol"]
-    initial = sample_pool(cfg["eval_scenarios_per_bank"], DEVELOPMENT_SEEDS,
-                          dt=policy.config.dt, device=device, dtype=dtype,
+    task = cfg.get("task", "hover")
+    split = getattr(args, "eval_split", "validation")
+    if split not in ("validation", "test"):
+        raise ValueError("eval_split must be validation or test")
+    seeds = (cfg.get("development_seeds", list(DEVELOPMENT_SEEDS)) if split == "validation"
+             else cfg.get("test_seeds", list(TEST_SEEDS)))
+    agile_config = agile_config_from_dict(cfg["agile"]) if task == "agile" else None
+    initial = sample_pool(cfg["eval_scenarios_per_bank"], seeds,
+                          dt=policy.config.dt, device="cpu" if agile_config is not None else device,
+                          dtype=dtype,
                           horizon=saved["binding"]["horizon"],
                           disturbances=DisturbanceConfig(**cfg["disturbances"]))
+    mission = None
+    if agile_config is not None:
+        mission_seed = cfg["mission_sampling"][split + "_seed"]
+        initial, mission = sample_agile_mission(
+            initial, replace(agile_config.mission,
+                             hover_fraction=cfg["mission_sampling"]["eval_hover_fraction"]),
+            seed=mission_seed,
+            difficulty=agile_config.fixed_eval_difficulty, horizon=saved["binding"]["horizon"])
+        initial = initial.to(device, dtype)
+        mission = mission.to(device, dtype)
     report = evaluate(
         policy,
         make_simulator(params, device),
         initial,
         saved["binding"]["horizon"],
-        TaskLossConfig(**cfg["loss"]),
+        agile_config.loss if agile_config is not None else TaskLossConfig(**cfg["loss"]),
+        mission=mission,
     )
     report.update(
+        task=task,
+        eval_split=split,
+        eval_seeds=list(seeds),
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,
         source_match=checkpoint_source == evaluator_source,
         numerical_backend=physics_backend_contract(device),
     )
-    atomic_json(Path(args.work_dir) / "evaluation.json", report)
+    if agile_config is not None:
+        report.update(eval_difficulty=agile_config.fixed_eval_difficulty,
+                      eval_mission_seed=mission_seed,
+                      eval_hover_fraction=cfg["mission_sampling"]["eval_hover_fraction"])
+    output = "evaluation.json" if split == "validation" else "evaluation_test.json"
+    atomic_json(Path(args.work_dir) / output, report)
     return report

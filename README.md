@@ -1,11 +1,41 @@
 # DiffPhys: multi-airframe recurrent motor control
 
 One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
-entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
-shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
-auxiliary network or single-airframe mode. The sole production Actor is B:
-GRUCell(16,64) + hidden-only Linear(64,4). Wc is removed, with no mask or
-alternative direct-feature branch. Geometric feedback is not used.
+entry. Training uses full-horizon BPTT, optional backward-only Time Decay,
+physical-group shrink-only gradient clipping and persistent Adam. There is no
+critic, teacher, auxiliary network or single-airframe mode. The hover Actor is
+GRUCell(16,64) + hidden-only Linear(64,4); the agile task adds 20 goal features
+to the same recurrent/readout structure. Wc is removed, with no mask or
+alternative direct-feature branch. No geometric feedback controller is added.
+
+## Agile flight: three-point continuous-reference training
+
+The `Agile-Flight-training` branch adds `--task agile`: start in hover, follow a
+smooth three-point position/attitude/velocity reference, then brake and hold the
+final point. The objective is continuous. Time progress and an update-based
+smooth curriculum replace task-pass gates, event-triggered phases and
+success-threshold promotion. The original world-fixed `30 * arm_length` boundary
+and sampled airframes/noise remain intact.
+
+```bash
+python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
+    --task agile --agile-config configs/agile_flight.json --time-decay 0 \
+    --init-checkpoint /absolute/path/hover.pt \
+    --work-dir runs/agile/from_hover_seed7
+```
+
+Replace the checkpoint placeholder before running. A compatible structured hover
+checkpoint copies the existing 16 input columns and zero-initializes the 20 added
+columns, with fresh Adam and task progress. Exact `--resume` remains separate and
+strict. Requested maneuvers are reduced for each original airframe when required
+by individual rotor thrust and motor-response limits; reports expose the actual
+tilt, speed and difficulty. This is a nominal reference screen, not a disturbed
+flight guarantee.
+
+See the [Chinese mathematical and usage guide](docs/agile_flight.md) for the S9
+construction, continuous loss, CPU example, initialization, checkpoint rules and
+limitations. Unless explicitly marked agile, the loss/reset descriptions and
+commands below document the existing hover task.
 
 ## Repository layout
 

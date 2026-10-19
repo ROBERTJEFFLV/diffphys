@@ -1,0 +1,27 @@
+{
+  "version": "agile-flight-training-v1",
+  "fixed_eval_difficulty": 1.0,
+  "mission": {
+    "tilt_degrees": 60.0,
+    "thrust_ratio": 1.2,
+    "boundary_margin_fraction": 0.2,
+    "half_span_fraction": 0.45,
+    "bend_fraction": 0.2,
+    "hold_seconds": 1.0,
+    "hover_fraction": 0.1,
+    "yaw_degrees": null,
+    "center_fraction": [0.0, 0.0, 0.0],
+    "actuator_margin_fraction": 0.01,
+    "shrink_factors": [1.0, 0.8, 0.6, 0.4, 0.25, 0.125, 0.0625, 0.03125, 0.0],
+    "screen_batch_size": 128
+  },
+  "loss": {},
+  "curriculum": {
+    "start_difficulty": 0.25,
+    "end_difficulty": 1.0,
+    "warmup_updates": 0,
+    "ramp_updates": 1000,
+    "interpolation": "smoothstep",
+    "fixed_difficulty": null
+  }
+}

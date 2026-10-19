@@ -58,10 +58,23 @@ VJP backend remains an explicit numerical reference, never an automatic fallback
 See docs/group_gradient_probe.md. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. The sole Actor is native B:
-GRUCell(16,64) followed by a hidden-only Linear(64,4); do not reintroduce the
+GRUCell(16,64) for hover or goal-conditioned GRUCell(36,64) for agile flight,
+followed by a hidden-only Linear(64,4); do not reintroduce the
 direct feature-to-readout Wc branch or an A/B production selector.
 Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
+
+The `Agile-Flight-training` extension uses `--task agile` and
+`configs/agile_flight.json`; the default hover task remains available. Three-point
+targets and smooth time weights are fixed before each episode. Do not add
+state-based waypoint switches, hover-success thresholds or performance-gated
+curriculum promotions: the requested training signals are continuous losses.
+Difficulty is a deterministic function of committed update count. Preserve the
+original physics, boundary, noise family and physical gradient groups. Source
+motor feasibility checks may cap a reference for the same airframe, but must
+report actual amplitude and retain every sampled aircraft. Hover weights-only
+initialization zero-pads the GRU input matrix; it must not restore legacy Adam or
+pretend to be exact resume. See `docs/agile_flight.md`.
 
 `docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;
 its legacy filename is retained. The old shared 10% budget is removed. TRAIN and

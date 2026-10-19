@@ -19,12 +19,19 @@ from diffphys.response_noise import DisturbanceConfig
 from diffphys.response_training import train, evaluate_checkpoint
 from diffphys.response_sampling import validate_sampling
 from diffphys.response_audit import AuditConfig
+from diffphys.agile_curriculum import DEFAULT_CONFIG, load_agile_config
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars="@")
     parser.convert_arg_line_to_args = lambda line: line.split()
     parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
+    parser.add_argument("--task", choices=("hover", "agile"), default="hover",
+                        help="training objective; evaluation always rebuilds the saved task")
+    parser.add_argument("--agile-config", type=Path, default=DEFAULT_CONFIG,
+                        help="three-point geometry, continuous loss and update-only amplitude schedule")
+    parser.add_argument("--eval-split", choices=("validation", "test"), default="validation",
+                        help="fixed validation bank or independent held-out test; evaluation mode only")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--threads", type=int, default=1)
@@ -34,7 +41,8 @@ def parse_args(argv=None):
                         help="TRAIN only: original random pool or fixed 4x4x4x2 physical coverage")
     parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
     parser.add_argument("--horizon", type=int, default=500)
-    parser.add_argument("--time-decay", type=float, default=1., help="backward-only decay s^-1; 0 gives exact BPTT")
+    parser.add_argument("--time-decay", type=float, default=None,
+                        help="backward-only decay s^-1; defaults hover=1, agile=0 (exact BPTT)")
     parser.add_argument("--updates", type=int, default=50)
     parser.add_argument("--max-seconds", type=float, default=1800.)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -65,10 +73,14 @@ def parse_args(argv=None):
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)
     initialize.add_argument("--init-checkpoint", type=Path,
-                            help="matching hidden-only B weights, fresh Adam; not exact resume")
+                            help="weights only with fresh Adam/RNG/progress; agile also accepts a compatible hover checkpoint")
     parser.add_argument("--checkpoint", type=Path, help="checkpoint for evaluation")
     config = ResponsePolicyConfig()
     for field in fields(config):
+        if field.name == "goal_conditioning":
+            # This architectural choice follows --task. argparse type=bool would
+            # incorrectly treat the text 'False' as True.
+            continue
         default = getattr(config, field.name)
         parser.add_argument("--"+field.name.replace("_", "-"), type=type(default), default=default)
     for field in fields(TaskLossConfig):
@@ -79,6 +91,9 @@ def parse_args(argv=None):
         default = getattr(AuditConfig(), field.name)
         parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
+    args.goal_conditioning = args.task == "agile"
+    if args.time_decay is None:
+        args.time_decay = 0. if args.task == "agile" else 1.
     if args.group_max_groups is None:
         args.group_max_groups = 128 if args.train_sampling == "coverage128" else 16
     if args.group_min_scenarios is None:
@@ -94,15 +109,21 @@ def parse_args(argv=None):
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
     try:
-        if any(getattr(args, field.name) is None for field in fields(TaskLossConfig)):
-            raise ValueError("specify --epsilon-p, --epsilon-a and --lambda-R explicitly")
-        TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})
+        if args.mode == "train" and args.task == "hover":
+            if any(getattr(args, field.name) is None for field in fields(TaskLossConfig)):
+                raise ValueError("specify --epsilon-p, --epsilon-a and --lambda-R explicitly")
+            TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})
+        elif args.mode == "train":
+            args.agile_training_config = load_agile_config(args.agile_config)
+            if args.agile_training_config.mission.hold_seconds >= args.horizon * args.dt:
+                raise ValueError("agile horizon must exceed mission hold_seconds")
+        ResponsePolicyConfig(**{field.name: getattr(args, field.name) for field in fields(ResponsePolicyConfig)})
         groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)
         AuditConfig.from_args(args)
         if args.mode == "train":
             validate_sampling(args.train_sampling, 4*args.scenarios)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         parser.error(str(error))
     if (args.mode == "train" and groups.layout == "coverage128"
             and args.scenarios * 4 < 128 * groups.min_scenarios):
@@ -120,7 +141,8 @@ def main(argv=None):
         result = evaluate_checkpoint(args)
     else:
         policy_config = ResponsePolicyConfig(**{f.name:getattr(args,f.name) for f in fields(ResponsePolicyConfig)})
-        loss_config = TaskLossConfig(**{f.name:getattr(args,f.name) for f in fields(TaskLossConfig)})
+        loss_config = (args.agile_training_config.loss if args.task == "agile" else
+                       TaskLossConfig(**{f.name:getattr(args,f.name) for f in fields(TaskLossConfig)}))
         result = train(args, policy_config, loss_config)
     print(json.dumps(result, indent=2, allow_nan=False))
 

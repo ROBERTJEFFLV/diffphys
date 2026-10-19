@@ -12,6 +12,8 @@ from .response_noise import DisturbanceConfig, measured_observation
 from .response_policy import (
     ResponseMotorPolicy, ResponsePolicyState,
 )
+from .agile_objective import (AgileLossConfig, AgileSchedule, agile_step,
+                              make_goal_packet, prepare_agile_schedule)
 
 
 # Differentiable closed-loop state edges covered by per-step gradient decay.
@@ -43,6 +45,7 @@ class TaskLossConfig:
 class ResponseClosedLoopState:
     physical: RaptorState
     policy: ResponsePolicyState
+    elapsed_steps: int = 0  # Planned clock; failed rows do not stop episode time.
 
 
 @dataclass(frozen=True)
@@ -60,13 +63,17 @@ class TaskTrajectory:
     pre_positions: torch.Tensor  # True p_t, before the command's physical transition.
     pre_orientations: torch.Tensor  # True unit q_t=[w,x,y,z], not noisy observations.
     post_orientations: torch.Tensor  # True q_(t+1), including the terminal transition.
+    agile_components: dict[str, torch.Tensor] | None = None
+    agile_measurements: dict[str, torch.Tensor] | None = None
 
 
 def observation(physical: RaptorState) -> torch.Tensor:
     return measured_observation(physical)
 
 
-def initialize(policy: ResponseMotorPolicy, physical: RaptorState) -> ResponseClosedLoopState:
+def initialize(policy: ResponseMotorPolicy, physical: RaptorState, *, mission=None) -> ResponseClosedLoopState:
+    if policy.config.goal_conditioning != (mission is not None):
+        raise ValueError("goal-conditioned policy and mission must be supplied together")
     obs = observation(physical)
     return ResponseClosedLoopState(physical, policy.initial_state(obs))
 
@@ -110,7 +117,7 @@ def _decay_closed_state(closed: ResponseClosedLoopState, rho: float) -> Response
         replace(state, **{name: _GradientDecay.apply(getattr(state, name), rho)
                           for name in names})
         for state, names in ((closed.physical, PHYSICAL_DYNAMIC), (closed.policy, POLICY_DYNAMIC))
-    ))
+    ), elapsed_steps=closed.elapsed_steps)
 
 
 def rollout(
@@ -122,6 +129,10 @@ def rollout(
     time_decay: float = 0.0,
     actor_probe=None,
     record_observations: bool = True,
+    mission=None,
+    agile_config: AgileLossConfig | None = None,
+    horizon: int | None = None,
+    agile_schedule: AgileSchedule | None = None,
 ) -> TaskTrajectory:
     """Unchanged flight; optional backward-only decay at every control step.
 
@@ -136,7 +147,19 @@ def rollout(
         raise ValueError("rollout must contain physical transitions")
     if abs(simulator.params.dt - policy.config.dt) > 1.0e-12:
         raise ValueError("training and deployment dt must agree")
-    closed = initialize(policy, initial) if isinstance(initial, RaptorState) else initial
+    if policy.config.goal_conditioning != (mission is not None):
+        raise ValueError("goal-conditioned policy and mission must be supplied together")
+    closed = initialize(policy, initial, mission=mission) if isinstance(initial, RaptorState) else initial
+    if mission is not None:
+        if horizon is None or horizon < closed.elapsed_steps+steps:
+            raise ValueError("agile rollout needs the whole planned horizon")
+        if agile_config is None:
+            raise ValueError("agile rollout needs its loss configuration")
+        if agile_schedule is None:
+            agile_schedule = prepare_agile_schedule(mission, agile_config, horizon=horizon,
+                                                      dt=simulator.params.dt)
+    elif agile_config is not None or agile_schedule is not None:
+        raise ValueError("agile configuration requires a mission")
     if (closed.physical.noise_tape.shape[1] > 1
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
@@ -145,16 +168,21 @@ def rollout(
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
     pre_positions, pre_orientations, post_orientations = [], [], []
+    agile_components, agile_measurements = {}, {}
     # A terminal row stays frozen outside its boundary, so it cannot become live
     # again when this rollout is resumed at the next metrics-chunk boundary.
     indices = (~simulator.terminated(closed.physical)).nonzero(as_tuple=True)[0]
     live = ResponseClosedLoopState(_select_rows(closed.physical, indices),
                                    _select_rows(closed.policy, indices))
     for step in range(steps):
+        planned_step = closed.elapsed_steps
         current_observation = observations[-1] if record_observations else None
-        if decay and indices.numel():
+        if decay and (indices.numel() or mission is not None):
             # Full and compact tensors are parallel aliases, not serial gates.
             # Cover observation, physics, GRU/history and delta-cost paths once.
+            # Agile charges the planned frozen tail too. Its identity-state
+            # edges must decay even after all rows fail; otherwise a failed
+            # row's surrogate gradient depends on whether another row is alive.
             closed = _decay_closed_state(closed, rho)
             live = _decay_closed_state(live, rho)
             current_observation = observation(closed.physical)
@@ -169,20 +197,37 @@ def rollout(
             active[indices] = True  # The upcoming crossing transition counts.
             if actor_probe is not None:
                 actor_probe.begin_step(indices)  # Training-only original-row metadata, not Actor input.
-            output = policy(current_observation.index_select(0, indices), live.policy)
+            if mission is None:
+                output = policy(current_observation.index_select(0, indices), live.policy)
+            else:
+                goals = make_goal_packet(current_observation, mission, planned_step*simulator.params.dt,
+                                         (horizon-planned_step)*simulator.params.dt,
+                                         schedule=agile_schedule, step=planned_step)
+                output = policy(current_observation.index_select(0, indices), live.policy,
+                                goals=goals.index_select(0, indices))
             physical = simulator.step(live.physical, output.action)
             closed = ResponseClosedLoopState(
                 _merge_rows(closed.physical, live.physical, physical, indices),
                 _merge_rows(closed.policy, live.policy, output.next_state, indices),
+                elapsed_steps=planned_step,
             )
             action = action.index_copy(0, indices, output.action)
             keep = (~simulator.terminated(physical)).nonzero(as_tuple=True)[0]
             indices = indices.index_select(0, keep)
             live = ResponseClosedLoopState(_select_rows(physical, keep),
                                            _select_rows(output.next_state, keep))
-        # Frozen terminal rows are storage padding only: no further Actor, RK4,
-        # memory or noise-index updates, and no costs/statistics for padded steps.
+        # Frozen terminal rows get no further Actor, RK4, memory or noise-index
+        # updates. Legacy losses/statistics mask the padding; agile keeps a
+        # continuous residual on the held failure state for the planned tail.
         physical = closed.physical
+        if mission is not None:
+            components, measurements = agile_step(
+                before, physical, active, mission, agile_config, step=planned_step+1,
+                horizon=horizon, dt=simulator.params.dt, schedule=agile_schedule)
+            for target, values in ((agile_components, components), (agile_measurements, measurements)):
+                for name, value in values.items():
+                    target.setdefault(name, []).append(value)
+        closed = replace(closed, elapsed_steps=planned_step+1)
         post_orientations.append(physical.orientation)
         valid.append(active)
         actions.append(action)
@@ -199,6 +244,8 @@ def rollout(
         torch.stack(velocities), torch.stack(omegas), torch.stack(action_deltas),
         torch.stack(omega_deltas), initial_physical, torch.stack(valid),
         torch.stack(pre_positions), torch.stack(pre_orientations), torch.stack(post_orientations),
+        {name: torch.stack(values) for name, values in agile_components.items()} if mission is not None else None,
+        {name: torch.stack(values) for name, values in agile_measurements.items()} if mission is not None else None,
     )
 
 
@@ -407,12 +454,13 @@ def tensors_finite(values):
 class FlightStatistics:
     """Streaming observations; no trajectory, labels or training gates retained."""
 
-    def __init__(self, initial, horizon, config):
+    def __init__(self, initial, horizon, config, *, component_names=TASK_COMPONENTS):
         self.horizon, self.config = horizon, config
+        self.component_names = tuple(component_names)
         self.squares = initial.position.new_zeros(3, initial.position.shape[0])
         self.saturation = self.squares[0].clone()
         self.valid_steps = torch.zeros_like(initial.step_index)
-        self.components = initial.position.new_zeros(len(TASK_COMPONENTS), initial.position.shape[0])
+        self.components = initial.position.new_zeros(len(self.component_names), initial.position.shape[0])
         self.risks = initial.position.new_zeros(2, initial.position.shape[0])
 
     @torch.no_grad()
@@ -430,10 +478,16 @@ class FlightStatistics:
                               * trace.valid).sum(0))
         if components is None:
             components = step_cost_components(trace, self.config, start=start, horizon=self.horizon)
-        for i, name in enumerate(TASK_COMPONENTS):
-            self.components[i].add_(components[name].sum(0))
+        for i, name in enumerate(self.component_names):
+            if name in components:
+                self.components[i].add_(components[name].sum(0))
         for i, value in enumerate(warning_risk_steps(trace).values()):
             self.risks[i].add_(value.sum(0))
+
+    @torch.no_grad()
+    def add_terminal(self, components):
+        for name, value in components.items():
+            self.components[self.component_names.index(name)].add_(value)
 
     def finish(self, costs, weights):
         count = self.valid_steps.sum().clamp_min(1)
@@ -444,7 +498,7 @@ class FlightStatistics:
                       motor_saturation_fraction=float(self.saturation.sum()/count),
                       physical_transitions=int(self.valid_steps.sum()),
                       task_components={name: float((self.components[i]*weights).sum())
-                                       for i, name in enumerate(TASK_COMPONENTS)},
+                                       for i, name in enumerate(self.component_names)},
                       omega_risk=float(_warning_risk_score(self.risks[0])),
                       saturation_risk=float(_warning_risk_score(self.risks[1])))
         return result

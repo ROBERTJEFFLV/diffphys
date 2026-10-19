@@ -37,6 +37,10 @@ def test_optional_observation_storage_preserves_flight_and_gradients(device, dec
     for field in fields(reference):
         if field.name in ('observations', 'end', 'initial'):
             continue
+        if field.name in ('agile_components', 'agile_measurements'):
+            assert getattr(reference, field.name) is None
+            assert getattr(reduced, field.name) is None
+            continue
         assert torch.equal(getattr(reference, field.name), getattr(reduced, field.name)), field.name
     for group in ('physical', 'policy'):
         a, b = getattr(reference.end, group), getattr(reduced.end, group)

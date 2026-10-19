@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -16,6 +15,7 @@ from diffphys.response_audit import AUDIT_VERSION, parameter_changes
 from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from diffphys.response_groups import GroupBalanceConfig
 from diffphys.response_task import TaskLossConfig
+from diffphys.agile_curriculum import agile_config_from_dict
 from diffphys.response_noise import DisturbanceConfig
 from diffphys.env_raptor import RaptorParams
 from diffphys.compiled_physics import make_simulator
@@ -23,7 +23,8 @@ from diffphys.response_execution import critical_gc
 from diffphys.response_adjoints import collect_rollout, backward_actor
 from diffphys.response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
                                restore_rng, capture_rng, sample_training_scenarios,
-                               safe_global_clip, atomic_json)
+                               sample_training_mission,
+                               safe_global_clip, atomic_json, require_reference_checkpoint)
 
 
 def compare_values(actual, expected):
@@ -58,6 +59,14 @@ def replay(path, mode='full'):
     cfg = capsule['binding']
     if cfg['source_sha256'] != source_hash():
         raise ValueError('replay source mismatch; use the accompanying audit/source.zip')
+    # The source digest binds code, not a capsule's editable metadata. Certify
+    # task/Actor/loss and physical contracts before either full or Adam replay.
+    require_reference_checkpoint({
+        'schema': cfg['protocol']['version'],
+        'architecture': cfg['protocol']['architecture'],
+        'policy_config': capsule['policy_config'],
+        'binding': cfg,
+    })
     if str(torch.__version__) != cfg['torch_version']:
         raise ValueError('exact replay needs the saved PyTorch version')
     device = torch.device(cfg['device'])
@@ -76,19 +85,30 @@ def replay(path, mode='full'):
     optimizer.zero_grad(set_to_none=True)
     if mode == 'full':
         sampling = {}
+        task = cfg['protocol'].get('task', 'hover')
+        if task not in ('hover', 'agile'):
+            raise ValueError('unsupported recorded training task')
+        agile_config = agile_config_from_dict(cfg['protocol']['agile']) if task == 'agile' else None
         initial, seeds = sample_training_scenarios(
             cfg['protocol']['scenarios_per_bank'], capsule['before']['sampling_index'],
-            dt=policy.config.dt, device=device, dtype=dtype, horizon=cfg['horizon'],
+            dt=policy.config.dt, device='cpu' if agile_config is not None else device,
+            dtype=dtype, horizon=cfg['horizon'],
             disturbances=DisturbanceConfig(**cfg['protocol']['disturbances']),
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
+        mission = None
+        if agile_config is not None:
+            initial, mission = sample_training_mission(
+                initial, capsule['before']['sampling_index'], agile_config,
+                horizon=cfg['horizon'], device=device, dtype=dtype, sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
         simulator = make_simulator(RaptorParams(dt=policy.config.dt), device)
-        loss = TaskLossConfig(**cfg['protocol']['loss'])
+        loss = agile_config.loss if agile_config is not None else TaskLossConfig(**cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
         with critical_gc():
             record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
-                                     time_decay=cfg['time_decay'], group_config=group)
+                                     time_decay=cfg['time_decay'], group_config=group,
+                                     **({'mission': mission} if mission is not None else {}))
             backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
         safe_global_clip(policy.parameters(), cfg['gradient_clip'])
     elif mode == 'adam':
