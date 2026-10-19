@@ -12,10 +12,12 @@ alternative direct-feature branch. No geometric feedback controller is added.
 
 The `Agile-Flight-training` branch adds `--task agile`: start in hover, follow a
 smooth three-point position/attitude/velocity reference, then brake and hold the
-final point. The objective is continuous. Time progress and an update-based
-smooth curriculum replace task-pass gates, event-triggered phases and
-success-threshold promotion. The original world-fixed `30 * arm_length` boundary
-and sampled airframes/noise remain intact.
+final point. Every update uses the same target-generation rules; there is no
+difficulty schedule or success-gated promotion. A fixed clock moves the reference
+from point 1 at reset, through point 2 at half the motion duration, to point 3
+and its final hold. The reference keeps advancing if the aircraft misses a point;
+continuous tracking losses penalize the deviation. The original world-fixed
+`30 * arm_length` boundary and sampled airframes/noise remain intact.
 
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
@@ -26,11 +28,15 @@ python tools/train_response_control.py @configs/response_raptor_multi_airframe.a
 
 Replace the checkpoint placeholder before running. A compatible structured hover
 checkpoint copies the existing 16 input columns and zero-initializes the 20 added
-columns, with fresh Adam and task progress. Exact `--resume` remains separate and
-strict. Requested maneuvers are reduced for each original airframe when required
-by individual rotor thrust and motor-response limits; reports expose the actual
-tilt, speed and difficulty. This is a nominal reference screen, not a disturbed
-flight guarantee.
+columns, with fresh Adam and sampling progress. All Actor weights remain trainable.
+Each output checkpoint contains the complete updated Actor and can be loaded
+without the original hover checkpoint. Inference still receives measured state
+and the time-varying goal packet. Exact `--resume` remains separate and strict.
+Requested maneuvers are reduced for each original airframe when required by
+individual rotor thrust and motor-response limits; reports expose the actual
+tilt, speed and geometric reference scale. This pre-rollout feasibility check
+does not use training progress or flight success. The default task mix requests
+three-point motion for every aircraft, with no separate hover replay samples.
 
 See the [Chinese mathematical and usage guide](docs/agile_flight.md) for the S9
 construction, continuous loss, CPU example, initialization, checkpoint rules and

@@ -260,8 +260,7 @@ def agile_metrics(physical: RaptorState, mission, config: AgileLossConfig, *,
         "final_omega_rms_rad_s": float(physical.omega.square().sum(-1).mean().sqrt()),
         "boundary_failure_rate": float(RaptorSimulator.terminated(physical).double().mean()),
         "reference_feasible_fraction": float(mission.feasible.double().mean()),
-        "requested_difficulty": float(mission.requested_difficulty),
-        "achieved_difficulty_mean": float(mission.difficulty.double().mean()),
+        "reference_scale_mean": float(mission.reference_scale.double().mean()),
     }
     if measurements is not None:
         mapping = {

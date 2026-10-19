@@ -22,7 +22,7 @@ def setup_case(horizon=61, count=4):
                           disturbances=DisturbanceConfig.clean())
     initial, mission = sample_agile_mission(
         raw, AgileMissionConfig(hold_seconds=.02, hover_fraction=1.),
-        seed=12, difficulty=.25, horizon=horizon)
+        seed=12, horizon=horizon)
     # A controlled geometric reference exercises a real RK4 rollout; actuator
     # feasibility of sampled missions has separate numerical tests.
     direction = torch.zeros_like(initial.position)

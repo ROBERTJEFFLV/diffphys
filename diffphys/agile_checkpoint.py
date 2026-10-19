@@ -1,6 +1,6 @@
 """Explicit, weights-only transfer into the goal-conditioned native Actor.
 
-This module never restores an optimizer, RNG, sampling index or curriculum.
+This module never restores an optimizer, RNG or sampling index.
 Exact continuation remains the training module's strict resume operation.
 """
 from __future__ import annotations

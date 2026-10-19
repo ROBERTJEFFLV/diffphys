@@ -25,8 +25,7 @@ from .response_noise import DisturbanceConfig, attach_disturbances, disturbance_
 from .response_policy import (ARCHITECTURE, AGILE_ARCHITECTURE,
                               ResponseMotorPolicy, ResponsePolicyConfig)
 from .agile_checkpoint import import_hover_checkpoint
-from .agile_curriculum import (agile_config_from_dict, load_agile_config,
-                               curriculum_difficulty)
+from .agile_config import agile_config_from_dict, load_agile_config
 from .agile_mission import sample_agile_mission
 from .agile_objective import AgileLossConfig, AGILE_OBJECTIVE_VERSION
 from .response_task import (
@@ -58,7 +57,7 @@ AGILE_TRAIN_SEED_BASE = 41_000_007
 AGILE_VALIDATION_SEED = 42_000_007
 AGILE_TEST_SEED = 44_000_007
 AGILE_SAMPLING_PROTOCOL = {
-    "version": "committed-update-cpu-mission-v1",
+    "version": "fixed-three-point-cpu-mission-v2",
     "train_seed_base": AGILE_TRAIN_SEED_BASE,
     "validation_seed": AGILE_VALIDATION_SEED,
     "test_seed": AGILE_TEST_SEED,
@@ -84,7 +83,7 @@ SOURCE_FILES = (
     "diffphys/agile_mission.py",
     "diffphys/agile_objective.py",
     "diffphys/agile_checkpoint.py",
-    "diffphys/agile_curriculum.py",
+    "diffphys/agile_config.py",
     "configs/agile_flight.json",
     "tools/train_response_control.py",
     "tools/replay_response_update.py",
@@ -302,23 +301,23 @@ def sample_training_mission(initial, update, config, *, horizon, device="cpu",
     """Attach the current update's task after delivery of the CPU physical pool.
 
     The worker prefetches physical parameters and immutable disturbance tapes
-    only.  Task amplitude is determined from the committed update, so resume,
-    failed-update rollback and update replay use the same continuous schedule.
-    Mission generation has its own seed and does not advance the training RNG.
+    only. The committed update chooses a reproducible seed, never geometry or
+    loss weights. Resume, rollback and replay recover the same three points.
+    Mission generation does not advance the training RNG.
     """
     if initial.position.device.type != "cpu":
         raise ValueError("agile missions must be sampled on the delivered CPU physical pool")
-    difficulty = curriculum_difficulty(update, config)
+    if type(update) is not int or update < 0:
+        raise ValueError("committed update must be a nonnegative integer")
     seed = AGILE_TRAIN_SEED_BASE + update
     if seed >= AGILE_VALIDATION_SEED:
         raise ValueError("TRAIN mission seed range would enter reserved EVAL")
     initial, mission = sample_agile_mission(
-        initial, config.mission, seed=seed, difficulty=difficulty, horizon=horizon)
+        initial, config.mission, seed=seed, horizon=horizon)
     if sampling_report is not None:
         sampling_report["agile"] = {
-            "schedule_update": update,
+            "sampling_update": update,
             "mission_seed": seed,
-            "requested_difficulty": difficulty,
             "mission": mission.report,
         }
     return initial.to(device, dtype), mission.to(device, dtype)
@@ -611,7 +610,7 @@ def train(args, policy_config, loss_config):
             report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config,
                               mission=eval_mission)
             if agile_config is not None:
-                report.update(eval_split="validation", eval_difficulty=agile_config.fixed_eval_difficulty,
+                report.update(eval_split="validation",
                               eval_mission_seed=AGILE_VALIDATION_SEED,
                               eval_hover_fraction=AGILE_SAMPLING_PROTOCOL["eval_hover_fraction"])
         finally:
@@ -639,8 +638,7 @@ def train(args, policy_config, loss_config):
             eval_initial, eval_mission = sample_agile_mission(
                 eval_initial, replace(agile_config.mission,
                                       hover_fraction=AGILE_SAMPLING_PROTOCOL["eval_hover_fraction"]),
-                seed=AGILE_VALIDATION_SEED,
-                difficulty=agile_config.fixed_eval_difficulty, horizon=args.horizon)
+                seed=AGILE_VALIDATION_SEED, horizon=args.horizon)
             eval_initial = eval_initial.to(device, dtype)
             eval_mission = eval_mission.to(device, dtype)
         if (
@@ -887,8 +885,7 @@ def evaluate_checkpoint(args):
         initial, mission = sample_agile_mission(
             initial, replace(agile_config.mission,
                              hover_fraction=cfg["mission_sampling"]["eval_hover_fraction"]),
-            seed=mission_seed,
-            difficulty=agile_config.fixed_eval_difficulty, horizon=saved["binding"]["horizon"])
+            seed=mission_seed, horizon=saved["binding"]["horizon"])
         initial = initial.to(device, dtype)
         mission = mission.to(device, dtype)
     report = evaluate(
@@ -909,8 +906,7 @@ def evaluate_checkpoint(args):
         numerical_backend=physics_backend_contract(device),
     )
     if agile_config is not None:
-        report.update(eval_difficulty=agile_config.fixed_eval_difficulty,
-                      eval_mission_seed=mission_seed,
+        report.update(eval_mission_seed=mission_seed,
                       eval_hover_fraction=cfg["mission_sampling"]["eval_hover_fraction"])
     output = "evaluation.json" if split == "validation" else "evaluation_test.json"
     atomic_json(Path(args.work_dir) / output, report)

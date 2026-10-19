@@ -4,9 +4,10 @@ The reference is a quadratic spatial Bezier with a ninth-order time law.  The
 motor audit is a *nominal sampled reference* audit, not a closed-loop guarantee:
 the motion reference does not encode the hidden force/pulse realization.  The
 reset and final hover attitude compensate the episode-constant force; pulses
-remain an unchanged disturbance.  No aircraft is resampled or dropped when a
-requested maneuver is too hard.  Its amplitude is reduced deterministically
-and both the requested and the actual task are recorded.
+remain an unchanged disturbance.  Every draw starts from the same configured
+geometry.  No aircraft is resampled or dropped when its nominal reference
+exceeds actuator limits: its reference is scaled deterministically and the
+physical reason and resulting geometry are recorded.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import torch
 
 from .env_raptor import RaptorState
 
-MISSION_VERSION = "agile-three-point-s9-actuator-audit-v1"
+MISSION_VERSION = "agile-three-point-s9-fixed-targets-actuator-audit-v2"
 GRAVITY = 9.81
 CONTROL_DT = .01
 MID_SPEED_COEFFICIENT = 315. / 64.
@@ -45,7 +46,7 @@ class AgileMissionConfig:
     half_span_fraction: float = .45
     bend_fraction: float = .2
     hold_seconds: float = 1.
-    hover_fraction: float = .1
+    hover_fraction: float = 0.
     yaw_degrees: Optional[float] = None
     center_fraction: tuple[float, float, float] = (0., 0., 0.)
     actuator_margin_fraction: float = .01
@@ -107,8 +108,7 @@ class AgileMission:
     duration: torch.Tensor
     hold_seconds: float
     position_scale: torch.Tensor
-    difficulty: torch.Tensor
-    requested_difficulty: float
+    reference_scale: torch.Tensor  # Geometric actuator cap, never a training schedule.
     feasible: torch.Tensor
     is_hover: torch.Tensor  # Intentional hover replay only; failed maneuvers stay agile rows.
     report: dict
@@ -349,10 +349,12 @@ def _summary(value, mask=None):
 
 @torch.no_grad()
 def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, seed: int,
-                         difficulty: float, horizon: int) -> tuple[RaptorState, AgileMission]:
-    """Retask an already sampled bank; no aircraft or disturbance redraws occur."""
-    if not math.isfinite(difficulty) or not 0 <= difficulty <= 1:
-        raise ValueError("difficulty must be in [0,1]")
+                         horizon: int) -> tuple[RaptorState, AgileMission]:
+    """Retask a sampled bank with fixed configured geometry and no stage input.
+
+    Airframes and disturbance tapes are retained.  Reference scaling only
+    enforces the nominal source actuator and boundary checks for each airframe.
+    """
     if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
         raise ValueError("horizon must be a positive integer")
     hold_steps = math.ceil(config.hold_seconds/CONTROL_DT-1e-10)
@@ -373,7 +375,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     direction = torch.stack((yaw.cos(), yaw.sin(), torch.zeros_like(yaw)), -1)
     side = torch.where(draw[:, 1] < .5, -1., 1.)
     lateral = side[:, None]*torch.stack((-yaw.sin(), yaw.cos(), torch.zeros_like(yaw)), -1)
-    planned_hover = (draw[:, 2] < config.hover_fraction) | (difficulty == 0)
+    planned_hover = draw[:, 2] < config.hover_fraction
     bound = initial.position_limit.detach().to("cpu", torch.float64)
     if not bool((torch.isfinite(bound) & (bound > 0)).all()):
         raise ValueError("original position limits must be finite and positive")
@@ -402,7 +404,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
         pending = (~accepted & ~planned_hover).nonzero(as_tuple=True)[0]
         if not pending.numel():
             break
-        amplitude = difficulty*factor
+        amplitude = factor
         for rows in pending.split(config.screen_batch_size):
             subset = {name: value.index_select(0, rows) for name, value in actuators.items()}
             ok, reason = _screen_reference(subset, center[rows], amplitude*base_span[rows],
@@ -434,14 +436,14 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     report = {
         "version": MISSION_VERSION, "aircraft_rows": n, "aircraft_rows_retained": n,
         "aircraft_resampled": 0, "horizon": horizon, "hold_seconds": config.hold_seconds,
-        "requested_difficulty": float(difficulty), "requested_tilt_degrees": config.tilt_degrees,
+        "requested_tilt_degrees": config.tilt_degrees,
         "requested_mid_thrust_ratio": config.thrust_ratio,
         "planned_hover_count": int(planned_hover.sum()), "moving_count": int(moving.sum()),
         "fallback_hover_count": int((stationary & ~planned_hover).sum()),
         "feasible_count": int(feasible.sum()), "infeasible_count": int((~feasible).sum()),
-        "difficulty_capped_count": int(((used < difficulty) & ~planned_hover).sum()),
+        "reference_capped_count": int(((used < 1.) & ~planned_hover).sum()),
         "time_capped_count": int((desired_duration > maximum_steps*CONTROL_DT).sum()),
-        "actual_difficulty": _summary(used, ~planned_hover),
+        "reference_scale": _summary(used, ~planned_hover),
         "actual_mid_tilt_degrees": _summary(tilt, moving),
         "actual_mid_speed_m_s": _summary(velocity.norm(dim=-1), moving),
         "actual_mid_thrust_ratio": _summary(actual_thrust_ratio, moving),
@@ -450,7 +452,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
                                      for flag, name in REASON_NAMES.items()},
         "boundary": "unchanged world-fixed position_limit; reference Bezier control hull inside margin",
         "actuator_screen": "unforced reference at every 100 Hz grid sample; individual rotor thrust and exact motor RK4 setpoints",
-        "difficulty_selection": "first passing descending amplitude; not a global maximum certificate",
+        "reference_selection": "first passing descending actuator scale; no training-stage input or global maximum certificate",
         "constant_force": "unchanged; compensated only in initial/final hover, not in maneuver targets",
         "pulses": "unchanged; no future pulse data used in goals, resets or feasibility screen",
         "guarantee": "no continuous-time, disturbed-tracking or learned-control guarantee",
@@ -460,8 +462,8 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     mission = AgileMission(
         start=output(start), waypoint=output(waypoint), goal=output(goal), rotation=output(rotation),
         velocity=output(velocity), direction=output(direction), duration=output(duration),
-        hold_seconds=config.hold_seconds, position_scale=output(bound), difficulty=output(used),
-        requested_difficulty=float(difficulty), feasible=output(feasible), is_hover=output(planned_hover),
+        hold_seconds=config.hold_seconds, position_scale=output(bound), reference_scale=output(used),
+        feasible=output(feasible), is_hover=output(planned_hover),
         report=report, half_span=output(span), hover_rotation=output(hover_rotation), center=output(center),
         bend=output(bend), limit_reason=output(first_reason), hover_feasible=output(hover_ok))
     zero = torch.zeros_like(initial.velocity)

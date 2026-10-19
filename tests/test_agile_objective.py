@@ -40,7 +40,7 @@ def scene(count=1, *, bend=(0., .03, -.01), durations=None, dtype=DTYPE):
         rotation=rotation.clone(), velocity=torch.zeros_like(center),
         direction=direction, duration=duration, hold_seconds=.2,
         position_scale=torch.ones(count, dtype=dtype),
-        difficulty=torch.full((count,), .25, dtype=dtype), requested_difficulty=.25,
+        reference_scale=torch.ones(count, dtype=dtype),
         feasible=torch.ones(count, dtype=torch.bool),
         is_hover=torch.zeros(count, dtype=torch.bool), report={},
         half_span=half_span, hover_rotation=rotation, center=center, bend=bend,
@@ -267,7 +267,7 @@ def test_metrics_and_loss_keep_all_original_rows_including_hover_and_infeasible(
     physical, mission = scene(4)
     mission = replace(mission, feasible=torch.tensor((True, True, False, False)),
                       is_hover=torch.tensor((True, False, True, False)),
-                      difficulty=torch.tensor((.1, .2, 0., 0.), dtype=DTYPE))
+                      reference_scale=torch.tensor((.1, .2, 0., 0.), dtype=DTYPE))
     offset = torch.arange(4, dtype=DTYPE)[:, None]*torch.tensor(((1., 0., 0.),), dtype=DTYPE)
     position = (mission.goal+offset).requires_grad_()
     physical = replace(physical, position=position, velocity=offset, omega=2*offset)
@@ -290,11 +290,12 @@ def test_metrics_and_loss_keep_all_original_rows_including_hover_and_infeasible(
     assert report["final_omega_rms_rad_s"] == pytest.approx(2*math.sqrt(14/4))
     assert report["reference_feasible_fraction"] == .5
     assert report["boundary_failure_rate"] == .75
-    assert report["achieved_difficulty_mean"] == pytest.approx(.075)
+    assert report["reference_scale_mean"] == pytest.approx(.075)
     assert report["midpoint_position_rms_m"] == pytest.approx(math.sqrt(30/4))
     assert report["rest_velocity_rms_m_s"] == pytest.approx(math.sqrt(30/4))
     assert report["midpoint_speed_mean_m_s"] == 2.5
-    assert not any(word in key for key in report for word in ("success", "passed", "dwell"))
+    assert not any(word in key for key in report
+                   for word in ("success", "passed", "dwell", "difficulty"))
 
 
 def test_no_event_progress_or_success_tolerance_in_continuous_objective_api():

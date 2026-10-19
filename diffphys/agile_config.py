@@ -1,9 +1,8 @@
-"""Strict task configuration and a preset continuous maneuver-amplitude schedule.
+"""Strict configuration for a fixed three-point training task.
 
-TRAIN draws the physical/noise pool, then samples a mission whose difficulty is
-a deterministic function of committed optimizer updates. No flight metric,
-event, pass/fail test or extra mutable scheduler state affects that function.
-Fixed difficulty-1 validation stays separate for comparable continuous losses.
+The same target-generation rule is used throughout training. Optimizer updates
+select reproducible random seeds only; they never change target geometry,
+timing, loss weights or a difficulty level. Validation uses fixed seeds.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from typing import Union, get_args, get_origin, get_type_hints
 from .agile_mission import AgileMissionConfig
 from .agile_objective import AgileLossConfig
 
-AGILE_TRAINING_VERSION = "agile-flight-training-v1"
+AGILE_TRAINING_VERSION = "agile-flight-training-v2"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs/agile_flight.json"
 
@@ -29,52 +28,17 @@ def _number(value, name: str) -> float:
 
 
 @dataclass(frozen=True)
-class AgileCurriculumConfig:
-    start_difficulty: float = .25
-    end_difficulty: float = 1.
-    warmup_updates: int = 0
-    ramp_updates: int = 1000
-    interpolation: str = "smoothstep"
-    fixed_difficulty: float | None = None
-
-    def __post_init__(self):
-        start = _number(self.start_difficulty, "start_difficulty")
-        end = _number(self.end_difficulty, "end_difficulty")
-        if not 0 <= start <= end <= 1:
-            raise ValueError("schedule difficulties must satisfy 0 <= start <= end <= 1")
-        if type(self.warmup_updates) is not int or self.warmup_updates < 0:
-            raise ValueError("warmup_updates must be a nonnegative integer")
-        if type(self.ramp_updates) is not int or self.ramp_updates < 1:
-            raise ValueError("ramp_updates must be a positive integer")
-        if type(self.interpolation) is not str or self.interpolation not in ("smoothstep", "linear"):
-            raise ValueError("interpolation must be smoothstep or linear")
-        if self.fixed_difficulty is not None:
-            fixed = _number(self.fixed_difficulty, "fixed_difficulty")
-            if not 0 <= fixed <= 1:
-                raise ValueError("fixed_difficulty must be in [0,1] or null")
-            object.__setattr__(self, "fixed_difficulty", fixed)
-        object.__setattr__(self, "start_difficulty", start)
-        object.__setattr__(self, "end_difficulty", end)
-
-
-@dataclass(frozen=True)
 class AgileTrainingConfig:
     version: str = AGILE_TRAINING_VERSION
     mission: AgileMissionConfig = field(default_factory=AgileMissionConfig)
     loss: AgileLossConfig = field(default_factory=AgileLossConfig)
-    curriculum: AgileCurriculumConfig = field(default_factory=AgileCurriculumConfig)
-    fixed_eval_difficulty: float = 1.
 
     def __post_init__(self):
         if self.version != AGILE_TRAINING_VERSION:
             raise ValueError("unsupported agile training config version")
         if (not isinstance(self.mission, AgileMissionConfig)
-                or not isinstance(self.loss, AgileLossConfig)
-                or not isinstance(self.curriculum, AgileCurriculumConfig)):
-            raise ValueError("agile mission, loss and curriculum must use their typed configs")
-        if _number(self.fixed_eval_difficulty, "fixed_eval_difficulty") != 1.:
-            raise ValueError("fixed_eval_difficulty must remain 1 for comparable validation")
-        object.__setattr__(self, "fixed_eval_difficulty", 1.)
+                or not isinstance(self.loss, AgileLossConfig)):
+            raise ValueError("agile mission and loss must use their typed configs")
 
     def to_dict(self) -> dict:
         """Return all effective fields as a canonical JSON-compatible snapshot."""
@@ -171,45 +135,16 @@ def agile_config_from_dict(value: dict) -> AgileTrainingConfig:
     strings, booleans, unknown fields and unsupported versions remain errors.
     """
     value = _json_tree(value)
-    required = {"version", "mission", "loss", "curriculum"}
+    required = {"version", "mission", "loss"}
     if not isinstance(value, dict):
         raise ValueError("agile training config must be a JSON object")
     if missing := required - set(value):
         raise ValueError("agile config is missing sections: " + ", ".join(sorted(missing)))
-    if unknown := set(value) - required - {"fixed_eval_difficulty"}:
+    if unknown := set(value) - required:
         raise ValueError("agile config contains unknown keys: " + ", ".join(sorted(unknown)))
     return AgileTrainingConfig(
         version=value["version"],
         mission=_section(AgileMissionConfig, value["mission"], "mission"),
         loss=_section(AgileLossConfig, value["loss"], "loss",
                       defaults=AgileTrainingConfig().loss),
-        curriculum=_section(AgileCurriculumConfig, value["curriculum"], "curriculum"),
-        fixed_eval_difficulty=value.get("fixed_eval_difficulty", 1.),
     )
-
-
-def _curriculum(config: AgileCurriculumConfig | AgileTrainingConfig) -> AgileCurriculumConfig:
-    if isinstance(config, AgileTrainingConfig):
-        return config.curriculum
-    if not isinstance(config, AgileCurriculumConfig):
-        raise ValueError("a typed agile curriculum config is required")
-    return config
-
-
-def curriculum_difficulty(update: int, config: AgileCurriculumConfig | AgileTrainingConfig) -> float:
-    """Return the scheduled amplitude from committed updates alone.
-
-    After warmup, u = clamp((update-warmup)/ramp, 0, 1). Smoothstep uses
-    u*u*(3-2*u), with zero slope at both endpoints. Resuming the same update
-    and saved config reproduces exactly the same amplitude without extra state.
-    """
-    if type(update) is not int or update < 0:
-        raise ValueError("committed update must be a nonnegative integer")
-    schedule = _curriculum(config)
-    if schedule.fixed_difficulty is not None:
-        return schedule.fixed_difficulty
-    elapsed = min(max(update-schedule.warmup_updates, 0), schedule.ramp_updates)
-    fraction = elapsed / schedule.ramp_updates
-    if schedule.interpolation == "smoothstep":
-        fraction = fraction * fraction * (3. - 2. * fraction)
-    return schedule.start_difficulty + (schedule.end_difficulty-schedule.start_difficulty) * fraction

@@ -5,14 +5,15 @@ import json
 import pytest
 import torch
 
-from diffphys.agile_curriculum import AgileCurriculumConfig, AgileTrainingConfig
+from diffphys.agile_config import AgileTrainingConfig, agile_config_from_dict
 from diffphys.agile_mission import AgileMissionConfig
 from diffphys.agile_objective import AGILE_OBJECTIVE_VERSION
 from diffphys.response_policy import AGILE_ARCHITECTURE, ResponsePolicyConfig
+from diffphys.response_noise import DisturbanceConfig
 from diffphys.response_task import TaskLossConfig
 from diffphys.response_training import (
     DEVELOPMENT_SEEDS, TEST_SEEDS, train, evaluate_checkpoint,
-    require_reference_checkpoint,
+    require_reference_checkpoint, sample_pool,
 )
 from tools.replay_response_update import compare_values, replay
 from tools.train_response_control import parse_args
@@ -20,13 +21,11 @@ from tools.train_response_control import parse_args
 
 @pytest.fixture
 def agile_config_file(tmp_path):
-    # Tiny geometry allows a short physical rollout; schedule changes at each
-    # of the first updates so a stale prefetched task would break this test.
+    # Tiny fixed geometry allows a short physical rollout. New updates draw new
+    # orientations from the same target distribution, with no amplitude ramp.
     config = AgileTrainingConfig(
         mission=AgileMissionConfig(hold_seconds=.04, half_span_fraction=1e-6,
                                    bend_fraction=1e-8, tilt_degrees=5.),
-        curriculum=AgileCurriculumConfig(start_difficulty=.2, end_difficulty=.8,
-                                         ramp_updates=2),
     )
     path = tmp_path / "agile.json"
     path.write_text(json.dumps(config.to_dict()))
@@ -56,6 +55,47 @@ def run(args):
 
 def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_updates_choose_only_seeds_and_do_not_scale_three_points(agile_config_file, monkeypatch):
+    import diffphys.response_training as training
+
+    config = agile_config_from_dict(json.loads(agile_config_file.read_text()))
+    initial = sample_pool(2, [7031], horizon=12, dtype=torch.float64,
+                          disturbances=DisturbanceConfig.clean())
+    native_sampler = training.sample_agile_mission
+    requested_seeds = []
+
+    def fixed_seed(bank, mission_config, *, seed, horizon):
+        requested_seeds.append(seed)
+        # Control the random draw so any update-dependent geometry change is
+        # visible. The only varying sampler argument is its random seed.
+        return native_sampler(bank, mission_config, seed=91, horizon=horizon)
+
+    monkeypatch.setattr(training, "sample_agile_mission", fixed_seed)
+    missions = []
+    updates = (0, 1, 1000, 999_999)
+    for update in updates:
+        _, mission = training.sample_training_mission(
+            initial, update, config, horizon=12, dtype=torch.float64)
+        missions.append(mission)
+    assert requested_seeds == [training.AGILE_TRAIN_SEED_BASE + update for update in updates]
+    for mission in missions[1:]:
+        for name in ("start", "waypoint", "goal", "rotation", "velocity", "duration",
+                     "reference_scale", "feasible", "is_hover"):
+            torch.testing.assert_close(getattr(mission, name), getattr(missions[0], name),
+                                       rtol=0, atol=0)
+        assert mission.report == missions[0].report
+
+
+@pytest.mark.parametrize("update", [-1, True, 1.0, "1", 1_000_000])
+def test_invalid_or_reserved_mission_update_rejected(agile_config_file, update):
+    import diffphys.response_training as training
+
+    config = agile_config_from_dict(json.loads(agile_config_file.read_text()))
+    initial = sample_pool(1, [7031], horizon=12, disturbances=DisturbanceConfig.clean())
+    with pytest.raises(ValueError, match="update|reserved"):
+        training.sample_training_mission(initial, update, config, horizon=12)
 
 
 def test_task_cli_controls_architecture_and_default_decay(tmp_path, agile_config_file):
@@ -93,13 +133,15 @@ def test_agile_resume_replay_and_fixed_evaluation_match(tmp_path, agile_config_f
     assert second["progress"]["sampling_index"] == 2
     history = rows(split / "history.jsonl")
     sampled = [row["training_sampling"]["agile"] for row in history]
-    assert [sample["schedule_update"] for sample in sampled] == [0, 1]
-    assert [sample["requested_difficulty"] for sample in sampled] == pytest.approx([.2, .5])
+    assert [sample["sampling_update"] for sample in sampled] == [0, 1]
+    assert sampled[1]["mission_seed"] == sampled[0]["mission_seed"] + 1
+    assert all("requested_difficulty" not in sample for sample in sampled)
+    assert all(sample["mission"]["planned_hover_count"] == 0 for sample in sampled)
     assert all(row["scenario_count"] == 32 for row in history)
     assert all(sample["mission"]["aircraft_rows_retained"] == 32 for sample in sampled)
     assert all(row["raw_gradient_norm"] > 0 for row in history)
     validation = rows(split / "evaluation.jsonl")
-    assert all(row["eval_difficulty"] == 1. and row["eval_hover_fraction"] == 0.
+    assert all("eval_difficulty" not in row and row["eval_hover_fraction"] == 0.
                for row in validation)
     assert all(row["mission_sampling"]["planned_hover_count"] == 0 for row in validation)
     assert all(row["scenario_count"] == 4 for row in validation)
@@ -132,14 +174,14 @@ def test_agile_resume_replay_and_fixed_evaluation_match(tmp_path, agile_config_f
     assert (split / "latest.pt").read_bytes() == saved_bytes
 
 
-def test_agile_resume_rejects_task_or_schedule_changes(tmp_path, agile_config_file):
+def test_agile_resume_rejects_task_or_geometry_changes(tmp_path, agile_config_file):
     work = tmp_path / "source"
     run(args_for(work, agile_config_file, 0))
     checkpoint = work / "latest.pt"
     saved = torch.load(checkpoint, weights_only=True)
     require_reference_checkpoint(saved)
     changed = json.loads(agile_config_file.read_text())
-    changed["curriculum"]["ramp_updates"] += 1
+    changed["mission"]["half_span_fraction"] *= 2
     modified = tmp_path / "changed.json"
     modified.write_text(json.dumps(changed))
     with pytest.raises(ValueError, match="configuration"):

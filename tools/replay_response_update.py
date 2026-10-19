@@ -15,7 +15,7 @@ from diffphys.response_audit import AUDIT_VERSION, parameter_changes
 from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from diffphys.response_groups import GroupBalanceConfig
 from diffphys.response_task import TaskLossConfig
-from diffphys.agile_curriculum import agile_config_from_dict
+from diffphys.agile_config import agile_config_from_dict
 from diffphys.response_noise import DisturbanceConfig
 from diffphys.env_raptor import RaptorParams
 from diffphys.compiled_physics import make_simulator

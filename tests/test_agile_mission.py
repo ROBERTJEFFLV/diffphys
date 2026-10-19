@@ -1,4 +1,5 @@
 from dataclasses import fields, replace
+import inspect
 import math
 
 import pytest
@@ -85,10 +86,10 @@ def test_rk4_motor_inverse_matches_original_physics_for_rising_and_falling():
 
 def test_sampler_preserves_airframes_tapes_rng_and_recomputes_actual_targets():
     original = clean_bank(12)
-    config = AgileMissionConfig(hover_fraction=0.)
+    config = AgileMissionConfig()
     rng = torch.random.get_rng_state().clone()
-    initial, mission = sample_agile_mission(original, config, seed=91, difficulty=.5, horizon=500)
-    repeated, duplicate = sample_agile_mission(original, config, seed=91, difficulty=.5, horizon=500)
+    initial, mission = sample_agile_mission(original, config, seed=91, horizon=500)
+    repeated, duplicate = sample_agile_mission(original, config, seed=91, horizon=500)
     assert torch.equal(rng, torch.random.get_rng_state())
     changed = {"position", "velocity", "omega", "orientation", "motor", "previous_action", "previous_velocity"}
     for field in fields(original):
@@ -104,7 +105,14 @@ def test_sampler_preserves_airframes_tapes_rng_and_recomputes_actual_targets():
     assert mission.report["aircraft_resampled"] == 0
     assert bool((mission.duration+mission.hold_seconds <= 5+1e-12).all())
     assert bool((mission.duration < 4.).any())
-    assert bool((mission.difficulty <= .5).all())
+    assert not bool(mission.is_hover.any())
+    assert bool((mission.reference_scale <= 1.).all())
+    assert set(mission.reference_scale.tolist()) <= set(config.shrink_factors)
+    torch.testing.assert_close(mission.half_span,
+                               mission.reference_scale*config.half_span_fraction*mission.position_scale)
+    assert "difficulty" not in inspect.signature(sample_agile_mission).parameters
+    assert not any("difficulty" in field.name for field in fields(mission))
+    assert not any("difficulty" in key for key in mission.report)
     assert bool(mission.feasible.any())
     mid = mission.nominal_reference(mission.duration/2)
     moving = ~mission.is_hover
@@ -123,7 +131,7 @@ def test_constant_force_hover_is_a_true_source_dynamics_equilibrium():
     force = original.mass[:, None]*original.velocity.new_tensor((.6, -.4, .3))
     original = replace(original, external_force=force)
     initial, mission = sample_agile_mission(original, AgileMissionConfig(hover_fraction=1.),
-                                           seed=4, difficulty=1., horizon=500)
+                                           seed=4, horizon=500)
     assert bool(mission.feasible.all())
     assert bool(mission.is_hover.all())
     held = RaptorSimulator().step(initial, 2*initial.motor-1)
@@ -138,7 +146,7 @@ def test_impossible_hover_is_flagged_and_kept_not_resampled():
     original = clean_bank(3)
     original = replace(original, external_force=original.mass[:, None]*original.velocity.new_tensor((100*GRAVITY, 0., 0.)))
     initial, mission = sample_agile_mission(original, AgileMissionConfig(hover_fraction=1.),
-                                           seed=4, difficulty=1., horizon=500)
+                                           seed=4, horizon=500)
     assert not bool(mission.feasible.any())
     assert bool(((mission.limit_reason & HOVER_EQUILIBRIUM_LIMIT) != 0).all())
     assert len(initial.mass) == 3
@@ -156,8 +164,8 @@ def test_hover_and_fallback_public_goals_do_not_encode_hidden_constant_force(fal
         original = replace(original, inertia=original.inertia*1e10)
     disturbed = replace(original, external_force=original.mass[:, None]*original.velocity.new_tensor((.6, -.4, .3)))
     config = AgileMissionConfig(hover_fraction=0. if fallback else 1.)
-    _, clean = sample_agile_mission(original, config, seed=3, difficulty=1., horizon=500)
-    _, changed = sample_agile_mission(disturbed, config, seed=3, difficulty=1., horizon=500)
+    _, clean = sample_agile_mission(original, config, seed=3, horizon=500)
+    _, changed = sample_agile_mission(disturbed, config, seed=3, horizon=500)
     for name in ("start", "waypoint", "goal", "rotation", "velocity", "direction", "duration",
                  "half_span", "center", "bend"):
         assert torch.equal(getattr(clean, name), getattr(changed, name)), name
@@ -167,25 +175,25 @@ def test_hover_and_fallback_public_goals_do_not_encode_hidden_constant_force(fal
                                atol=1e-12, rtol=1e-12)
 
 
-def test_motor_torque_limits_reduce_difficulty_without_hiding_airframes():
+def test_motor_torque_limits_cap_reference_without_hiding_airframes():
     original = clean_bank(2)
     original = replace(original, inertia=original.inertia*1e10)
     initial, mission = sample_agile_mission(original, AgileMissionConfig(hover_fraction=0.),
-                                           seed=8, difficulty=1., horizon=500)
+                                           seed=8, horizon=500)
     assert len(initial.mass) == 2
     assert initial.inertia is original.inertia
     assert not bool(mission.feasible.any())
     assert not bool(mission.is_hover.any())  # Still counted as failed attempted agile tasks.
-    assert bool((mission.difficulty == 0).all())
+    assert bool((mission.reference_scale == 0).all())
     assert mission.report["fallback_hover_count"] == 2
-    assert mission.report["difficulty_capped_count"] == 2
+    assert mission.report["reference_capped_count"] == 2
     assert mission.report["initial_rejection_counts"]["individual_rotor_thrust"] == 2
 
 
 def test_reported_feasible_motion_passes_the_same_full_actuator_grid():
     original = clean_bank(6)
     config = AgileMissionConfig(hover_fraction=0.)
-    _, mission = sample_agile_mission(original, config, seed=44, difficulty=1., horizon=500)
+    _, mission = sample_agile_mission(original, config, seed=44, horizon=500)
     ok, _ = _screen_reference(_actuators(original), mission.center, mission.half_span,
                               mission.bend, mission.direction, mission.duration,
                               mission.position_scale, config)
@@ -206,9 +214,9 @@ def test_config_rejects_invalid_values(kwargs):
 def test_short_horizon_rejected_and_selection_keeps_metadata_types():
     original = clean_bank(3)
     with pytest.raises(ValueError, match="horizon"):
-        sample_agile_mission(original, AgileMissionConfig(), seed=1, difficulty=.1, horizon=100)
+        sample_agile_mission(original, AgileMissionConfig(), seed=1, horizon=100)
     _, mission = sample_agile_mission(original, AgileMissionConfig(hover_fraction=1.), seed=1,
-                                      difficulty=0., horizon=500)
+                                      horizon=500)
     selected = mission.select(torch.tensor((2, 0))).to("cpu", torch.float32)
     assert selected.start.dtype == torch.float32
     assert selected.feasible.dtype == torch.bool

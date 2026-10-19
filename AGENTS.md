@@ -69,7 +69,9 @@ The `Agile-Flight-training` extension uses `--task agile` and
 targets and smooth time weights are fixed before each episode. Do not add
 state-based waypoint switches, hover-success thresholds or performance-gated
 curriculum promotions: the requested training signals are continuous losses.
-Difficulty is a deterministic function of committed update count. Preserve the
+Use the same three-point target-generation rule throughout training. Do not add
+difficulty levels, update-dependent geometry ramps or automatic loss schedules.
+Committed updates select reproducible mission seeds only. Preserve the
 original physics, boundary, noise family and physical gradient groups. Source
 motor feasibility checks may cap a reference for the same airframe, but must
 report actual amplitude and retain every sampled aircraft. Hover weights-only

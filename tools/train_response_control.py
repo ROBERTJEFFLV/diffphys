@@ -19,7 +19,7 @@ from diffphys.response_noise import DisturbanceConfig
 from diffphys.response_training import train, evaluate_checkpoint
 from diffphys.response_sampling import validate_sampling
 from diffphys.response_audit import AuditConfig
-from diffphys.agile_curriculum import DEFAULT_CONFIG, load_agile_config
+from diffphys.agile_config import DEFAULT_CONFIG, load_agile_config
 
 
 def parse_args(argv=None):
@@ -29,7 +29,7 @@ def parse_args(argv=None):
     parser.add_argument("--task", choices=("hover", "agile"), default="hover",
                         help="training objective; evaluation always rebuilds the saved task")
     parser.add_argument("--agile-config", type=Path, default=DEFAULT_CONFIG,
-                        help="three-point geometry, continuous loss and update-only amplitude schedule")
+                        help="fixed three-point geometry and continuous loss")
     parser.add_argument("--eval-split", choices=("validation", "test"), default="validation",
                         help="fixed validation bank or independent held-out test; evaluation mode only")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
