@@ -96,7 +96,8 @@ def test_retained_training_and_eval_configs_match_their_clis(tmp_path):
     from tools.evaluate_response_long import parse_args as parse_eval_args
     root=Path(__file__).resolve().parents[1]
     configs={p.name:p for p in (root/'configs').glob('*.args')}
-    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args'}
+    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args',
+                          'agile_flight.args'}
     args=parse_args(['@'+str(configs['response_raptor_multi_airframe.args'])])
     assert args.scenarios==768 and args.eval_scenarios==128 and args.horizon==500
     assert args.group_max_groups==128 and args.group_min_scenarios==24

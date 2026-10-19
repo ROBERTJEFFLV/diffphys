@@ -57,7 +57,7 @@ AGILE_TRAIN_SEED_BASE = 41_000_007
 AGILE_VALIDATION_SEED = 42_000_007
 AGILE_TEST_SEED = 44_000_007
 AGILE_SAMPLING_PROTOCOL = {
-    "version": "fixed-three-point-cpu-mission-v2",
+    "version": "fixed-three-point-cpu-mission-v3",
     "train_seed_base": AGILE_TRAIN_SEED_BASE,
     "validation_seed": AGILE_VALIDATION_SEED,
     "test_seed": AGILE_TEST_SEED,

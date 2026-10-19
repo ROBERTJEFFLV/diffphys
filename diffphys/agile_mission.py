@@ -1,13 +1,13 @@
 """Three-point missions without changing the sampled airframes or their boundary.
 
-The reference is a quadratic spatial Bezier with a ninth-order time law.  The
-motor audit is a *nominal sampled reference* audit, not a closed-loop guarantee:
-the motion reference does not encode the hidden force/pulse realization.  The
-reset and final hover attitude compensate the episode-constant force; pulses
-remain an unchanged disturbance.  Every draw starts from the same configured
-geometry.  No aircraft is resampled or dropped when its nominal reference
-exceeds actuator limits: its reference is scaled deterministically and the
-physical reason and resulting geometry are recorded.
+The reference is a quadratic spatial Bezier with a ninth-order time law. Every
+draw starts from the same configured geometry. A bounded duration search keeps
+the full path whenever a tested duration passes the nominal motor audit; spatial
+scaling is a last resort at the longest allowed duration. This sampled-reference
+audit is not a closed-loop guarantee and never reads the Actor's performance.
+Original sampled velocities are retained as initial tracking errors. The public
+reference does not encode any hidden force/pulse realization when disturbances
+are explicitly enabled. No aircraft is resampled or dropped.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import torch
 
 from .env_raptor import RaptorState
 
-MISSION_VERSION = "agile-three-point-s9-fixed-targets-actuator-audit-v2"
+MISSION_VERSION = "agile-three-point-s9-duration-search-initial-velocity-v3"
 GRAVITY = 9.81
 CONTROL_DT = .01
 MID_SPEED_COEFFICIENT = 315. / 64.
@@ -40,23 +40,24 @@ REASON_NAMES = {
 
 @dataclass(frozen=True)
 class AgileMissionConfig:
-    tilt_degrees: float = 60.
+    tilt_degrees: float = 75.
     thrust_ratio: float = 1.2
     boundary_margin_fraction: float = .2
-    half_span_fraction: float = .45
-    bend_fraction: float = .2
+    half_span_fraction: float = .70
+    bend_fraction: float = .38
     hold_seconds: float = 1.
     hover_fraction: float = 0.
     yaw_degrees: Optional[float] = None
     center_fraction: tuple[float, float, float] = (0., 0., 0.)
     actuator_margin_fraction: float = .01
+    duration_search_factor: float = 1.05
     shrink_factors: tuple[float, ...] = (1., .8, .6, .4, .25, .125, .0625, .03125, 0.)
     screen_batch_size: int = 128
 
     def __post_init__(self):
         for name in ("tilt_degrees", "thrust_ratio", "boundary_margin_fraction",
                      "half_span_fraction", "bend_fraction", "hold_seconds",
-                     "hover_fraction", "actuator_margin_fraction"):
+                     "hover_fraction", "actuator_margin_fraction", "duration_search_factor"):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(name + " must be finite")
         if not 0 <= self.tilt_degrees < 89:
@@ -69,6 +70,8 @@ class AgileMissionConfig:
             raise ValueError("half_span_fraction and bend_fraction must be in (0,1)")
         if not 0 <= self.hover_fraction <= 1 or not 0 <= self.actuator_margin_fraction < .5:
             raise ValueError("invalid hover fraction or actuator margin")
+        if not 1.01 <= self.duration_search_factor <= 2.:
+            raise ValueError("duration_search_factor must be in [1.01,2] for a bounded search")
         if self.yaw_degrees is not None and not math.isfinite(self.yaw_degrees):
             raise ValueError("yaw_degrees must be finite or None")
         if len(self.center_fraction) != 3 or any(
@@ -181,6 +184,20 @@ def reference_kinematics(center, half_span, bend, direction, duration, time):
     j = tangent*q3[..., None] - 24*bend*(q1*q2)[..., None]
     snap = tangent*q4[..., None] - bend*(32*q1*q3 + 24*q2.square())[..., None]
     return p, v, a, j, snap
+
+
+def reference_arc_length(half_span, bend):
+    """Exact spatial length, independent of the monotone S9 time law.
+
+    Wolfram-derived integral of sqrt(4 L^2 + 16 |d|^2 (1-2q)^2)
+    over q in [0,1]. The straight and zero-length limits are explicit.
+    """
+    magnitude = bend.norm(dim=-1)
+    safe_span = half_span.clamp_min(1e-15)
+    safe_bend = magnitude.clamp_min(1e-15)
+    curved = ((half_span.square()+4*magnitude.square()).sqrt()
+              + half_span.square()*torch.asinh(2*magnitude/safe_span)/(2*safe_bend))
+    return torch.where(magnitude > 0, curved, 2*half_span)
 
 
 def _normalize_with_derivatives(value, first, second):
@@ -352,8 +369,9 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
                          horizon: int) -> tuple[RaptorState, AgileMission]:
     """Retask a sampled bank with fixed configured geometry and no stage input.
 
-    Airframes and disturbance tapes are retained.  Reference scaling only
-    enforces the nominal source actuator and boundary checks for each airframe.
+    Airframes and disturbance tapes are retained. Duration selection and any
+    final spatial scaling enforce nominal source actuator/boundary checks only.
+    Initial velocity is a sampled tracking error, not an additional waypoint.
     """
     if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
         raise ValueError("horizon must be a positive integer")
@@ -394,13 +412,57 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
                                     torch.full_like(desired_duration, maximum_steps*CONTROL_DT))
     motion_steps = (2*torch.ceil(desired_duration/(2*CONTROL_DT))).long().clamp(4, maximum_steps)
     duration = motion_steps.to(torch.float64)*CONTROL_DT
+    initial_duration = duration.clone()
     actuators = _actuators(initial)
     hover_rotation, hover_motor, hover_ok = _hover_equilibrium(actuators, direction)
     used = torch.zeros(n, dtype=torch.float64)
     accepted = planned_hover.clone()
     first_reason = torch.zeros(n, dtype=torch.long)
     first_checked = torch.zeros(n, dtype=torch.bool)
-    for factor in config.shrink_factors:
+    last_steps = torch.full((n,), -1, dtype=torch.long)
+    geometry_rejected = torch.zeros(n, dtype=torch.bool)
+    audit_evaluations = 0
+    # Keep the larger spatial path first. For the same acceleration reduction
+    # s, time dilation reduces jerk by s**1.5 and snap by s**2, whereas scaling
+    # geometry reduces both only by s. The first passing candidate maximizes
+    # midpoint tilt among the tested durations for this fixed geometry.
+    search_count = 1 + math.ceil(math.log(maximum_steps/int(motion_steps.min()))
+                                 / math.log(config.duration_search_factor))
+    for attempt in range(search_count):
+        pending = (~accepted & ~planned_hover & ~geometry_rejected
+                   & (last_steps < maximum_steps)).nonzero(as_tuple=True)[0]
+        if not pending.numel():
+            break
+        candidate = (2*torch.ceil(motion_steps.to(torch.float64)
+                                  *config.duration_search_factor**attempt/2)).long()
+        candidate.clamp_(max=maximum_steps)
+        # Always test the horizon endpoint, even if floating-point logarithms
+        # place the last multiplicative candidate just below it.
+        if attempt == search_count-1:
+            candidate.fill_(maximum_steps)
+        pending = pending[candidate[pending] > last_steps[pending]]
+        if not pending.numel():
+            continue
+        for rows in pending.split(config.screen_batch_size):
+            subset = {name: value.index_select(0, rows) for name, value in actuators.items()}
+            trial_duration = candidate[rows].to(torch.float64)*CONTROL_DT
+            ok, reason = _screen_reference(subset, center[rows], base_span[rows],
+                                           base_bend[rows], direction[rows], trial_duration,
+                                           bound[rows], config)
+            audit_evaluations += len(rows)
+            first = ~first_checked[rows]
+            first_reason[rows[first]] = reason[first]
+            first_checked[rows] = True
+            geometry_rejected[rows] = (reason & GEOMETRY_LIMIT) != 0
+            last_steps[rows] = candidate[rows]
+            passing = rows[ok]
+            used[passing] = 1.
+            duration[passing] = trial_duration[ok]
+            accepted[passing] = True
+    # Only references that failed every applicable full-length candidate reach
+    # the spatial fallback. Retain the aircraft and record the geometric cap.
+    duration[~accepted] = maximum_steps*CONTROL_DT
+    for factor in config.shrink_factors[1:]:
         pending = (~accepted & ~planned_hover).nonzero(as_tuple=True)[0]
         if not pending.numel():
             break
@@ -410,6 +472,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
             ok, reason = _screen_reference(subset, center[rows], amplitude*base_span[rows],
                                            amplitude*base_bend[rows], direction[rows], duration[rows],
                                            bound[rows], config)
+            audit_evaluations += len(rows)
             first = ~first_checked[rows]
             first_reason[rows[first]] = reason[first]
             first_checked[rows] = True
@@ -433,6 +496,19 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     moving = ~stationary
     tilt = torch.rad2deg(torch.acos(rotation[:, 2, 2].clamp(-1., 1.)))
     actual_thrust_ratio = (mid_a+mid_a.new_tensor((0., 0., GRAVITY))).norm(dim=-1)/GRAVITY
+    # The original sampler zeros its guidance rows. Give those rows a velocity
+    # from the same per-axis distribution, using an independent fixed-size RNG
+    # draw; all originally nonzero velocities remain exact. This does not alter
+    # mission geometry, physical sampling, sensor tapes or the global RNG.
+    velocity_generator = torch.Generator(device="cpu").manual_seed(
+        (int(seed)^0xA611E917)&((1<<63)-1))
+    velocity_draw = (5*torch.rand(n, 3, generator=velocity_generator, dtype=torch.float64)-2.5).to(
+        device=device, dtype=dtype)
+    missing_velocity = (initial.velocity == 0).all(-1)
+    initial_velocity = torch.where(missing_velocity[:, None], velocity_draw, initial.velocity)
+    # Intentional hover replay alone remains stationary; it is disabled by the
+    # default config. Failed attempted maneuvers still keep their initial speed.
+    initial_velocity = torch.where(planned_hover[:, None].to(device), 0., initial_velocity)
     report = {
         "version": MISSION_VERSION, "aircraft_rows": n, "aircraft_rows_retained": n,
         "aircraft_resampled": 0, "horizon": horizon, "hold_seconds": config.hold_seconds,
@@ -442,19 +518,26 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
         "fallback_hover_count": int((stationary & ~planned_hover).sum()),
         "feasible_count": int(feasible.sum()), "infeasible_count": int((~feasible).sum()),
         "reference_capped_count": int(((used < 1.) & ~planned_hover).sum()),
+        "time_stretched_count": int(((duration > initial_duration) & ~planned_hover).sum()),
         "time_capped_count": int((desired_duration > maximum_steps*CONTROL_DT).sum()),
         "reference_scale": _summary(used, ~planned_hover),
         "actual_mid_tilt_degrees": _summary(tilt, moving),
         "actual_mid_speed_m_s": _summary(velocity.norm(dim=-1), moving),
         "actual_mid_thrust_ratio": _summary(actual_thrust_ratio, moving),
+        "actual_path_length_m": _summary(reference_arc_length(span, bend), moving),
+        "initial_speed_m_s": _summary(initial_velocity.norm(dim=-1).to("cpu", torch.float64)),
+        "initial_zero_velocity_replaced_count": int((missing_velocity.to("cpu") & ~planned_hover).sum()),
         "motion_duration_seconds": _summary(duration),
+        "duration_stretch_factor": _summary(duration/initial_duration, ~planned_hover),
+        "actuator_screen_evaluations": audit_evaluations,
         "initial_rejection_counts": {name: int(((first_reason & flag) != 0).sum())
                                      for flag, name in REASON_NAMES.items()},
         "boundary": "unchanged world-fixed position_limit; reference Bezier control hull inside margin",
         "actuator_screen": "unforced reference at every 100 Hz grid sample; individual rotor thrust and exact motor RK4 setpoints",
-        "reference_selection": "first passing descending actuator scale; no training-stage input or global maximum certificate",
-        "constant_force": "unchanged; compensated only in initial/final hover, not in maneuver targets",
-        "pulses": "unchanged; no future pulse data used in goals, resets or feasibility screen",
+        "reference_selection": "first passing ascending duration grid at full geometry; then descending spatial fallback at maximum duration; no global optimum certificate",
+        "initial_velocity": "original nonzero velocities retained; zero-velocity maneuver rows filled from independent per-axis U[-2.5,2.5] m/s; initial tracking error, not reference velocity",
+        "constant_force": "agile CLI defaults off; if explicitly enabled, compensated only in initial/final equilibrium, never in maneuver targets",
+        "pulses": "agile CLI defaults off; existing tapes retained and never used in goals, resets or feasibility screen",
         "guarantee": "no continuous-time, disturbed-tracking or learned-control guarantee",
     }
     def output(value):
@@ -467,8 +550,8 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
         report=report, half_span=output(span), hover_rotation=output(hover_rotation), center=output(center),
         bend=output(bend), limit_reason=output(first_reason), hover_feasible=output(hover_ok))
     zero = torch.zeros_like(initial.velocity)
-    hover_initial = replace(initial, position=mission.start, velocity=zero, omega=zero.clone(),
+    retasked_initial = replace(initial, position=mission.start, velocity=initial_velocity, omega=zero,
                             orientation=output(_rotation_quaternion(hover_rotation)), motor=output(hover_motor),
                             previous_action=torch.zeros_like(initial.previous_action),
-                            previous_velocity=torch.zeros_like(initial.previous_velocity))
-    return hover_initial, mission
+                            previous_velocity=initial_velocity[:, None, :].expand_as(initial.previous_velocity).clone())
+    return retasked_initial, mission

@@ -1,4 +1,4 @@
-"""RAPTOR constant Gaussian force and independent, causal noisy measurements.
+"""Optional RAPTOR external forces and independent, causal noisy measurements.
 
 One distribution is used by TRAIN and fixed EVAL. Gaussian draws are unbounded;
 these settings are not actuator-reserve bounds or learned-stability guarantees.
@@ -16,7 +16,7 @@ import torch
 if TYPE_CHECKING:
     from .env_raptor import RaptorState
 
-NOISE_VERSION = "raptor-force-pulses-gaussian-observation-delay-v3"
+NOISE_VERSION = "raptor-optional-force-pulses-gaussian-observation-delay-v4"
 RAPTOR_FORCE_COEFFICIENT = 0.3
 CONTROL_DT = 0.01
 VELOCITY_HISTORY_STEPS = 3
@@ -39,10 +39,19 @@ class DisturbanceConfig:
     omega_std: float = 0.002          # radians/second
     velocity_delay_min: float = 0.010 # seconds; a constant latency per episode
     velocity_delay_max: float = 0.030
+    force_enabled: bool = True       # constant force and force-at-point pulses only
 
     def __post_init__(self):
-        if not isinstance(self.enabled, bool) or not isinstance(self.pulse_enabled, bool):
-            raise ValueError("disturbance enabled and pulse_enabled must be boolean")
+        for name in ("enabled", "force_enabled", "pulse_enabled"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError("disturbance " + name + " must be boolean")
+        # Store effective settings in checkpoint snapshots. A force-free run
+        # must not advertise active force-at-point pulses; the master switch
+        # also turns off all forces as well as measurement noise and latency.
+        if not self.enabled:
+            object.__setattr__(self, "force_enabled", False)
+        if not self.force_enabled:
+            object.__setattr__(self, "pulse_enabled", False)
         for name in ("position_std", "velocity_std", "attitude_std", "omega_std",
                      "velocity_delay_min", "velocity_delay_max"):
             value = getattr(self, name)
@@ -58,8 +67,12 @@ class DisturbanceConfig:
 
     @classmethod
     def from_args(cls, args):
+        external_forces = getattr(args, "external_forces", None)
+        if external_forces is None:
+            external_forces = getattr(args, "task", "hover") != "agile"
         return cls(enabled=not args.disable_disturbances,
                    pulse_enabled=not args.disable_pulses,
+                   force_enabled=external_forces,
                    position_std=args.position_noise_std, velocity_std=args.velocity_noise_std,
                    attitude_std=args.attitude_noise_std, omega_std=args.omega_noise_std,
                    velocity_delay_min=args.velocity_delay_min,
@@ -151,13 +164,14 @@ def attach_disturbances(state: RaptorState, config: DisturbanceConfig, *, seed: 
     tape = torch.zeros(n, 1, MEASUREMENT_DIM, dtype=dtype)
     sigma_force, delay = zero, zero
     if config.enabled:
-        force_rng = _generator(seed, 0xF04CE)
         noise_rng = _generator(seed, 0x5E4502)
         delay_rng = _generator(seed, 0xDE1A7)
-        # FP64 at reset avoids avoidable loss in the physical scale calculation.
-        u = torch.rand(n, generator=force_rng, dtype=torch.float64)
-        sigma_force = raptor_force_std(state.mass.double(), state.thrust_to_weight.double(), u).to(dtype)
-        force = torch.randn(n, 3, generator=force_rng, dtype=dtype) * sigma_force[:, None]
+        if config.force_enabled:
+            force_rng = _generator(seed, 0xF04CE)
+            # FP64 at reset avoids avoidable loss in the physical scale calculation.
+            u = torch.rand(n, generator=force_rng, dtype=torch.float64)
+            sigma_force = raptor_force_std(state.mass.double(), state.thrust_to_weight.double(), u).to(dtype)
+            force = torch.randn(n, 3, generator=force_rng, dtype=dtype) * sigma_force[:, None]
         std = torch.tensor((config.position_std, config.velocity_std,
                             config.attitude_std, config.omega_std), dtype=dtype)
         std = std.repeat_interleave(3)[None].expand(n, MEASUREMENT_DIM).clone()
@@ -166,7 +180,7 @@ def attach_disturbances(state: RaptorState, config: DisturbanceConfig, *, seed: 
                  (config.velocity_delay_max - config.velocity_delay_min) *
                  torch.rand(n, generator=delay_rng, dtype=torch.float64)).to(dtype)
     pulse_tape, pulse_active = sample_pulses(state, sigma_force, seed=seed, horizon=horizon,
-                                           enabled=config.enabled and config.pulse_enabled)
+                                           enabled=config.enabled and config.force_enabled and config.pulse_enabled)
     rotation_tape = rotation_error(tape[:, :, 6:9].reshape(-1, 3)).reshape(n, tape.shape[1], 3, 3)
     if not all(bool(torch.isfinite(x).all()) for x in (force, sigma_force, tape, delay, rotation_tape, pulse_tape)):
         raise FloatingPointError("nonfinite sampled disturbance")
@@ -234,7 +248,8 @@ def disturbance_report(state: RaptorState) -> dict:
     def span(value):
         return [float(value.min()), float(value.max())]
     return {"version": NOISE_VERSION, "deployment_authorized": False,
-            "force_model": "raptor-source-gaussian-episode-constant-no-extra-g",
+            "force_model": ("raptor-source-gaussian-episode-constant-no-extra-g"
+                            if bool(state.force_std.any()) else "disabled"),
             "force_std_N": span(state.force_std),
             "force_norm_N": span(state.external_force.norm(dim=-1)),
             "measurement_std": {name: span(state.noise_std[:, part]) for name, part in

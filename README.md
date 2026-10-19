@@ -10,18 +10,22 @@ alternative direct-feature branch. No geometric feedback controller is added.
 
 ## Agile flight: three-point continuous-reference training
 
-The `Agile-Flight-training` branch adds `--task agile`: start in hover, follow a
-smooth three-point position/attitude/velocity reference, then brake and hold the
-final point. Every update uses the same target-generation rules; there is no
+The `Agile-Flight-training` branch adds `--task agile`: start at point 1 with
+initial linear velocity, follow a smooth three-point
+position/attitude/velocity reference, then brake and hold the final point.
+The v3 defaults request a **75-degree midpoint tilt**, half-span `0.70 * position_limit`
+and bend magnitude `0.38 * position_limit`, inside the original boundary.
+Every update uses the same target-generation rules; there is no
 difficulty schedule or success-gated promotion. A fixed clock moves the reference
 from point 1 at reset, through point 2 at half the motion duration, to point 3
 and its final hold. The reference keeps advancing if the aircraft misses a point;
 continuous tracking losses penalize the deviation. The original world-fixed
-`30 * arm_length` boundary and sampled airframes/noise remain intact.
+`30 * arm_length` boundary and sampled airframes remain intact. Agile disables
+constant external force and force-at-point pulses by default, while retaining
+measurement noise and velocity latency. Hover keeps its existing force default.
 
 ```bash
-python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
-    --task agile --agile-config configs/agile_flight.json --time-decay 0 \
+python tools/train_response_control.py @configs/agile_flight.args \
     --init-checkpoint /absolute/path/hover.pt \
     --work-dir runs/agile/from_hover_seed7
 ```
@@ -32,11 +36,30 @@ columns, with fresh Adam and sampling progress. All Actor weights remain trainab
 Each output checkpoint contains the complete updated Actor and can be loaded
 without the original hover checkpoint. Inference still receives measured state
 and the time-varying goal packet. Exact `--resume` remains separate and strict.
-Requested maneuvers are reduced for each original airframe when required by
-individual rotor thrust and motor-response limits; reports expose the actual
-tilt, speed and geometric reference scale. This pre-rollout feasibility check
+The new argument file uses **H800 at 100 Hz (8 seconds)** with a final hold of at
+least 1 second and Time Decay 0. CUDA still compiles each original RK4 physics
+step's forward and backward through strict Inductor/AOTAutograd; the full rollout
+remains connected by autograd, with native GRU, loss, group probe and Adam.
+CPU physics remains the native reference. The original hover argument file is
+unchanged.
+
+For each original airframe, the planner first keeps the complete path and searches
+longer motion durations on a fixed grid until individual rotor thrust and motor
+response pass the nominal audit. It uses geometric shrink only if no full path
+duration passes within the horizon. Reports expose actual midpoint tilt/speed,
+path length, initial speed, duration stretch and any geometric fallback. This is
+a finite candidate search, not a global or continuous-time optimality claim, and
 does not use training progress or flight success. The default task mix requests
 three-point motion for every aircraft, with no separate hover replay samples.
+
+The nominal S9 reference still starts at rest. Actual initial velocity is an
+initial tracking error handled by the continuous loss, with matching delayed
+velocity history; it is not an extra waypoint or recovery gate. Existing nonzero
+velocities are retained. Originally stationary guidance rows receive an
+independent seeded per-axis `Uniform[-2.5, 2.5] m/s` draw, matching the original
+non-guidance range, without replacing the aircraft or its noise tapes. Reports
+record this zero-velocity replacement count. An initial velocity can point
+outward, so reference containment alone does not establish actual recovery.
 
 See the [Chinese mathematical and usage guide](docs/agile_flight.md) for the S9
 construction, continuous loss, CPU example, initialization, checkpoint rules and
@@ -211,7 +234,14 @@ The dashboard itself never launches export or simulation.
 Polling is bounded and read-only; shared CPU/disk/display resources still have
 some overhead. Run it on another machine with synced files for best isolation.
 
-## One disturbance protocol for TRAIN and EVAL
+## Disturbance settings shared by TRAIN and EVAL
+
+The force-enabled protocol below remains the default for **hover** and is
+available to agile with `--enable-external-forces`. Agile defaults to force off:
+constant force, pulse force and its induced torque are zero; sensor noise and
+latency remain as listed. `--disable-external-forces` selects force off explicitly
+for either task. The selected settings are saved with the checkpoint and reused
+for fixed EVAL and exact replay.
 
 | Component | Distribution | Lifetime |
 |---|---|---|
@@ -250,9 +280,11 @@ pulse can push AND rotate the aircraft; its torque is not frozen as attitude cha
 TRAIN resamples airframes, initial states, constant force, pulses, latency and
 measurement tapes each update. The **single** fixed EVAL retains original random
 airframe sampling and fixed seeds/tapes; the conditional disturbance laws above
-are shared. EVAL reads saved checkpoint settings, not new CLI noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
-turns off all disturbances for regression. Neither undoes the harder reset below
-or creates another evaluator.
+are shared when external forces are enabled. EVAL reads saved checkpoint settings,
+not new CLI noise flags. `--disable-pulses` disables pulses while retaining any
+enabled constant force and sensors; `--disable-disturbances` turns off all
+disturbances, including sensors and latency, for regression. Neither undoes the
+harder hover reset below or creates another evaluator.
 
 Measurement scales are L2F-inspired. SO(3) rotation-vector noise is not identical
 to L2F's matrix-element corruption. Uniform 10-30 ms latency is a modeling choice

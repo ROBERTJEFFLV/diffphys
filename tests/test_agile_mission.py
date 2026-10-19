@@ -7,7 +7,7 @@ import torch
 
 from diffphys.agile_mission import (
     AgileMissionConfig, GRAVITY, HOVER_EQUILIBRIUM_LIMIT, MID_SPEED_COEFFICIENT,
-    _actuators, _screen_reference, flatness_attitude, reference_kinematics,
+    _actuators, _screen_reference, flatness_attitude, reference_arc_length, reference_kinematics,
     rk4_motor_setpoint, sample_agile_mission, smootherstep9,
 )
 from diffphys.env_raptor import RaptorParams, RaptorSimulator
@@ -73,6 +73,61 @@ def test_flatness_angular_velocity_and_acceleration_match_time_derivatives():
     torch.testing.assert_close(omega_dot, (wp-wm)/(2*eps), atol=1e-6, rtol=1e-6)
 
 
+def test_exact_arc_length_matches_spatial_quadrature_and_degenerate_limits():
+    # Integrate the spatial tangent independently of both the closed form and
+    # its S9 timing. Include a straight line, a point, and zero forward span.
+    span = torch.tensor((.7, .7, 0., 0., 1e-7), dtype=torch.float64)
+    bend = torch.zeros(5, 3, dtype=torch.float64)
+    bend[:, 1] = bend.new_tensor((.2, 0., 0., .3, .2))
+    q = torch.linspace(0, 1, 20_001, dtype=torch.float64)
+    forward = span[:, None]*span.new_tensor((1., 0., 0.))
+    tangent = 2*forward[None] + 4*(1-2*q)[:, None, None]*bend[None]
+    numerical = torch.trapezoid(tangent.norm(dim=-1), q, dim=0)
+    actual = reference_arc_length(span, bend)
+    torch.testing.assert_close(actual, numerical, atol=2e-9, rtol=1e-8)
+    assert actual[1] == 1.4
+    assert actual[2] == 0.
+    assert actual[3] == .6
+
+
+def test_full_geometry_is_retained_until_the_first_passing_duration(monkeypatch):
+    import diffphys.agile_mission as module
+
+    original = clean_bank(1, horizon=800)
+    config = AgileMissionConfig()
+    native_screen = module._screen_reference
+    attempts = []
+
+    def record_trial(actuators, center, span, bend, direction, duration, bound, config):
+        ok, reason = native_screen(actuators, center, span, bend, direction,
+                                   duration, bound, config)
+        attempts.append((duration.clone(), span.clone(), bend.clone(), ok.clone(), reason.clone()))
+        return ok, reason
+
+    monkeypatch.setattr(module, "_screen_reference", record_trial)
+    _, mission = sample_agile_mission(original, config, seed=44, horizon=800)
+    assert len(attempts) > 1  # This aircraft cannot fly the first candidate.
+    assert bool(mission.feasible.all())
+    assert torch.equal(mission.reference_scale, torch.ones_like(mission.reference_scale))
+    assert mission.report["reference_capped_count"] == 0
+    assert mission.report["time_stretched_count"] == 1
+    assert all(not bool(ok.any()) for _, _, _, ok, _ in attempts[:-1])
+    assert bool(attempts[-1][3].all())
+    assert bool((attempts[-2][4] != 0).all())
+    assert bool((attempts[-2][0] < mission.duration).all())
+    torch.testing.assert_close(attempts[-1][0], mission.duration, rtol=0, atol=0)
+    assert all(bool((a[0] < b[0]).all()) for a, b in zip(attempts, attempts[1:]))
+    for _, span, bend, _, _ in attempts:
+        torch.testing.assert_close(span, config.half_span_fraction*mission.position_scale)
+        torch.testing.assert_close(bend, mission.bend, rtol=0, atol=0)
+    # The chosen path is independently rechecked by the unwrapped physical
+    # actuator audit, rather than accepting the sampler's feasibility flag.
+    ok, _ = native_screen(_actuators(original), mission.center, mission.half_span,
+                          mission.bend, mission.direction, mission.duration,
+                          mission.position_scale, config)
+    assert bool(ok.all())
+
+
 def test_rk4_motor_inverse_matches_original_physics_for_rising_and_falling():
     original = clean_bank(4)
     now = torch.full_like(original.motor, .45)
@@ -124,6 +179,46 @@ def test_sampler_preserves_airframes_tapes_rng_and_recomputes_actual_targets():
     curve = mission.nominal_reference(torch.linspace(0, 5, 1001, dtype=torch.float64)[:, None])
     assert bool((curve.position.abs() <= (1-config.boundary_margin_fraction)*mission.position_scale[None, :, None]+1e-12).all())
     assert torch.equal(initial.previous_action, torch.zeros_like(initial.previous_action))
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_initial_velocity_preserves_draws_fills_zero_rows_and_keeps_sensor_tapes(dtype):
+    original = RaptorSimulator().reset(4, seed=314, dtype=dtype, horizon=800,
+                                       disturbances=DisturbanceConfig(force_enabled=False))
+    velocity = original.velocity.clone()
+    velocity[[0, 2]] = 0.
+    original = replace(original, velocity=velocity)
+    rng = torch.random.get_rng_state().clone()
+    initial, mission = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=800)
+    repeated, _ = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=800)
+    # Geometry choices and feasibility backoff cannot consume the velocity
+    # stream or silently replace already sampled nonzero kinematics.
+    turned, _ = sample_agile_mission(original, AgileMissionConfig(yaw_degrees=0.),
+                                     seed=91, horizon=800)
+    redrawn, _ = sample_agile_mission(original, AgileMissionConfig(), seed=92, horizon=800)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert torch.equal(initial.velocity, repeated.velocity)
+    assert torch.equal(initial.velocity, turned.velocity)
+    assert torch.equal(initial.velocity[[1, 3]], original.velocity[[1, 3]])
+    assert torch.equal(redrawn.velocity[[1, 3]], original.velocity[[1, 3]])
+    assert not torch.equal(initial.velocity[[0, 2]], redrawn.velocity[[0, 2]])
+    assert bool((initial.velocity.norm(dim=-1) > 0).all())
+    assert bool((initial.velocity[[0, 2]].abs() <= 2.5).all())
+    assert initial.velocity.dtype == dtype
+    assert mission.report["initial_zero_velocity_replaced_count"] == 2
+    assert mission.report["initial_speed_m_s"]["min"] > 0
+    expected_history = initial.velocity[:, None, :].expand_as(initial.previous_velocity)
+    assert torch.equal(initial.previous_velocity, expected_history)
+    assert bool((original.noise_tape != 0).any())
+    for name in ("noise_tape", "rotation_tape", "pulse_tape", "pulse_active_tape",
+                 "noise_row", "noise_std", "velocity_delay", "guidance"):
+        assert getattr(initial, name) is getattr(original, name), name
+    assert torch.equal(initial.previous_action, torch.zeros_like(initial.previous_action))
+    # Added speed is a physical initial tracking error; the first reference
+    # point is still the same stationary endpoint, with no fourth waypoint.
+    start = mission.nominal_reference(0.)
+    torch.testing.assert_close(start.position, initial.position)
+    assert torch.equal(start.velocity, torch.zeros_like(start.velocity))
 
 
 def test_constant_force_hover_is_a_true_source_dynamics_equilibrium():
@@ -205,6 +300,8 @@ def test_reported_feasible_motion_passes_the_same_full_actuator_grid():
     {"tilt_degrees": 90.}, {"thrust_ratio": 0.}, {"boundary_margin_fraction": 1.},
     {"hold_seconds": 0.}, {"hover_fraction": -1.}, {"shrink_factors": (1., .5)},
     {"center_fraction": (0., 0., .9)}, {"screen_batch_size": 0},
+    {"duration_search_factor": 1.}, {"duration_search_factor": 2.01},
+    {"duration_search_factor": float("nan")},
 ))
 def test_config_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):

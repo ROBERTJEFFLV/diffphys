@@ -6,6 +6,45 @@ user-requested recurrent force pulses and harder initial kinematics. TRAIN and
 the single fixed EVAL use the same distribution. This is not an exact RAPTOR
 native benchmark and no stability, recoverability or deployment guarantee is made.
 
+## Task-specific external force setting
+
+The v3 agile task uses the user's requested **no external force, retained initial
+linear velocity** setting. With `--task agile`, constant external force and every
+force-at-point pulse are disabled by default, including the corresponding pulse
+torque. Gravity, rotor thrust/torque and motor dynamics remain unchanged.
+Measurement Gaussians and 10-30 ms velocity latency remain active. The ordinary
+hover task retains the force-enabled protocol documented below.
+
+`--disable-external-forces` makes the force-only choice explicit for either task;
+`--enable-external-forces` opts into the original force protocol. These choices
+are mutually exclusive and are stored in the checkpoint binding, used by fixed
+EVAL, exact resume and update replay. The force switch does not alter the sampled
+aircraft, initial physical draws, sensor noise tapes or delay values for a fixed seed.
+`--disable-pulses` only suppresses pulses; `--disable-disturbances` suppresses
+all disturbances, including sensor noise and latency, and is therefore different
+from the agile default.
+
+Agile moves the sampled aircraft to point 1, sets angular velocity to zero and
+uses static-equilibrium orientation/motors, while retaining each maneuver row's
+originally nonzero world linear velocity. Originally zero-velocity guidance rows
+receive a new independent seeded per-axis `Uniform[-2.5, 2.5] m/s` draw, matching
+the original non-guidance range. This only fills initial velocity; aircraft,
+physical parameters and sensor noise are not resampled. The mission report
+includes `initial_zero_velocity_replaced_count`. All three previous-velocity
+slots are initialized to the actual starting velocity. Only intentional
+hover rows use a rest reset. Failed attempted maneuvers keep their initial
+velocity even when their reference falls back to a stationary point. No initial
+velocity is repeatedly injected during the rollout.
+
+The nominal S9 reference still begins with zero velocity, so the retained initial
+velocity is an intentional initial tracking error for the continuous loss. It
+does not introduce another waypoint, recovery stage or success threshold. The
+velocity need not point toward point 2 and can initially point out of the arena;
+the planner's continuous reference containment does not guarantee recovery from
+every such state. Original position termination remains unchanged, and rows are
+not filtered or resampled according to recoverability. See
+[the three-point mission guide](agile_flight.md) for geometry and time planning.
+
 ## Constant force and pulse scale
 
 The pinned RAPTOR numerical law is retained without inserting an extra g:
@@ -72,7 +111,7 @@ constant field. It is recomputed at EVERY RK4 stage with the true intermediate
 attitude. It is never computed with the noisy Actor attitude, frozen at pulse
 onset, or added a second time. Differentiation through R(q) is retained.
 
-## Harder initial states
+## Original hover recovery initialization
 
 For the 90% non-guidance population:
 
@@ -91,7 +130,8 @@ re-encoding of true motor state. All three prior velocity slots equal reset
 velocity; their original measurement noise is reused at startup.
 
 Position-only first failure is strict per-axis exceedance of 30*arm_length.
-Initial conditions and loss settings are unchanged. Some initial
+These hover initial conditions and loss settings are unchanged by the agile
+force switch; agile's position/orientation/motor reset is described above. Some initial
 conditions/pulses may be unrecoverable. Numerical/gradient tests
 cannot establish trained survival under this distribution.
 
@@ -125,7 +165,8 @@ Observing motion AFTER a pulse is legitimate feedback, not privileged leakage.
 Both pulse tapes are immutable original-pool tensors, shared under stable
 noise_row IDs when live rows compact. No random numbers are drawn by step or
 observe. Separate CPU RNG streams leave constant force, sensors, latency and
-initial-state draws unchanged when only pulses are disabled. Pulse sampling is
+initial-state draws unchanged when only pulses are disabled. Disabling all
+external forces also preserves sensor, latency and initial-state draws. Pulse sampling is
 independent of Actor quality, reward or survival. Exogenous tape values need no
 Actor gradient; physical, recurrent and measurement-history paths remain
 connected, including the posture-dependent pulse torque and 50-step boundaries.
@@ -140,6 +181,8 @@ explicit and starts fresh Adam. Use a new work directory.
 `--disable-pulses` exists for regression, not as a second evaluator; it leaves
 harder resets and other noise unchanged. `--disable-disturbances` turns off all
 noise/pulses for physical unit tests but does not undo harder initialization.
+The separate force-only setting permits agile's requested training distribution
+without using this sensor-clean regression mode.
 
 ## Source provenance and evidence
 

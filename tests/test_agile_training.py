@@ -1,6 +1,7 @@
 """Bounded training-chain checks; these do not establish learned flight ability."""
 from dataclasses import fields
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -116,6 +117,27 @@ def test_task_cli_controls_architecture_and_default_decay(tmp_path, agile_config
     assert not hasattr(evaluation, "agile_training_config")
 
 
+def test_agile_cli_has_longer_horizon_and_argument_file_overrides_hover_defaults(monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(root)
+    bare = parse_args(["--task", "agile"])
+    assert bare.horizon == 800
+    assert bare.time_decay == 0.
+    assert bare.external_forces is False
+    legacy = parse_args(["@configs/response_raptor_multi_airframe.args"])
+    assert legacy.task == "hover" and legacy.horizon == 500
+    assert legacy.external_forces is True
+    configured = parse_args(["@configs/agile_flight.args"])
+    assert configured.task == "agile" and configured.horizon == 800
+    assert configured.time_decay == 0. and configured.external_forces is False
+    assert configured.train_sampling == legacy.train_sampling == "coverage128"
+    assert configured.scenarios == legacy.scenarios == 768
+    assert configured.device == legacy.device == "cuda"
+    explicit = parse_args(["@configs/agile_flight.args", "--horizon", "900"])
+    assert explicit.horizon == 900
+    assert parse_args(["--task", "agile", "--horizon", "600"]).horizon == 600
+
+
 def test_agile_resume_replay_and_fixed_evaluation_match(tmp_path, agile_config_file):
     full, split = tmp_path / "full", tmp_path / "split"
     run(args_for(full, agile_config_file, 2))
@@ -129,6 +151,10 @@ def test_agile_resume_replay_and_fixed_evaluation_match(tmp_path, agile_config_f
     assert second["schema"] == "raptor-multi-airframe-gaussian-v6"
     assert second["policy_config"]["goal_conditioning"] is True
     assert second["binding"]["protocol"]["task_objective"] == AGILE_OBJECTIVE_VERSION
+    saved_disturbances = second["binding"]["protocol"]["disturbances"]
+    assert saved_disturbances["enabled"] is True
+    assert saved_disturbances["force_enabled"] is False
+    assert saved_disturbances["pulse_enabled"] is False
     assert "curriculum" not in second["progress"]  # No pass/fail scheduler state.
     assert second["progress"]["sampling_index"] == 2
     history = rows(split / "history.jsonl")
@@ -137,6 +163,7 @@ def test_agile_resume_replay_and_fixed_evaluation_match(tmp_path, agile_config_f
     assert sampled[1]["mission_seed"] == sampled[0]["mission_seed"] + 1
     assert all("requested_difficulty" not in sample for sample in sampled)
     assert all(sample["mission"]["planned_hover_count"] == 0 for sample in sampled)
+    assert all(sample["mission"]["initial_speed_m_s"]["min"] > 0 for sample in sampled)
     assert all(row["scenario_count"] == 32 for row in history)
     assert all(sample["mission"]["aircraft_rows_retained"] == 32 for sample in sampled)
     assert all(row["raw_gradient_norm"] > 0 for row in history)

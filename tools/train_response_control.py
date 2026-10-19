@@ -40,7 +40,8 @@ def parse_args(argv=None):
     parser.add_argument("--train-sampling", choices=("random", "coverage128"), default="random",
                         help="TRAIN only: original random pool or fixed 4x4x4x2 physical coverage")
     parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
-    parser.add_argument("--horizon", type=int, default=500)
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="control steps; defaults hover=500, agile=800 at 100 Hz")
     parser.add_argument("--time-decay", type=float, default=None,
                         help="backward-only decay s^-1; defaults hover=1, agile=0 (exact BPTT)")
     parser.add_argument("--updates", type=int, default=50)
@@ -60,6 +61,12 @@ def parse_args(argv=None):
     parser.add_argument("--group-vjp-chunk-size", type=int, default=16,
                         help="used only by the vjp reference, not by the one-pass probe")
     parser.add_argument("--disable-disturbances", action="store_true", help="zero-noise regression fixture")
+    external_forces = parser.add_mutually_exclusive_group()
+    external_forces.add_argument("--disable-external-forces", dest="external_forces", action="store_false",
+                                 help="disable constant/pulse external forces and pulse torque; retain measurement noise and latency")
+    external_forces.add_argument("--enable-external-forces", dest="external_forces", action="store_true",
+                                 help="enable external forces; defaults hover=on, agile=off")
+    parser.set_defaults(external_forces=None)
     parser.add_argument("--disable-pulses", action="store_true", help="disable only pulses for regression; retain harder initial states")
     parser.add_argument("--position-noise-std", type=float, default=.001, help="metres per acquired sample per axis")
     parser.add_argument("--velocity-noise-std", type=float, default=.002, help="m/s per acquired sample per axis")
@@ -92,6 +99,10 @@ def parse_args(argv=None):
         parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
     args.goal_conditioning = args.task == "agile"
+    if args.horizon is None:
+        args.horizon = 800 if args.task == "agile" else 500
+    if args.external_forces is None:
+        args.external_forces = args.task == "hover"
     if args.time_decay is None:
         args.time_decay = 0. if args.task == "agile" else 1.
     if args.group_max_groups is None:

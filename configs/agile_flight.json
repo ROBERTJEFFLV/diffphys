@@ -1,16 +1,17 @@
 {
-  "version": "agile-flight-training-v2",
+  "version": "agile-flight-training-v3",
   "mission": {
-    "tilt_degrees": 60.0,
+    "tilt_degrees": 75.0,
     "thrust_ratio": 1.2,
     "boundary_margin_fraction": 0.2,
-    "half_span_fraction": 0.45,
-    "bend_fraction": 0.2,
+    "half_span_fraction": 0.7,
+    "bend_fraction": 0.38,
     "hold_seconds": 1.0,
     "hover_fraction": 0.0,
     "yaw_degrees": null,
     "center_fraction": [0.0, 0.0, 0.0],
     "actuator_margin_fraction": 0.01,
+    "duration_search_factor": 1.05,
     "shrink_factors": [1.0, 0.8, 0.6, 0.4, 0.25, 0.125, 0.0625, 0.03125, 0.0],
     "screen_batch_size": 128
   },

@@ -44,7 +44,9 @@ are `diffphys/env_raptor.py`, `diffphys/response_noise.py`, `diffphys/response_p
 `diffphys/compiled_physics.py`, `diffphys/strict_inductor.py`, `diffphys/scene_prefetch.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
-The sole training config is `configs/response_raptor_multi_airframe.args`.
+The hover training config is `configs/response_raptor_multi_airframe.args`;
+`configs/agile_flight.args` selects agile with its longer H800 horizon and
+Time Decay 0 while retaining the same accelerated execution path.
 CUDA production uses strict full-step Inductor compilation of the original
 `RaptorSimulator.step`, dynamic survivor compaction, critical-region GC scheduling,
 and one persistent spawn CPU sampler with one pending/ready next batch. CPU
@@ -72,15 +74,26 @@ curriculum promotions: the requested training signals are continuous losses.
 Use the same three-point target-generation rule throughout training. Do not add
 difficulty levels, update-dependent geometry ramps or automatic loss schedules.
 Committed updates select reproducible mission seeds only. Preserve the
-original physics, boundary, noise family and physical gradient groups. Source
-motor feasibility checks may cap a reference for the same airframe, but must
-report actual amplitude and retain every sampled aircraft. Hover weights-only
+original physics, boundary, measurement noise family and physical gradient groups.
+The v3 user-requested agile exception disables external constant force and pulses
+by default, preserves originally nonzero linear velocity for maneuver rows,
+and fills originally zero-velocity maneuver rows from an independent seeded
+per-axis Uniform[-2.5,2.5] m/s draw without replacing their aircraft or noise.
+Initialize all velocity-history slots consistently. The nominal S9 reference
+still starts at rest; continuous loss handles this initial tracking error without
+a new recovery phase or success gate. Hover retains its previous force default;
+an explicit external-force choice belongs in the checkpoint binding and replay.
+Source motor feasibility checks first search longer durations at full geometry,
+then allow geometric shrink at the maximum duration if required. Report actual
+tilt, path length, initial speed, duration stretch and amplitude, and retain every
+sampled aircraft. These checks do not certify global optimality or learned
+recovery. Hover weights-only
 initialization zero-pads the GRU input matrix; it must not restore legacy Adam or
 pretend to be exact resume. See `docs/agile_flight.md`.
 
 `docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;
-its legacy filename is retained. The old shared 10% budget is removed. TRAIN and
-the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
+its legacy filename is retained. The old shared 10% budget is removed. For the
+force-enabled protocol, TRAIN and the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
 Gaussians, uniform 10-30 ms velocity latency, and the requested 0.1 s force-at-point
 pulses with randomized phase/0.8-1.2 s onset intervals. Pulse torque is computed
 from the body lever and true intermediate attitude at each RK4 stage, not a

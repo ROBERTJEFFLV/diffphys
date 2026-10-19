@@ -20,9 +20,12 @@ def _write(tmp_path, value):
 
 def test_default_config_is_explicit_valid_and_roundtrips(tmp_path):
     config = load_agile_config()
-    assert config.version == "agile-flight-training-v2"
-    assert config.mission.tilt_degrees == 60.
+    assert config.version == "agile-flight-training-v3"
+    assert config.mission.tilt_degrees == 75.
     assert config.mission.thrust_ratio == 1.2
+    assert config.mission.half_span_fraction == .70
+    assert config.mission.bend_fraction == .38
+    assert config.mission.duration_search_factor == 1.05
     assert config.mission.hold_seconds == 1.
     assert config.mission.hover_fraction == 0.
     assert set(config.to_dict()) == {"version", "mission", "loss"}
@@ -40,9 +43,9 @@ def test_saved_config_reconstruction_does_not_read_current_file(tmp_path, monkey
 
 
 def test_omitted_nested_fields_expand_defaults():
-    config = agile_config_from_dict({"version": "agile-flight-training-v2",
+    config = agile_config_from_dict({"version": "agile-flight-training-v3",
                                     "mission": {}, "loss": {}})
-    assert config.mission.tilt_degrees == 60.
+    assert config.mission.tilt_degrees == 75.
     assert config.mission.hover_fraction == 0.
 
 
@@ -59,11 +62,16 @@ def test_omitted_nested_fields_expand_defaults():
     ("mission", "tilt_degrees", True),
     ("mission", "center_fraction", [0, False, 0]),
     ("mission", "screen_batch_size", 128.0),
+    ("mission", "duration_search_factor", "1.05"),
+    ("mission", "duration_search_factor", True),
+    ("mission", "duration_search_factor", 1.),
+    ("mission", "duration_search_factor", 2.01),
     ("mission", "hold_seconds", 0),
     ("mission", "shrink_factors", [1., .5]),
     ("loss", "hold_weight", -1.),
     (None, "fixed_eval_difficulty", .5),
     (None, "version", "agile-flight-training-v1"),
+    (None, "version", "agile-flight-training-v2"),
     (None, "version", "unknown"),
 ])
 def test_unknown_keys_invalid_types_and_invalid_values_fail(tmp_path, section, key, value):
@@ -80,7 +88,7 @@ def test_missing_sections_duplicate_json_and_nonfinite_values_fail(tmp_path):
     with pytest.raises(ValueError, match="loss"):
         load_agile_config(_write(tmp_path, data))
     path = tmp_path / "invalid.json"
-    path.write_text('{"version":"agile-flight-training-v2","version":"other"}')
+    path.write_text('{"version":"agile-flight-training-v3","version":"other"}')
     with pytest.raises(ValueError, match="duplicate"):
         load_agile_config(path)
     path.write_text('{"value":NaN}')
