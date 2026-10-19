@@ -12,13 +12,13 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from response_policy import ResponsePolicyConfig
-from response_task import TaskLossConfig
-from response_groups import GroupBalanceConfig
-from response_noise import DisturbanceConfig
-from response_training import train, evaluate_checkpoint
-from response_sampling import validate_sampling
-from response_audit import AuditConfig
+from diffphys.response_policy import ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_groups import GroupBalanceConfig
+from diffphys.response_noise import DisturbanceConfig
+from diffphys.response_training import train, evaluate_checkpoint
+from diffphys.response_sampling import validate_sampling
+from diffphys.response_audit import AuditConfig
 
 
 def parse_args(argv=None):
@@ -27,8 +27,6 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
-    parser.add_argument("--rotation-backend", choices=("eager", "compile"), default="eager",
-                        help="compile only quaternion-to-rotation; RK4 and Actor stay unchanged")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
@@ -63,7 +61,7 @@ def parse_args(argv=None):
     parser.add_argument("--velocity-delay-max", type=float, default=.030, help="episode latency upper bound, <=.030 seconds")
     parser.add_argument("--development-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=50)
-    parser.add_argument("--work-dir", type=Path, default=Path("runs/attitude_delta_gru_only_no_cvar/seed7"))
+    parser.add_argument("--work-dir", type=Path, default=Path("runs/compiled_prefetch/seed7"))
     initialize = parser.add_mutually_exclusive_group()
     initialize.add_argument("--resume", type=Path)
     initialize.add_argument("--init-checkpoint", type=Path,

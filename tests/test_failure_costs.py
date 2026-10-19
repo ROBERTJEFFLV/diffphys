@@ -9,7 +9,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from response_task import TaskLossConfig, rollout, step_costs, scenario_costs, uniform_scene_weights, step_cost_components
+from diffphys.response_task import TaskLossConfig, rollout, step_costs, scenario_costs, uniform_scene_weights, step_cost_components
 from loss_fixtures import parse_loss_args as parse_args
 from test_episode_termination import actor, CountingSimulator, scheduled, flat_grads
 

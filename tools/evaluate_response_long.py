@@ -18,10 +18,10 @@ sys.path.insert(0,str(ROOT))
 
 import torch
 
-from response_long_eval import LongEvalConfig, LongHoverEval, make_schedule, EvalSchedule, LONG_EVAL_VERSION
-from response_noise import DisturbanceConfig
-from response_task import _select_rows
-from response_training import (DEVELOPMENT_SEEDS, SOURCE_FILES, atomic_json, atomic_torch,
+from diffphys.response_long_eval import LongEvalConfig, LongHoverEval, make_schedule, EvalSchedule, LONG_EVAL_VERSION
+from diffphys.response_noise import DisturbanceConfig
+from diffphys.response_task import _select_rows
+from diffphys.response_training import (DEVELOPMENT_SEEDS, SOURCE_FILES, atomic_json, atomic_torch,
                                load_policy_checkpoint, model_hash, sample_pool, source_hash)
 
 
@@ -80,7 +80,7 @@ def main(argv=None):
         # The production compactor assumes a full-length index vector is identity.
         if len(ids)==total:
             index=torch.tensor(ids,device=device)
-            from env_raptor import IMMUTABLE_TAPES
+            from diffphys.env_raptor import IMMUTABLE_TAPES
             initial=replace(initial,**{f.name:getattr(initial,f.name).index_select(0,index)
                            for f in fields(initial) if f.name not in IMMUTABLE_TAPES})
         else:
@@ -88,7 +88,7 @@ def main(argv=None):
         schedule=EvalSchedule(schedule.targets,schedule.forces_world[:,ids],schedule.points_body[:,ids],
                               schedule.face_ids[:,ids],schedule.surface_half_extents[ids])
     env=LongHoverEval(policy,initial,config,schedule)
-    evaluator_files=list(SOURCE_FILES)+['response_long_eval.py','tools/evaluate_response_long.py']
+    evaluator_files=list(SOURCE_FILES)+['diffphys/response_long_eval.py','tools/evaluate_response_long.py']
     digest=hashlib.sha256()
     for name in evaluator_files:
         content=(ROOT/name).read_bytes();digest.update(name.encode());digest.update(content)

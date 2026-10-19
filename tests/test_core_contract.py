@@ -41,7 +41,7 @@ def test_reviewed_physics_actor_loss_time_decay_and_adam_kernels():
     contract=json.loads((ROOT/'tests/core_contract.json').read_text())
     for name,symbols in contract['symbols'].items():
         for qualified,expected in symbols.items():
-            node=ast.parse((ROOT/name).read_text())
+            node=ast.parse((ROOT/"diffphys"/name).read_text())
             for symbol in qualified.split('.'):
                 node=next(x for x in node.body if isinstance(x,(ast.FunctionDef,ast.ClassDef)) and x.name==symbol)
             actual=canonical_digest(node)

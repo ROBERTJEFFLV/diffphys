@@ -7,21 +7,21 @@ from pathlib import Path
 import pytest
 import torch
 
-from response_training import sample_training_scenarios
+from diffphys.response_training import sample_training_scenarios
 from loss_fixtures import parse_loss_args as parse_args
 
 
-def test_production_config_selects_2048_coverage_without_changing_eval():
+def test_production_config_selects_3072_coverage_without_changing_eval():
     root = Path(__file__).resolve().parents[1]
     args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args')])
     assert getattr(args, 'train_sampling', None) == 'coverage128'
-    assert args.scenarios == 512 and args.eval_scenarios == 128
+    assert args.scenarios == 768 and args.eval_scenarios == 128
     assert args.group_max_groups == 128
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
 def test_all_128_cells_have_exactly_16_distinct_airframes(dtype):
-    from response_sampling import physics_cell_ids
+    from diffphys.response_sampling import physics_cell_ids
     report = {}
     state, _ = sample_training_scenarios(512, 0, dtype=dtype, horizon=5,
                                         sampling='coverage128', sampling_report=report)
@@ -43,9 +43,9 @@ def assert_state_equal(a, b, excluded=()):
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
 def test_yaw_measure_uses_thrust_and_inertia_not_extra_arm_division(dtype):
     from dataclasses import replace
-    from env_raptor import RaptorSimulator
-    from response_noise import DisturbanceConfig
-    from response_sampling import yaw_authority
+    from diffphys.env_raptor import RaptorSimulator
+    from diffphys.response_noise import DisturbanceConfig
+    from diffphys.response_sampling import yaw_authority
     s = RaptorSimulator().reset(256, seed=201, dtype=dtype, disturbances=DisturbanceConfig.clean())
     actual = yaw_authority(s)
     expected = (s.torque_to_inertia.double() * s.rotor_torque_constant[:, 0].double()
@@ -59,9 +59,9 @@ def test_yaw_measure_uses_thrust_and_inertia_not_extra_arm_division(dtype):
 def test_every_cell_id_and_boundary_convention(dtype, monkeypatch):
     import itertools
     from dataclasses import replace
-    from env_raptor import RaptorSimulator
-    from response_noise import DisturbanceConfig
-    import response_sampling as sampling
+    from diffphys.env_raptor import RaptorSimulator
+    from diffphys.response_noise import DisturbanceConfig
+    import diffphys.response_sampling as sampling
     definition = sampling.sampling_contract('coverage128')
     grid = list(itertools.product(range(4), range(4), range(4), range(2)))
     s = RaptorSimulator().reset(128, seed=5, dtype=dtype, disturbances=DisturbanceConfig.clean())
@@ -79,8 +79,8 @@ def test_every_cell_id_and_boundary_convention(dtype, monkeypatch):
 
 def test_coverage_keeps_original_candidate_rows_and_clean_physical_coupling(monkeypatch):
     from dataclasses import replace
-    import response_sampling as sampling
-    from env_raptor import RaptorSimulator
+    import diffphys.response_sampling as sampling
+    from diffphys.env_raptor import RaptorSimulator
     captured = []
     original = RaptorSimulator.reset
     def recording_reset(self, *args, **kwargs):
@@ -105,8 +105,8 @@ def test_coverage_keeps_original_candidate_rows_and_clean_physical_coupling(monk
     assert torch.equal(s.previous_action, torch.zeros_like(s.previous_action))
     assert len(report['candidate_seeds']) == len(set(report['candidate_seeds']))
     # Sorting/shuffling must not introduce new hidden state fields into the Actor.
-    from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-    from response_noise import measured_observation
+    from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+    from diffphys.response_noise import measured_observation
     p = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).double()
     obs = measured_observation(s)
     changed = replace(s, torque_to_inertia=s.torque_to_inertia+100, inertia=s.inertia*2,
@@ -116,8 +116,8 @@ def test_coverage_keeps_original_candidate_rows_and_clean_physical_coupling(monk
 
 @pytest.mark.parametrize('count', [128, 512, 2048])
 def test_repeatability_refresh_and_no_global_rng_consumption(count):
-    import response_sampling as sampling
-    from response_noise import DisturbanceConfig
+    import diffphys.response_sampling as sampling
+    from diffphys.response_noise import DisturbanceConfig
     report_a, report_b = {}, {}
     torch.manual_seed(21)
     before = torch.get_rng_state().clone()
@@ -139,9 +139,9 @@ def test_repeatability_refresh_and_no_global_rng_consumption(count):
 
 
 def test_noise_attached_once_after_selection_and_original_row_ids_survive_compaction(monkeypatch):
-    import response_training as training
-    from response_noise import pulse_at
-    from response_task import _select_rows
+    import diffphys.response_training as training
+    from diffphys.response_noise import pulse_at
+    from diffphys.response_task import _select_rows
     calls = []
     original = training.attach_disturbances
     def attach(state, config, **kwargs):
@@ -160,7 +160,7 @@ def test_noise_attached_once_after_selection_and_original_row_ids_survive_compac
 
 
 def test_original_random_and_eval_pools_do_not_change():
-    from response_training import sample_pool, DEVELOPMENT_SEEDS
+    from diffphys.response_training import sample_pool, DEVELOPMENT_SEEDS
     a, seeds = sample_training_scenarios(8, 2, horizon=4)
     b = sample_pool(8,seeds,horizon=4)
     assert_state_equal(a,b)
@@ -172,7 +172,7 @@ def test_original_random_and_eval_pools_do_not_change():
 
 
 def test_legacy_adaptive_api_still_available_but_production_uses_fixed_cells():
-    from response_groups import GroupBalanceConfig, physics_group_layout
+    from diffphys.response_groups import GroupBalanceConfig, physics_group_layout
     state, _ = sample_training_scenarios(512,0,horizon=1,sampling='coverage128')
     _, counts = physics_group_layout(state, GroupBalanceConfig())
     assert counts.tolist() == [128]*16
@@ -188,7 +188,7 @@ def test_invalid_coverage_size_fails_before_writing(scenarios, tmp_path):
 
 
 def test_incomplete_coverage_raises_instead_of_duplicate_or_random_fallback(monkeypatch):
-    import response_sampling as sampling
+    import diffphys.response_sampling as sampling
     monkeypatch.setattr(sampling, 'MAX_CANDIDATE_ROUNDS', 2)
     monkeypatch.setattr(sampling, 'physics_cell_ids', lambda state, definition: torch.zeros(len(state.mass),dtype=torch.long))
     with pytest.raises(RuntimeError,match='candidate budget exhausted'):
@@ -197,8 +197,8 @@ def test_incomplete_coverage_raises_instead_of_duplicate_or_random_fallback(monk
 
 def test_invalid_yaw_and_reference_features_are_not_sanitized():
     from dataclasses import replace
-    from env_raptor import RaptorSimulator
-    from response_sampling import physics_cell_ids
+    from diffphys.env_raptor import RaptorSimulator
+    from diffphys.response_sampling import physics_cell_ids
     s = RaptorSimulator().reset(2,seed=3)
     with pytest.raises(ValueError,match='yaw authority'):
         physics_cell_ids(replace(s,inertia=torch.zeros_like(s.inertia)))
@@ -207,21 +207,21 @@ def test_invalid_yaw_and_reference_features_are_not_sanitized():
 
 
 def test_coverage_contract_is_frozen_and_bound_in_checkpoint(tmp_path):
-    from response_sampling import sampling_contract
-    from response_training import binding, SOURCE_FILES
-    from response_policy import ResponsePolicyConfig
-    from response_task import TaskLossConfig
+    from diffphys.response_sampling import sampling_contract
+    from diffphys.response_training import binding, SOURCE_FILES
+    from diffphys.response_policy import ResponsePolicyConfig
+    from diffphys.response_task import TaskLossConfig
     args = parse_args(['--device','cpu','--train-sampling','coverage128','--scenarios','512'])
     contract = binding(args,ResponsePolicyConfig(),test_loss())
     assert contract['training_sampling'] == sampling_contract('coverage128')
-    assert 'response_sampling.py' in SOURCE_FILES and 'configs/physics_coverage.json' in SOURCE_FILES
+    assert 'diffphys/response_sampling.py' in SOURCE_FILES and 'configs/physics_coverage.json' in SOURCE_FILES
     assert contract['training_sampling']['calibration']['seed_base'] == 6500000000
 
 
 def test_coverage_resume_repeats_actor_adam_and_next_selected_pool(tmp_path):
     import json
     from test_reference_training import args_for, run
-    from response_training import evaluate_checkpoint
+    from diffphys.response_training import evaluate_checkpoint
     def args(path,updates,extra=()):
         return args_for(path,updates,('--scenarios','32','--horizon','2','--train-sampling','coverage128','--group-max-groups','128','--group-min-scenarios','1',*extra))
     full, split = tmp_path/'full',tmp_path/'split'
@@ -252,9 +252,9 @@ def test_coverage_resume_repeats_actor_adam_and_next_selected_pool(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
 def test_coverage_cpu_draws_equal_cuda_transfer_and_short_backward():
-    from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-    from response_task import rollout, task_loss, TaskLossConfig
-    from env_raptor import RaptorSimulator
+    from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+    from diffphys.response_task import rollout, task_loss, TaskLossConfig
+    from diffphys.env_raptor import RaptorSimulator
     a,_=sample_training_scenarios(32,0,horizon=5,sampling='coverage128')
     b,_=sample_training_scenarios(32,0,horizon=5,sampling='coverage128',device='cuda')
     assert_state_equal(a,b.to('cpu',torch.float32))

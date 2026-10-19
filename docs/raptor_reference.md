@@ -67,7 +67,7 @@ with provenance; independent force-at-point numerical/gradient tests cover it.
 
 ## Scope and compatibility
 
-The only production simulator is env_raptor.py. No single-airframe L2F mode,
+The only production simulator is diffphys/env_raptor.py. No single-airframe L2F mode,
 critic, teacher, alternate optimizer, independent torque-noise process or additive
 command noise is introduced. Omitting these uncertainties does not mean dynamics
 randomization mathematically subsumes them. Existing motor dynamics are unchanged.

@@ -8,11 +8,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from response_groups import GroupBalanceConfig, normalize_group_rows
-from response_adjoints import collect_rollout, backward_actor
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import TaskLossConfig, rollout
-from response_training import sample_training_scenarios
+from diffphys.response_groups import GroupBalanceConfig, normalize_group_rows
+from diffphys.response_adjoints import collect_rollout, backward_actor
+from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig, rollout
+from diffphys.response_training import sample_training_scenarios
 
 
 def cfg(backend="probe", cap=1., chunk=16):
@@ -23,7 +23,7 @@ def cfg(backend="probe", cap=1., chunk=16):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("decay", [0., 1.])
 def test_one_graph_traversal_matches_every_group_and_leaves_actor_forward_unchanged(dtype, decay):
-    from response_grad_probe import GroupGradientProbe
+    from diffphys.response_grad_probe import GroupGradientProbe
     torch.manual_seed(31)
     initial, _ = sample_training_scenarios(32, 0, horizon=12, sampling="coverage128", dtype=dtype)
     policy = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(dtype=dtype)
@@ -32,7 +32,7 @@ def test_one_graph_traversal_matches_every_group_and_leaves_actor_forward_unchan
     limit[::11] = .001
     initial = replace(initial, position_limit=limit)
     original = copy.deepcopy(policy)
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     simulator = RaptorSimulator()
     loss = test_loss()
     reference = collect_rollout(original, simulator, initial, loss, horizon=12,
@@ -59,7 +59,7 @@ def test_one_graph_traversal_matches_every_group_and_leaves_actor_forward_unchan
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_gru_gate_derivative_matches_native_gru_including_recurrent_bias(dtype):
-    from response_grad_probe import gru_gate_deltas
+    from diffphys.response_grad_probe import gru_gate_deltas
     torch.manual_seed(79)
     gru = torch.nn.GRUCell(5, 7).to(dtype=dtype)
     x, h, d = [torch.randn(9, n, dtype=dtype) for n in (5, 7, 7)]
@@ -73,7 +73,7 @@ def test_gru_gate_derivative_matches_native_gru_including_recurrent_bias(dtype):
 
 
 def test_probe_rejects_mutated_weights_before_replay_and_cleans_up():
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,0,horizon=4,sampling="coverage128",dtype=torch.float64)
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     rec=collect_rollout(policy,RaptorSimulator(),initial,test_loss(),horizon=4,group_config=cfg())
@@ -87,9 +87,9 @@ def test_probe_rejects_mutated_weights_before_replay_and_cleans_up():
 
 
 def test_probe_raw_group_vectors_match_serial_vjp_with_recurrent_parameter_reuse():
-    from response_grad_probe import GroupGradientProbe
-    from response_groups import physics_group_layout
-    from env_raptor import RaptorSimulator
+    from diffphys.response_grad_probe import GroupGradientProbe
+    from diffphys.response_groups import physics_group_layout
+    from diffphys.env_raptor import RaptorSimulator
     torch.manual_seed(77)
     # Unequal adaptive groups verify the N/n_g seed normalization as well.
     initial=RaptorSimulator().reset(65,seed=37,horizon=6,dtype=torch.float64)
@@ -116,7 +116,7 @@ def test_probe_raw_group_vectors_match_serial_vjp_with_recurrent_parameter_reuse
 
 @pytest.mark.parametrize("decay", [0., 1.])
 def test_long_horizon_probe_handles_delay_pulses_and_terminations_across_metric_boundary(decay):
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     torch.manual_seed(6)
     initial,_=sample_training_scenarios(32,8,horizon=80,sampling="coverage128",dtype=torch.float64)
     a=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
@@ -135,8 +135,8 @@ def test_long_horizon_probe_handles_delay_pulses_and_terminations_across_metric_
 
 
 def test_failing_probe_does_not_publish_partial_parameter_gradients(monkeypatch):
-    from response_grad_probe import GroupGradientProbe
-    from env_raptor import RaptorSimulator
+    from diffphys.response_grad_probe import GroupGradientProbe
+    from diffphys.env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,1,horizon=3,sampling="coverage128",dtype=torch.float64)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     for param in p.parameters():
@@ -155,7 +155,7 @@ def test_failing_probe_does_not_publish_partial_parameter_gradients(monkeypatch)
 
 
 def test_forward_failure_removes_hooks_without_changing_actor(monkeypatch):
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,1,horizon=3,sampling="coverage128",dtype=torch.float64)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     state=copy.deepcopy(p.state_dict())
@@ -170,9 +170,9 @@ def test_forward_failure_removes_hooks_without_changing_actor(monkeypatch):
 
 
 def test_actor_forward_raw_tensors_remain_bitwise_equal_with_probe():
-    from env_raptor import RaptorSimulator
-    from response_grad_probe import GroupGradientProbe
-    from response_groups import physics_group_layout
+    from diffphys.env_raptor import RaptorSimulator
+    from diffphys.response_grad_probe import GroupGradientProbe
+    from diffphys.response_groups import physics_group_layout
     initial,_=sample_training_scenarios(32,4,horizon=53,sampling="coverage128",dtype=torch.float64)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     probe=GroupGradientProbe(p,*physics_group_layout(initial,cfg()))
@@ -185,7 +185,7 @@ def test_actor_forward_raw_tensors_remain_bitwise_equal_with_probe():
 
 
 def test_repeated_capture_backward_does_not_leave_live_hooks_or_saved_inputs():
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,7,horizon=3,sampling="coverage128",dtype=torch.float64)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
     for _ in range(3):
@@ -198,7 +198,7 @@ def test_repeated_capture_backward_does_not_leave_live_hooks_or_saved_inputs():
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="CUDA unavailable")
 @pytest.mark.parametrize("dtype",[torch.float32,torch.float64])
 def test_cuda_fused_gru_single_backward_matches_reference(dtype):
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     torch.backends.cuda.matmul.allow_tf32=False
     torch.backends.cudnn.allow_tf32=False
     initial,_=sample_training_scenarios(32,3,horizon=65,sampling="coverage128",device="cuda",dtype=dtype)
@@ -225,12 +225,12 @@ def test_cuda_fused_gru_single_backward_matches_reference(dtype):
 
 def test_cli_defaults_to_probe_reference_is_explicit_and_checkpoint_bound(tmp_path):
     from loss_fixtures import parse_loss_args as parse_args
-    from response_training import binding, SOURCE_FILES
+    from diffphys.response_training import binding, SOURCE_FILES
     default=parse_args(["--device","cpu"])
     ref=parse_args(["--device","cpu","--group-backward","vjp"])
     assert GroupBalanceConfig.from_args(default).backward_backend == "probe"
     assert GroupBalanceConfig.from_args(ref).backward_backend == "vjp"
-    assert "response_grad_probe.py" in SOURCE_FILES
+    assert "diffphys/response_grad_probe.py" in SOURCE_FILES
     a=binding(default,ResponsePolicyConfig(),test_loss())
     b=binding(ref,ResponsePolicyConfig(),test_loss())
     assert a["group_balance"]["backward_backend"] != b["group_balance"]["backward_backend"]
@@ -247,8 +247,8 @@ def test_recorded_vjp_backend_replays_and_cannot_resume_as_probe(tmp_path):
 
 
 def test_probe_does_not_call_reference_or_depend_on_chunk_size(monkeypatch):
-    from env_raptor import RaptorSimulator
-    import response_adjoints
+    from diffphys.env_raptor import RaptorSimulator
+    import diffphys.response_adjoints as response_adjoints
     initial,_=sample_training_scenarios(32,7,horizon=4,sampling="coverage128",dtype=torch.float64)
     torch.manual_seed(6)
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4)).double()
@@ -266,7 +266,7 @@ def test_probe_does_not_call_reference_or_depend_on_chunk_size(monkeypatch):
 
 
 def test_probe_refuses_autocast_instead_of_silently_changing_group_derivatives():
-    from env_raptor import RaptorSimulator
+    from diffphys.env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,0,horizon=2,sampling="coverage128")
     p=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4))
     with torch.autocast("cpu",dtype=torch.bfloat16):

@@ -5,11 +5,11 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 import torch
 
-from response_task import (TaskLossConfig, FlightStatistics, initialize, rollout,
+from .response_task import (TaskLossConfig, FlightStatistics, initialize, rollout,
                            step_cost_components, uniform_scene_weights)
-from response_groups import (GroupBalanceConfig, group_gradient_coefficients,
+from .response_groups import (GroupBalanceConfig, group_gradient_coefficients,
                              backward_group_gradients, physics_group_layout)
-from response_grad_probe import GroupGradientProbe
+from .response_grad_probe import GroupGradientProbe
 
 # Streaming metrics/cost reduction preserves the original 50-step reduction order.
 # This is NOT truncated BPTT: closed-loop tensors are never detached between chunks.

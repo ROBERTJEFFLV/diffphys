@@ -6,8 +6,8 @@ import math
 
 import torch
 
-from env_raptor import RaptorState
-from response_sampling import CELL_COUNT, physics_cell_ids, yaw_authority
+from .env_raptor import RaptorState
+from .response_sampling import CELL_COUNT, physics_cell_ids, yaw_authority
 
 
 GROUP_BALANCE_VERSION = "physical-group-fixed-cap-v2"

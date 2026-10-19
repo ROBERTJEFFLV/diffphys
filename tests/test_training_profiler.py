@@ -3,8 +3,8 @@ import pytest
 import torch
 
 from tools.profile_response_training import main
-from response_policy import ARCHITECTURE, ResponseMotorPolicy
-from response_training import model_hash
+from diffphys.response_policy import ARCHITECTURE, ResponseMotorPolicy
+from diffphys.response_training import model_hash
 
 
 def test_cpu_profiler_never_steps_or_mutates_checkpoint(tmp_path, monkeypatch):
@@ -25,7 +25,7 @@ def test_cpu_profiler_never_steps_or_mutates_checkpoint(tmp_path, monkeypatch):
     assert len(result['samples']) == 1
     assert result['scenes'] == 128
     assert result['samples'][0]['physical_transitions'] <= 384
-    assert result['numerical_backend']['rotation'] == 'eager'
+    assert result['numerical_backend']['physics'] == 'native-cpu-reference'
     assert result['median_seconds'] > 0
     assert result['samples'][0]['peak_bytes'] is None
 

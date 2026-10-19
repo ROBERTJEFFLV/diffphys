@@ -2,7 +2,7 @@
 
 ## What changes, and what does not
 
-`--group-backward probe` is the production default. `response_grad_probe.py`
+`--group-backward probe` is the production default. `diffphys/response_grad_probe.py`
 observes the existing native `nn.GRUCell` and `nn.Linear` outputs and computes
 their local parameter contributions grouped by the existing physical-cell IDs.
 One scalar vector-Jacobian product traverses the original full H500 graph.

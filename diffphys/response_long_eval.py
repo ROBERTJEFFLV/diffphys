@@ -13,10 +13,10 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from env_raptor import RaptorParams, RaptorSimulator, RaptorState, quaternion_rotation
-from response_noise import executed_command, measured_observation
-from response_policy import ResponseMotorPolicy
-from response_task import _merge_rows, _select_rows
+from .env_raptor import RaptorParams, RaptorSimulator, RaptorState, quaternion_rotation
+from .response_noise import executed_command, measured_observation
+from .response_policy import ResponseMotorPolicy
+from .response_task import _merge_rows, _select_rows
 
 LONG_EVAL_VERSION = 'moving-hover-60s-surface-pulses-v2-gaussian-history'
 

@@ -6,10 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from env_raptor import RaptorSimulator, quaternion_rotation
-from response_noise import DisturbanceConfig
-from response_policy import ResponseMotorPolicy
-import response_task as task
+from diffphys.env_raptor import RaptorSimulator, quaternion_rotation
+from diffphys.response_noise import DisturbanceConfig
+from diffphys.response_policy import ResponseMotorPolicy
+import diffphys.response_task as task
 
 
 def rotation_q(angle, axis=2, dtype=torch.float64):

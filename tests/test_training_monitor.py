@@ -144,7 +144,7 @@ def test_monitor_import_and_poll_never_import_torch_or_training(tmp_path):
 import sys, importlib.abc
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, name, *args):
-        if name.split('.')[0] in ('torch','response_training','response_task','env_raptor'):
+        if name.split('.')[0] in ('torch','diffphys'):
             raise AssertionError('forbidden viewer import: '+name)
 sys.meta_path.insert(0,Block())
 from tools.response_monitor import TrainingLogs
@@ -200,7 +200,7 @@ def test_headless_gui_renders_without_torch_and_does_not_change_run(tmp_path,win
 import sys, importlib.abc
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, name, *args):
-        if name.split('.')[0] in ('torch','response_training','env_raptor'):
+        if name.split('.')[0] in ('torch','diffphys'):
             raise AssertionError('forbidden render import '+name)
 sys.meta_path.insert(0,Block())
 if sys.argv[1]=='dashboard':

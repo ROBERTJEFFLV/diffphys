@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from tools.train_response_control import parse_args
 
 
@@ -25,4 +25,4 @@ def test_gru_only_run_config_has_only_confirmed_loss_and_no_geometry_flags():
     assert not any(hasattr(args, name) for name in ('residual_amplitude', 'residual_gain',
                                                   'horizontal_accel_limit', 'vertical_fraction',
                                                   'antipodal_epsilon'))
-    assert str(args.work_dir) == 'runs/attitude_delta_lambda25_gru_only_no_cvar/seed7'
+    assert str(args.work_dir) == 'runs/compiled_prefetch_3072/fresh_seed7'

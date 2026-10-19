@@ -7,6 +7,38 @@ auxiliary network or single-airframe mode. The sole production Actor is B:
 GRUCell(16,64) + hidden-only Linear(64,4). Wc is removed, with no mask or
 alternative direct-feature branch. Geometric feedback is not used.
 
+## Repository layout
+
+```text
+diffphys/    Core Python package: simulator, sensing, Actor, loss and training
+tools/       Command-line tools, replay players and training monitor
+tests/       Deterministic regressions and protected kernel contract
+configs/     Training/evaluation arguments and frozen physical coverage
+docs/        Protocol, numerical methods and usage documentation
+```
+
+Import library code through the package, for example
+`from diffphys.env_raptor import RaptorSimulator`. Run the commands below from
+the repository root; no package installation is needed.
+
+The package move updates imports, source paths and archive manifests. Numerical
+kernels and protected contract hashes are retained. Source bindings change:
+exact resume/evaluation of pre-move checkpoints requires their original checkout.
+Existing checkpoint hashes must not be rewritten to accept the new layout.
+
+Production CUDA training uses strict full-step Compiled physics, original
+survivor compaction, GC deferral over forward/backward, and one persistent
+`spawn` CPU sampler with one next-batch cache. CPU uses native physics as a
+numerical reference. All execution runs through `tools/train_response_control.py`;
+there is no separate experiment trainer or A/C/P selector. See
+[current execution and measured qualifications](docs/gpu_efficiency.md).
+
+The retired experimental implementations and detailed reports are preserved
+in the [source archive](docs/archive/README.md). Existing generated runs,
+checkpoints, licenses, source audit evidence and local agent configuration
+are retained. Old exact resume uses its archived source; no checkpoint hash
+is rewritten to accept the new production source.
+
 ## Run
 
 Python 3.11+, PyTorch 2.10, NumPy and pytest. Install the PyTorch build matching
@@ -15,35 +47,35 @@ your CUDA runtime; no native extension build is required.
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
-    --work-dir runs/attitude_delta_lambda25_gru_only_no_cvar/evaluation
+    --checkpoint runs/compiled_prefetch_3072/fresh_seed7/best.pt \
+    --work-dir runs/compiled_prefetch_3072/evaluation
 python -m pytest -q tests
 ```
 
-The checked-in config uses one GPU, 4 x 512 = **2048 TRAIN** scenes per update,
+The checked-in config uses one GPU, 4 x 768 = **3072 TRAIN** scenes per update,
 2 x 128 = **256 fixed EVAL** scenes, H500 at 100 Hz, memory dimension 64,
 Time Decay 1 s^-1, Adam 3e-4, gradient scale 0.1 and global clip 10.
 It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
 **per bank**, not totals. No training runs on import.
 
 TRAIN now uses [fixed physical coverage](docs/physics_coverage.md):
-TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 16 scenes each.
+TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 24 scenes each.
 Candidate aircraft retain the original physical coupling and initial conditions;
 noise is attached after selection. Fixed EVAL does not change. The 128 fixed
-sampling cells are now also the 128 gradient groups: 16 initial scenes each,
+sampling cells are now also the 128 gradient groups: 24 initial scenes each,
 including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
 after equal-scene weighting/gradient-scale, never amplified, then averaged. Groups are processed
 using a training-only native GRU/Linear gradient probe in one backward graph
 traversal. The former eight-chunk VJP path is an explicit reference backend only.
 This preserves per-group clipping, not an approximation of the group norms.
 See [one-pass probes and profiling](docs/group_gradient_probe.md). Update evidence
-is retained locally by `response_audit.py`. CUDA throughput must
+is retained locally by `diffphys/response_audit.py`. CUDA throughput must
 be measured on the target GPU; fewer traversals do not promise a specific latency.
 
-The main config explicitly compiles the original quaternion rotation inside RK4
-(`--rotation-backend compile`), retaining the Actor and other physics. See
-[measured CUDA optimizations and checkpoint boundaries](docs/gpu_efficiency.md)
-for the timing, numerical checks, rejected experiments and read-only profiler.
+The checked-in config starts new runs under `runs/compiled_prefetch_3072/fresh_seed7`.
+CUDA uses the strict compiler directly; the former `--rotation-backend` option
+is removed. Sampling, EVAL, audit, checkpoints, worker startup/shutdown and
+final cleanup remain within the run time budget.
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
 with the checked-in config and the former smaller pool, use a NEW run directory:
@@ -66,7 +98,7 @@ training checkpoints.
 
 ```bash
 python tools/evaluate_response_long.py @configs/response_long_eval.args \
-    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
+    --checkpoint runs/compiled_prefetch_3072/fresh_seed7/best.pt \
     --work-dir runs/long_hover_eval/seed20260927
 python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
 ```
@@ -103,8 +135,8 @@ scores cannot be compared directly; use the retained physical flight metrics.
 
 An old-source/objective run cannot be exactly resumed with this source. Keep its
 checkpoint and checkout intact; `--init-checkpoint PATH` explicitly imports only
-same-architecture weights into a fresh Adam/sampling/best-score run. For 2048
-scenes, keep `--scenarios 512` (four-bank size convention). Exact resume inside
+same-architecture weights into a fresh Adam/sampling/best-score run. For 3072
+scenes, use `--scenarios 768` and `--group-min-scenarios 24` (four-bank size convention). Exact resume inside
 this new run requires matching source, objective and sampler settings.
 
 ## Online metrics without live training rendering
@@ -126,9 +158,9 @@ The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
 
 ```bash
 python tools/short_eval_replay.py \
-    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7 --device cuda
+    --run-dir runs/compiled_prefetch_3072/fresh_seed7 --device cuda
 python tools/monitor_response_training.py \
-    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7
+    --run-dir runs/compiled_prefetch_3072/fresh_seed7
 ```
 
 The exporter retains the latest complete fixed-EVAL trace, including the exact
@@ -276,15 +308,15 @@ are recorded with old/new provenance in the core contract; other protected hashe
 not CUDA throughput, convergence, trained recovery or real-flight safety results.
 Checkpoints retain `deployment_authorized: false`.
 
-`env_raptor.py` owns physics; `response_noise.py` sampling/sensing/pulse tapes;
-`response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
-`response_adjoints.py` and `response_groups.py` grouped full BPTT;
-`response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
-`response_grad_probe.py` one-traversal layer-local group derivatives;
-`response_audit.py` bounded Actor/Adam/RNG update evidence;
+`diffphys/env_raptor.py` owns physics; `diffphys/response_noise.py` sampling/sensing/pulse tapes;
+`diffphys/response_policy.py` the deployable Actor; `diffphys/response_task.py` rollout/true losses;
+`diffphys/response_adjoints.py` and `diffphys/response_groups.py` grouped full BPTT;
+`diffphys/response_training.py` banks/Adam/checkpoints; `diffphys/response_sampling.py` TRAIN coverage;
+`diffphys/response_grad_probe.py` one-traversal layer-local group derivatives;
+`diffphys/response_audit.py` bounded Actor/Adam/RNG update evidence;
 `tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
 [third-party notices](THIRD_PARTY_NOTICES.md) are retained. Retired source and
-alternative implementations are preserved in Git history, not the production
-tree. The current physics and training files use eager PyTorch; the experimental
-compiled hotpath backend is not included.
+alternative implementations are preserved in Git history and the documented
+source archive. CUDA production uses strict whole-step compilation and bounded CPU prefetch;
+CPU keeps the native numerical reference.

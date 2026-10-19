@@ -2,8 +2,8 @@
 from loss_fixtures import test_loss
 from dataclasses import replace
 import torch
-from env_raptor import RaptorSimulator
-from response_task import rollout,TaskLossConfig,step_costs,reference_episode_metrics
+from diffphys.env_raptor import RaptorSimulator
+from diffphys.response_task import rollout,TaskLossConfig,step_costs,reference_episode_metrics
 from test_episode_termination import actor,flat_grads
 
 

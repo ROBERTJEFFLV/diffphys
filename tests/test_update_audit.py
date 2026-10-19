@@ -7,10 +7,10 @@ import pytest
 import torch
 
 from loss_fixtures import parse_loss_args as parse_args
-from response_policy import ResponsePolicyConfig
-from response_task import TaskLossConfig
-from response_training import train
-from response_audit import AuditConfig
+from diffphys.response_policy import ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_training import train
+from diffphys.response_audit import AuditConfig
 from tools.replay_response_update import replay, compare_values
 
 
@@ -95,8 +95,8 @@ def test_invalid_audit_configs_fail(name,value):
 
 
 def test_fixed_eval_regression_pins_all_recent_updates_without_veto(tmp_path):
-    from response_audit import UpdateAudit
-    from response_training import atomic_json,atomic_torch,SOURCE_FILES,ROOT
+    from diffphys.response_audit import UpdateAudit
+    from diffphys.response_training import atomic_json,atomic_torch,SOURCE_FILES,ROOT
     run(args_for(tmp_path,2,('--audit-raw-factor','1000000000')))
     ckpt=torch.load(tmp_path/'latest.pt',weights_only=True)
     progress=ckpt['progress']

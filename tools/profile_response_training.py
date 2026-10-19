@@ -9,7 +9,7 @@ allocation, excluding the display, driver and other processes.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import gc
 import json
 from pathlib import Path
@@ -21,12 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
-from env_raptor import RaptorSimulator, rotation_backend_contract
-from response_adjoints import collect_rollout, backward_actor
-from response_groups import GroupBalanceConfig
-from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import TaskLossConfig
-from response_training import sample_training_scenarios, model_hash, source_hash, atomic_json
+from diffphys.env_raptor import RaptorParams
+from diffphys.compiled_physics import make_simulator, physics_backend_contract
+from diffphys.response_execution import critical_gc
+from diffphys.response_adjoints import collect_rollout, backward_actor
+from diffphys.response_groups import GroupBalanceConfig
+from diffphys.response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_training import sample_training_scenarios, model_hash, source_hash, atomic_json
 
 
 def main(argv=None):
@@ -34,7 +36,6 @@ def main(argv=None):
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--scenes', type=int, default=2048, help='TOTAL scenes, multiple of 128')
     parser.add_argument('--horizon', type=int, default=500)
-    parser.add_argument('--rotation-backend', choices=('eager', 'compile'), default='eager')
     parser.add_argument('--warmup', type=int, default=1)
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--seed', type=int, default=7)
@@ -67,7 +68,7 @@ def main(argv=None):
         if model_hash(policy) != saved.get('model_sha256'):
             raise ValueError('checkpoint model digest mismatch')
     original = model_hash(policy)
-    simulator = RaptorSimulator(rotation_backend=args.rotation_backend)
+    simulator = make_simulator(RaptorParams(), args.device)
     groups = GroupBalanceConfig(max_groups=128, min_scenarios=args.scenes//128, layout='coverage128')
     def synchronize():
         if args.device == 'cuda':
@@ -84,11 +85,13 @@ def main(argv=None):
         if args.device == 'cuda':
             torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-        record = collect_rollout(policy, simulator, initial, loss, horizon=args.horizon,
-                                  time_decay=1., group_config=groups)
-        synchronize();middle = time.perf_counter()
-        backward_actor(policy, simulator, record, loss)
-        synchronize();end = time.perf_counter()
+        with critical_gc():
+            record = collect_rollout(policy, simulator, initial, loss, horizon=args.horizon,
+                                      time_decay=1., group_config=groups)
+            synchronize();middle = time.perf_counter()
+            backward_actor(policy, simulator, record, loss)
+            synchronize();end = time.perf_counter()
+            record = replace(record, costs=record.costs.detach())
         row = {'forward_seconds':middle-start, 'backward_seconds':end-middle,
                'total_seconds':end-start, 'physical_transitions':record.metrics['physical_transitions'],
                'physical_transitions_per_second':record.metrics['physical_transitions']/(end-start),
@@ -105,7 +108,7 @@ def main(argv=None):
               'torch_version':str(torch.__version__), 'dtype':'float32', 'policy_config':asdict(config),
               'scenes':args.scenes, 'horizon':args.horizon, 'train_seeds':seeds,
               'loss_config':asdict(loss), 'time_decay':1., 'gradient_scale':.1,
-              'numerical_backend':rotation_backend_contract(args.rotation_backend),
+              'numerical_backend':physics_backend_contract(args.device),
               'sampling_seconds':sampling, 'warmups':warmups, 'samples':samples,
               'median_seconds':statistics.median(r['total_seconds'] for r in samples),
               'scope':'Frozen Actor float32 forward/backward only; no Adam, audit I/O, learning or resume claim.'}

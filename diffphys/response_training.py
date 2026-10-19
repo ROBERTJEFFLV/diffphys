@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
 import copy
+import gc
 import hashlib
 import json
 import math
@@ -13,15 +14,16 @@ import random
 import signal
 import tempfile
 import time
+import traceback
 
 import numpy as np
 import torch
 
-from env_raptor import (RaptorParams, RaptorSimulator, RaptorState, environment_contract,
-                        rotation_backend_contract, ACTION_CONVENTION)
-from response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
-from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import (
+from .env_raptor import (RaptorParams, RaptorState, environment_contract,
+                        ACTION_CONVENTION)
+from .response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
+from .response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from .response_task import (
     TaskLossConfig,
     TASK_OBJECTIVE_VERSION,
     sample_scenarios,
@@ -32,30 +34,36 @@ from response_task import (
     hard_risk_metrics,
     tensors_finite,
 )
-from response_adjoints import collect_rollout, backward_actor
-from response_execution import exit_class
-from response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
-from response_sampling import sample_coverage, sampling_contract, validate_sampling
-from response_audit import AuditConfig, UpdateAudit, parameter_changes, json_report
+from .response_adjoints import collect_rollout, backward_actor
+from .response_execution import exit_class, critical_gc
+from .compiled_physics import make_simulator, physics_backend_contract
+from .scene_prefetch import PrefetchedSampler
+from .response_groups import GroupBalanceConfig, GROUP_BALANCE_VERSION
+from .response_sampling import sample_coverage, sampling_contract, validate_sampling
+from .response_audit import AuditConfig, UpdateAudit, parameter_changes, json_report
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL_VERSION = "raptor-multi-airframe-gaussian-v6"
 TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
 SOURCE_FILES = (
-    "response_policy.py",
-    "response_task.py",
-    "response_adjoints.py",
-    "response_groups.py",
-    "response_grad_probe.py",
-    "response_sampling.py",
-    "response_audit.py",
+    "diffphys/__init__.py",
+    "diffphys/response_policy.py",
+    "diffphys/response_task.py",
+    "diffphys/response_adjoints.py",
+    "diffphys/response_groups.py",
+    "diffphys/response_grad_probe.py",
+    "diffphys/response_sampling.py",
+    "diffphys/response_audit.py",
     "configs/physics_coverage.json",
-    "response_training.py",
-    "response_execution.py",
-    "env_raptor.py",
-    "response_noise.py",
+    "diffphys/response_training.py",
+    "diffphys/response_execution.py",
+    "diffphys/compiled_physics.py",
+    "diffphys/strict_inductor.py",
+    "diffphys/scene_prefetch.py",
+    "diffphys/env_raptor.py",
+    "diffphys/response_noise.py",
     "tools/train_response_control.py",
     "tools/replay_response_update.py",
 )
@@ -151,8 +159,8 @@ def require_reference_checkpoint(value):
     TaskLossConfig(**cfg["loss"])
     params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
-            or cfg.get("environment_source_sha256") != file_hash(ROOT / "env_raptor.py")
-            or cfg.get("noise_source_sha256") != file_hash(ROOT / "response_noise.py")):
+            or cfg.get("environment_source_sha256") != file_hash(ROOT / "diffphys/env_raptor.py")
+            or cfg.get("noise_source_sha256") != file_hash(ROOT / "diffphys/response_noise.py")):
         raise ValueError("checkpoint environment/action contract mismatch")
     DisturbanceConfig(**cfg["disturbances"])
     if value["policy_config"]["dt"] != params.dt:
@@ -288,8 +296,8 @@ def binding(args, policy_config, loss_config):
             "scenarios_per_bank": args.scenarios,
             "disturbances": asdict(DisturbanceConfig.from_args(args)),
             "eval_scenarios_per_bank": args.eval_scenarios,
-            "environment_source_sha256": file_hash(ROOT / "env_raptor.py"),
-            "noise_source_sha256": file_hash(ROOT / "response_noise.py"),
+            "environment_source_sha256": file_hash(ROOT / "diffphys/env_raptor.py"),
+            "noise_source_sha256": file_hash(ROOT / "diffphys/response_noise.py"),
             "environment_params": asdict(RaptorParams(dt=policy_config.dt)),
             "environment": environment_contract(RaptorParams(dt=policy_config.dt)),
             "development_seeds": list(DEVELOPMENT_SEEDS),
@@ -315,7 +323,13 @@ def binding(args, policy_config, loss_config):
         "training_banks": TRAINING_BANKS,
         "training_sampling": sampling_contract(getattr(args, "train_sampling", "random")),
         "torch_version": str(torch.__version__),
-        "numerical_backend": rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
+        "numerical_backend": physics_backend_contract(args.device),
+        "numerical_runtime": {"cuda":torch.version.cuda, "cudnn":torch.backends.cudnn.version(),
+                              "gpu":torch.cuda.get_device_name(args.device) if torch.device(args.device).type == "cuda" else None,
+                              "tf32":False},
+        "execution": {"version":"compiled-prefetch-v1", "cpu_sampling":"spawn-one-batch",
+                      "worker_threads":args.threads, "interop_threads":torch.get_num_interop_threads(),
+                      "gc":"defer-forward-backward", "compaction":"dynamic"},
     }
 
 
@@ -402,8 +416,7 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = ResponseMotorPolicy(policy_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt),
-                                rotation_backend=getattr(args, "rotation_backend", "eager"))
+    simulator = make_simulator(RaptorParams(dt=policy_config.dt), device)
     group_config = GroupBalanceConfig.from_args(args)
     disturbances = DisturbanceConfig.from_args(args)
     audit_config = AuditConfig.from_args(args)
@@ -461,7 +474,15 @@ def train(args, policy_config, loss_config):
     audit = UpdateAudit(work, audit_config, evaluation_interval=args.development_every,
                         binding=run_binding, source_root=ROOT, source_files=SOURCE_FILES,
                         torch_writer=atomic_torch, json_writer=atomic_json)
+    if progress.get("sampling_index", progress["updates"]) != progress["updates"]:
+        raise ValueError("inconsistent checkpoint sampling progress")
+    progress["sampling_index"] = progress["updates"]
     elapsed_before = progress["elapsed_seconds"]
+    entry_gc = gc.isenabled()
+    sampler = None
+    record = backward = before = initial = None
+    gradients_for_audit = {}
+    failure = None
     stop = []
     old_handlers = {}
 
@@ -470,9 +491,7 @@ def train(args, policy_config, loss_config):
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_handlers[signum] = signal.signal(signum, interrupted)
-    eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
-                               device=device, dtype=dtype, horizon=args.horizon,
-                               disturbances=disturbances)
+    eval_initial = None
 
     def save(name="latest.pt"):
         atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
@@ -498,12 +517,20 @@ def train(args, policy_config, loss_config):
             save("best.pt")
 
     try:
+        eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
+                                   device=device, dtype=dtype, horizon=args.horizon,
+                                   disturbances=disturbances)
         if (
             progress.get("last_evaluated_update") != progress["updates"]
             and progress["updates"] == 0
         ):
             evaluation()
         save()
+        if progress["updates"] < args.updates:
+            sampler = PrefetchedSampler(TRAINING_BANKS*args.scenarios, args.horizon,
+                                        progress["updates"], args.updates, dtype=dtype,
+                                        threads=args.threads, sampling=sampling,
+                                        dt=policy_config.dt, disturbances=disturbances)
         while progress["updates"] < args.updates:
             if stop:
                 progress["status"] = "interrupted"
@@ -526,7 +553,7 @@ def train(args, policy_config, loss_config):
             seeds, sampling_report = [], {}
             try:
                 sampling_report = {}
-                initial, seeds = sample_training_scenarios(
+                initial, seeds = sampler(
                     args.scenarios,
                     progress["updates"],
                     dt=policy_config.dt,
@@ -538,22 +565,25 @@ def train(args, policy_config, loss_config):
                     sampling_report=sampling_report,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                record = collect_rollout(
-                    policy,
-                    simulator,
-                    initial,
-                    loss_config,
-                    horizon=args.horizon,
-                    time_decay=args.time_decay,
-                    group_config=group_config,
-                )
-                _sync(device)
-                forward_done = time.monotonic()
-                backward = backward_actor(
-                    policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
-                )
-                _sync(device)
-                backward_done = time.monotonic()
+                with critical_gc():
+                    record = collect_rollout(
+                        policy,
+                        simulator,
+                        initial,
+                        loss_config,
+                        horizon=args.horizon,
+                        time_decay=args.time_decay,
+                        group_config=group_config,
+                    )
+                    _sync(device)
+                    forward_done = time.monotonic()
+                    backward = backward_actor(
+                        policy, simulator, record, loss_config, gradient_scale=args.gradient_scale,
+                    )
+                    _sync(device)
+                    backward_done = time.monotonic()
+                    # Full backward and Probe.close are complete before restoring GC.
+                    record = replace(record, costs=record.costs.detach())
                 raw_norm = safe_global_clip(policy.parameters(), args.gradient_clip)
                 # Clone after all gradient transformations, before Adam can act.
                 gradients_for_audit = {name: None if p.grad is None else p.grad.detach().clone()
@@ -569,7 +599,9 @@ def train(args, policy_config, loss_config):
                     raise FloatingPointError("nonfinite actual Actor parameter-step norm")
                 _sync(device)
                 optimizer_done = time.monotonic()
-            except Exception as error:
+            except BaseException as error:
+                if record is not None and record.probe is not None:
+                    record.probe.close()
                 # Preserve the attempted state BEFORE restoring Actor/Adam/RNG.
                 try:
                     audit.record(update=progress["updates"]+1, before=before, policy=policy,
@@ -594,7 +626,7 @@ def train(args, policy_config, loss_config):
                     gradients=gradients_for_audit,
                     groups={"layout": record.group_balance, "gradient": backward["group_gradient"]},
                     changes=changes)
-            except Exception:
+            except BaseException:
                 # Do not silently train without requested evidence if storage fails.
                 policy.load_state_dict(before[0])
                 optimizer.load_state_dict(before[1])
@@ -604,9 +636,11 @@ def train(args, policy_config, loss_config):
             _sync(device)
             audit_done = time.monotonic()
             progress["updates"] += 1
+            progress["sampling_index"] = progress["updates"]
             progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
             row = {
                 "update": progress["updates"],
+                **sampler.last,
                 "train_seeds": seeds,
                 "training_sampling": sampling_report,
                 **record.metrics,
@@ -632,32 +666,56 @@ def train(args, policy_config, loss_config):
             }
             _append(work / "history.jsonl", row)
             print(json.dumps(row, allow_nan=False), flush=True)
-            del record, backward, before, gradients_for_audit
+            record = backward = before = initial = None
+            gradients_for_audit = {}
+            optimizer.zero_grad(set_to_none=True)
             if progress["updates"] % args.development_every == 0:
                 evaluation()
             if progress["updates"] % args.checkpoint_every == 0:
                 save()
         else:
             progress["status"] = "update_budget"
-    except Exception as error:
+    except BaseException as error:
         progress.update(status="failed", error=type(error).__name__ + ": " + str(error))
-        save("failure.pt")
-        raise
+        traceback.clear_frames(error.__traceback__)
+        failure = error.with_traceback(None)
     finally:
+        if record is not None and record.probe is not None:
+            record.probe.close()
+        record = backward = before = initial = None
+        gradients_for_audit = {}
+        optimizer.zero_grad(set_to_none=True)
+        cleanup = {}
+        try:
+            if sampler is not None:
+                sampler.worker.close()
+                cleanup.update(worker_closed=sampler.worker.closed, worker_pid=sampler.worker.pid,
+                               worker_close_seconds=sampler.worker.close_seconds)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+                progress.update(status="failed", error=type(error).__name__ + ": " + str(error))
+        finally:
+            (gc.enable if entry_gc else gc.disable)()
+            cleanup.update(entry_gc_enabled=entry_gc, gc_enabled=gc.isenabled(),
+                           closed_probes=all(not module._forward_hooks for module in policy.modules()))
+            drain = time.monotonic()
+            gc.collect()
+            _sync(device)
+            cleanup["final_gc_seconds"] = time.monotonic()-drain
+            progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+        save("failure.pt" if failure else "latest.pt")
         progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
-        for signum, handler in old_handlers.items():
-            signal.signal(signum, handler)
-        if progress["status"] != "failed":
-            save()
         atomic_json(
             work / "summary.json",
-            {
-                **progress,
-                "exit_class": exit_class(progress["status"]),
-                "final_seeds_consumed": [],
-                "deployment_authorized": False,
-            },
+            {**progress, "cleanup":cleanup, "exit_class":exit_class(progress["status"]),
+             "final_seeds_consumed":[], "deployment_authorized":False},
         )
+    if failure is not None:
+        raise failure
+
     return progress
 
 
@@ -672,6 +730,9 @@ def evaluate_checkpoint(args):
         if args.device == "auto" and torch.cuda.is_available()
         else "cpu" if args.device == "auto" else args.device
     )
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     dtype = getattr(torch, saved["binding"]["dtype"])
     policy, _ = load_policy_checkpoint(args.checkpoint, device, dtype)
     cfg = saved["binding"]["protocol"]
@@ -681,7 +742,7 @@ def evaluate_checkpoint(args):
                           disturbances=DisturbanceConfig(**cfg["disturbances"]))
     report = evaluate(
         policy,
-        RaptorSimulator(params, rotation_backend=getattr(args, "rotation_backend", "eager")),
+        make_simulator(params, device),
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),
@@ -690,7 +751,7 @@ def evaluate_checkpoint(args):
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,
         source_match=checkpoint_source == evaluator_source,
-        numerical_backend=rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
+        numerical_backend=physics_backend_contract(device),
     )
     atomic_json(Path(args.work_dir) / "evaluation.json", report)
     return report

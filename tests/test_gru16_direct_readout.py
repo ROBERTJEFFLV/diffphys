@@ -6,9 +6,9 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from env_raptor import RaptorSimulator
-from response_policy import CONTROL_FEATURE_DIM, OBSERVATION_DIM, ResponseMotorPolicy, ResponsePolicyConfig, ResponsePolicyState
-from response_task import observation
+from diffphys.env_raptor import RaptorSimulator
+from diffphys.response_policy import CONTROL_FEATURE_DIM, OBSERVATION_DIM, ResponseMotorPolicy, ResponsePolicyConfig, ResponsePolicyState
+from diffphys.response_task import observation
 from loss_fixtures import parse_loss_args as parse_args
 from test_episode_termination import actor
 

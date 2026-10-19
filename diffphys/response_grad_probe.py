@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from response_policy import ResponseMotorPolicy
+from .response_policy import ResponseMotorPolicy
 
 PROBE_VERSION = "native-gru-linear-group-probe-v1"
 
@@ -214,7 +214,7 @@ class GroupGradientProbe:
         self._closed = True
 
     def backward(self, costs, coefficients, parameters, config, *, gradient_scale):
-        from response_groups import normalize_group_rows
+        from .response_groups import normalize_group_rows
 
         if self._used or self._closed:
             raise RuntimeError("group probe backward is single-use")

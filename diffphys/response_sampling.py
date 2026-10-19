@@ -15,8 +15,8 @@ from typing import Sequence
 
 import torch
 
-from env_raptor import IMMUTABLE_TAPES, RaptorParams, RaptorSimulator, RaptorState
-from response_noise import DisturbanceConfig
+from .env_raptor import IMMUTABLE_TAPES, RaptorParams, RaptorSimulator, RaptorState
+from .response_noise import DisturbanceConfig
 
 SAMPLING_VERSION = "physics-coverage128-conditional-yaw-v1"
 CELL_COUNT = 128
@@ -25,7 +25,7 @@ RISING_EDGES = (0.0475, 0.065, 0.0825)
 FALLING_EDGES = (0.0975, 0.165, 0.2325)
 MAX_CANDIDATE_ROUNDS = 16
 DEFINITION_FILE = "configs/physics_coverage.json"
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def validate_sampling(mode: str, count: int) -> None:
@@ -52,7 +52,7 @@ def sampling_contract(mode: str) -> dict:
     thresholds = data.get("yaw_medians_by_tti_bin", [])
     if len(thresholds) != 4 or any(not math.isfinite(x) or x <= 0 for x in thresholds):
         raise ValueError("four finite positive conditional yaw thresholds are required")
-    env_hash = hashlib.sha256((ROOT / "env_raptor.py").read_bytes()).hexdigest()
+    env_hash = hashlib.sha256((ROOT / "diffphys/env_raptor.py").read_bytes()).hexdigest()
     if data.get("environment_source_sha256") != env_hash:
         raise ValueError("physical generator changed: review and recalibrate coverage thresholds")
     return {**data, "mode": mode, "cells": CELL_COUNT,

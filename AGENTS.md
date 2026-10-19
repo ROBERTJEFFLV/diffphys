@@ -31,14 +31,27 @@ The existing rule still applies: run training/validation only when explicitly re
 
 ## Project Structure & Module Organization
 
+Core library code lives in the `diffphys/` Python package; use package-qualified
+imports from tools and tests. Keep command-line scripts in `tools/`, deterministic
+regressions in `tests/`, arguments/calibration in `configs/` and documentation in
+`docs/`. Run commands from the repository root without installing the package.
+
 There is one RAPTOR-style multi-airframe training path. The production modules
-are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
-`response_task.py`, `response_adjoints.py`, `response_groups.py`,
-`response_training.py`, `response_execution.py`, `response_sampling.py`,
-`response_audit.py`, `response_grad_probe.py`, and the single CLI
+are `diffphys/env_raptor.py`, `diffphys/response_noise.py`, `diffphys/response_policy.py`,
+`diffphys/response_task.py`, `diffphys/response_adjoints.py`, `diffphys/response_groups.py`,
+`diffphys/response_training.py`, `diffphys/response_execution.py`, `diffphys/response_sampling.py`,
+`diffphys/response_audit.py`, `diffphys/response_grad_probe.py`,
+`diffphys/compiled_physics.py`, `diffphys/strict_inductor.py`, `diffphys/scene_prefetch.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
 The sole training config is `configs/response_raptor_multi_airframe.args`.
+CUDA production uses strict full-step Inductor compilation of the original
+`RaptorSimulator.step`, dynamic survivor compaction, critical-region GC scheduling,
+and one persistent spawn CPU sampler with one pending/ready next batch. CPU
+physics remains the native numerical reference. Do not restore experiment
+A/C/P selectors, Mask, bool-fill or the retired rotation-only backend. Compiler
+errors propagate; source-bound old runs require their archived source. See
+`docs/gpu_efficiency.md` and `docs/archive/README.md`.
 Full BPTT, Time Decay and physical-cell shrink-only gradient clipping are the retained
 algorithm. Production uses one native-backward group probe; the older grouped
 VJP backend remains an explicit numerical reference, never an automatic fallback.
@@ -67,7 +80,7 @@ three previous world-velocity slots differentiable through Time Decay.
 Generated runs/checkpoints, applicable provenance and license notices, source
 audit evidence and local agent configuration are not disposable source. Historical
 reference material is not imported into production. Removed runtime paths remain
-recoverable from Git history.
+recoverable from Git history or the documented source archive.
 
 ## Build and Development Commands
 
@@ -79,10 +92,10 @@ python tools/train_response_control.py @configs/response_raptor_multi_airframe.a
 ```
 
 `--scenarios` retains its four-bank size convention. The checked-in config uses
-coverage128 sampling, 4x512=2048 TRAIN scenes with 16 scenes per physical cell.
+coverage128 sampling, 4x768=3072 TRAIN scenes with 24 scenes per physical cell.
 Bare CLI defaults retain the original random 4x128=512 pool for compatibility.
 Fixed EVAL pools two original random banks (default 2x128=256). For production coverage128, sampling cells
-are also the 128 fixed gradient groups (16 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
+are also the 128 fixed gradient groups (24 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
 candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only CLI modes are train and evaluate.
 Exact resume requires identical source/config; never rewrite checkpoint hashes
 to bypass an environment/noise mismatch. Older protocol checkpoints require their

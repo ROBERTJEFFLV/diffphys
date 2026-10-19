@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from response_noise import (DisturbanceConfig, attach_disturbances, executed_command,
+from .response_noise import (DisturbanceConfig, attach_disturbances, executed_command,
                             NOISE_VERSION, VELOCITY_HISTORY_STEPS, pulse_at)
 
 ENVIRONMENT_VERSION = "raptor-multi-airframe-pulsed-recovery-v6"
@@ -55,22 +55,6 @@ def quaternion_rotation(q: torch.Tensor) -> torch.Tensor:
         2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x),
         2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y),
     ), -1).reshape(*q.shape[:-1], 3, 3)
-
-
-def rotation_backend_contract(backend: str) -> dict:
-    if backend not in ("eager", "compile"):
-        raise ValueError("rotation backend must be eager or compile")
-    return {"rotation": backend, "version": "quaternion-rotation-nofma-v1",
-            "options": {"triton.cudagraphs": False, "emulate_precision_casts": True,
-                        "emulate_divison_rounding": True} if backend == "compile" else None}
-
-
-@lru_cache(maxsize=1)
-def _compiled_rotation():
-    # Compile only this elementwise expression. The rest of RK4, the Actor,
-    # termination/compaction and native backward probe remain ordinary PyTorch.
-    return torch.compile(quaternion_rotation, fullgraph=True, dynamic=True,
-                         options=rotation_backend_contract("compile")["options"])
 
 
 @dataclass(frozen=True)
@@ -122,10 +106,9 @@ class RaptorState:
 
 
 class RaptorSimulator:
-    def __init__(self, params: RaptorParams = RaptorParams(), *, rotation_backend: str = "eager"):
+    def __init__(self, params: RaptorParams = RaptorParams()):
         self.params = params
-        rotation_backend_contract(rotation_backend)
-        self._rotation = quaternion_rotation if rotation_backend == "eager" else _compiled_rotation()
+        self._rotation = quaternion_rotation
 
     @torch.no_grad()
     def reset(self, batch_size: int, *, device="cpu", dtype=torch.float32,

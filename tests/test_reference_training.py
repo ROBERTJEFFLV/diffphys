@@ -5,9 +5,9 @@ import pytest
 import torch
 
 from loss_fixtures import parse_loss_args as parse_args
-from response_policy import ResponsePolicyConfig
-from response_task import TaskLossConfig
-from response_training import train,evaluate_checkpoint,require_reference_checkpoint
+from diffphys.response_policy import ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_training import train,evaluate_checkpoint,require_reference_checkpoint
 
 
 def args_for(path,updates=2,extra=()):
@@ -98,7 +98,8 @@ def test_retained_training_and_eval_configs_match_their_clis(tmp_path):
     configs={p.name:p for p in (root/'configs').glob('*.args')}
     assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args'}
     args=parse_args(['@'+str(configs['response_raptor_multi_airframe.args'])])
-    assert args.scenarios==512 and args.eval_scenarios==128 and args.horizon==500
+    assert args.scenarios==768 and args.eval_scenarios==128 and args.horizon==500
+    assert args.group_max_groups==128 and args.group_min_scenarios==24
     assert args.train_sampling=="coverage128"
     assert args.time_decay==1 and not args.disable_disturbances
     assert (args.position_noise_std,args.velocity_noise_std,args.attitude_noise_std,args.omega_noise_std)==(.001,.002,.001,.002)

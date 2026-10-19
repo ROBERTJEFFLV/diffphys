@@ -81,9 +81,9 @@ that every attitude change is undesirable. The larger fixed coefficient is an
 experimental setting and does not establish that learned yaw spin will disappear.
 Position/action smoothing, learning rate and sampling are unchanged.
 
-The checked-in argument file preserves 2048 TRAIN scenes, coverage128, H500,
+The checked-in argument file now uses 3072 TRAIN scenes, coverage128, H500,
 Time Decay 1, gradient_scale .1, group cap 1, global clip 10 and Adam lr 3e-4.
-It uses a fresh `runs/attitude_delta_lambda25_gru_only_no_cvar/seed7` directory and supplies the three
+It uses a fresh `runs/compiled_prefetch_3072/fresh_seed7` directory and supplies the three
 confirmed constants above. Training remains an explicit CLI operation, separately authorized by the user.
 
 `step_cost_components()` returns position, attitude_delta, action_delta, dead, terminal

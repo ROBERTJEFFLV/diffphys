@@ -12,14 +12,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
-from response_audit import AUDIT_VERSION, parameter_changes
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_groups import GroupBalanceConfig
-from response_task import TaskLossConfig
-from response_noise import DisturbanceConfig
-from env_raptor import RaptorSimulator, RaptorParams
-from response_adjoints import collect_rollout, backward_actor
-from response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
+from diffphys.response_audit import AUDIT_VERSION, parameter_changes
+from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_groups import GroupBalanceConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_noise import DisturbanceConfig
+from diffphys.env_raptor import RaptorParams
+from diffphys.compiled_physics import make_simulator
+from diffphys.response_execution import critical_gc
+from diffphys.response_adjoints import collect_rollout, backward_actor
+from diffphys.response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
                                restore_rng, capture_rng, sample_training_scenarios,
                                safe_global_clip, atomic_json)
 
@@ -30,7 +32,8 @@ def compare_values(actual, expected):
         if not torch.is_tensor(actual) or actual.shape != expected.shape or actual.dtype != expected.dtype:
             return False, float('inf')
         a, b = actual.detach().cpu(), expected.detach().cpu()
-        same = torch.equal(a, b)
+        same = (torch.equal(a, b) and torch.equal(a.contiguous().reshape(-1).view(torch.uint8),
+                                                 b.contiguous().reshape(-1).view(torch.uint8)))
         diff = float((a.double()-b.double()).abs().max()) if a.numel() else 0.
         return same, diff
     if isinstance(expected, dict):
@@ -80,13 +83,13 @@ def replay(path, mode='full'):
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
-        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt),
-                                    rotation_backend=cfg.get("numerical_backend", {}).get("rotation", "eager"))
+        simulator = make_simulator(RaptorParams(dt=policy.config.dt), device)
         loss = TaskLossConfig(**cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
-        record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
-                                 time_decay=cfg['time_decay'], group_config=group)
-        backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
+        with critical_gc():
+            record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
+                                     time_decay=cfg['time_decay'], group_config=group)
+            backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
         safe_global_clip(policy.parameters(), cfg['gradient_clip'])
     elif mode == 'adam':
         for name, parameter in policy.named_parameters():

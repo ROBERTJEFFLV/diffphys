@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from env_raptor import RaptorState
+    from .env_raptor import RaptorState
 
 NOISE_VERSION = "raptor-force-pulses-gaussian-observation-delay-v3"
 RAPTOR_FORCE_COEFFICIENT = 0.3

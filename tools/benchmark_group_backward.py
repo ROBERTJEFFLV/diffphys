@@ -21,12 +21,12 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from env_raptor import RaptorSimulator
-from response_adjoints import collect_rollout, backward_actor
-from response_groups import GroupBalanceConfig
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import TaskLossConfig
-from response_training import sample_training_scenarios, source_hash, atomic_json
+from diffphys.env_raptor import RaptorSimulator
+from diffphys.response_adjoints import collect_rollout, backward_actor
+from diffphys.response_groups import GroupBalanceConfig
+from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_task import TaskLossConfig
+from diffphys.response_training import sample_training_scenarios, source_hash, atomic_json
 
 
 def synchronize(device):

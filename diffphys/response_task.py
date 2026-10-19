@@ -7,9 +7,9 @@ from typing import Optional
 
 import torch
 
-from env_raptor import RaptorParams, RaptorSimulator, RaptorState, IMMUTABLE_TAPES
-from response_noise import DisturbanceConfig, measured_observation
-from response_policy import (
+from .env_raptor import RaptorParams, RaptorSimulator, RaptorState, IMMUTABLE_TAPES
+from .response_noise import DisturbanceConfig, measured_observation
+from .response_policy import (
     ResponseMotorPolicy, ResponsePolicyState,
 )
 

@@ -7,10 +7,10 @@ import torch
 
 from loss_fixtures import test_loss
 
-from env_raptor import RaptorSimulator
-import response_task as task
-from response_adjoints import collect_rollout,backward_actor
-from response_groups import normalize_group_rows
+from diffphys.env_raptor import RaptorSimulator
+import diffphys.response_task as task
+from diffphys.response_adjoints import collect_rollout,backward_actor
+from diffphys.response_groups import normalize_group_rows
 from test_episode_termination import actor,flat_grads
 
 
@@ -71,7 +71,7 @@ def test_invalid_decay(alpha):
 
 @pytest.mark.parametrize('alpha',[0.,1.])
 def test_delay_and_recurrent_graph_survive_fifty_step_metrics_boundary(alpha):
-    from response_noise import DisturbanceConfig
+    from diffphys.response_noise import DisturbanceConfig
     s=RaptorSimulator().reset(64,seed=34,horizon=70,dtype=torch.float64,
                              disturbances=DisturbanceConfig())
     p=actor();other=copy.deepcopy(p);sim=RaptorSimulator();loss=test_loss()

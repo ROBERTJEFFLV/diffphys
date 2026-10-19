@@ -6,11 +6,11 @@ import copy
 import pytest
 import torch
 
-from env_raptor import RaptorSimulator
-from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from response_task import rollout, step_costs, TaskLossConfig
-from response_groups import GroupBalanceConfig
-from response_adjoints import collect_rollout, backward_actor
+from diffphys.env_raptor import RaptorSimulator
+from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from diffphys.response_task import rollout, step_costs, TaskLossConfig
+from diffphys.response_groups import GroupBalanceConfig
+from diffphys.response_adjoints import collect_rollout, backward_actor
 
 DEVICES = ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA is unavailable'))]
@@ -50,7 +50,7 @@ def test_optional_observation_storage_preserves_flight_and_gradients(device, dec
 
 @pytest.mark.parametrize('decay', [0., 1.])
 def test_training_omits_observation_storage_but_keeps_probe_and_chunk_gradients(decay, monkeypatch):
-    import response_adjoints as adjoints
+    import diffphys.response_adjoints as adjoints
     simulator = RaptorSimulator()
     initial = simulator.reset(32, seed=91, horizon=60, dtype=torch.float64)
     torch.manual_seed(47)
@@ -87,13 +87,13 @@ def test_training_omits_observation_storage_but_keeps_probe_and_chunk_gradients(
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
 def test_cached_physics_vectors_reuse_allocation_without_changing_rk4(device, dtype, monkeypatch):
-    import env_raptor as env
+    import diffphys.env_raptor as env
     env._constant_vector.cache_clear()
     simulator = RaptorSimulator()
     initial = simulator.reset(3, seed=57, horizon=3, device=device, dtype=dtype)
     action = torch.full_like(initial.motor, .13, requires_grad=True)
     rng = torch.random.get_rng_state().clone()
-    with patch('env_raptor.torch.tensor', wraps=torch.tensor) as factory:
+    with patch('diffphys.env_raptor.torch.tensor', wraps=torch.tensor) as factory:
         first = simulator.step(initial, action)
         allocated = factory.call_count
         second = simulator.step(initial, action)
@@ -112,7 +112,7 @@ def test_cached_physics_vectors_reuse_allocation_without_changing_rk4(device, dt
 
 
 def test_probe_keeps_fp64_accumulation_without_explicit_cast_temporary():
-    from response_grad_probe import GroupGradientProbe
+    from diffphys.response_grad_probe import GroupGradientProbe
     torch.manual_seed(57)
     policy = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=4))
     probe = GroupGradientProbe(policy, torch.arange(4).reshape(2, 2), torch.tensor([2, 2]))
@@ -124,37 +124,3 @@ def test_probe_keeps_fp64_accumulation_without_explicit_cast_temporary():
     assert torch.isfinite(probe.rows).all()
     assert probe.rows.norm() > 0
     probe.close()
-
-
-@pytest.mark.parametrize('device', DEVICES)
-def test_compiled_rotation_backend_preserves_rk4_and_all_actor_gradients(device):
-    torch.manual_seed(827)
-    initial = RaptorSimulator().reset(8, seed=63, horizon=16, device=device)
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).to(device)
-    other = copy.deepcopy(policy)
-    loss = TaskLossConfig(.01, .01, .2)
-    eager = rollout(policy, RaptorSimulator(rotation_backend='eager'), initial, 16, time_decay=1.)
-    compiled = rollout(other, RaptorSimulator(rotation_backend='compile'), initial, 16, time_decay=1.)
-    for name in ('actions', 'observations', 'positions', 'velocities', 'omegas', 'valid'):
-        torch.testing.assert_close(getattr(eager, name), getattr(compiled, name), rtol=1e-6, atol=1e-6)
-    step_costs(eager, loss).sum().backward()
-    step_costs(compiled, loss).sum().backward()
-    for a, b in zip(policy.parameters(), other.parameters()):
-        torch.testing.assert_close(a.grad, b.grad, rtol=1e-5, atol=1e-6)
-
-
-def test_rotation_backend_is_explicit_in_binding_and_rejects_invalid_choice():
-    from tools.train_response_control import parse_args
-    from response_training import binding
-    loss = TaskLossConfig(.01, .01, .2)
-    extra = ['--epsilon-p', '.01', '--epsilon-a', '.01', '--lambda-R', '.2']
-    eager = parse_args(extra + ['--rotation-backend', 'eager'])
-    compiled = parse_args(extra + ['--rotation-backend', 'compile'])
-    a, b = [binding(args, ResponsePolicyConfig(), loss) for args in (eager, compiled)]
-    assert a['numerical_backend']['rotation'] == 'eager'
-    assert b['numerical_backend']['rotation'] == 'compile'
-    assert b['numerical_backend']['options']['emulate_precision_casts'] is True
-    assert b['numerical_backend']['options']['triton.cudagraphs'] is False
-    assert a != b
-    with pytest.raises(ValueError, match='rotation backend'):
-        RaptorSimulator(rotation_backend='unsupported')
