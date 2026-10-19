@@ -16,7 +16,7 @@ from typing import Union, get_args, get_origin, get_type_hints
 from .agile_mission import AgileMissionConfig
 from .agile_objective import AgileLossConfig
 
-AGILE_TRAINING_VERSION = "agile-flight-training-v3"
+AGILE_TRAINING_VERSION = "agile-flight-training-v4"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs/agile_flight.json"
 

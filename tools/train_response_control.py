@@ -40,8 +40,8 @@ def parse_args(argv=None):
     parser.add_argument("--train-sampling", choices=("random", "coverage128"), default="random",
                         help="TRAIN only: original random pool or fixed 4x4x4x2 physical coverage")
     parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
-    parser.add_argument("--horizon", type=int, default=None,
-                        help="control steps; defaults hover=500, agile=800 at 100 Hz")
+    parser.add_argument("--horizon", type=int, default=500,
+                        help="control steps; default 500 at 100 Hz")
     parser.add_argument("--time-decay", type=float, default=None,
                         help="backward-only decay s^-1; defaults hover=1, agile=0 (exact BPTT)")
     parser.add_argument("--updates", type=int, default=50)
@@ -99,8 +99,6 @@ def parse_args(argv=None):
         parser.add_argument("--audit-" + field.name.replace("_", "-"), type=type(default), default=default)
     args = parser.parse_args(argv)
     args.goal_conditioning = args.task == "agile"
-    if args.horizon is None:
-        args.horizon = 800 if args.task == "agile" else 500
     if args.external_forces is None:
         args.external_forces = args.task == "hover"
     if args.time_decay is None:
@@ -126,8 +124,8 @@ def parse_args(argv=None):
             TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})
         elif args.mode == "train":
             args.agile_training_config = load_agile_config(args.agile_config)
-            if args.agile_training_config.mission.hold_seconds >= args.horizon * args.dt:
-                raise ValueError("agile horizon must exceed mission hold_seconds")
+            if args.horizon < 4:
+                raise ValueError("agile horizon must allow at least four motion steps")
         ResponsePolicyConfig(**{field.name: getattr(args, field.name) for field in fields(ResponsePolicyConfig)})
         groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)

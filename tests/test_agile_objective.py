@@ -38,7 +38,7 @@ def scene(count=1, *, bend=(0., .03, -.01), durations=None, dtype=DTYPE):
         start=center-half_span[:, None]*direction,
         waypoint=center+bend, goal=center+half_span[:, None]*direction,
         rotation=rotation.clone(), velocity=torch.zeros_like(center),
-        direction=direction, duration=duration, hold_seconds=.2,
+        direction=direction, duration=duration,
         position_scale=torch.ones(count, dtype=dtype),
         reference_scale=torch.ones(count, dtype=dtype),
         feasible=torch.ones(count, dtype=torch.bool),
@@ -88,9 +88,79 @@ def test_schedule_is_detached_normalized_and_matches_each_midpoint():
     torch.testing.assert_close(schedule.position[-1], mission.goal)
     assert torch.equal(schedule.velocity[-1], torch.zeros_like(mission.velocity))
     assert torch.equal(schedule.phase[-1], torch.ones(2, dtype=DTYPE))
-    assert torch.equal(schedule.rest_weight[:80], torch.zeros(80, dtype=DTYPE))
-    assert bool((schedule.rest_weight[81:]-schedule.rest_weight[80:-1] > 0).all())
-    torch.testing.assert_close(schedule.rest_weight.sum(), torch.ones((), dtype=DTYPE))
+    assert not hasattr(schedule, "rest_weight")
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_motion_can_end_exactly_at_horizon_without_a_reserved_hold_interval(dtype):
+    _, mission = scene(durations=(HORIZON*DT,), dtype=dtype)
+    schedule = prepare_agile_schedule(mission, AgileLossConfig(), horizon=HORIZON, dt=DT)
+    torch.testing.assert_close(schedule.position[HORIZON], mission.goal)
+    assert torch.equal(schedule.velocity[HORIZON], torch.zeros_like(mission.velocity))
+    assert torch.equal(schedule.phase[HORIZON], torch.ones(1, dtype=dtype))
+    assert not any("hold" in field.name for field in fields(schedule))
+
+
+def test_final_point_reference_and_goal_packet_continue_after_motion_and_horizon():
+    _, mission = scene(2, durations=(.6, 1.))
+    observation = torch.zeros(2, 22, dtype=DTYPE)
+    for time in (1., 1.01, 3., 1234.):
+        reference = mission.nominal_reference(time)
+        torch.testing.assert_close(reference.position, mission.goal, rtol=0, atol=0)
+        for value in (reference.velocity, reference.acceleration, reference.jerk,
+                      reference.snap, reference.omega, reference.omega_dot):
+            assert torch.equal(value, torch.zeros_like(value))
+        packet = make_goal_packet(observation, mission, time, HORIZON*DT-time)
+        assert packet.shape == (2, 23)
+        for section in (slice(0, 3), slice(3, 6), slice(6, 9)):
+            torch.testing.assert_close(packet[:, section], mission.goal, rtol=0, atol=0)
+        torch.testing.assert_close(packet[:, 9:18], reference.rotation.flatten(1), rtol=0, atol=0)
+        assert torch.equal(packet[:, 18:21], torch.zeros_like(mission.velocity))
+        assert torch.equal(packet[:, 21], torch.ones(2, dtype=DTYPE))
+        assert torch.equal(packet[:, 22], torch.zeros(2, dtype=DTYPE))
+
+
+@pytest.mark.parametrize("scheduled", (False, True))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_packet_switches_each_row_to_only_the_endpoint_using_time_not_arrival(scheduled, dtype):
+    _, mission = scene(2, durations=(.6, 1.), dtype=dtype)
+    config = AgileLossConfig()
+    schedule = prepare_agile_schedule(mission, config, horizon=HORIZON, dt=DT) if scheduled else None
+    observation = torch.zeros(2, 22, dtype=dtype)
+    for step in (59, 60, 61, HORIZON):
+        time = step*DT
+        kwargs = {"schedule": schedule, "step": step} if scheduled else {}
+        packet = make_goal_packet(observation, mission, time, HORIZON*DT-time, **kwargs)
+        finished = time >= mission.duration
+        for row in range(2):
+            if finished[row]:
+                for section in (slice(0, 3), slice(3, 6), slice(6, 9)):
+                    torch.testing.assert_close(packet[row, section], mission.goal[row], rtol=0, atol=0)
+                expected_rotation = mission.nominal_reference(time).rotation[row]
+                torch.testing.assert_close(packet[row, 9:18], expected_rotation.flatten(), rtol=0, atol=0)
+                assert torch.equal(packet[row, 18:21], torch.zeros(3, dtype=dtype))
+            else:
+                torch.testing.assert_close(packet[row, 3:6], mission.waypoint[row], rtol=0, atol=0)
+                torch.testing.assert_close(packet[row, 9:18], mission.rotation[row].flatten(), rtol=0, atol=0)
+                torch.testing.assert_close(packet[row, 18:21], mission.velocity[row], rtol=0, atol=0)
+        # Changing observations cannot latch arrival or undo the clock target.
+        altered = make_goal_packet(observation+1000, mission, time, HORIZON*DT-time, **kwargs)
+        assert torch.equal(packet, altered)
+
+
+@pytest.mark.parametrize("scheduled", (False, True))
+def test_endpoint_packet_never_exposes_hidden_force_equilibrium(scheduled):
+    _, mission = scene()
+    observation = torch.zeros(1, 22, dtype=DTYPE)
+    config = AgileLossConfig()
+    schedule = prepare_agile_schedule(mission, config, horizon=HORIZON, dt=DT) if scheduled else None
+    kwargs = {"schedule": schedule, "step": HORIZON} if scheduled else {}
+    hidden_changed = replace(mission, hover_rotation=mission.hover_rotation+1000.)
+    first = make_goal_packet(observation, mission, HORIZON*DT, 0., **kwargs)
+    second = make_goal_packet(observation, hidden_changed, HORIZON*DT, 0., **kwargs)
+    assert torch.equal(first, second)
+    expected = torch.eye(3, dtype=DTYPE).flatten()[None]
+    torch.testing.assert_close(first[:, 9:18], expected, rtol=0, atol=0)
 
 
 def test_goal_packet_is_clock_only_and_independent_of_observation_or_truth():
@@ -196,14 +266,13 @@ def test_quaternion_sign_preserves_all_attitude_losses():
     for step in (40, 95):
         first, _ = step_cost(before, first_state, mission, step=step)
         second, _ = step_cost(before, second_state, mission, step=step)
-        for name in ("midpoint_attitude", "rest_attitude"):
-            torch.testing.assert_close(first[name], second[name], atol=0., rtol=0.)
+        torch.testing.assert_close(first["midpoint_attitude"], second["midpoint_attitude"], atol=0., rtol=0.)
     first = agile_terminal(first_state, mission, AgileLossConfig())
     second = agile_terminal(second_state, mission, AgileLossConfig())
     torch.testing.assert_close(first["final_attitude"], second["final_attitude"], atol=0., rtol=0.)
 
 
-def test_final_rest_and_terminal_speed_and_rate_have_gradients_without_arrival():
+def test_terminal_speed_and_rate_have_gradients_without_arrival():
     before, mission = scene()
     velocity = torch.tensor(((.4, -.2, .1),), dtype=DTYPE, requires_grad=True)
     omega = torch.tensor(((.3, -.4, .2),), dtype=DTYPE, requires_grad=True)
@@ -211,14 +280,57 @@ def test_final_rest_and_terminal_speed_and_rate_have_gradients_without_arrival()
     after = replace(before, position=mission.start, velocity=velocity, omega=omega)
     components, _ = step_cost(before, after, mission, step=95, active=torch.tensor((False,)))
     terminal = agile_terminal(after, mission, AgileLossConfig())
-    for name, values, tensor in (("rest_velocity", components, velocity),
-                                 ("rest_omega", components, omega),
+    for name, values, tensor in (("tracking_velocity", components, velocity),
                                  ("final_velocity", terminal, velocity),
                                  ("final_omega", terminal, omega)):
         assert values[name].item() > 0.
         gradient, = torch.autograd.grad(values[name].sum(), tensor, retain_graph=True)
         assert torch.isfinite(gradient).all()
         assert bool((gradient*tensor > 0).all())
+
+
+def test_late_tracking_has_no_extra_hold_cost_or_terminal_weight_window():
+    before, mission = scene()
+    after = replace(before, position=mission.goal+.03,
+                    velocity=torch.tensor(((.4, -.2, .1),), dtype=DTYPE),
+                    omega=torch.tensor(((.3, -.4, .2),), dtype=DTYPE))
+    config = AgileLossConfig()
+    no_terminal = replace(config, terminal_position_weight=0., terminal_velocity_weight=0.,
+                          terminal_attitude_weight=0., terminal_omega_weight=0., final_weight=0.)
+    for step in (81, 90, HORIZON):
+        components, metrics = step_cost(before, after, mission, step=step, config=config)
+        other, _ = step_cost(before, after, mission, step=step, config=no_terminal)
+        assert components["tracking_position"].item() > 0.
+        assert components["tracking_velocity"].item() > 0.
+        assert not any(name.startswith(("rest_", "final_", "hold_")) for name in components)
+        assert not any(name.startswith(("rest_", "hold_")) for name in metrics)
+        for name in components:
+            torch.testing.assert_close(components[name], other[name], rtol=0, atol=0)
+    assert agile_terminal(after, mission, config)["final_velocity"].item() > 0.
+    assert all(value.item() == 0. for value in agile_terminal(after, mission, no_terminal).values())
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("speed", (0., .4))
+def test_terminal_velocity_derivative_matches_closed_form_at_rest_and_in_motion(dtype, speed):
+    physical, mission = scene(dtype=dtype)
+    config = AgileLossConfig()
+    velocity = torch.tensor(((speed, -.5*speed, .25*speed),), dtype=dtype, requires_grad=True)
+    after = replace(physical, velocity=velocity)
+    cost = agile_terminal(after, mission, config)["final_velocity"]
+    gradient, = torch.autograd.grad(cost.sum(), velocity)
+    scale = config.terminal_velocity_scale_m_s
+    radius = torch.sqrt((velocity.detach()/scale).square().sum(-1, keepdim=True)
+                        +config.smooth_epsilon**2)
+    expected = config.final_weight*config.terminal_velocity_weight*velocity.detach()/(scale**2*radius)
+    assert torch.isfinite(gradient).all()
+    torch.testing.assert_close(gradient, expected)
+    if speed == 0.:
+        assert cost.item() == 0.
+        assert torch.equal(gradient, torch.zeros_like(gradient))
+    else:
+        assert cost.item() > 0.
+        assert bool((gradient*velocity > 0).all())
 
 
 @pytest.mark.parametrize("sign", (-1., 1.))
@@ -280,7 +392,7 @@ def test_metrics_and_loss_keep_all_original_rows_including_hover_and_infeasible(
     squares = torch.tensor((1., 4., 9., 16.), dtype=DTYPE)
     measurements = {name: squares for name in (
         "midpoint_position_sq", "midpoint_velocity_sq", "midpoint_attitude_sq",
-        "reference_position_sq", "reference_velocity_sq", "rest_speed_sq", "rest_omega_sq",
+        "reference_position_sq", "reference_velocity_sq",
     )}
     measurements["midpoint_speed"] = squares.sqrt()
     report = agile_metrics(physical, mission, config, measurements=measurements)
@@ -292,10 +404,10 @@ def test_metrics_and_loss_keep_all_original_rows_including_hover_and_infeasible(
     assert report["boundary_failure_rate"] == .75
     assert report["reference_scale_mean"] == pytest.approx(.075)
     assert report["midpoint_position_rms_m"] == pytest.approx(math.sqrt(30/4))
-    assert report["rest_velocity_rms_m_s"] == pytest.approx(math.sqrt(30/4))
+    assert report["reference_velocity_rms_m_s"] == pytest.approx(math.sqrt(30/4))
     assert report["midpoint_speed_mean_m_s"] == 2.5
     assert not any(word in key for key in report
-                   for word in ("success", "passed", "dwell", "difficulty"))
+                   for word in ("success", "passed", "dwell", "difficulty", "rest_", "hold_"))
 
 
 def test_no_event_progress_or_success_tolerance_in_continuous_objective_api():
@@ -304,14 +416,14 @@ def test_no_event_progress_or_success_tolerance_in_continuous_objective_api():
     assert "progress" not in inspect.signature(agile_step).parameters
     assert "next_observation" not in inspect.signature(agile_step).parameters
     assert not any(word in field.name for field in fields(AgileLossConfig)
-                   for word in ("tolerance", "success", "crossing", "dwell"))
+                   for word in ("tolerance", "success", "crossing", "dwell", "hold", "rest_"))
 
 
 @pytest.mark.parametrize("kwargs", (
     {"boundary_weight": -1.}, {"tracking_position_weight": True},
-    {"smooth_epsilon": 0.}, {"rest_velocity_scale_m_s": "1"},
-    {"midpoint_window_fraction": 1.}, {"rest_attitude_scale_rad": math.pi},
-    {"final_weight": float("nan")}, {"hold_weight": float("inf")},
+    {"smooth_epsilon": 0.}, {"terminal_velocity_scale_m_s": "1"},
+    {"midpoint_window_fraction": 1.}, {"terminal_attitude_scale_rad": math.pi},
+    {"final_weight": float("nan")}, {"terminal_omega_scale_rad_s": float("inf")},
 ))
 def test_invalid_continuous_loss_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
@@ -322,7 +434,7 @@ def test_incompatible_time_schedule_and_invalid_packet_dimensions_are_rejected()
     physical, mission = scene()
     config = AgileLossConfig()
     schedule = prepare_agile_schedule(mission, config, horizon=HORIZON, dt=DT)
-    with pytest.raises(ValueError, match="motion plus rest"):
+    with pytest.raises(ValueError, match="mission motion"):
         prepare_agile_schedule(replace(mission, duration=mission.duration+1.),
                                config, horizon=HORIZON, dt=DT)
     with pytest.raises(ValueError, match="horizon/dt mismatch"):

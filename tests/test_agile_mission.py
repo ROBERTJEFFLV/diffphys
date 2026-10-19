@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from diffphys.agile_mission import (
-    AgileMissionConfig, GRAVITY, HOVER_EQUILIBRIUM_LIMIT, MID_SPEED_COEFFICIENT,
+    AgileMissionConfig, GRAVITY, HOVER_EQUILIBRIUM_LIMIT, MID_ACCELERATION_COEFFICIENT,
+    MID_SPEED_COEFFICIENT,
     _actuators, _screen_reference, flatness_attitude, reference_arc_length, reference_kinematics,
     rk4_motor_setpoint, sample_agile_mission, smootherstep9,
 )
@@ -73,6 +74,67 @@ def test_flatness_angular_velocity_and_acceleration_match_time_derivatives():
     torch.testing.assert_close(omega_dot, (wp-wm)/(2*eps), atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("tilt_degrees", (90., 105., 135.))
+def test_heading_frame_and_derivatives_continue_through_horizontal_and_inverted_thrust(dtype, tilt_degrees):
+    # Prescribe a rotating thrust vector with known angular velocity and
+    # acceleration. Its heading stays transverse, including at exactly 90 deg.
+    time = torch.tensor((-.001, 0., .001), dtype=dtype)
+    angle = math.radians(tilt_degrees)+.7*time-.1*time.square()
+    rate = .7-.2*time
+    heading = time.new_tensor((math.cos(.37), math.sin(.37), 0.))
+    lateral = time.new_tensor((-math.sin(.37), math.cos(.37), 0.))
+    up = time.new_tensor((0., 0., 1.))
+    body_z = angle.sin()[:, None]*lateral+angle.cos()[:, None]*up
+    tangent = angle.cos()[:, None]*lateral-angle.sin()[:, None]*up
+    force = 1.2*GRAVITY*body_z
+    jerk = 1.2*GRAVITY*rate[:, None]*tangent
+    snap = 1.2*GRAVITY*(-.2*tangent-rate.square()[:, None]*body_z)
+    rotation, omega, omega_dot, valid = flatness_attitude(
+        force-GRAVITY*up, jerk, snap, heading.expand(3, 3))
+    tolerance = dict(rtol=2e-5, atol=2e-6) if dtype == torch.float32 else dict(rtol=1e-12, atol=1e-12)
+    assert bool(valid.all())
+    assert all(bool(torch.isfinite(value).all()) for value in (rotation, omega, omega_dot))
+    torch.testing.assert_close(rotation.transpose(-1, -2)@rotation,
+                               torch.eye(3, dtype=dtype).expand(3, 3, 3), **tolerance)
+    torch.testing.assert_close(torch.linalg.det(rotation), torch.ones(3, dtype=dtype), **tolerance)
+    torch.testing.assert_close(rotation[:, :, 2], body_z, **tolerance)
+    expected_omega = torch.zeros_like(omega)
+    expected_omega[:, 0] = -rate
+    expected_omega_dot = torch.zeros_like(omega_dot)
+    expected_omega_dot[:, 0] = .2
+    torch.testing.assert_close(omega, expected_omega, **tolerance)
+    torch.testing.assert_close(omega_dot, expected_omega_dot, **tolerance)
+    assert float((rotation[2]-rotation[0]).norm()) < .005
+    measured_tilt = float(torch.rad2deg(torch.acos(rotation[1, 2, 2].clamp(-1., 1.))))
+    assert measured_tilt == pytest.approx(tilt_degrees, abs=1e-4 if dtype == torch.float32 else 1e-10)
+    if tilt_degrees > 90.:
+        assert rotation[1, 2, 2] < 0
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("tilt_degrees", (90., 105., 135.))
+def test_s9_midpoint_acceleration_represents_requested_inverted_pose(dtype, tilt_degrees):
+    config = AgileMissionConfig(tilt_degrees=tilt_degrees)
+    direction = torch.tensor(((1., 0., 0.),), dtype=dtype)
+    theta = math.radians(config.tilt_degrees)
+    normalized_acceleration = direction.new_tensor((
+        0., config.thrust_ratio*math.sin(theta), 1-config.thrust_ratio*math.cos(theta)))
+    bend = (.3*normalized_acceleration/normalized_acceleration.norm())[None]
+    duration = (MID_ACCELERATION_COEFFICIENT*.3/(GRAVITY*normalized_acceleration.norm())).sqrt()[None]
+    _, velocity, acceleration, jerk, snap = reference_kinematics(
+        torch.zeros_like(direction), direction.new_tensor((.7,)), bend, direction,
+        duration, duration/2)
+    rotation, omega, omega_dot, valid = flatness_attitude(acceleration, jerk, snap, direction)
+    assert bool(valid.all())
+    assert bool((velocity[:, 0] > 0).all())  # Pass-through target remains moving.
+    assert all(bool(torch.isfinite(value).all()) for value in (rotation, omega, omega_dot))
+    actual = float(torch.rad2deg(torch.acos(rotation[0, 2, 2].clamp(-1., 1.))))
+    assert actual == pytest.approx(tilt_degrees, abs=1e-4 if dtype == torch.float32 else 1e-10)
+    if tilt_degrees > 90.:
+        assert rotation[0, 2, 2] < 0
+
+
 def test_exact_arc_length_matches_spatial_quadrature_and_degenerate_limits():
     # Integrate the spatial tangent independently of both the closed form and
     # its S9 timing. Include a straight line, a point, and zero forward span.
@@ -90,10 +152,29 @@ def test_exact_arc_length_matches_spatial_quadrature_and_degenerate_limits():
     assert actual[3] == .6
 
 
+def test_motion_can_use_all_500_steps_and_endpoint_persists_without_a_hold_interval():
+    original = clean_bank(2, horizon=500)
+    # A gentle straight reference uses all available time by construction.
+    # No mandatory final interval is subtracted from the five-second horizon.
+    config = AgileMissionConfig(tilt_degrees=0., thrust_ratio=1., half_span_fraction=.001)
+    _, mission = sample_agile_mission(original, config, seed=44, horizon=500)
+    assert bool(mission.feasible.all())
+    assert torch.equal(mission.duration, torch.full_like(mission.duration, 5.))
+    assert not hasattr(mission, "hold_seconds")
+    reference = mission.nominal_reference(torch.tensor(((0.,), (2.5,), (5.,), (6.,)), dtype=torch.float64))
+    torch.testing.assert_close(reference.position[0], mission.start)
+    torch.testing.assert_close(reference.position[1], mission.waypoint)
+    torch.testing.assert_close(reference.position[2], mission.goal)
+    torch.testing.assert_close(reference.position[3], mission.goal)
+    for derivative in (reference.velocity, reference.acceleration, reference.jerk,
+                       reference.snap, reference.omega, reference.omega_dot):
+        assert torch.equal(derivative[2:], torch.zeros_like(derivative[2:]))
+
+
 def test_full_geometry_is_retained_until_the_first_passing_duration(monkeypatch):
     import diffphys.agile_mission as module
 
-    original = clean_bank(1, horizon=800)
+    original = clean_bank(1, horizon=500)
     config = AgileMissionConfig()
     native_screen = module._screen_reference
     attempts = []
@@ -105,7 +186,7 @@ def test_full_geometry_is_retained_until_the_first_passing_duration(monkeypatch)
         return ok, reason
 
     monkeypatch.setattr(module, "_screen_reference", record_trial)
-    _, mission = sample_agile_mission(original, config, seed=44, horizon=800)
+    _, mission = sample_agile_mission(original, config, seed=44, horizon=500)
     assert len(attempts) > 1  # This aircraft cannot fly the first candidate.
     assert bool(mission.feasible.all())
     assert torch.equal(mission.reference_scale, torch.ones_like(mission.reference_scale))
@@ -158,8 +239,9 @@ def test_sampler_preserves_airframes_tapes_rng_and_recomputes_actual_targets():
         assert torch.equal(getattr(initial, field.name), getattr(repeated, field.name)), field.name
     assert len(initial.mass) == len(original.mass)
     assert mission.report["aircraft_resampled"] == 0
-    assert bool((mission.duration+mission.hold_seconds <= 5+1e-12).all())
-    assert bool((mission.duration < 4.).any())
+    assert bool((mission.duration <= 5+1e-12).all())
+    assert not hasattr(mission, "hold_seconds")
+    assert "hold_seconds" not in mission.report
     assert not bool(mission.is_hover.any())
     assert bool((mission.reference_scale <= 1.).all())
     assert set(mission.reference_scale.tolist()) <= set(config.shrink_factors)
@@ -183,19 +265,19 @@ def test_sampler_preserves_airframes_tapes_rng_and_recomputes_actual_targets():
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
 def test_initial_velocity_preserves_draws_fills_zero_rows_and_keeps_sensor_tapes(dtype):
-    original = RaptorSimulator().reset(4, seed=314, dtype=dtype, horizon=800,
+    original = RaptorSimulator().reset(4, seed=314, dtype=dtype, horizon=500,
                                        disturbances=DisturbanceConfig(force_enabled=False))
     velocity = original.velocity.clone()
     velocity[[0, 2]] = 0.
     original = replace(original, velocity=velocity)
     rng = torch.random.get_rng_state().clone()
-    initial, mission = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=800)
-    repeated, _ = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=800)
+    initial, mission = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=500)
+    repeated, _ = sample_agile_mission(original, AgileMissionConfig(), seed=91, horizon=500)
     # Geometry choices and feasibility backoff cannot consume the velocity
     # stream or silently replace already sampled nonzero kinematics.
     turned, _ = sample_agile_mission(original, AgileMissionConfig(yaw_degrees=0.),
-                                     seed=91, horizon=800)
-    redrawn, _ = sample_agile_mission(original, AgileMissionConfig(), seed=92, horizon=800)
+                                     seed=91, horizon=500)
+    redrawn, _ = sample_agile_mission(original, AgileMissionConfig(), seed=92, horizon=500)
     assert torch.equal(rng, torch.random.get_rng_state())
     assert torch.equal(initial.velocity, repeated.velocity)
     assert torch.equal(initial.velocity, turned.velocity)
@@ -296,9 +378,30 @@ def test_reported_feasible_motion_passes_the_same_full_actuator_grid():
     assert bool(mission.feasible.any())
 
 
+def test_default_sampler_keeps_actuator_feasible_midpoints_beyond_90_degrees():
+    original = clean_bank(32, horizon=500)
+    config = AgileMissionConfig()
+    _, mission = sample_agile_mission(original, config, seed=91, horizon=500)
+    inverted = mission.feasible & (mission.rotation[:, 2, 2] < 0)
+    assert bool(inverted.any())
+    rows = inverted.nonzero(as_tuple=True)[0]
+    selected = mission.select(rows)
+    actual = selected.nominal_reference(selected.duration/2)
+    assert bool((actual.rotation[:, 2, 2] < 0).all())
+    torch.testing.assert_close(actual.position, selected.waypoint)
+    torch.testing.assert_close(actual.rotation, selected.rotation)
+    actuators = {name: value.index_select(0, rows)
+                 for name, value in _actuators(original).items()}
+    ok, _ = _screen_reference(actuators, selected.center, selected.half_span,
+                              selected.bend, selected.direction, selected.duration,
+                              selected.position_scale, config)
+    assert bool(ok.all())
+
+
 @pytest.mark.parametrize("kwargs", (
-    {"tilt_degrees": 90.}, {"thrust_ratio": 0.}, {"boundary_margin_fraction": 1.},
-    {"hold_seconds": 0.}, {"hover_fraction": -1.}, {"shrink_factors": (1., .5)},
+    {"tilt_degrees": 180.}, {"tilt_degrees": -.01},
+    {"thrust_ratio": 0.}, {"boundary_margin_fraction": 1.},
+    {"hover_fraction": -1.}, {"shrink_factors": (1., .5)},
     {"center_fraction": (0., 0., .9)}, {"screen_batch_size": 0},
     {"duration_search_factor": 1.}, {"duration_search_factor": 2.01},
     {"duration_search_factor": float("nan")},
@@ -311,7 +414,7 @@ def test_config_rejects_invalid_values(kwargs):
 def test_short_horizon_rejected_and_selection_keeps_metadata_types():
     original = clean_bank(3)
     with pytest.raises(ValueError, match="horizon"):
-        sample_agile_mission(original, AgileMissionConfig(), seed=1, horizon=100)
+        sample_agile_mission(original, AgileMissionConfig(), seed=1, horizon=3)
     _, mission = sample_agile_mission(original, AgileMissionConfig(hover_fraction=1.), seed=1,
                                       horizon=500)
     selected = mission.select(torch.tensor((2, 0))).to("cpu", torch.float32)

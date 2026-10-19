@@ -21,7 +21,7 @@ def setup_case(horizon=61, count=4):
     raw = simulator.reset(count, seed=17, horizon=horizon, dtype=torch.float64,
                           disturbances=DisturbanceConfig.clean())
     initial, mission = sample_agile_mission(
-        raw, AgileMissionConfig(hold_seconds=.02, hover_fraction=1.),
+        raw, AgileMissionConfig(hover_fraction=1.),
         seed=12, horizon=horizon)
     # A controlled geometric reference exercises a real RK4 rollout; actuator
     # feasibility of sampled missions has separate numerical tests.
@@ -29,7 +29,7 @@ def setup_case(horizon=61, count=4):
     direction[:, 0] = 1.
     initial = replace(initial, position=-.15*direction, velocity=direction.clone(),
                       previous_velocity=direction[:, None].expand(-1, 3, -1).clone())
-    duration = max(2, 2*((horizon-2)//2))*.01
+    duration = max(4, 2*(horizon//2))*.01
     mission = replace(mission, start=initial.position.clone(),
                       waypoint=torch.zeros_like(direction), goal=.15*direction,
                       direction=direction, velocity=(315*.15/(64*duration))*direction,

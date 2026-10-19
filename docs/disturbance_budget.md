@@ -8,7 +8,7 @@ native benchmark and no stability, recoverability or deployment guarantee is mad
 
 ## Task-specific external force setting
 
-The v3 agile task uses the user's requested **no external force, retained initial
+The agile task uses the user's requested **no external force, retained initial
 linear velocity** setting. With `--task agile`, constant external force and every
 force-at-point pulse are disabled by default, including the corresponding pulse
 torque. Gravity, rotor thrust/torque and motor dynamics remain unchanged.

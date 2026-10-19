@@ -1,6 +1,6 @@
 @configs/response_raptor_multi_airframe.args
 --task agile
 --agile-config configs/agile_flight.json
---horizon 800
+--horizon 500
 --time-decay 0
 --work-dir runs/agile/from_hover_seed7

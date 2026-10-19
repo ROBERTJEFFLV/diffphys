@@ -45,7 +45,7 @@ are `diffphys/env_raptor.py`, `diffphys/response_noise.py`, `diffphys/response_p
 `tools/train_response_control.py`. See README.md for responsibilities.
 
 The hover training config is `configs/response_raptor_multi_airframe.args`;
-`configs/agile_flight.args` selects agile with its longer H800 horizon and
+`configs/agile_flight.args` selects agile with its H500 horizon and
 Time Decay 0 while retaining the same accelerated execution path.
 CUDA production uses strict full-step Inductor compilation of the original
 `RaptorSimulator.step`, dynamic survivor compaction, critical-region GC scheduling,
@@ -75,13 +75,19 @@ Use the same three-point target-generation rule throughout training. Do not add
 difficulty levels, update-dependent geometry ramps or automatic loss schedules.
 Committed updates select reproducible mission seeds only. Preserve the
 original physics, boundary, measurement noise family and physical gradient groups.
-The v3 user-requested agile exception disables external constant force and pulses
+The user-requested agile exception disables external constant force and pulses
 by default, preserves originally nonzero linear velocity for maneuver rows,
 and fills originally zero-velocity maneuver rows from an independent seeded
 per-axis Uniform[-2.5,2.5] m/s draw without replacing their aircraft or noise.
 Initialize all velocity-history slots consistently. The nominal S9 reference
 still starts at rest; continuous loss handles this initial tracking error without
-a new recovery phase or success gate. Hover retains its previous force default;
+a new recovery phase or success gate. The v4 mission requests 105-degree midpoint
+tilt through a projected-heading frame that remains continuous across 90 degrees.
+Keep all H500 steps available for motion; do not restore a fixed hold duration or
+late-time hold loss. After the planned motion endpoint, all public goal fields
+must specify the final point, zero velocity and the unforced level attitude.
+The once-at-H terminal residual still guides braking and attitude recovery.
+Hover retains its previous force default;
 an explicit external-force choice belongs in the checkpoint binding and replay.
 Source motor feasibility checks first search longer durations at full geometry,
 then allow geometric shrink at the maximum duration if required. Report actual

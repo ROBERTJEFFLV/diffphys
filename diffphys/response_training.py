@@ -57,7 +57,7 @@ AGILE_TRAIN_SEED_BASE = 41_000_007
 AGILE_VALIDATION_SEED = 42_000_007
 AGILE_TEST_SEED = 44_000_007
 AGILE_SAMPLING_PROTOCOL = {
-    "version": "fixed-three-point-cpu-mission-v3",
+    "version": "fixed-three-point-cpu-mission-v4",
     "train_seed_base": AGILE_TRAIN_SEED_BASE,
     "validation_seed": AGILE_VALIDATION_SEED,
     "test_seed": AGILE_TEST_SEED,
@@ -495,8 +495,8 @@ def train(args, policy_config, loss_config):
             agile_config = load_agile_config(getattr(args, "agile_config", None))
         if loss_config != agile_config.loss:
             raise ValueError("agile loss must match the expanded agile configuration")
-        if agile_config.mission.hold_seconds >= args.horizon * policy_config.dt:
-            raise ValueError("agile horizon must exceed mission hold_seconds")
+        if args.horizon < 4:
+            raise ValueError("agile horizon must allow at least four motion steps")
     elif not isinstance(loss_config, TaskLossConfig):
         raise ValueError("hover task requires the hover loss configuration")
     sampling = getattr(args, "train_sampling", "random")

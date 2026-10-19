@@ -12,12 +12,11 @@ import torch
 
 from .env_raptor import RaptorSimulator, RaptorState
 
-AGILE_OBJECTIVE_VERSION = "continuous-three-point-flatness-tracking-final-rest-v1"
+AGILE_OBJECTIVE_VERSION = "continuous-three-point-flatness-tracking-terminal-target-v2"
 GOAL_PACKET_DIM = 23
 AGILE_STEP_COMPONENTS = (
     "tracking_position", "tracking_velocity", "midpoint_position",
     "midpoint_velocity", "midpoint_attitude", "action_delta", "boundary",
-    "rest_position", "rest_velocity", "rest_attitude", "rest_omega",
 )
 AGILE_TERMINAL_COMPONENTS = (
     "final_position", "final_velocity", "final_attitude", "final_omega",
@@ -40,14 +39,13 @@ class AgileLossConfig:
     action_delta_weight: float = .02
     boundary_weight: float = 5.0
     final_weight: float = 2.0
-    hold_weight: float = 1.0
     boundary_margin_fraction: float = .15
     midpoint_window_fraction: float = .06
     midpoint_position_scale_fraction: float = .15
-    rest_position_scale_fraction: float = .04
-    rest_velocity_scale_m_s: float = .3
-    rest_attitude_scale_rad: float = .2
-    rest_omega_scale_rad_s: float = .5
+    terminal_position_scale_fraction: float = .04
+    terminal_velocity_scale_m_s: float = .3
+    terminal_attitude_scale_rad: float = .2
+    terminal_omega_scale_rad_s: float = .5
     velocity_scale_floor_m_s: float = .5
     smooth_epsilon: float = .01
 
@@ -62,11 +60,11 @@ class AgileLossConfig:
             elif value <= 0:
                 raise ValueError(field.name + " must be positive")
         for name in ("boundary_margin_fraction", "midpoint_window_fraction",
-                     "midpoint_position_scale_fraction", "rest_position_scale_fraction"):
+                     "midpoint_position_scale_fraction", "terminal_position_scale_fraction"):
             if getattr(self, name) >= 1:
                 raise ValueError(name + " must be less than one")
-        if self.rest_attitude_scale_rad >= math.pi:
-            raise ValueError("rest_attitude_scale_rad must be less than pi")
+        if self.terminal_attitude_scale_rad >= math.pi:
+            raise ValueError("terminal_attitude_scale_rad must be less than pi")
 
 
 @dataclass(frozen=True)
@@ -77,7 +75,6 @@ class AgileSchedule:
     rotation: torch.Tensor
     phase: torch.Tensor
     midpoint_weight: torch.Tensor
-    rest_weight: torch.Tensor
     horizon: int
     dt: float
 
@@ -103,14 +100,15 @@ def _attitude_angle(rotation, target):
 def prepare_agile_schedule(mission, config: AgileLossConfig, *, horizon: int, dt: float) -> AgileSchedule:
     if type(horizon) is not int or horizon < 1 or not math.isfinite(dt) or dt <= 0:
         raise ValueError("horizon and dt must be positive")
-    if not 0 < mission.hold_seconds < horizon*dt:
-        raise ValueError("horizon must include motion and the final rest interval")
     if (not bool(torch.isfinite(mission.duration).all())
             or not bool((mission.duration > 0).all())
-            or bool((mission.duration+mission.hold_seconds > horizon*dt+1e-6).any())):
-        raise ValueError("mission motion plus rest must fit the planned horizon")
-    time = torch.arange(horizon+1, device=mission.duration.device,
-                        dtype=mission.duration.dtype)[:, None]*dt
+            or bool((mission.duration > horizon*dt+1e-6).any())):
+        raise ValueError("mission motion must fit the planned horizon")
+    # Mission durations are quantized in FP64 then cast. Use the same clock
+    # arithmetic: FP32 arange*dt can otherwise fall one ULP below an endpoint
+    # and retain its obsolete midpoint target for an extra control step.
+    time = (torch.arange(horizon+1, device=mission.duration.device, dtype=torch.float64)*dt).to(
+        dtype=mission.duration.dtype)[:, None]
     reference = mission.nominal_reference(time)
     phase = (time/mission.duration).clamp(0., 1.)
     # Follow the reference near the middle: distance to a fixed waypoint
@@ -118,12 +116,10 @@ def prepare_agile_schedule(mission, config: AgileLossConfig, *, horizon: int, dt
     middle = torch.exp(-.5*((time[1:]/mission.duration-.5)
                            /config.midpoint_window_fraction).square())
     middle = middle/middle.sum(0, keepdim=True).clamp_min(torch.finfo(time.dtype).tiny)
-    # This final-time window does not depend on whether the aircraft has arrived.
-    u = ((time[1:, 0]-(horizon*dt-mission.hold_seconds))/mission.hold_seconds).clamp(0., 1.)
-    rest = u.pow(3)*(10.+u*(-15.+6.*u))
-    rest = rest/rest.sum().clamp_min(torch.finfo(time.dtype).tiny)
+    # The ordinary p/v reference remains at the final point after motion ends.
+    # No fixed hold interval or additional late-time weight is introduced.
     return AgileSchedule(reference.position, reference.velocity, reference.rotation,
-                         phase, middle, rest, horizon, dt)
+                         phase, middle, horizon, dt)
 
 
 def make_goal_packet(observation22: torch.Tensor, mission, time_seconds,
@@ -134,7 +130,9 @@ def make_goal_packet(observation22: torch.Tensor, mission, time_seconds,
     Current reference p(3), middle p(3), end p(3), middle R(9), middle v(3),
     normalized motion time(1), remaining seconds(1). The policy transforms these
     using measured p/R. Hidden force, motor truth and hover equilibrium attitude
-    are absent from the packet.
+    are absent from the packet. At and after the planned motion endpoint, all
+    three position slots specify the final point, the velocity slot is zero,
+    and the attitude slot specifies the public unforced endpoint attitude.
     """
     n = len(mission.start)
     if observation22.shape != (n, 22):
@@ -142,30 +140,40 @@ def make_goal_packet(observation22: torch.Tensor, mission, time_seconds,
     if schedule is None:
         reference = mission.nominal_reference(time_seconds)
         position = reference.position
+        reference_rotation = reference.rotation
         phase = (torch.as_tensor(time_seconds, device=mission.duration.device,
                                  dtype=mission.duration.dtype)/mission.duration).clamp(0., 1.)
     else:
         if step is None or not 0 <= step <= schedule.horizon:
             raise ValueError("schedule requires a valid step")
         position, phase = schedule.position[step], schedule.phase[step]
+        reference_rotation = schedule.rotation[step]
+    # Completion of the public time reference is independent of true position,
+    # velocity, flight success or hidden disturbance equilibrium. Continue to
+    # send one endpoint target, rather than the obsolete midpoint maneuver.
+    finished = phase >= 1.
+    position = torch.where(finished[:, None], mission.goal, position)
+    midpoint = torch.where(finished[:, None], mission.goal, mission.waypoint)
+    rotation = torch.where(finished[:, None, None], reference_rotation, mission.rotation)
+    velocity = torch.where(finished[:, None], 0., mission.velocity)
     remaining = torch.as_tensor(remaining_seconds, device=observation22.device,
                                 dtype=observation22.dtype)
     if remaining.numel() == 1:
         remaining = remaining.reshape(1).expand(n)
     if remaining.shape != (n,):
         raise ValueError("remaining_seconds must be scalar or [scene]")
-    return torch.cat((position, mission.waypoint, mission.goal, mission.rotation.flatten(1),
-                      mission.velocity, phase[:, None], remaining.clamp_min(0.)[:, None]), -1)
+    return torch.cat((position, midpoint, mission.goal, rotation.flatten(1),
+                      velocity, phase[:, None], remaining.clamp_min(0.)[:, None]), -1)
 
 
-def _rest_terms(physical, mission, config):
+def _terminal_terms(physical, mission, config):
     position = _smooth_norm((physical.position-mission.goal)
-                           /(mission.position_scale*config.rest_position_scale_fraction)[:, None],
+                           /(mission.position_scale*config.terminal_position_scale_fraction)[:, None],
                            config.smooth_epsilon)
-    velocity = _smooth_norm(physical.velocity/config.rest_velocity_scale_m_s, config.smooth_epsilon)
-    angle_scale = 2.*math.sin(config.rest_attitude_scale_rad/2.)**2
+    velocity = _smooth_norm(physical.velocity/config.terminal_velocity_scale_m_s, config.smooth_epsilon)
+    angle_scale = 2.*math.sin(config.terminal_attitude_scale_rad/2.)**2
     attitude = _attitude_cost(physical.rotation, mission.hover_rotation)/angle_scale
-    omega = _smooth_norm(physical.omega/config.rest_omega_scale_rad_s, config.smooth_epsilon)
+    omega = _smooth_norm(physical.omega/config.terminal_omega_scale_rad_s, config.smooth_epsilon)
     return position, velocity, attitude, omega
 
 
@@ -174,7 +182,7 @@ def agile_step(before: RaptorState, after: RaptorState, active: torch.Tensor, mi
                schedule: AgileSchedule | None = None):
     """Per-row smooth costs at a predetermined time, with no arrival decisions.
 
-    Tracking/rest still penalize frozen failure states at each planned time.
+    Tracking still penalizes frozen failure states at each planned time.
     Early failure cannot eliminate their remaining loss. The original simulator
     stops evaluating the Actor and RK4 for failed rows as before.
     """
@@ -196,8 +204,6 @@ def agile_step(before: RaptorState, after: RaptorState, active: torch.Tensor, mi
     v = _smooth_norm(v_error/speed_scale[:, None], config.smooth_epsilon)
     rotation = after.rotation
     middle = schedule.midpoint_weight[step-1]
-    rest = config.hold_weight*schedule.rest_weight[step-1]
-    rp, rv, rr, rw = _rest_terms(after, mission, config)
     delta = torch.where(active[:, None], after.previous_action-before.previous_action, 0.)
     warning = ((after.position.abs()/after.position_limit[:, None]
                 -(1.-config.boundary_margin_fraction))/config.boundary_margin_fraction
@@ -210,10 +216,6 @@ def agile_step(before: RaptorState, after: RaptorState, active: torch.Tensor, mi
         "midpoint_attitude": config.midpoint_attitude_weight*middle*_attitude_cost(rotation, r_ref),
         "action_delta": config.action_delta_weight*_smooth_norm(delta, config.smooth_epsilon)/horizon,
         "boundary": config.boundary_weight*warning/horizon,
-        "rest_position": rest*config.terminal_position_weight*rp,
-        "rest_velocity": rest*config.terminal_velocity_weight*rv,
-        "rest_attitude": rest*config.terminal_attitude_weight*rr,
-        "rest_omega": rest*config.terminal_omega_weight*rw,
     }
     with torch.no_grad():
         # Timestamp selection is independent of flight state, with no threshold
@@ -227,15 +229,13 @@ def agile_step(before: RaptorState, after: RaptorState, active: torch.Tensor, mi
             "midpoint_speed": selected*after.velocity.norm(dim=-1),
             "reference_position_sq": p_error.square().sum(-1)/horizon,
             "reference_velocity_sq": v_error.square().sum(-1)/horizon,
-            "rest_speed_sq": schedule.rest_weight[step-1]*after.velocity.square().sum(-1),
-            "rest_omega_sq": schedule.rest_weight[step-1]*after.omega.square().sum(-1),
         }
     return components, metrics
 
 
 def agile_terminal(physical: RaptorState, mission, config: AgileLossConfig) -> dict[str, torch.Tensor]:
     """Final residual once at H, including every original failed/frozen row."""
-    p, v, rotation, omega = _rest_terms(physical, mission, config)
+    p, v, rotation, omega = _terminal_terms(physical, mission, config)
     return {
         "final_position": config.final_weight*config.terminal_position_weight*p,
         "final_velocity": config.final_weight*config.terminal_velocity_weight*v,
@@ -269,8 +269,6 @@ def agile_metrics(physical: RaptorState, mission, config: AgileLossConfig, *,
             "midpoint_attitude_sq": "midpoint_attitude_rms_rad",
             "reference_position_sq": "reference_position_rms_m",
             "reference_velocity_sq": "reference_velocity_rms_m_s",
-            "rest_speed_sq": "rest_velocity_rms_m_s",
-            "rest_omega_sq": "rest_omega_rms_rad_s",
         }
         result.update({name: float(measurements[key].double().mean().sqrt()) for key, name in mapping.items()})
         result["midpoint_speed_mean_m_s"] = float(measurements["midpoint_speed"].double().mean())

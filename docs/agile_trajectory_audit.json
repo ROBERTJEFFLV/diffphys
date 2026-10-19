@@ -1,5 +1,5 @@
 {
-  "purpose": "Deterministic nominal reference-generator comparison; no policy rollout, trained performance or CUDA benchmark.",
+  "purpose": "Deterministic nominal reference comparison and separate force-free noisy reset checks; no learned-policy rollout, long training or CUDA benchmark.",
   "date_utc": "2026-10-19",
   "runtime": {
     "torch": "2.10.0+cpu",
@@ -11,66 +11,9 @@
   "physical_seed": 314,
   "mission_seed": 91,
   "aircraft_count": 32,
+  "reference_comparison_fixture": "RaptorSimulator.reset(32, seed=314, dtype=torch.float64, horizon=800, disturbances=DisturbanceConfig.clean()); both generators use these exact airframes; clean is a regression fixture, not the agile training noise setting.",
   "original_position_limit_unchanged": true,
   "previous": {
-    "commit": "624c6b4213de629a961f0677a9fba15f47071f6b",
-    "horizon": 500,
-    "config": {
-      "tilt_degrees": 60.0,
-      "thrust_ratio": 1.2,
-      "boundary_margin_fraction": 0.2,
-      "half_span_fraction": 0.45,
-      "bend_fraction": 0.2,
-      "hold_seconds": 1.0,
-      "hover_fraction": 0.0,
-      "yaw_degrees": null,
-      "center_fraction": [
-        0.0,
-        0.0,
-        0.0
-      ],
-      "actuator_margin_fraction": 0.01,
-      "shrink_factors": [
-        1.0,
-        0.8,
-        0.6,
-        0.4,
-        0.25,
-        0.125,
-        0.0625,
-        0.03125,
-        0.0
-      ],
-      "screen_batch_size": 128
-    },
-    "summary": {
-      "midpoint_tilt_degrees": {
-        "min": 7.671095506471886,
-        "mean": 38.591387033790085,
-        "max": 59.685638956537844
-      },
-      "path_length_m": {
-        "min": 0.480128121705676,
-        "mean": 2.1540719598185865,
-        "max": 4.957115759528844
-      },
-      "midpoint_speed_m_s": {
-        "min": 0.5737078681891993,
-        "mean": 2.6343323062553172,
-        "max": 5.189927024141403
-      },
-      "motion_duration_seconds": {
-        "min": 0.88,
-        "mean": 1.7349999999999999,
-        "max": 2.24
-      },
-      "moving_count": 32,
-      "feasible_count": 32,
-      "reference_capped_count": 26
-    }
-  },
-  "current": {
-    "production_source_sha256": "5d9fab102cea0a9245bc5293a7b6a379afec0942032ab0fce0399c69a83b33bd",
     "horizon": 800,
     "config": {
       "tilt_degrees": 75.0,
@@ -107,6 +50,7 @@
         "mean": 55.03956309014585,
         "max": 74.87659182799375
       },
+      "midpoint_tilt_above_90_count": 0,
       "path_length_m": {
         "min": 1.382961247011775,
         "mean": 5.705767646132822,
@@ -200,23 +144,319 @@
       "constant_force": "agile CLI defaults off; if explicitly enabled, compensated only in initial/final equilibrium, never in maneuver targets",
       "pulses": "agile CLI defaults off; existing tapes retained and never used in goals, resets or feasibility screen",
       "guarantee": "no continuous-time, disturbed-tracking or learned-control guarantee"
-    }
+    },
+    "commit": "69f00b947ebb94889efa85dca9a5978afeeb36e1"
   },
-  "initialization_checks": {
-    "every_maneuver_has_nonzero_speed": true,
-    "nonzero_original_velocities_retained": true,
-    "velocity_history_matches": true,
-    "constant_force_zero": true,
-    "pulse_tape_zero": true,
-    "sensor_noise_retained": true,
-    "velocity_latency_retained": true
+  "current": {
+    "horizon": 500,
+    "config": {
+      "tilt_degrees": 105.0,
+      "thrust_ratio": 1.2,
+      "boundary_margin_fraction": 0.2,
+      "half_span_fraction": 0.7,
+      "bend_fraction": 0.38,
+      "hover_fraction": 0.0,
+      "yaw_degrees": null,
+      "center_fraction": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actuator_margin_fraction": 0.01,
+      "duration_search_factor": 1.05,
+      "shrink_factors": [
+        1.0,
+        0.8,
+        0.6,
+        0.4,
+        0.25,
+        0.125,
+        0.0625,
+        0.03125,
+        0.0
+      ],
+      "screen_batch_size": 128
+    },
+    "summary": {
+      "midpoint_tilt_degrees": {
+        "min": 27.09036322872073,
+        "mean": 62.825402634113054,
+        "max": 104.73422874161687
+      },
+      "midpoint_tilt_above_90_count": 5,
+      "path_length_m": {
+        "min": 1.382961247011775,
+        "mean": 5.70576764613282,
+        "max": 9.168206365754953
+      },
+      "midpoint_speed_m_s": {
+        "min": 2.2352020322486217,
+        "mean": 4.430509286260351,
+        "max": 6.514844086358464
+      },
+      "motion_duration_seconds": {
+        "min": 1.3,
+        "mean": 2.6712499999999997,
+        "max": 4.46
+      },
+      "moving_count": 32,
+      "feasible_count": 32,
+      "reference_capped_count": 0
+    },
+    "report": {
+      "version": "agile-three-point-s9-wide-angle-terminal-target-v4",
+      "aircraft_rows": 32,
+      "aircraft_rows_retained": 32,
+      "aircraft_resampled": 0,
+      "horizon": 500,
+      "requested_tilt_degrees": 105.0,
+      "requested_mid_thrust_ratio": 1.2,
+      "planned_hover_count": 0,
+      "moving_count": 32,
+      "fallback_hover_count": 0,
+      "feasible_count": 32,
+      "infeasible_count": 0,
+      "reference_capped_count": 0,
+      "time_stretched_count": 31,
+      "time_capped_count": 0,
+      "reference_scale": {
+        "min": 1.0,
+        "mean": 1.0,
+        "max": 1.0
+      },
+      "actual_mid_tilt_degrees": {
+        "min": 27.09036322872073,
+        "mean": 62.825402634113054,
+        "max": 104.73422874161687
+      },
+      "actual_mid_speed_m_s": {
+        "min": 2.2352020322486217,
+        "mean": 4.430509286260351,
+        "max": 6.514844086358464
+      },
+      "actual_mid_thrust_ratio": {
+        "min": 0.6630428115011039,
+        "mean": 0.7442280152194474,
+        "max": 1.1916645692132013
+      },
+      "actual_path_length_m": {
+        "min": 1.382961247011775,
+        "mean": 5.70576764613282,
+        "max": 9.168206365754953
+      },
+      "initial_speed_m_s": {
+        "min": 1.0894212728396613,
+        "mean": 2.578906722942836,
+        "max": 3.804671850375622
+      },
+      "initial_zero_velocity_replaced_count": 1,
+      "motion_duration_seconds": {
+        "min": 1.3,
+        "mean": 2.6712499999999997,
+        "max": 4.46
+      },
+      "duration_stretch_factor": {
+        "min": 1.0,
+        "mean": 1.3975044298808381,
+        "max": 1.8898305084745763
+      },
+      "actuator_screen_evaluations": 241,
+      "initial_rejection_counts": {
+        "reference_boundary": 0,
+        "reference_attitude": 0,
+        "individual_rotor_thrust": 27,
+        "rk4_motor_setpoint": 31,
+        "constant_force_hover": 0,
+        "nonfinite": 0
+      },
+      "boundary": "unchanged world-fixed position_limit; reference Bezier control hull inside margin",
+      "attitude_frame": "reference heading projected perpendicular to thrust; continuous across 90 degrees; no fixed Euler yaw constraint",
+      "endpoint_reference": "position=goal and zero velocity, acceleration and angular rate from motion end onward; no reserved hold duration",
+      "actuator_screen": "unforced reference at every 100 Hz grid sample; individual rotor thrust and exact motor RK4 setpoints",
+      "reference_selection": "first passing ascending duration grid at full geometry; then descending spatial fallback at maximum duration; no global optimum certificate",
+      "initial_velocity": "original nonzero velocities retained; zero-velocity maneuver rows filled from independent per-axis U[-2.5,2.5] m/s; initial tracking error, not reference velocity",
+      "constant_force": "agile CLI defaults off; if explicitly enabled, compensated only in initial/final equilibrium, never in maneuver targets",
+      "pulses": "agile CLI defaults off; existing tapes retained and never used in goals, resets or feasibility screen",
+      "guarantee": "no continuous-time, disturbed-tracking or learned-control guarantee"
+    },
+    "production_source_sha256": "39a848a0862efd77c0a50e4bbd0480f3534a16779baf536266503884b3816beb",
+    "midpoint_tilt_degrees_by_aircraft": [
+      65.90687693656771,
+      34.48192659905079,
+      45.620412198044136,
+      64.31431043442568,
+      56.824328953697254,
+      93.24226265605921,
+      45.99848355001597,
+      51.955434131144166,
+      98.02554757288904,
+      79.99212670472546,
+      51.95529578444351,
+      59.118893587802496,
+      73.62331023265753,
+      59.62031556010972,
+      46.1772095620931,
+      34.60521936496803,
+      45.23441993670317,
+      87.52306363655038,
+      30.087725765993504,
+      73.276475651174,
+      27.09036322872073,
+      73.67822815004355,
+      58.558832468339205,
+      44.624686242100026,
+      58.85183528189691,
+      59.22335080004326,
+      93.74268330187559,
+      73.00490120914327,
+      104.73422874161687,
+      93.87205799765113,
+      51.96029663562061,
+      73.48778141545178
+    ],
+    "above_90_aircraft_indices": [
+      5,
+      8,
+      26,
+      28,
+      29
+    ],
+    "duration_seconds_by_aircraft": [
+      3.1,
+      2.96,
+      3.4,
+      1.3,
+      1.7,
+      2.1,
+      3.74,
+      2.94,
+      1.76,
+      1.34,
+      2.82,
+      2.9,
+      2.46,
+      2.68,
+      2.92,
+      3.64,
+      2.06,
+      2.68,
+      3.68,
+      2.24,
+      4.46,
+      2.08,
+      3.48,
+      2.46,
+      2.6,
+      3.04,
+      2.08,
+      2.66,
+      2.04,
+      2.32,
+      2.7600000000000002,
+      3.08
+    ],
+    "position_limit_m_by_aircraft": [
+      4.898559847535663,
+      2.724298555252552,
+      4.408000114866325,
+      0.8433959595604777,
+      1.302581663296711,
+      3.3024370163757912,
+      5.366334164977475,
+      3.633647353686874,
+      2.5173380062025075,
+      1.104835144065492,
+      3.3430698336585696,
+      3.9127688073829074,
+      3.4166788266647417,
+      3.3646307273417744,
+      3.2805536618121782,
+      4.130467237287849,
+      1.6080268169633678,
+      4.9208196969637,
+      3.812900941542723,
+      2.81985106142298,
+      5.184824907114418,
+      2.4444327068717975,
+      5.591211049479641,
+      2.270309461163497,
+      3.1336002332404167,
+      4.305830662939325,
+      3.2664951551749724,
+      3.962103154002019,
+      3.8574967978002768,
+      4.072461101155671,
+      3.2025604822280433,
+      5.346285233054419
+    ]
   },
-  "validation": {
-    "agile_passed": 122,
-    "other_targeted_passed": 104,
-    "total_passed": 226,
-    "cuda_skipped": 1,
-    "unrelated_h500_deselected": 1,
-    "long_training_run": false
-  }
+  "agile_training_reset_check": {
+    "config": {
+      "enabled": true,
+      "pulse_enabled": false,
+      "position_std": 0.001,
+      "velocity_std": 0.002,
+      "attitude_std": 0.001,
+      "omega_std": 0.002,
+      "velocity_delay_min": 0.01,
+      "velocity_delay_max": 0.03,
+      "force_enabled": false
+    },
+    "horizon": 500,
+    "checks": {
+      "all_maneuver_initial_velocities_nonzero": true,
+      "original_nonzero_velocities_bitwise_retained": true,
+      "history_slots_match_actual_initial_velocity": true,
+      "position_limits_bitwise_retained": true,
+      "external_force_is_zero": true,
+      "external_torque_is_zero": true,
+      "pulse_tape_is_zero": true,
+      "measurement_noise_is_present": true,
+      "measurement_tape_bitwise_retained": true,
+      "velocity_delay_bitwise_retained": true,
+      "velocity_delay_within_10_to_30_ms": true
+    },
+    "initial_speed_m_s": {
+      "min": 1.0894212728396613,
+      "mean": 2.578906722942836,
+      "max": 3.804671850375622
+    },
+    "initial_zero_velocity_replaced_count": 1
+  },
+  "wolfram_verification": {
+    "source": "docs/agile_trajectory_optimization.wl",
+    "source_sha256": "abeba4ac44fffdc249ce9da2dc09e41d7a12423a92b3edb555f2269ac334c4c0",
+    "full_file_executed": true,
+    "tilt_derivative_identity_residual": 0,
+    "tilt_derivative_strictly_positive": true,
+    "square_completion_identity_residual": 0,
+    "transverse_lower_bound_strictly_positive": true,
+    "projection_first_second_derivative_residuals": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ],
+    "normalization_first_second_derivative_residuals": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ],
+    "exact_horizontal_thrust_tilt_at_eta_6_over_5": "Pi/2",
+    "exact_roll_body_rate_and_acceleration": "{{angle_prime,0,0},{angle_double_prime,0,0}}"
+  },
+  "interpretation": "Requested tilt may decrease after timing/actuator checks. H500 reserves no hold interval; the nominal endpoint remains commanded for any t>=T. These finite-sample checks do not demonstrate learned flight or stability after the training horizon."
 }

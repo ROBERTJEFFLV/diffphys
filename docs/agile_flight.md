@@ -1,6 +1,6 @@
 # 三点机动飞行：数学、训练和悬停权重迁移
 
-本说明对应 `Agile-Flight-training` 分支的 `--task agile` 和 `agile-flight-training-v3` 配置。任务是：从点一带初速出发，按参考位姿和非零速度经过点二，再减速到点三并保持悬停。默认请求中间倾角为 75°，扩大边界内的路径跨度，并优先延长运动时间来满足电机能力。训练关闭恒定外力和外力脉冲，保留测量噪声与速度延迟。
+本说明对应 `Agile-Flight-training` 分支的 `--task agile` 和 `agile-flight-training-v4` 配置。任务是：从点一带初速出发，按参考位姿和非零速度经过点二，再减速到点三。默认请求中间倾角为 **105°**，采用原边界内的较长路径，训练长度恢复为 **500 步、5 秒**。全部 500 步都可用于参考运动，不再预留末段保持时间；参考运动结束后持续发送终点目标。训练关闭恒定外力和外力脉冲，保留测量噪声与速度延迟。
 
 每轮训练使用同一套三点生成规则，没有按更新次数或学习成绩改变目标幅度的课程。训练采用连续时间参考和连续损失，不设置到点切换、悬停达标或成功率门槛。名义参考仍从静止开始；真实初速作为初始跟踪误差，由同一套连续损失驱动恢复，详见第 4 节。
 
@@ -77,29 +77,45 @@ $$
 =-Kh\mathbf n+(g-KH)\mathbf e_z.
 $$
 
-机体推力轴沿 $\mathbf f_m$；在其竖直分量为正时，中点倾角满足
+机体推力轴沿 $\mathbf f_m$。采用可以区分锐角和钝角的双参数反正切，中点倾角满足
 
 $$
-\boxed{\tan\theta_m=\frac{K|h|}{g-KH}.}
+\boxed{\theta_m=\operatorname{atan2}(K|h|,g-KH)\in[0,\pi].}
 $$
 
 因此速度、曲率、高度和姿态不能独立乱抽。中点通常还有非零角速度：飞机正在改变倾斜方向，不能仅因为它位于途经点就把角速度参考设为零。
 
-完整姿态由推力轴和固定偏航角共同确定。令 $\mathbf f=\ddot{\mathbf p}+g\mathbf e_z$，代码使用
+完整姿态由推力轴和投影参考航向共同确定。令 $\mathbf f=\ddot{\mathbf p}+g\mathbf e_z$，代码使用
 
 $$
 \mathbf b_3=\frac{\mathbf f}{\|\mathbf f\|},\qquad
-\mathbf b_1=\frac{f_z\mathbf e-(\mathbf f\cdot\mathbf e)\mathbf e_z}
-{\|f_z\mathbf e-(\mathbf f\cdot\mathbf e)\mathbf e_z\|},\qquad
+\mathbf x=\mathbf e-(\mathbf e\cdot\mathbf b_3)\mathbf b_3,\qquad
+\mathbf b_1=\frac{\mathbf x}{\|\mathbf x\|},\qquad
 \mathbf b_2=\mathbf b_3\times\mathbf b_1,\quad
 R=[\mathbf b_1\;\mathbf b_2\;\mathbf b_3].
 $$
 
-在 $f_z>0$ 的适用范围内，机体前轴的水平投影与 $\mathbf e$ 同向。中点姿态不是把机体前轴直接对齐速度再任意添加倾角。角速度由 $[\boldsymbol\omega]_\times=R^T\dot R$ 求得，角加速度继续由解析时间导数求得；筛选器排除近自由落体、推力方向退化或进入倒飞范围的名义参考。
+这把参考航向 $\mathbf e$ 投影到推力轴的法平面，给出完整的旋转矩阵。起点、中点和终点的机体前轴与 $\mathbf e$ 同向，途中不再强制固定 Euler yaw。中点恰好 90° 时，$\mathbf f\cdot\mathbf e=0$，所以 $\mathbf x=\mathbf e$，没有旧公式的退化。
 
-### 默认的 75° 和推力比 1.2
+设 $c=\mathbf e\cdot\mathbf b_3$，解析导数为
 
-`tilt_degrees=75` 与 `thrust_ratio=1.2` 定义的是**请求中点姿态及该点总推力与重量的比值**。后者不是把飞机本身的推重比改为 1.2。默认构造
+$$
+\dot{\mathbf x}=-\dot c\mathbf b_3-c\dot{\mathbf b}_3,\qquad
+\ddot{\mathbf x}=-\ddot c\mathbf b_3-2\dot c\dot{\mathbf b}_3-c\ddot{\mathbf b}_3.
+$$
+
+单位化后得到 $R,\dot R,\ddot R$，再由 $[\boldsymbol\omega]_\times=R^T\dot R$ 求角速度及其解析导数。对当前曲线，$\mathbf f=A\mathbf e+C(h\mathbf n+H\mathbf e_z)+g\mathbf e_z$。与 $\mathbf e$ 垂直的推力分量满足
+
+$$
+\|\mathbf f_\perp\|^2=(Ch)^2+(CH+g)^2
+\ge\frac{g^2h^2}{h^2+H^2}>0\quad(h\ne0).
+$$
+
+因此非零曲线且请求倾角在 $(0,180^\circ)$ 时，没有精确的航向平行奇点。筛选器仍排除推力模长过小、航向投影退化以及执行器超限；世界竖直推力为零或负值本身不再作为拒绝条件。旋翼总推力始终为 $m\|\mathbf f\|\ge0$，水平或向下的世界推力由机体朝向实现。
+
+### 默认的 105° 和推力比 1.2
+
+`tilt_degrees=105` 与 `thrust_ratio=1.2` 定义的是**请求中点姿态及该点总推力与重量的比值**。后者不是把飞机本身的推重比改为 1.2。默认构造
 
 $$
 \mathbf D=\eta\sin\theta\,\mathbf n+(1-\eta\cos\theta)\mathbf e_z,
@@ -117,11 +133,11 @@ $$
 \mathbf a_m=g[-\eta\sin\theta\,\mathbf n+(\eta\cos\theta-1)\mathbf e_z].
 $$
 
-75°、1.2 对应中点向下加速度约 $0.6894g$，所以是带高度变化的倾侧机动。恒高 75° 转弯仅中点就需要 $1/\cos75^\circ\approx3.86$ 倍重量的总推力，不能与这里的参考混淆。默认中心为零时，端点控制点长度为 $0.70B_i$，中间控制点长度为 $0.76B_i$，均小于保留余量后的 $0.80B_i$；原边界本身没有扩大。
+105°、1.2 对应中点向下加速度约 $1.3106g$；恰好 90° 时竖直加速度为 $-g$。因此这里是带高度变化、可短暂超过水平倾角的机动，中点并不要求保持高度。默认中心为零时，端点控制点长度为 $0.70B_i$，中间控制点长度为 $0.76B_i$，均小于保留余量后的 $0.80B_i$；原边界本身没有扩大。
 
-实现会把运动时长量化到偶数个 100 Hz 控制步，让中点恰好落在网格上，并给末段悬停保留时间。新的 `configs/agile_flight.args` 默认 H800，共 8 秒，`hold_seconds=1`，因此运动段最多 7 秒；通过物理检查的参考可以提前结束，并在终点继续保持。量化、时间上限和执行器限制后的实际中点速度、倾角会重新计算并写入报告。扩大路径和延长 episode 是两个不同设置：只把 H500 改为 H800，不会自动增加原来的三点间距。
+实现会把运动时长量化到偶数个 100 Hz 控制步，让中点恰好落在网格上。`configs/agile_flight.args` 默认 H500，共 5 秒，允许 $T=5$ 秒；`hold_seconds` 字段及相应的时间预留已经移除。通过物理检查的参考可以提前结束，之后持续给出终点位置、零速度和水平姿态。量化、时间上限和执行器限制后的实际中点速度、倾角会重新计算并写入报告。默认较长的空间几何保持为 $L=0.70B_i,\|\mathbf d\|=0.38B_i$，不会因恢复 H500 而主动缩短。
 
-本版本覆盖对称倾侧转弯和斜向跃升。`yaw_degrees` 可以固定航向；`center_fraction` 可以改变相对于原边界的中心位置。它不支持任意三个位置与任意三个姿态完全独立指定，也不包含翻滚一周或倒飞等动作。
+`tilt_degrees` 现在接受 $[0,180^\circ)$，包括 90°、105° 和更大倾角。精确 180° 不属于当前姿态构造的有效参数，接近 180° 的请求也可能因推力、转矩和电机响应被显著放慢，从而减小实际倾角。允许输入一个角度不等于每架机体都能完成该角度。`yaw_degrees` 固定路径的参考航向；`center_fraction` 改变相对于原边界的中心位置。该几何族允许短暂倒倾，但不描述完整翻滚一周，也不支持任意三个位置与任意三个姿态独立指定。
 
 ### Wolfram 核验与有界形状优化
 
@@ -132,7 +148,7 @@ $$
 +\frac{L^2}{2b}\operatorname{asinh}\!\left(\frac{2b}{L}\right),
 $$
 
-直线极限为 $2L$。在不发生空间回退时，新默认曲线长度为约 $1.639753B$；旧默认曲线为约 $1.007376B$，几何本身延长约 62.8%。实际生成结果的增幅还受旧版空间回退和新版时间选择影响。
+直线极限为 $2L$。在不发生空间回退时，当前曲线长度约为 $1.639753B$，沿用 v3 的较长几何。相对于 v2 的 $L=0.45B,b=0.20B$、弧长约 $1.007376B$，几何本身延长约 62.8%。本次恢复 H500 保留这一跨度和弯曲量，v3 与 v4 的默认弧长相同。
 
 Wolfram 对 S9 路径的平方 snap 积分给出
 
@@ -158,15 +174,18 @@ $$
 | $L\mapsto sL,\ \mathbf d\mapsto s\mathbf d$，时间不变 | $s$ | $s$ | $s$ | $s$ |
 | $T\mapsto T/\sqrt{s}$，几何不变 | $1$ | $s$ | $s^{3/2}$ | $s^2$ |
 
-因此延长时间能保留完整路径，并更明显地降低姿态变化和电机变化需求。它不是把同一个 75° 动作任意放慢后仍宣称倾角不变：实际姿态必须由新的加速度重新计算。令 $s=(T_*/T)^2$，完整几何的中点满足
+因此延长时间能保留完整路径，并更明显地降低姿态变化和电机变化需求。实际姿态必须由新的加速度重新计算。令 $s=(T_*/T)^2$，完整几何的中点满足
 
 $$
-\tan\theta_m(s)=\frac{s\eta\sin\theta}{1-s(1-\eta\cos\theta)},\qquad
-\frac{d\tan\theta_m}{ds}
-=\frac{\eta\sin\theta}{[1-s(1-\eta\cos\theta)]^2}>0
+\theta_m(s)=\operatorname{atan2}\!\left(s\eta\sin\theta,1-s(1-\eta\cos\theta)\right),
 $$
 
-（要求推力竖直分量为正，且请求倾角在 $0<\theta<89^\circ$）。在这个几何族内，较短的可行时长保留较大的实际中间倾角。Wolfram Language 的可复现推导见 [`agile_trajectory_optimization.wl`](agile_trajectory_optimization.wl)。实现采用有限时间候选和 100 Hz 执行器审核；这不等于求得连续时间、全局最优的轨迹，也不证明全部可行时长构成单一区间。
+$$
+\frac{d\theta_m}{ds}
+=\frac{\eta\sin\theta}{(s\eta\sin\theta)^2+[1-s(1-\eta\cos\theta)]^2}>0.
+$$
+
+该式适用于 $0<\theta<180^\circ,\eta>0,s>0$，跨过 90° 仍连续且严格单调。因此在这个几何族内，较短的可行时长保留较大的实际中间倾角。Wolfram 使用的双参数写法是 `ArcTan[vertical, horizontal]`，参数顺序与 Python `atan2(horizontal, vertical)` 相反。可复现推导见 [`agile_trajectory_optimization.wl`](agile_trajectory_optimization.wl)。实现采用有限时间候选和 100 Hz 执行器审核；这不等于求得连续时间、全局最优的轨迹，也不证明全部可行时长构成单一区间。
 
 若完整几何在全部候选上都不通过，才在最大运动时长下使用几何比例 $a$ 缩放
 
@@ -174,7 +193,7 @@ $$
 L_a=aL,\qquad \mathbf d_a=a\mathbf d.
 $$
 
-速度和加速度都随这个比例线性变化；姿态从新的加速度重新求解，不能把角度直接当成 $a\times75^\circ$。报告中的 `reference_scale` 仍然只表示这次构造用了多大的几何比例，`duration_stretch_factor` 则单独记录时间变化；它们都不衡量学习难度。
+速度和加速度都随这个比例线性变化；姿态从新的加速度重新求解，不能把角度直接当成 $a\times105^\circ$。报告中的 `reference_scale` 仍然只表示这次构造用了多大的几何比例，`duration_stretch_factor` 则单独记录时间变化；它们都不衡量学习难度。
 
 空间回退仍按固定比例表检查，默认值为 `1, 0.8, 0.6, 0.4, 0.25, 0.125, 0.0625, 0.03125, 0`，采用第一个通过名义物理检查的比例。所有检查均在 rollout 前完成，不读取 Actor 的飞行表现，也不决定何时换点。所有已经抽好的飞机、测量噪声和物理组都保留。外力是否启用是单独保存的任务设置，不由参考可行性结果切换。
 
@@ -234,6 +253,8 @@ $$
 | 点二姿态、点二通过速度 | 9 + 3 | 提供中途机动要求 |
 | $\operatorname{clip}(t/T,0,1)$、本条轨迹剩余秒数 | 1 + 1 | 提供连续时间进度和剩余时间 |
 
+当 $t\ge T$ 时，保持 23 维接口，三个位置槽全部填入 $\mathbf p_f$，原中点速度槽填零，原中点姿态槽填入公开的水平终点姿态；进度为 1，剩余时间非负截断。因此结束运动后只发送终点要求，不再继续发送已过时的中点倾角。这个变化由预定时钟触发，与飞机是否真的到达无关。预计算目标时钟先在 FP64 中乘以控制周期再转换到任务 dtype，与运动时长的量化一致，避免 FP32 舍入令终点命令晚一拍。
+
 Actor 将这些目标与测量位置、姿态等一起转换为反馈特征，经 GRU 输出四路电机命令。顺序同时体现在目标字段的语义和随时间移动的参考中。它没有一个需要达标才能前进的离散任务编号。
 
 **当前实现采用预定时间顺序。** 如果飞机在中点时刻没有飞到点二，参考仍然继续向点三推进；它不会等待补过点二。连续损失惩罚这个偏差，并通过可微物理把梯度传回较早的电机动作和网络参数。因此，这个实现表达了按顺序飞行的训练要求，但不能把“按时间推进参考”表述为已经保证实际逐点穿过。
@@ -242,21 +263,20 @@ Actor 将这些目标与测量位置、姿态等一起转换为反馈特征，�
 
 ### 连续损失怎样提供梯度
 
-Actor 看到测量状态、公开目标和连续时间进度。输入中的 `phase` 是 $\operatorname{clip}(t/T,0,1)$，位置参考由它经过 $S_9$ 后生成；其阶段信息不由仿真真值、“已经通过”或“悬停达标”触发。全程损失跟踪参考位置、速度，中点时间窗额外强调位置、速度和参考姿态，末段损失强调终点位置、零速度、平衡姿态与零角速度。没有在机动中惩罚角速度偏离零，也没有对全程角速度参考单独增加跟踪项。
+Actor 看到测量状态、公开目标和连续时间进度。输入中的 `phase` 是 $\operatorname{clip}(t/T,0,1)$，位置参考由它经过 $S_9$ 后生成；其阶段信息不由仿真真值、“已经通过”或“悬停达标”触发。全程损失跟踪参考位置、速度，中点时间窗额外强调位置、速度和参考姿态，最后 H 状态的单次终点残差强调终点位置、零速度、平衡姿态与零角速度。没有在机动中惩罚角速度偏离零，也没有对全程角速度参考单独增加跟踪项。
 
-最后至少 `hold_seconds` 的参考保持为终点位置和零速度、零角速度；训练逐时计算这一段的损失，不使用连续达标步数或通过/失败门槛。具体权重如下，所有时间窗在 rollout 前根据时钟预先计算。
+固定保持时间及对应的 `hold_weight`、逐步 `rest_*` 损失和指标均已移除。刹车仍有全程速度参考和最后状态的速度残差提供梯度；终点姿态及角速度仍由最后状态的连续残差引导，不设置任何悬停成功判断。具体权重如下，中点时间权重在 rollout 前根据时钟预先计算。
 
 | 损失部分 | 时间权重 | 默认主要权重 |
 |---|---|---|
 | 全程参考位置、速度 | 每步 $1/N_{\rm steps}$ | 位置 1，速度 0.25 |
 | 中点附近位置、速度、姿态 | 以 $t/T=0.5$ 为中心、宽度 $0.06T$ 的归一化高斯窗 | 位置 4，速度 1，姿态 2 |
-| 最后 1 秒的终点位置、速度、姿态、角速度 | 五次 smoothstep 逐渐增加，再归一化 | 位置 1，速度 0.5，姿态 0.25，角速度 0.05 |
-| 最后一个状态 | 终点残差再计算一次 | 上述终点权重乘 2 |
+| 最后 H 状态的终点位置、速度、姿态、角速度 | 只计算一次终点残差 | 位置 1，速度 0.5，姿态 0.25，角速度 0.05，再统一乘 2 |
 | 电机命令变化、边界余量 | 每步 $1/N_{\rm steps}$ | 命令 0.02，边界 5 |
 
-其中 $N_{\rm steps}$ 为 episode 的总控制步数，agile 参数文件默认 800。
+其中 $N_{\rm steps}$ 为 episode 的总控制步数，agile 参数文件默认 500。
 
-中点高斯窗跟踪的是**该时刻的移动参考**，仅在中心时刻它等于途经点。若把整个时间窗的位置目标都固定为途经点，会给减速停留留下错误激励。每架飞机的运动段可以提前结束，此时全程位置、速度损失继续跟踪终点；额外的静止姿态和角速度损失在整个 episode 的最后 `hold_seconds` 内平滑增加。
+中点高斯窗跟踪的是**该时刻的移动参考**，仅在中心时刻它等于途经点。若把整个时间窗的位置目标都固定为途经点，会给减速停留留下错误激励。每架飞机的运动段可以提前结束，此时普通位置、速度损失继续跟踪终点。终点后的参考可持续提供，但训练只对实际展开的 H500 计算梯度；持续发送目标本身不等于已经验证 5 秒以后的稳定悬停。
 
 原边界导致的终止仍停止该行后续 Actor 和物理步进，但保留它的末状态，继续计算剩余时间的参考残差和终点残差。提前越界不能删除剩余任务损失，原有飞机行也不会从平均 objective 中移除。
 
@@ -267,7 +287,7 @@ $$
 =1-\cos\theta_{\rm error}.
 $$
 
-向量残差使用 $\rho_\epsilon(\mathbf x)=\sqrt{\|\mathbf x\|^2+\epsilon^2}-\epsilon$，默认 $\epsilon=0.01$。默认全程位置尺度为 $B_i$，中点位置尺度为 $0.15B_i$，静止位置尺度为 $0.04B_i$；跟踪速度尺度为 $\max(\|\mathbf v_m\|,0.5\,\mathrm{m/s})$。静止速度、姿态和角速度尺度分别为 0.3 m/s、0.2 rad、0.5 rad/s。这些量用于归一化损失，均不是“通过阈值”。
+向量残差使用 $\rho_\epsilon(\mathbf x)=\sqrt{\|\mathbf x\|^2+\epsilon^2}-\epsilon$，默认 $\epsilon=0.01$。默认全程位置尺度为 $B_i$，中点位置尺度为 $0.15B_i$，终点位置尺度为 $0.04B_i$；跟踪速度尺度为 $\max(\|\mathbf v_m\|,0.5\,\mathrm{m/s})$。终点速度、姿态和角速度尺度分别为 0.3 m/s、0.2 rad、0.5 rad/s，对应新的 `terminal_*_scale*` 字段。这些量用于归一化损失，均不是“通过阈值”。姿态损失在 90° 和 105° 的相对误差处有非零角度梯度；精确 180° 的相对误差是该矩阵损失的驻点，本次没有声称解决完整翻滚的全部姿态优化问题。
 
 ### 固定目标分布与验证
 
@@ -322,7 +342,7 @@ policy.eval()
 
 `--resume` 则用于同一 agile 任务的严格续训，需要保存的源码、任务配置、数值后端与其它绑定保持一致，并恢复 Adam、随机状态、采样和已提交更新数。它与 `--init-checkpoint` 互斥。不要通过修改旧 checkpoint 的摘要来绕过匹配检查。
 
-训练保留全时域反向传播。agile 参数文件使用 `--time-decay 0`，因此不会在物理状态、GRU 记忆、速度历史或中间统计区间处主动截断远期梯度。这里沿用 `CPU_compile_accelerated` 的执行链：CUDA 单步 `RaptorSimulator.step` 通过 `torch.compile(fullgraph=True, dynamic=True)` 和 strict Inductor 编译，AOTAutograd 生成该物理步的前向与反向；CPU 保留原生物理参考。GRU、完整展开、任务损失、分组梯度探针和 Adam 仍由原训练链执行。H800 的完整 BPTT 由各步 autograd 图相连，不等于把整条 800 步训练编译成一个图。
+训练保留全时域反向传播。agile 参数文件使用 `--time-decay 0`，因此不会在物理状态、GRU 记忆、速度历史或中间统计区间处主动截断远期梯度。这里沿用 `CPU_compile_accelerated` 的执行链：CUDA 单步 `RaptorSimulator.step` 通过 `torch.compile(fullgraph=True, dynamic=True)` 和 strict Inductor 编译，AOTAutograd 生成该物理步的前向与反向；CPU 保留原生物理参考。GRU、完整展开、任务损失、分组梯度探针和 Adam 仍由原训练链执行。H500 的完整 BPTT 由各步 autograd 图相连，不等于把整条 500 步训练编译成一个图。
 
 如另开实验采用 `--time-decay 0.2`，前向飞行与损失不变，但每个计划时间步的状态反向梯度会乘以 $e^{-0.2\Delta t}$。agile 在越界后的冻结状态上也继续相同的恒等状态扩展与反向衰减，使剩余损失的梯度不依赖同批其它飞机是否还在飞行；不会再次执行冻结行的 Actor 或物理步进。这是替代梯度，会减弱远期终点损失对较早动作的影响，不应称为原始完整梯度。已有的物理组梯度缩小裁剪也仍然会改变最终优化器收到的梯度。
 
@@ -338,7 +358,7 @@ python tools/train_response_control.py @configs/agile_flight.args \
     --work-dir runs/agile/from_hover_seed7
 ```
 
-`@configs/agile_flight.args` 复用原加速配置的 CUDA、CPU 预取和物理分组设置，选择 agile、H800、Time Decay 0 和无外力训练。训练规模仍是 3072 条场景，示例预算仍为 50 次更新或 1800 秒；这些资源和预算参数可在命令末尾显式覆盖。原 `configs/response_raptor_multi_airframe.args` 继续作为 hover 配置，保留 H500 和 Time Decay 1。旧悬停损失的参数即使在继承配置中出现，也不会成为 agile 的姿态变化惩罚。
+`@configs/agile_flight.args` 复用原加速配置的 CUDA、CPU 预取和物理分组设置，选择 agile、H500、Time Decay 0 和无外力训练。训练规模仍是 3072 条场景，示例预算仍为 50 次更新或 1800 秒；这些资源和预算参数可在命令末尾显式覆盖。原 `configs/response_raptor_multi_airframe.args` 继续作为 hover 配置，保留 H500 和 Time Decay 1。旧悬停损失的参数即使在继承配置中出现，也不会成为 agile 的姿态变化惩罚。
 
 外力设置与任务配置一起保存在 checkpoint 绑定中；评估、严格续训和更新重放沿用保存的设置。修改源码、任务配置或外力协议需要新运行，并通过 `--init-checkpoint` 显式迁移兼容权重；不能用新的 CLI 标志偷偷改变旧 checkpoint 的评估环境。
 
@@ -382,11 +402,11 @@ python tools/train_response_control.py --mode evaluate --task agile \
 
 | 配置部分 | 作用 |
 |---|---|
-| `version` | 当前为 `agile-flight-training-v3`，与旧版本的严格续训区分 |
-| `mission` | 请求倾角与推力比、固定几何规则、边界余量、末段保持时间、`duration_search_factor` 和物理可行性检查 |
+| `version` | 当前为 `agile-flight-training-v4`，与旧版本的严格续训区分 |
+| `mission` | 请求倾角与推力比、固定几何规则、边界余量、`duration_search_factor` 和物理可行性检查；无保持时间字段 |
 | `loss` | 连续位置、速度、姿态、角速度及命令/边界损失的尺度与权重 |
 
-检查日志时同时看连续 objective 与任务生成报告。`actual_mid_tilt_degrees`、`actual_mid_speed_m_s` 和 `actual_path_length_m` 记录真正生成的机动要求；`initial_speed_m_s` 记录真实初速，`initial_zero_velocity_replaced_count` 记录原零速度机动行的补采；`time_stretched_count` 与 `duration_stretch_factor` 记录时间扩展，`reference_scale` 与 `reference_capped_count` 记录剩余的空间回退。`fallback_hover_count`、`infeasible_count`、`initial_rejection_counts` 和 `actuator_screen_evaluations` 用于解释退化参考及规划工作量。不能只看配置中的“75°”，也不能把这些参考指标当成 Actor 已实现的飞行结果。
+检查日志时同时看连续 objective 与任务生成报告。`actual_mid_tilt_degrees`、`actual_mid_speed_m_s` 和 `actual_path_length_m` 记录真正生成的机动要求；`initial_speed_m_s` 记录真实初速，`initial_zero_velocity_replaced_count` 记录原零速度机动行的补采；`time_stretched_count` 与 `duration_stretch_factor` 记录时间扩展，`reference_scale` 与 `reference_capped_count` 记录剩余的空间回退。`fallback_hover_count`、`infeasible_count`、`initial_rejection_counts` 和 `actuator_screen_evaluations` 用于解释退化参考及规划工作量。不能只看配置中的“105°”，也不能把这些参考指标当成 Actor 已实现的飞行结果。
 
 源码与测试的入口包括：
 
@@ -398,40 +418,40 @@ python tools/train_response_control.py --mode evaluate --task agile \
 
 单元测试和小规模数值检查能验证公式、接口、梯度与保存恢复逻辑；它们不等于已经得到会特技飞行的权重，也不等于 CUDA 吞吐或实飞效果。训练结果应由实际运行日志中的连续损失和飞行轨迹单独说明。
 
-### 本次 v3 版本的验证
+### 本次 v4 版本的验证
 
-2026-10-19 集成验证使用 PyTorch 2.10.0+cpu。三组有针对性的回归共 **226 项通过**；1 项依赖 CUDA 的测试跳过，1 项与本次修改无关的完整 H500 图检查未选入。agile 相关测试为 122 项；扰动、物理约定、旧训练/重放和生产管线回归为 104 项。新增参数文件的清单断言更新后，该项单独重新执行通过；其余测试无需重复运行。
+2026-10-19 集成验证使用 PyTorch 2.10.0+cpu。针对本次改动的回归共 **166 项通过**，覆盖全部 agile 测试、物理约定和生产管线。生产管线第一次在受限环境中因 PyTorch 进程间 socket 权限失败；取得所需进程通信权限后，原测试 11 项全部通过，没有改动采样器实现。
 
 ```bash
-python -m pytest -q tests/test_agile*.py
-python -m pytest -q tests/test_external_force_switch.py tests/test_disturbances.py \
-    tests/test_pulse_physics.py tests/test_core_contract.py tests/test_reference_training.py \
-    tests/test_update_audit.py tests/test_production_pipeline.py \
-    -k 'not actual_h500_default_width_graph_with_delayed_measurements'
+python -m pytest -q tests/test_agile*.py tests/test_core_contract.py \
+    tests/test_production_pipeline.py
 ```
 
-验证范围包括参考公式与原边界、保留几何的时间搜索、无外力但保留测量噪声/延迟、
+验证范围包括精确 90°、105° 和 135° 下的 SO(3) 姿态、解析角速度与角加速度、
+参考占满 500 步、末点在任意后续时刻持续有效、FP32 时钟边界的一致性、
+固定保持窗口完全移除、原边界、无外力但保留测量噪声/延迟、
 初速和历史速度一致性、连续损失梯度、物理展开与统计分块、16→36 权重迁移、
-固定任务采样、保存恢复和完整更新重放。独立检查点测试已在 FP32/FP64 下验证
+固定任务采样、保存恢复和完整更新重放。独立检查点测试在 FP32/FP64 下验证
 原始参数与新增目标列都能更新，并在移除原悬停文件后，由新 Python 进程仅加载
 输出 `.pt` 复现保存的权重、电机输出和 GRU 状态。固定采样回归检查同一随机种子
 下更新数不会改变生成规则；目标参数不会随训练表现推进。
 
-另外，对同一批原始 32 架飞机（物理种子 314、任务种子 91、FP64、CPU 单线程）比较了父版本 `624c6b4213de629a961f0677a9fba15f47071f6b` 的生成器与当前生成器。两者使用同一套原始机型、同一位置边界及无外力输入；旧版使用默认 H500/60°，新版使用默认 H800/75°。这是参考生成器检查，没有运行 Actor 飞行或训练更新。完整数值和配置见 [`agile_trajectory_audit.json`](agile_trajectory_audit.json)。
+另外，对同一批原始 32 架飞机（物理种子 314、任务种子 91、FP64、CPU 单线程）比较了父版本 `69f00b947ebb94889efa85dca9a5978afeeb36e1` 的生成器与当前生成器。两者使用相同原始机型、位置边界和 clean 名义参考夹具；父版本使用默认 H800/75°，v4 使用默认 H500/105°。clean 只用于这一参考对照，实际 agile 训练仍保留传感器噪声。这里没有运行 Actor 飞行或正式训练。完整数值、随机种子、逐机倾角和调用方式见 [`agile_trajectory_audit.json`](agile_trajectory_audit.json)。
 
-| 经过执行器审核后的参考指标 | 父版本 | v3 |
+| 经过执行器审核后的参考指标 | 父版本 v3 | 当前 v4 |
 |---|---:|---:|
-| 平均中点倾角 | 38.5914° | 55.0396° |
-| 中点倾角范围 | 7.6711–59.6856° | 30.1714–74.8766° |
-| 平均路径长度 | 2.1541 m | 5.7058 m |
-| 平均中点速度 | 2.6343 m/s | 4.3716 m/s |
-| 平均运动时长 | 1.735 s | 2.685 s |
-| 路径发生空间缩放的样本 | 26 / 32 | 0 / 32 |
+| 平均中点倾角 | 55.0396° | 62.8254° |
+| 中点倾角范围 | 30.1714–74.8766° | 27.0904–104.7342° |
+| 实际中点倾角超过 90° | 0 / 32 | 5 / 32 |
+| 平均路径长度 | 5.7058 m | 5.7058 m |
+| 平均中点速度 | 4.3716 m/s | 4.4305 m/s |
+| 平均运动时长 | 2.685 s | 2.67125 s |
+| 路径发生空间缩放的样本 | 0 / 32 | 0 / 32 |
 | 通过名义执行器审核的样本 | 32 / 32 | 32 / 32 |
 
-当前样本的全部初速非零，非零原始速度保持逐位一致，三个历史速度槽与真实初速一致，外力和脉冲为零，传感器噪声及速度延迟保留。这些有限样本结果不能替代整个机型分布上的效果验证。
+这表明配置上限和真实参考都已越过 90°，同时仍有机体因原执行器能力而降低实际倾角。单独用 `DisturbanceConfig(force_enabled=False)` 的真实 agile 噪声设置核对 reset：全部机动初速非零，非零原始速度保持逐位一致，三个历史速度槽与真实初速一致，外力和脉冲为零，传感器噪声存在且其采样带与速度延迟保持逐位一致。这些有限样本结果不能替代整个机型分布上的效果验证。
 
-本次没有改动 `env_raptor.py`、`compiled_physics.py`、`strict_inductor.py`、`response_execution.py`、`scene_prefetch.py`、`response_grad_probe.py` 或原 hover 参数文件；它们仍与加速基线 `bf5b08d95e4cd99602f15e5b747ffd6012eed944` 一致。新规划仍在物理 bank 预取交付后于 CPU 上执行，日志记录 `agile_mission_and_upload_seconds`；不能将 H800 的成本和吞吐视为与 H500 相同。
+本次没有改动 `env_raptor.py`、`compiled_physics.py`、`strict_inductor.py`、`response_execution.py`、`scene_prefetch.py`、`response_grad_probe.py` 或原 hover 参数文件；它们仍与加速基线 `bf5b08d95e4cd99602f15e5b747ffd6012eed944` 一致。规划仍在物理 bank 预取交付后于 CPU 上执行，日志记录 `agile_mission_and_upload_seconds`。本次环境没有 CUDA，未重新执行 CUDA 前向/反向编译或吞吐探针。
 
 测试使用结构兼容的合成检查点；用户实际已训练的悬停 `.pt` 尚未导入。本次没有进行
 长时间机动训练，CPU 验证也不代表 CUDA 性能或已学会飞行。

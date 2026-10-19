@@ -12,13 +12,14 @@ alternative direct-feature branch. No geometric feedback controller is added.
 
 The `Agile-Flight-training` branch adds `--task agile`: start at point 1 with
 initial linear velocity, follow a smooth three-point
-position/attitude/velocity reference, then brake and hold the final point.
-The v3 defaults request a **75-degree midpoint tilt**, half-span `0.70 * position_limit`
+position/attitude/velocity reference, then brake at the final point.
+The v4 defaults request a **105-degree midpoint tilt**, half-span `0.70 * position_limit`
 and bend magnitude `0.38 * position_limit`, inside the original boundary.
 Every update uses the same target-generation rules; there is no
 difficulty schedule or success-gated promotion. A fixed clock moves the reference
-from point 1 at reset, through point 2 at half the motion duration, to point 3
-and its final hold. The reference keeps advancing if the aircraft misses a point;
+from point 1 at reset, through point 2 at half the motion duration, to point 3.
+After motion ends, every goal slot describes the final point with zero velocity
+and level attitude; no fixed hold duration is reserved. The reference keeps advancing if the aircraft misses a point;
 continuous tracking losses penalize the deviation. The original world-fixed
 `30 * arm_length` boundary and sampled airframes remain intact. Agile disables
 constant external force and force-at-point pulses by default, while retaining
@@ -36,12 +37,18 @@ columns, with fresh Adam and sampling progress. All Actor weights remain trainab
 Each output checkpoint contains the complete updated Actor and can be loaded
 without the original hover checkpoint. Inference still receives measured state
 and the time-varying goal packet. Exact `--resume` remains separate and strict.
-The new argument file uses **H800 at 100 Hz (8 seconds)** with a final hold of at
-least 1 second and Time Decay 0. CUDA still compiles each original RK4 physics
+The agile argument file uses **H500 at 100 Hz (5 seconds)** and Time Decay 0.
+All 500 steps are available to the motion reference. CUDA still compiles each original RK4 physics
 step's forward and backward through strict Inductor/AOTAutograd; the full rollout
 remains connected by autograd, with native GRU, loss, group probe and Adam.
 CPU physics remains the native reference. The original hover argument file is
 unchanged.
+
+The projected-heading attitude frame is continuous at and beyond 90 degrees;
+`tilt_degrees` accepts `[0, 180)`. The midpoint target uses the actual acceleration
+after timing and actuator checks, so an aircraft may receive a smaller tilt than
+the requested 105 degrees. World-vertical thrust may be negative in an inverted
+segment while collective body-axis rotor thrust remains positive.
 
 For each original airframe, the planner first keeps the complete path and searches
 longer motion durations on a fixed grid until individual rotor thrust and motor

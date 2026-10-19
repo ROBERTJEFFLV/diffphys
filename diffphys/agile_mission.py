@@ -19,7 +19,7 @@ import torch
 
 from .env_raptor import RaptorState
 
-MISSION_VERSION = "agile-three-point-s9-duration-search-initial-velocity-v3"
+MISSION_VERSION = "agile-three-point-s9-wide-angle-terminal-target-v4"
 GRAVITY = 9.81
 CONTROL_DT = .01
 MID_SPEED_COEFFICIENT = 315. / 64.
@@ -40,12 +40,11 @@ REASON_NAMES = {
 
 @dataclass(frozen=True)
 class AgileMissionConfig:
-    tilt_degrees: float = 75.
+    tilt_degrees: float = 105.
     thrust_ratio: float = 1.2
     boundary_margin_fraction: float = .2
     half_span_fraction: float = .70
     bend_fraction: float = .38
-    hold_seconds: float = 1.
     hover_fraction: float = 0.
     yaw_degrees: Optional[float] = None
     center_fraction: tuple[float, float, float] = (0., 0., 0.)
@@ -56,14 +55,14 @@ class AgileMissionConfig:
 
     def __post_init__(self):
         for name in ("tilt_degrees", "thrust_ratio", "boundary_margin_fraction",
-                     "half_span_fraction", "bend_fraction", "hold_seconds",
+                     "half_span_fraction", "bend_fraction",
                      "hover_fraction", "actuator_margin_fraction", "duration_search_factor"):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(name + " must be finite")
-        if not 0 <= self.tilt_degrees < 89:
-            raise ValueError("tilt_degrees must be in [0,89); inverted maneuvers are not this family")
-        if self.thrust_ratio <= 0 or self.hold_seconds <= 0:
-            raise ValueError("thrust_ratio and hold_seconds must be positive")
+        if not 0 <= self.tilt_degrees < 180:
+            raise ValueError("tilt_degrees must be in [0,180); exact inversion is singular in this reference family")
+        if self.thrust_ratio <= 0:
+            raise ValueError("thrust_ratio must be positive")
         if not 0 <= self.boundary_margin_fraction < 1:
             raise ValueError("boundary_margin_fraction must be in [0,1)")
         if not 0 < self.half_span_fraction < 1 or not 0 < self.bend_fraction < 1:
@@ -109,7 +108,6 @@ class AgileMission:
     velocity: torch.Tensor
     direction: torch.Tensor
     duration: torch.Tensor
-    hold_seconds: float
     position_scale: torch.Tensor
     reference_scale: torch.Tensor  # Geometric actuator cap, never a training schedule.
     feasible: torch.Tensor
@@ -217,14 +215,21 @@ def _vee(matrix):
 
 
 def flatness_attitude(acceleration, jerk, snap, direction):
-    """Continuous fixed-yaw frame and exact angular rates of the unforced path."""
+    """Projected-heading frame with exact rates, continuous across 90 deg tilt.
+
+    The reference heading is projected into the plane perpendicular to thrust.
+    This specifies a full SO(3) attitude without a fixed-Euler-yaw chart's 90 deg
+    singularity. Nonzero thrust and a nonparallel heading remain necessary.
+    """
     up = acceleration.new_tensor((0., 0., 1.))
     force = acceleration + GRAVITY*up
     b3, db3, ddb3 = _normalize_with_derivatives(force, jerk, snap)
-    # This x axis has horizontal projection along direction, hence fixed Euler
-    # yaw when force_z>0.  Do not confuse body tilt with velocity direction.
-    x, dx, ddx = (value[..., 2:3]*direction - (value*direction).sum(-1, keepdim=True)*up
-                  for value in (force, jerk, snap))
+    projection = (b3*direction).sum(-1, keepdim=True)
+    dprojection = (db3*direction).sum(-1, keepdim=True)
+    ddprojection = (ddb3*direction).sum(-1, keepdim=True)
+    x = direction-projection*b3
+    dx = -dprojection*b3-projection*db3
+    ddx = -ddprojection*b3-2*dprojection*db3-projection*ddb3
     b1, db1, ddb1 = _normalize_with_derivatives(x, dx, ddx)
     b2 = torch.linalg.cross(b3, b1, dim=-1)
     db2 = torch.linalg.cross(db3, b1, dim=-1)+torch.linalg.cross(b3, db1, dim=-1)
@@ -235,8 +240,9 @@ def flatness_attitude(acceleration, jerk, snap, direction):
     second = torch.stack((ddb1, ddb2, ddb3), -1)
     omega = _vee(rotation.transpose(-1, -2) @ first)
     omega_dot = _vee(rotation.transpose(-1, -2) @ second)
-    valid = ((force[..., 2] > .02*GRAVITY) & (force.norm(dim=-1) > .05*GRAVITY)
-             & (x.norm(dim=-1) > 1e-8))
+    # A downward world-vertical component is valid for an inverted attitude;
+    # collective rotor thrust remains positive along the body's third axis.
+    valid = ((force.norm(dim=-1) > .05*GRAVITY) & (x.norm(dim=-1) > 1e-8))
     return rotation, omega, omega_dot, valid
 
 
@@ -375,10 +381,9 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     """
     if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
         raise ValueError("horizon must be a positive integer")
-    hold_steps = math.ceil(config.hold_seconds/CONTROL_DT-1e-10)
-    maximum_steps = 2*((horizon-hold_steps)//2)
+    maximum_steps = 2*(horizon//2)
     if maximum_steps < 4:
-        raise ValueError("horizon must allow at least four motion steps plus the requested hold")
+        raise ValueError("horizon must allow at least four motion steps")
     if bool((initial.step_index != 0).any()):
         raise ValueError("agile missions must be attached at reset")
     n = len(initial.mass)
@@ -511,7 +516,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     initial_velocity = torch.where(planned_hover[:, None].to(device), 0., initial_velocity)
     report = {
         "version": MISSION_VERSION, "aircraft_rows": n, "aircraft_rows_retained": n,
-        "aircraft_resampled": 0, "horizon": horizon, "hold_seconds": config.hold_seconds,
+        "aircraft_resampled": 0, "horizon": horizon,
         "requested_tilt_degrees": config.tilt_degrees,
         "requested_mid_thrust_ratio": config.thrust_ratio,
         "planned_hover_count": int(planned_hover.sum()), "moving_count": int(moving.sum()),
@@ -533,6 +538,8 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
         "initial_rejection_counts": {name: int(((first_reason & flag) != 0).sum())
                                      for flag, name in REASON_NAMES.items()},
         "boundary": "unchanged world-fixed position_limit; reference Bezier control hull inside margin",
+        "attitude_frame": "reference heading projected perpendicular to thrust; continuous across 90 degrees; no fixed Euler yaw constraint",
+        "endpoint_reference": "position=goal and zero velocity, acceleration and angular rate from motion end onward; no reserved hold duration",
         "actuator_screen": "unforced reference at every 100 Hz grid sample; individual rotor thrust and exact motor RK4 setpoints",
         "reference_selection": "first passing ascending duration grid at full geometry; then descending spatial fallback at maximum duration; no global optimum certificate",
         "initial_velocity": "original nonzero velocities retained; zero-velocity maneuver rows filled from independent per-axis U[-2.5,2.5] m/s; initial tracking error, not reference velocity",
@@ -545,7 +552,7 @@ def sample_agile_mission(initial: RaptorState, config: AgileMissionConfig, *, se
     mission = AgileMission(
         start=output(start), waypoint=output(waypoint), goal=output(goal), rotation=output(rotation),
         velocity=output(velocity), direction=output(direction), duration=output(duration),
-        hold_seconds=config.hold_seconds, position_scale=output(bound), reference_scale=output(used),
+        position_scale=output(bound), reference_scale=output(used),
         feasible=output(feasible), is_hover=output(planned_hover),
         report=report, half_span=output(span), hover_rotation=output(hover_rotation), center=output(center),
         bend=output(bend), limit_reason=output(first_reason), hover_feasible=output(hover_ok))

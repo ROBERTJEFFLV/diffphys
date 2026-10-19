@@ -25,7 +25,7 @@ def agile_config_file(tmp_path):
     # Tiny fixed geometry allows a short physical rollout. New updates draw new
     # orientations from the same target distribution, with no amplitude ramp.
     config = AgileTrainingConfig(
-        mission=AgileMissionConfig(hold_seconds=.04, half_span_fraction=1e-6,
+        mission=AgileMissionConfig(half_span_fraction=1e-6,
                                    bend_fraction=1e-8, tilt_degrees=5.),
     )
     path = tmp_path / "agile.json"
@@ -117,18 +117,18 @@ def test_task_cli_controls_architecture_and_default_decay(tmp_path, agile_config
     assert not hasattr(evaluation, "agile_training_config")
 
 
-def test_agile_cli_has_longer_horizon_and_argument_file_overrides_hover_defaults(monkeypatch):
+def test_agile_cli_retains_500_step_horizon_and_explicit_argument_overrides(monkeypatch):
     root = Path(__file__).resolve().parents[1]
     monkeypatch.chdir(root)
     bare = parse_args(["--task", "agile"])
-    assert bare.horizon == 800
+    assert bare.horizon == 500
     assert bare.time_decay == 0.
     assert bare.external_forces is False
     legacy = parse_args(["@configs/response_raptor_multi_airframe.args"])
     assert legacy.task == "hover" and legacy.horizon == 500
     assert legacy.external_forces is True
     configured = parse_args(["@configs/agile_flight.args"])
-    assert configured.task == "agile" and configured.horizon == 800
+    assert configured.task == "agile" and configured.horizon == 500
     assert configured.time_decay == 0. and configured.external_forces is False
     assert configured.train_sampling == legacy.train_sampling == "coverage128"
     assert configured.scenarios == legacy.scenarios == 768
