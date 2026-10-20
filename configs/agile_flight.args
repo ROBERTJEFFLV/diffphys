@@ -1,6 +1,16 @@
-@configs/response_raptor_multi_airframe.args
 --task agile
---agile-config configs/agile_flight.json
+--agile-config configs/waypoint_flight.json
+--device cuda
+--dtype float32
+--threads 4
+--scenarios 128
+--eval-scenarios 32
+--train-sampling coverage128
 --horizon 500
 --time-decay 0
---work-dir runs/agile/from_hover_seed7
+--updates 50
+--max-seconds 1800
+--lr 0.0003
+--gradient-clip 10
+--checkpoint-every 10
+--eval-every 50

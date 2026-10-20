@@ -1,0 +1,43 @@
+{
+  "base_commit": "91870972219ff47e133bc463b4dc213b0a5803e3",
+  "python": "3.13.5",
+  "torch": "2.10.0+cpu",
+  "cuda_available": false,
+  "targeted_pytest": {
+    "passed": 25,
+    "seconds": 16.68,
+    "command": "python -m pytest -q tests/test_waypoint_event_core.py tests/test_waypoint_event_integration.py"
+  },
+  "default_physical_bank": {
+    "scenes": 512,
+    "horizon": 500,
+    "sampling": "coverage128",
+    "seed": 7,
+    "bank_key": "79ab907aa115ef4fadf6d55c447d7457cee6660fcfc4df4c0cd9324337dcc341",
+    "elapsed_seconds": 0.079814,
+    "band_half_width_m": [
+      0.2527916133403778,
+      0.5
+    ],
+    "requested_tilt_degrees": 105.0,
+    "source_force_nonzero": 0
+  },
+  "protected_base_blobs": {
+    "diffphys/env_raptor.py": "4d443046b0444644cad9bae1ecb4870997573bef",
+    "diffphys/response_noise.py": "ad9ffdd516808ee56a11591b778fb50248e00831",
+    "diffphys/response_policy.py": "7eacd2d80b6bcdec537e9196661f499da8c342e7",
+    "diffphys/compiled_physics.py": "00255f6cc2f9293f5d95389bd38d61a8700bd85a",
+    "diffphys/strict_inductor.py": "803a2aa7f80b06aa3f34539d909b99a59281e552",
+    "diffphys/scene_prefetch.py": "be387e171180af3a741091409c383adcdb9086df",
+    "diffphys/response_sampling.py": "883c931ce73609ccc14959c1378cf6668a5d4678",
+    "diffphys/response_execution.py": "0ebff3a3396a553292fdb2515ee34678990bdab5",
+    "configs/physics_coverage.json": "6f1f1d2764cdfa0ecccced7c91ccb970b9011c83"
+  },
+  "limitations": [
+    "Not a full checkout regression; targeted dependency snapshot only.",
+    "No CUDA compiler runtime or throughput test in this environment.",
+    "No actual user hover checkpoint, long Actor training or hardware flight.",
+    "Constraints are numerically sampled, not globally or continuously certified.",
+    "Old planar solver feasibility results are not Actor success rates."
+  ]
+}
