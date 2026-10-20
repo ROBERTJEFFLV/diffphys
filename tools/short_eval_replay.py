@@ -23,11 +23,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from diffphys.env_raptor import RaptorParams
-from diffphys.compiled_physics import make_simulator, physics_backend_contract
-from diffphys.response_noise import DisturbanceConfig
-from diffphys.response_task import TaskLossConfig
-from diffphys.response_training import (
+from env_raptor import RaptorParams, RaptorSimulator
+from response_noise import DisturbanceConfig
+from response_task import TaskLossConfig
+from response_training import (
     DEVELOPMENT_SEEDS,
     evaluate,
     load_policy_checkpoint,
@@ -284,12 +283,10 @@ def export_checkpoint(checkpoint_path, run_dir, *, device="cuda"):
     policy, saved = load_policy_checkpoint(checkpoint_path, device, dtype)
     policy.eval()
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
         torch.cuda.reset_peak_memory_stats(device)
     protocol = saved["binding"]["protocol"]
     horizon = int(saved["binding"]["horizon"])
-    simulator = make_simulator(RaptorParams(**protocol["environment_params"]), device)
+    simulator = RaptorSimulator(RaptorParams(**protocol["environment_params"]))
     initial = sample_pool(
         int(protocol["eval_scenarios_per_bank"]), DEVELOPMENT_SEEDS,
         dt=policy.config.dt, device=device, dtype=dtype, horizon=horizon,
@@ -325,7 +322,6 @@ def export_checkpoint(checkpoint_path, run_dir, *, device="cuda"):
     )
     return {
         "checkpoint_update": update,
-        "numerical_backend": physics_backend_contract(device),
         "report": {name: report[name] for name in METRIC_KEYS},
         "capture_seconds": capture_seconds,
         "trajectory_uncompressed_bytes": int(sum(value.nbytes for value in arrays.values())),

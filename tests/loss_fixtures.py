@@ -1,5 +1,5 @@
 """Explicit test-only scales; these numbers are not production recommendations."""
-from diffphys.response_task import TaskLossConfig
+from response_task import TaskLossConfig
 from tools.train_response_control import parse_args
 
 LOSS_FLAGS = ('--epsilon-p', '.5', '--epsilon-a', '.25', '--lambda-R', '.4')

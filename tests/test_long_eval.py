@@ -6,14 +6,14 @@ import math
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_noise import DisturbanceConfig, measured_observation
-from diffphys.response_policy import ResponseMotorPolicy
+from env_raptor import RaptorSimulator
+from response_noise import DisturbanceConfig, measured_observation
+from response_policy import ResponseMotorPolicy
 
 
 def api():
-    assert importlib.util.find_spec('diffphys.response_long_eval') is not None, 'long EVAL environment is missing'
-    import diffphys.response_long_eval as response_long_eval
+    assert importlib.util.find_spec('response_long_eval') is not None, 'long EVAL environment is missing'
+    import response_long_eval
     return response_long_eval
 
 

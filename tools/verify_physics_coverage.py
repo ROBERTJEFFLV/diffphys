@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_noise import DisturbanceConfig
-from diffphys.response_sampling import physics_cell_ids, sampling_contract, yaw_authority, TTI_EDGES
-from diffphys.response_training import sample_training_scenarios
+from env_raptor import RaptorSimulator
+from response_noise import DisturbanceConfig
+from response_sampling import physics_cell_ids, sampling_contract, yaw_authority, TTI_EDGES
+from response_training import sample_training_scenarios
 
 
 def main():

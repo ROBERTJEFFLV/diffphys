@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator, IMMUTABLE_TAPES, environment_contract, RaptorParams
-from diffphys.response_noise import DisturbanceConfig, pulse_at, measured_observation
+from env_raptor import RaptorSimulator, IMMUTABLE_TAPES, environment_contract, RaptorParams
+from response_noise import DisturbanceConfig, pulse_at, measured_observation
 
 
 def with_pulse(s, force, point, start=0, duration=10):

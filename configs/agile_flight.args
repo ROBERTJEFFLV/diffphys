@@ -1,16 +1,5 @@
---task agile
---agile-config configs/waypoint_flight.json
---device cuda
---dtype float32
---threads 4
---scenarios 128
---eval-scenarios 32
---train-sampling coverage128
---horizon 500
+@configs/response_raptor_multi_airframe.args
+--mission-config configs/pass_stop.json
 --time-decay 0
---updates 50
---max-seconds 1800
---lr 0.0003
---gradient-clip 10
---checkpoint-every 10
---eval-every 50
+--disable-pulses
+--work-dir runs/pass_stop/seed7

@@ -8,14 +8,14 @@ import pytest
 import torch
 
 from test_reference_training import args_for, run
-from diffphys.response_training import evaluate_checkpoint
+from response_training import evaluate_checkpoint
 
 
 def test_training_and_resume_without_teacher_module(tmp_path):
     # Simulate installing only the production Actor/physics modules.
     code = """
 import sys
-sys.modules['diffphys.response_contraction'] = None
+sys.modules['response_contraction'] = None
 from test_reference_training import args_for, run
 from pathlib import Path
 path = Path(sys.argv[1])

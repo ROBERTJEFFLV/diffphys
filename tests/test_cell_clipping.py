@@ -7,11 +7,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from diffphys.response_groups import (GroupBalanceConfig, normalize_group_rows,
+from response_groups import (GroupBalanceConfig, normalize_group_rows,
                              physics_group_layout, group_gradient_coefficients,
                              backward_group_gradients)
-from diffphys.response_sampling import sample_coverage, physics_cell_ids
-from diffphys.response_task import TaskLossConfig, uniform_scene_weights
+from response_sampling import sample_coverage, physics_cell_ids
+from response_task import TaskLossConfig, uniform_scene_weights
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -57,7 +57,7 @@ def test_all_128_groups_exactly_match_existing_sampler_cells(dtype):
 
 
 def test_cell_groups_refuse_missing_or_unequal_quotas():
-    from diffphys.response_training import sample_pool
+    from response_training import sample_pool
     with pytest.raises(ValueError, match='quota|128'):
         physics_group_layout(sample_pool(32, [7,8,9,10], horizon=1), cell_config())
 
@@ -83,10 +83,10 @@ def test_all_128_group_vjps_match_analytic_mean_clip_mean_and_use_eight_calls():
 
 
 def test_uncapped_128_cell_gru_gradients_recover_original_pooled_objective():
-    from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-    from diffphys.response_task import rollout, task_loss
-    from diffphys.response_adjoints import collect_rollout, backward_actor
-    from diffphys.env_raptor import RaptorSimulator
+    from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+    from response_task import rollout, task_loss
+    from response_adjoints import collect_rollout, backward_actor
+    from env_raptor import RaptorSimulator
     import copy
     torch.manual_seed(123)
     initial, _ = sample_coverage(128, [7,8,9,10], dtype=torch.float64)
@@ -111,10 +111,10 @@ def test_invalid_fixed_caps_are_rejected(bad_cap):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 def test_cuda_fixed_cells_and_eight_chunk_gru_backward():
-    from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-    from diffphys.response_adjoints import collect_rollout, backward_actor
-    from diffphys.response_training import sample_training_scenarios
-    from diffphys.env_raptor import RaptorSimulator
+    from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+    from response_adjoints import collect_rollout, backward_actor
+    from response_training import sample_training_scenarios
+    from env_raptor import RaptorSimulator
     initial,_=sample_training_scenarios(32,0,horizon=5,sampling='coverage128',device='cuda')
     policy=ResponseMotorPolicy(ResponsePolicyConfig(memory_dim=8)).cuda()
     rec=collect_rollout(policy,RaptorSimulator(),initial,test_loss(),horizon=5,group_config=cell_config())

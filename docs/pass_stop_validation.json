@@ -1,0 +1,52 @@
+{
+  "master_commit": "82e7634ac82e8f719f33ee028768a73a82d33191",
+  "previous_aft_commit": "85bf954454008ed83a08f790d78c22a2893e837d",
+  "tests": {
+    "passed": 68,
+    "seconds": 31.46,
+    "scope": "focused dependency snapshot, not full old checkout",
+    "exit_code": 0
+  },
+  "protected_master_blobs": {
+    "env_raptor.py": "a1cc9b0235405778788f742a0329f58187db0125",
+    "response_noise.py": "e43b11017c673289a5c13d431966b757c668da39",
+    "response_policy.py": "fd019d1d570113abf5a43a8728754e93bfd8caab",
+    "response_task.py": "bb08935c68d72dff72876ed504da2409ad1a210d",
+    "response_groups.py": "d9ba236a36b69a963d803200b7357ddf85b5bcd9",
+    "response_sampling.py": "60db377738a12b9d42cbedb252e344e6eb75687e",
+    "response_audit.py": "e914c60b61e39630edbfe446f2d47bbb5c384528",
+    "response_execution.py": "455ea13d9bba81259e90cb161dd987cf94b3d8e4",
+    "configs/physics_coverage.json": "5f348dbd22ec5458d391f70dc63979a2cb1a0da4"
+  },
+  "time_audit": {
+    "temporal_shift_trials": 24,
+    "gradient_descent_steps_per_case": 10,
+    "maximum_finite_difference_error": 3.3932856524643285e-10,
+    "all_shifts_improved": true,
+    "monotonicity": [
+      {
+        "dtype": "torch.float32",
+        "partial_derivatives": 128256,
+        "negative": 0,
+        "nonzero": 819,
+        "finite": true
+      },
+      {
+        "dtype": "torch.float64",
+        "partial_derivatives": 128256,
+        "negative": 0,
+        "nonzero": 787,
+        "finite": true
+      }
+    ],
+    "settled_at_2_seconds": 2.0,
+    "leaves_again_at_4_seconds": 4.01,
+    "reproduce": "python tools/audit_pass_stop_time.py --report time_gradient_checks.json",
+    "limitations": [
+      "Synthetic residual/time-shift tests, not dynamically optimized flight.",
+      "Hard control switches and first-hit selection remain nondifferentiable.",
+      "The surrogate is not an exact ranking of arbitrary incomplete flights.",
+      "No CUDA execution or trained-hover checkpoint tested."
+    ]
+  }
+}

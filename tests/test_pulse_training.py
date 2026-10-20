@@ -7,13 +7,13 @@ import json
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator, IMMUTABLE_TAPES, environment_contract, RaptorParams
-from diffphys.response_noise import DisturbanceConfig, measured_observation, pulse_at
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import rollout, step_costs, TaskLossConfig, _select_rows
-from diffphys.response_adjoints import collect_rollout, backward_actor
-from diffphys.response_groups import normalize_group_rows
-from diffphys.response_training import sample_pool, sample_training_scenarios, DEVELOPMENT_SEEDS
+from env_raptor import RaptorSimulator, IMMUTABLE_TAPES, environment_contract, RaptorParams
+from response_noise import DisturbanceConfig, measured_observation, pulse_at
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import rollout, step_costs, TaskLossConfig, _select_rows
+from response_adjoints import collect_rollout, backward_actor
+from response_groups import normalize_group_rows
+from response_training import sample_pool, sample_training_scenarios, DEVELOPMENT_SEEDS
 from test_episode_termination import flat_grads
 from test_reference_training import args_for, run
 
@@ -107,7 +107,7 @@ def test_train_pulses_resample_and_eval_pulses_repeat():
 
 
 def test_pulse_checkpoint_resume_and_stored_eval_settings(tmp_path):
-    from diffphys.response_training import evaluate_checkpoint, require_reference_checkpoint
+    from response_training import evaluate_checkpoint, require_reference_checkpoint
     def args(path,updates,extra=()):
         return args_for(path,updates,('--horizon','120',*extra))
     full,split=tmp_path/'full',tmp_path/'split'

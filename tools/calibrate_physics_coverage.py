@@ -17,9 +17,9 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_noise import DisturbanceConfig
-from diffphys.response_sampling import SAMPLING_VERSION, TTI_EDGES, RISING_EDGES, FALLING_EDGES, yaw_authority
+from env_raptor import RaptorSimulator
+from response_noise import DisturbanceConfig
+from response_sampling import SAMPLING_VERSION, TTI_EDGES, RISING_EDGES, FALLING_EDGES, yaw_authority
 
 
 def calibrate() -> dict:
@@ -34,7 +34,7 @@ def calibrate() -> dict:
             groups[j].append(authority[ids == j])
     values = [torch.cat(group) for group in groups]
     return {"version": SAMPLING_VERSION,
-            "environment_source_sha256": hashlib.sha256((ROOT / 'diffphys/env_raptor.py').read_bytes()).hexdigest(),
+            "environment_source_sha256": hashlib.sha256((ROOT / 'env_raptor.py').read_bytes()).hexdigest(),
             "tti_edges": list(TTI_EDGES), "rising_edges": list(RISING_EDGES),
             "falling_edges": list(FALLING_EDGES),
             "yaw_authority": "single_rotor_km_times_maximum_thrust_over_Jz",

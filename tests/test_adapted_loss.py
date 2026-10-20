@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import diffphys.response_task as task
-from diffphys.response_adjoints import collect_rollout, backward_actor
-from diffphys.response_groups import GroupBalanceConfig
-from diffphys.env_raptor import RaptorSimulator
+import response_task as task
+from response_adjoints import collect_rollout, backward_actor
+from response_groups import GroupBalanceConfig
+from env_raptor import RaptorSimulator
 from test_episode_termination import actor, CountingSimulator, scheduled, flat_grads
 
 
@@ -236,8 +236,8 @@ def test_deleted_loss_fields_are_not_silently_accepted(old_field):
 
 
 def test_objective_version_is_bound_and_old_checkpoint_cannot_resume(tmp_path):
-    from diffphys.response_training import binding, _checkpoint, require_reference_checkpoint
-    from diffphys.response_policy import ResponsePolicyConfig
+    from response_training import binding, _checkpoint, require_reference_checkpoint
+    from response_policy import ResponsePolicyConfig
     from tools.train_response_control import parse_args
     args = parse_args(['--device', 'cpu', '--epsilon-p', '.5', '--epsilon-a', '.25', '--lambda-R', '.4'])
     policy = actor()
@@ -260,7 +260,7 @@ def test_objective_version_is_bound_and_old_checkpoint_cannot_resume(tmp_path):
 
 def test_old_objective_only_imports_weights_not_adam_best_score_or_sampling_index(tmp_path):
     from test_reference_training import args_for, run
-    from diffphys.response_training import evaluate_checkpoint
+    from response_training import evaluate_checkpoint
     source, imported = tmp_path/'source', tmp_path/'imported'
     run(args_for(source, 1))
     saved = torch.load(source/'latest.pt', weights_only=True)
@@ -284,7 +284,7 @@ def test_old_objective_only_imports_weights_not_adam_best_score_or_sampling_inde
 
 
 def test_streaming_components_match_the_full_eval_objective_and_physical_metrics():
-    from diffphys.response_training import evaluate
+    from response_training import evaluate
     initial = scheduled([1, 51, 71]*32, 70)
     policy = actor()
     record = collect_rollout(policy, CountingSimulator(), initial, config(), horizon=70)

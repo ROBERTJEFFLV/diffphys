@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from diffphys.response_task import step_costs, TASK_OBJECTIVE_VERSION
+from response_task import step_costs, TASK_OBJECTIVE_VERSION
 from loss_fixtures import test_loss, parse_loss_args as parse_args
 from test_reference_training import args_for, run
 
@@ -28,8 +28,8 @@ def constant_trace(horizon, dtype=torch.float64):
 def test_production_config_preserves_sampling_group_and_optimizer_settings():
     root = Path(__file__).resolve().parents[1]
     args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args')])
-    assert args.scenarios == 768 and args.horizon == 500
-    assert args.group_max_groups == 128 and args.group_min_scenarios == 24
+    assert args.scenarios == 512 and args.horizon == 500
+    assert args.group_max_groups == 128 and args.group_min_scenarios == 16
     assert args.lr == 3e-4 and args.time_decay == 1 and args.gradient_scale == .1
 
 

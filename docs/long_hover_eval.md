@@ -2,7 +2,7 @@
 
 This is an independent, inference-only environment. It does not alter training,
 the Actor, its optimizer, the training loss, or the training source-hash contract.
-`diffphys/response_long_eval.py` provides `LongHoverEval`: construction initializes one
+`response_long_eval.py` provides `LongHoverEval`: construction initializes one
 continuous episode, `step()` advances it and `run()` completes it.
 
 ## Run

@@ -8,13 +8,13 @@ import torch
 
 from loss_fixtures import test_loss
 
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_noise import (DisturbanceConfig, attach_disturbances, measured_observation,
+from env_raptor import RaptorSimulator
+from response_noise import (DisturbanceConfig, attach_disturbances, measured_observation,
                             executed_command, raptor_force_std, rotation_error)
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import (rollout, step_costs, TaskLossConfig, observation,
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import (rollout, step_costs, TaskLossConfig, observation,
                            _select_rows, initialize, _decay_closed_state)
-from diffphys.response_training import sample_pool, sample_training_scenarios, DEVELOPMENT_SEEDS
+from response_training import sample_pool, sample_training_scenarios, DEVELOPMENT_SEEDS
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -214,8 +214,8 @@ def test_cuda_noisy_rollout_and_backward():
 
 def test_actual_h500_default_width_graph_with_delayed_measurements():
     """Constructed no-termination fixture, NOT a learned flight-performance test."""
-    from diffphys.response_training import pool_states
-    from diffphys.response_adjoints import collect_rollout, backward_actor
+    from response_training import pool_states
+    from response_adjoints import collect_rollout, backward_actor
     torch.manual_seed(30)
     sim=RaptorSimulator()
     one=sim.reset(1,seed=7,horizon=500,dtype=torch.float64,disturbances=DisturbanceConfig.clean())

@@ -11,8 +11,8 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from diffphys.response_task import sample_scenarios, TaskLossConfig, uniform_scene_weights
-from diffphys.response_groups import (GroupBalanceConfig, physics_group_layout,
+from response_task import sample_scenarios, TaskLossConfig, uniform_scene_weights
+from response_groups import (GroupBalanceConfig, physics_group_layout,
     group_gradient_coefficients, normalize_group_rows, backward_group_gradients)
 
 

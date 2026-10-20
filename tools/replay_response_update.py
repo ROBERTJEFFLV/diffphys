@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -11,20 +12,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
-from diffphys.response_audit import AUDIT_VERSION, parameter_changes
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_groups import GroupBalanceConfig
-from diffphys.response_task import TaskLossConfig
-from diffphys.agile_config import agile_config_from_dict
-from diffphys.response_noise import DisturbanceConfig
-from diffphys.env_raptor import RaptorParams
-from diffphys.compiled_physics import make_simulator
-from diffphys.response_execution import critical_gc
-from diffphys.response_adjoints import collect_rollout, backward_actor
-from diffphys.response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
+from response_audit import AUDIT_VERSION, parameter_changes
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_groups import GroupBalanceConfig
+from response_task import TaskLossConfig
+from pass_stop import loss_config as parse_loss_config, policy_class
+from response_noise import DisturbanceConfig
+from env_raptor import RaptorSimulator, RaptorParams
+from response_adjoints import collect_rollout, backward_actor
+from response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
                                restore_rng, capture_rng, sample_training_scenarios,
-                               sample_training_mission,
-                               safe_global_clip, atomic_json, require_reference_checkpoint)
+                               safe_global_clip, atomic_json)
 
 
 def compare_values(actual, expected):
@@ -33,8 +31,7 @@ def compare_values(actual, expected):
         if not torch.is_tensor(actual) or actual.shape != expected.shape or actual.dtype != expected.dtype:
             return False, float('inf')
         a, b = actual.detach().cpu(), expected.detach().cpu()
-        same = (torch.equal(a, b) and torch.equal(a.contiguous().reshape(-1).view(torch.uint8),
-                                                 b.contiguous().reshape(-1).view(torch.uint8)))
+        same = torch.equal(a, b)
         diff = float((a.double()-b.double()).abs().max()) if a.numel() else 0.
         return same, diff
     if isinstance(expected, dict):
@@ -59,14 +56,6 @@ def replay(path, mode='full'):
     cfg = capsule['binding']
     if cfg['source_sha256'] != source_hash():
         raise ValueError('replay source mismatch; use the accompanying audit/source.zip')
-    # The source digest binds code, not a capsule's editable metadata. Certify
-    # task/Actor/loss and physical contracts before either full or Adam replay.
-    require_reference_checkpoint({
-        'schema': cfg['protocol']['version'],
-        'architecture': cfg['protocol']['architecture'],
-        'policy_config': capsule['policy_config'],
-        'binding': cfg,
-    })
     if str(torch.__version__) != cfg['torch_version']:
         raise ValueError('exact replay needs the saved PyTorch version')
     device = torch.device(cfg['device'])
@@ -77,7 +66,8 @@ def replay(path, mode='full'):
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-    policy = ResponseMotorPolicy(ResponsePolicyConfig(**capsule['policy_config'])).to(device=device, dtype=dtype)
+    loss = parse_loss_config(cfg['protocol']['loss'])
+    policy = policy_class(loss)(ResponsePolicyConfig(**capsule['policy_config'])).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg['lr'])
     migrate_actor_weights(policy, capsule['before']['model'])
     migrate_named_adam(optimizer, policy, capsule['before']['optimizer'], capsule['optimizer_parameter_names'])
@@ -85,31 +75,20 @@ def replay(path, mode='full'):
     optimizer.zero_grad(set_to_none=True)
     if mode == 'full':
         sampling = {}
-        task = cfg['protocol'].get('task', 'hover')
-        if task not in ('hover', 'agile'):
-            raise ValueError('unsupported recorded training task')
-        agile_config = agile_config_from_dict(cfg['protocol']['agile']) if task == 'agile' else None
         initial, seeds = sample_training_scenarios(
             cfg['protocol']['scenarios_per_bank'], capsule['before']['sampling_index'],
-            dt=policy.config.dt, device='cpu' if agile_config is not None else device,
-            dtype=dtype, horizon=cfg['horizon'],
+            dt=policy.config.dt, device=device, dtype=dtype, horizon=cfg['horizon'],
             disturbances=DisturbanceConfig(**cfg['protocol']['disturbances']),
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
-        mission = None
-        if agile_config is not None:
-            initial, mission = sample_training_mission(
-                initial, capsule['before']['sampling_index'], agile_config,
-                horizon=cfg['horizon'], device=device, dtype=dtype, sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
-        simulator = make_simulator(RaptorParams(dt=policy.config.dt), device)
-        loss = agile_config.loss if agile_config is not None else TaskLossConfig(**cfg['protocol']['loss'])
+        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt),
+                                    rotation_backend=cfg.get("numerical_backend", {}).get("rotation", "eager"))
+        loss = parse_loss_config(cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
-        with critical_gc():
-            record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
-                                     time_decay=cfg['time_decay'], group_config=group,
-                                     **({'mission': mission} if mission is not None else {}))
-            backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
+        record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
+                                 time_decay=cfg['time_decay'], group_config=group)
+        backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
         safe_global_clip(policy.parameters(), cfg['gradient_clip'])
     elif mode == 'adam':
         for name, parameter in policy.named_parameters():

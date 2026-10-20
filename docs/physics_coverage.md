@@ -11,15 +11,15 @@ The existing random sampler remains available; fixed EVAL is always unchanged.
 ## Cells and pool size
 
 The production argument file selects `--train-sampling coverage128` and
-`--scenarios 768`. The latter retains its original four-bank size convention:
-4 * 768 = 3072 selected scenes in ONE pool, not four separate quota pools.
+`--scenarios 512`. The latter retains its original four-bank size convention:
+4 * 512 = 2048 selected scenes in ONE pool, not four separate quota pools.
 
 - TTI: [40,330), [330,620), [620,910), [910,1200].
 - Motor rise time (s): [.03,.0475), [.0475,.065), [.065,.0825), [.0825,.10].
 - Motor fall time (s): [.03,.0975), [.0975,.165), [.165,.2325), [.2325,.30].
 - Yaw: below / at-or-above a fixed conditional median for that TTI interval.
 
-Thus 4 * 4 * 4 * 2 = 128 cells, with 24 scenes per cell at 3072 TRAIN scenes.
+Thus 4 * 4 * 4 * 2 = 128 cells, with 16 scenes per cell at 2048 TRAIN scenes.
 Cell ID is `(((tti_bin*4 + rise_bin)*4 + fall_bin)*2 + yaw_bin)`.
 Interior equality belongs to the higher bin. FP32 edges use FP32 representation.
 Any positive multiple of 128 is supported as the total TRAIN size; incomplete
@@ -27,19 +27,11 @@ quotas are rejected, not silently rounded. Bare CLI calls still default to the
 original random sampler, including small CPU tests and existing custom scripts.
 
 Originally the 128 cells only controlled sampling. The later clipping change now
-also uses these SAME fixed IDs for 128 gradient groups. At N=3072 each contains
-24 initial scenes. The frozen yaw medians and original sampler are unchanged;
-`diffphys/response_groups.py` no longer re-splits coverage pools into 16 adaptive groups.
+also uses these SAME fixed IDs for 128 gradient groups. At N=2048 each contains
+16 initial scenes. The frozen yaw medians and original sampler are unchanged;
+`response_groups.py` no longer re-splits coverage pools into 16 adaptive groups.
 Legacy random-pool API calls can still request the adaptive layout, with the new
 shrink-only fixed cap. No batch median normalization remains.
-
-The move to the `diffphys/` package changes only the simulator's noise import.
-`configs/physics_coverage.json` records the old/new source hashes in
-`environment_source_updates`; the reset and physics kernels are unchanged, so
-the frozen calibration draws and yaw thresholds are retained. This provenance
-update does not migrate or rewrite any checkpoint binding. The later production
-P promotion records a further source-only change when retiring the rotation-only
-wrapper; native reset/RK4 ASTs and the yaw calibration values remain unchanged.
 
 ## What yaw means
 

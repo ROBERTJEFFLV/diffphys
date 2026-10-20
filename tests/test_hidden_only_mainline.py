@@ -5,13 +5,13 @@ from dataclasses import replace
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator
+from env_raptor import RaptorSimulator
 from loss_fixtures import test_loss
-from diffphys.response_adjoints import collect_rollout, backward_actor
-from diffphys.response_groups import GroupBalanceConfig
-from diffphys.response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import initialize, rollout
-from diffphys.response_training import sample_training_scenarios
+from response_adjoints import collect_rollout, backward_actor
+from response_groups import GroupBalanceConfig
+from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import initialize, rollout
+from response_training import sample_training_scenarios
 from test_reference_training import args_for, run
 
 

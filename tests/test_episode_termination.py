@@ -6,10 +6,10 @@ import copy
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_noise import DisturbanceConfig
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import ResponseClosedLoopState, TaskTrajectory, TaskLossConfig, initialize, observation, rollout, step_costs, uniform_scene_weights, reference_episode_metrics, _select_rows
+from env_raptor import RaptorSimulator
+from response_noise import DisturbanceConfig
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import ResponseClosedLoopState, TaskTrajectory, TaskLossConfig, initialize, observation, rollout, step_costs, uniform_scene_weights, reference_episode_metrics, _select_rows
 
 
 def select(state,index):

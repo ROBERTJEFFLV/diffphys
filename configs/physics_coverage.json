@@ -14,7 +14,7 @@
     "source": "independent_original_clean_reset_no_actor_or_eval",
     "torch_version": "2.10.0+cpu"
   },
-  "environment_source_sha256": "4e9bd66519ab1ad1eb811555e4d9a43bd5990862c979b1ee35ead04ec6835928",
+  "environment_source_sha256": "2dca14c7400b3a7ec0b12f0836cdcb0b53143c98317bae88d4bcd692d0c2f2ae",
   "falling_edges": [
     0.0975,
     0.165,
@@ -50,18 +50,6 @@
       "new_sha256": "2dca14c7400b3a7ec0b12f0836cdcb0b53143c98317bae88d4bcd692d0c2f2ae",
       "reset_canonical_sha256": "35385feea176af438c95743efda7dbbc81603b2cb1a86705040bcb84c8e6c7e4",
       "reason": "Optional, bound quaternion-rotation compiler backend only. RK4 equations and reset draws are unchanged; existing yaw calibration retained after reset AST and FP32/FP64 field equivalence checks. Whole-RK4 compilation is not enabled."
-    },
-    {
-      "previous_sha256": "2dca14c7400b3a7ec0b12f0836cdcb0b53143c98317bae88d4bcd692d0c2f2ae",
-      "new_sha256": "d24663f557e9b243b12e32d2d5006bd4c1a1a6e16a3d386bbc9cacffe97d75fc",
-      "reset_canonical_sha256": "35385feea176af438c95743efda7dbbc81603b2cb1a86705040bcb84c8e6c7e4",
-      "reason": "Move the simulator into the diffphys package; only the noise import becomes package-relative. All non-import AST nodes, including reset and RK4, are unchanged. Existing physical draws and yaw thresholds are retained; checkpoint bindings are not rewritten."
-    },
-    {
-      "previous_sha256": "d24663f557e9b243b12e32d2d5006bd4c1a1a6e16a3d386bbc9cacffe97d75fc",
-      "new_sha256": "4e9bd66519ab1ad1eb811555e4d9a43bd5990862c979b1ee35ead04ec6835928",
-      "reset_canonical_sha256": "35385feea176af438c95743efda7dbbc81603b2cb1a86705040bcb84c8e6c7e4",
-      "reason": "Retire the rotation-only compiler wrapper after strict whole-step compilation qualification. Native reset and every RK4 method AST are unchanged; retain original calibration draws and yaw thresholds. This records new production source, without rewriting any checkpoint binding."
     }
   ]
 }

@@ -1,8 +1,8 @@
 import math
 import pytest
 import torch
-from diffphys.env_raptor import RaptorSimulator,RaptorParams
-from diffphys.response_noise import DisturbanceConfig,executed_command
+from env_raptor import RaptorSimulator,RaptorParams
+from response_noise import DisturbanceConfig,executed_command
 
 def _numpy_step(s, action):
     """Independent scalar/NumPy port of upstream RK4; does not call our RHS."""

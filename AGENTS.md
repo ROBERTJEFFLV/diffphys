@@ -31,75 +31,28 @@ The existing rule still applies: run training/validation only when explicitly re
 
 ## Project Structure & Module Organization
 
-Core library code lives in the `diffphys/` Python package; use package-qualified
-imports from tools and tests. Keep command-line scripts in `tools/`, deterministic
-regressions in `tests/`, arguments/calibration in `configs/` and documentation in
-`docs/`. Run commands from the repository root without installing the package.
-
 There is one RAPTOR-style multi-airframe training path. The production modules
-are `diffphys/env_raptor.py`, `diffphys/response_noise.py`, `diffphys/response_policy.py`,
-`diffphys/response_task.py`, `diffphys/response_adjoints.py`, `diffphys/response_groups.py`,
-`diffphys/response_training.py`, `diffphys/response_execution.py`, `diffphys/response_sampling.py`,
-`diffphys/response_audit.py`, `diffphys/response_grad_probe.py`,
-`diffphys/compiled_physics.py`, `diffphys/strict_inductor.py`, `diffphys/scene_prefetch.py`, and the single CLI
+are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
+`response_task.py`, `response_adjoints.py`, `response_groups.py`,
+`response_training.py`, `response_execution.py`, `response_sampling.py`,
+`response_audit.py`, `response_grad_probe.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
-The hover training config is `configs/response_raptor_multi_airframe.args`;
-`configs/agile_flight.args` selects agile with its H500 horizon and
-Time Decay 0 while retaining the same accelerated execution path.
-CUDA production uses strict full-step Inductor compilation of the original
-`RaptorSimulator.step`, dynamic survivor compaction, critical-region GC scheduling,
-and one persistent spawn CPU sampler with one pending/ready next batch. CPU
-physics remains the native numerical reference. Do not restore experiment
-A/C/P selectors, Mask, bool-fill or the retired rotation-only backend. Compiler
-errors propagate; source-bound old runs require their archived source. See
-`docs/gpu_efficiency.md` and `docs/archive/README.md`.
+The sole training config is `configs/response_raptor_multi_airframe.args`.
 Full BPTT, Time Decay and physical-cell shrink-only gradient clipping are the retained
 algorithm. Production uses one native-backward group probe; the older grouped
 VJP backend remains an explicit numerical reference, never an automatic fallback.
 See docs/group_gradient_probe.md. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
 network belongs to the production chain. The sole Actor is native B:
-GRUCell(16,64) for hover or goal-conditioned GRUCell(36,64) for agile flight,
-followed by a hidden-only Linear(64,4); do not reintroduce the
+GRUCell(16,64) followed by a hidden-only Linear(64,4); do not reintroduce the
 direct feature-to-readout Wc branch or an A/B production selector.
 Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
 
-The `Agile-Flight-training` extension uses `--task agile` and
-`configs/agile_flight.json`; the default hover task remains available. Three-point
-targets and smooth time weights are fixed before each episode. Do not add
-state-based waypoint switches, hover-success thresholds or performance-gated
-curriculum promotions: the requested training signals are continuous losses.
-Use the same three-point target-generation rule throughout training. Do not add
-difficulty levels, update-dependent geometry ramps or automatic loss schedules.
-Committed updates select reproducible mission seeds only. Preserve the
-original physics, boundary, measurement noise family and physical gradient groups.
-The user-requested agile exception disables external constant force and pulses
-by default, preserves originally nonzero linear velocity for maneuver rows,
-and fills originally zero-velocity maneuver rows from an independent seeded
-per-axis Uniform[-2.5,2.5] m/s draw without replacing their aircraft or noise.
-Initialize all velocity-history slots consistently. The nominal S9 reference
-still starts at rest; continuous loss handles this initial tracking error without
-a new recovery phase or success gate. The v4 mission requests 105-degree midpoint
-tilt through a projected-heading frame that remains continuous across 90 degrees.
-Keep all H500 steps available for motion; do not restore a fixed hold duration or
-late-time hold loss. After the planned motion endpoint, all public goal fields
-must specify the final point, zero velocity and the unforced level attitude.
-The once-at-H terminal residual still guides braking and attitude recovery.
-Hover retains its previous force default;
-an explicit external-force choice belongs in the checkpoint binding and replay.
-Source motor feasibility checks first search longer durations at full geometry,
-then allow geometric shrink at the maximum duration if required. Report actual
-tilt, path length, initial speed, duration stretch and amplitude, and retain every
-sampled aircraft. These checks do not certify global optimality or learned
-recovery. Hover weights-only
-initialization zero-pads the GRU input matrix; it must not restore legacy Adam or
-pretend to be exact resume. See `docs/agile_flight.md`.
-
 `docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;
-its legacy filename is retained. The old shared 10% budget is removed. For the
-force-enabled protocol, TRAIN and the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
+its legacy filename is retained. The old shared 10% budget is removed. TRAIN and
+the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
 Gaussians, uniform 10-30 ms velocity latency, and the requested 0.1 s force-at-point
 pulses with randomized phase/0.8-1.2 s onset intervals. Pulse torque is computed
 from the body lever and true intermediate attitude at each RK4 stage, not a
@@ -114,7 +67,7 @@ three previous world-velocity slots differentiable through Time Decay.
 Generated runs/checkpoints, applicable provenance and license notices, source
 audit evidence and local agent configuration are not disposable source. Historical
 reference material is not imported into production. Removed runtime paths remain
-recoverable from Git history or the documented source archive.
+recoverable from Git history.
 
 ## Build and Development Commands
 
@@ -126,10 +79,10 @@ python tools/train_response_control.py @configs/response_raptor_multi_airframe.a
 ```
 
 `--scenarios` retains its four-bank size convention. The checked-in config uses
-coverage128 sampling, 4x768=3072 TRAIN scenes with 24 scenes per physical cell.
+coverage128 sampling, 4x512=2048 TRAIN scenes with 16 scenes per physical cell.
 Bare CLI defaults retain the original random 4x128=512 pool for compatibility.
 Fixed EVAL pools two original random banks (default 2x128=256). For production coverage128, sampling cells
-are also the 128 fixed gradient groups (24 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
+are also the 128 fixed gradient groups (16 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
 candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only CLI modes are train and evaluate.
 Exact resume requires identical source/config; never rewrite checkpoint hashes
 to bypass an environment/noise mismatch. Older protocol checkpoints require their

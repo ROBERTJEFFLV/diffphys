@@ -1,0 +1,97 @@
+"""One retained full-horizon graph; physical-group Actor gradients and Time Decay."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from contextlib import nullcontext
+import torch
+
+from response_task import (TaskLossConfig, FlightStatistics, initialize, rollout,
+                           step_cost_components, uniform_scene_weights)
+from response_groups import (GroupBalanceConfig, group_gradient_coefficients,
+                             backward_group_gradients, physics_group_layout)
+from response_grad_probe import GroupGradientProbe
+
+# Streaming metrics/cost reduction preserves the original 50-step reduction order.
+# This is NOT truncated BPTT: closed-loop tensors are never detached between chunks.
+METRIC_CHUNK = 50
+
+
+@dataclass(frozen=True)
+class RolloutRecord:
+    costs: torch.Tensor
+    weights: torch.Tensor
+    metrics: dict
+    group_coefficients: torch.Tensor
+    group_balance: dict
+    group_config: GroupBalanceConfig
+    loss_config: TaskLossConfig
+    probe: GroupGradientProbe | None = None
+
+
+def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_decay=1.,
+                    group_config: GroupBalanceConfig = GroupBalanceConfig()):
+    from pass_stop import PassStopLossConfig, prepare, typed_costs
+    if isinstance(config, PassStopLossConfig):
+        if time_decay != 0:
+            raise ValueError("PASS/STOP time objective requires --time-decay 0")
+        closed = prepare(policy, initial, config)
+        probe = (GroupGradientProbe(policy, *physics_group_layout(initial, group_config))
+                 if group_config.backward_backend == "probe" else None)
+        try:
+            with probe.capture() if probe is not None else nullcontext():
+                trace = rollout(policy, simulator, closed, horizon, actor_probe=probe)
+                costs, metrics, _ = typed_costs(trace, config)
+            weights = uniform_scene_weights(costs)
+            coefficients, report = group_gradient_coefficients(weights, initial, group_config)
+            return RolloutRecord(costs, weights, metrics, coefficients, report,
+                                 group_config, config, probe)
+        except BaseException:
+            if probe is not None:
+                probe.close()
+            raise
+    if horizon < 1:
+        raise ValueError("horizon must be positive")
+    closed = initialize(policy, initial)
+    statistics = FlightStatistics(initial, horizon, config)
+    probe = (GroupGradientProbe(policy, *physics_group_layout(initial, group_config))
+             if group_config.backward_backend == "probe" else None)
+    chunks = []
+    try:
+        with probe.capture() if probe is not None else nullcontext():
+            for start in range(0, horizon, METRIC_CHUNK):
+                trace = rollout(policy, simulator, closed, min(METRIC_CHUNK, horizon-start),
+                                time_decay=time_decay, actor_probe=probe, record_observations=False)
+                components = step_cost_components(trace, config, start=start, horizon=horizon)
+                chunks.append(sum(components.values()))
+                statistics.add(trace, start, components=components)
+                closed = trace.end
+        costs = torch.cat(chunks).sum(0)
+        if not bool(torch.isfinite(costs).all()):
+            raise FloatingPointError("nonfinite full-horizon costs")
+        weights = uniform_scene_weights(costs)
+        coefficients, report = group_gradient_coefficients(weights, initial, group_config)
+        return RolloutRecord(costs, weights, statistics.finish(costs.detach(), weights),
+                             coefficients, report, group_config, config, probe)
+    except BaseException:
+        if probe is not None:
+            probe.close()
+        raise
+
+
+def backward_actor(policy, simulator, record, config, *, gradient_scale=.1):
+    if config != record.loss_config:
+        if record.probe is not None:
+            record.probe.close()
+        raise ValueError("recorded task objective changed")
+    parameters = [p for p in policy.parameters() if p.requires_grad]
+    if record.probe is not None:
+        gradients, report = record.probe.backward(record.costs, record.group_coefficients,
+                                                  parameters, record.group_config,
+                                                  gradient_scale=gradient_scale)
+    else:
+        gradients, report = backward_group_gradients(record.costs, record.group_coefficients,
+                                                    parameters, record.group_config,
+                                                    gradient_scale=gradient_scale)
+    for parameter, gradient in zip(parameters, gradients):
+        parameter.grad = gradient
+    return {"group_gradient": report}

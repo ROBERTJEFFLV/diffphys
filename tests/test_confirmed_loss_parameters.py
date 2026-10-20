@@ -7,12 +7,12 @@ import math
 import pytest
 import torch
 
-from diffphys.env_raptor import RaptorSimulator
-from diffphys.response_adjoints import collect_rollout, backward_actor
-from diffphys.response_groups import GroupBalanceConfig
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import TaskLossConfig, smooth_l2, rollout, scenario_costs, task_loss_components
-from diffphys.response_training import binding, _checkpoint, require_reference_checkpoint, sample_training_scenarios
+from env_raptor import RaptorSimulator
+from response_adjoints import collect_rollout, backward_actor
+from response_groups import GroupBalanceConfig
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import TaskLossConfig, smooth_l2, rollout, scenario_costs, task_loss_components
+from response_training import binding, _checkpoint, require_reference_checkpoint, sample_training_scenarios
 from tools.train_response_control import parse_args
 from test_adapted_loss import trace_fixture
 

@@ -9,9 +9,9 @@ import numpy as np
 import torch
 from unittest.mock import patch
 
-from diffphys.env_raptor import RaptorParams, RaptorSimulator
-from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
-from diffphys.response_task import TaskLossConfig, rollout, sample_scenarios
+from env_raptor import RaptorParams, RaptorSimulator
+from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
+from response_task import TaskLossConfig, rollout, sample_scenarios
 from tools.short_eval_replay import capture_short_eval, save_latest_replay
 from tools.response_monitor import launch_replay, replay_entry
 from tools.play_response_short import FORCE_FIELDS, force_at_frame, load_replay
@@ -145,14 +145,3 @@ def test_terminated_scene_stays_frozen_in_the_saved_short_trace():
     np.testing.assert_array_equal(arrays["orientation"][1:, 0], np.repeat(
         arrays["orientation"][1:2, 0], horizon, axis=0
     ))
-
-
-def test_checkpoint_export_reports_production_backend_and_matches_fixed_eval(tmp_path):
-    from test_reference_training import args_for,run
-    from tools.short_eval_replay import export_checkpoint
-    folder=tmp_path/'run'
-    run(args_for(folder,0))
-    result=export_checkpoint(folder/'latest.pt',folder,device='cpu')
-    assert result['numerical_backend']=={'physics':'native-cpu-reference'}
-    assert result['logged_metrics_match'] is True
-    assert result['checkpoint_update']==0

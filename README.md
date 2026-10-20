@@ -1,109 +1,11 @@
 # DiffPhys: multi-airframe recurrent motor control
 
 One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
-entry. Training uses full-horizon BPTT, optional backward-only Time Decay,
-physical-group shrink-only gradient clipping and persistent Adam. There is no
-critic, teacher, auxiliary network or single-airframe mode. The hover Actor is
-GRUCell(16,64) + hidden-only Linear(64,4); the agile task adds 20 goal features
-to the same recurrent/readout structure. Wc is removed, with no mask or
-alternative direct-feature branch. No geometric feedback controller is added.
-
-## Agile flight: three-point continuous-reference training
-
-The `Agile-Flight-training` branch adds `--task agile`: start at point 1 with
-initial linear velocity, follow a smooth three-point
-position/attitude/velocity reference, then brake at the final point.
-The v4 defaults request a **105-degree midpoint tilt**, half-span `0.70 * position_limit`
-and bend magnitude `0.38 * position_limit`, inside the original boundary.
-Every update uses the same target-generation rules; there is no
-difficulty schedule or success-gated promotion. A fixed clock moves the reference
-from point 1 at reset, through point 2 at half the motion duration, to point 3.
-After motion ends, every goal slot describes the final point with zero velocity
-and level attitude; no fixed hold duration is reserved. The reference keeps advancing if the aircraft misses a point;
-continuous tracking losses penalize the deviation. The original world-fixed
-`30 * arm_length` boundary and sampled airframes remain intact. Agile disables
-constant external force and force-at-point pulses by default, while retaining
-measurement noise and velocity latency. Hover keeps its existing force default.
-
-```bash
-python tools/train_response_control.py @configs/agile_flight.args \
-    --init-checkpoint /absolute/path/hover.pt \
-    --work-dir runs/agile/from_hover_seed7
-```
-
-Replace the checkpoint placeholder before running. A compatible structured hover
-checkpoint copies the existing 16 input columns and zero-initializes the 20 added
-columns, with fresh Adam and sampling progress. All Actor weights remain trainable.
-Each output checkpoint contains the complete updated Actor and can be loaded
-without the original hover checkpoint. Inference still receives measured state
-and the time-varying goal packet. Exact `--resume` remains separate and strict.
-The agile argument file uses **H500 at 100 Hz (5 seconds)** and Time Decay 0.
-All 500 steps are available to the motion reference. CUDA still compiles each original RK4 physics
-step's forward and backward through strict Inductor/AOTAutograd; the full rollout
-remains connected by autograd, with native GRU, loss, group probe and Adam.
-CPU physics remains the native reference. The original hover argument file is
-unchanged.
-
-The projected-heading attitude frame is continuous at and beyond 90 degrees;
-`tilt_degrees` accepts `[0, 180)`. The midpoint target uses the actual acceleration
-after timing and actuator checks, so an aircraft may receive a smaller tilt than
-the requested 105 degrees. World-vertical thrust may be negative in an inverted
-segment while collective body-axis rotor thrust remains positive.
-
-For each original airframe, the planner first keeps the complete path and searches
-longer motion durations on a fixed grid until individual rotor thrust and motor
-response pass the nominal audit. It uses geometric shrink only if no full path
-duration passes within the horizon. Reports expose actual midpoint tilt/speed,
-path length, initial speed, duration stretch and any geometric fallback. This is
-a finite candidate search, not a global or continuous-time optimality claim, and
-does not use training progress or flight success. The default task mix requests
-three-point motion for every aircraft, with no separate hover replay samples.
-
-The nominal S9 reference still starts at rest. Actual initial velocity is an
-initial tracking error handled by the continuous loss, with matching delayed
-velocity history; it is not an extra waypoint or recovery gate. Existing nonzero
-velocities are retained. Originally stationary guidance rows receive an
-independent seeded per-axis `Uniform[-2.5, 2.5] m/s` draw, matching the original
-non-guidance range, without replacing the aircraft or its noise tapes. Reports
-record this zero-velocity replacement count. An initial velocity can point
-outward, so reference containment alone does not establish actual recovery.
-
-See the [Chinese mathematical and usage guide](docs/agile_flight.md) for the S9
-construction, continuous loss, CPU example, initialization, checkpoint rules and
-limitations. Unless explicitly marked agile, the loss/reset descriptions and
-commands below document the existing hover task.
-
-## Repository layout
-
-```text
-diffphys/    Core Python package: simulator, sensing, Actor, loss and training
-tools/       Command-line tools, replay players and training monitor
-tests/       Deterministic regressions and protected kernel contract
-configs/     Training/evaluation arguments and frozen physical coverage
-docs/        Protocol, numerical methods and usage documentation
-```
-
-Import library code through the package, for example
-`from diffphys.env_raptor import RaptorSimulator`. Run the commands below from
-the repository root; no package installation is needed.
-
-The package move updates imports, source paths and archive manifests. Numerical
-kernels and protected contract hashes are retained. Source bindings change:
-exact resume/evaluation of pre-move checkpoints requires their original checkout.
-Existing checkpoint hashes must not be rewritten to accept the new layout.
-
-Production CUDA training uses strict full-step Compiled physics, original
-survivor compaction, GC deferral over forward/backward, and one persistent
-`spawn` CPU sampler with one next-batch cache. CPU uses native physics as a
-numerical reference. All execution runs through `tools/train_response_control.py`;
-there is no separate experiment trainer or A/C/P selector. See
-[current execution and measured qualifications](docs/gpu_efficiency.md).
-
-The retired experimental implementations and detailed reports are preserved
-in the [source archive](docs/archive/README.md). Existing generated runs,
-checkpoints, licenses, source audit evidence and local agent configuration
-are retained. Old exact resume uses its archived source; no checkpoint hash
-is rewritten to accept the new production source.
+entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
+shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
+auxiliary network or single-airframe mode. The sole production Actor is B:
+GRUCell(16,64) + hidden-only Linear(64,4). Wc is removed, with no mask or
+alternative direct-feature branch. Geometric feedback is not used.
 
 ## Run
 
@@ -113,35 +15,35 @@ your CUDA runtime; no native extension build is required.
 ```bash
 python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
 python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/compiled_prefetch_3072/fresh_seed7/best.pt \
-    --work-dir runs/compiled_prefetch_3072/evaluation
+    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
+    --work-dir runs/attitude_delta_lambda25_gru_only_no_cvar/evaluation
 python -m pytest -q tests
 ```
 
-The checked-in config uses one GPU, 4 x 768 = **3072 TRAIN** scenes per update,
+The checked-in config uses one GPU, 4 x 512 = **2048 TRAIN** scenes per update,
 2 x 128 = **256 fixed EVAL** scenes, H500 at 100 Hz, memory dimension 64,
 Time Decay 1 s^-1, Adam 3e-4, gradient scale 0.1 and global clip 10.
 It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
 **per bank**, not totals. No training runs on import.
 
 TRAIN now uses [fixed physical coverage](docs/physics_coverage.md):
-TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 24 scenes each.
+TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 16 scenes each.
 Candidate aircraft retain the original physical coupling and initial conditions;
 noise is attached after selection. Fixed EVAL does not change. The 128 fixed
-sampling cells are now also the 128 gradient groups: 24 initial scenes each,
+sampling cells are now also the 128 gradient groups: 16 initial scenes each,
 including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
 after equal-scene weighting/gradient-scale, never amplified, then averaged. Groups are processed
 using a training-only native GRU/Linear gradient probe in one backward graph
 traversal. The former eight-chunk VJP path is an explicit reference backend only.
 This preserves per-group clipping, not an approximation of the group norms.
 See [one-pass probes and profiling](docs/group_gradient_probe.md). Update evidence
-is retained locally by `diffphys/response_audit.py`. CUDA throughput must
+is retained locally by `response_audit.py`. CUDA throughput must
 be measured on the target GPU; fewer traversals do not promise a specific latency.
 
-The checked-in config starts new runs under `runs/compiled_prefetch_3072/fresh_seed7`.
-CUDA uses the strict compiler directly; the former `--rotation-backend` option
-is removed. Sampling, EVAL, audit, checkpoints, worker startup/shutdown and
-final cleanup remain within the run time budget.
+The main config explicitly compiles the original quaternion rotation inside RK4
+(`--rotation-backend compile`), retaining the Actor and other physics. See
+[measured CUDA optimizations and checkpoint boundaries](docs/gpu_efficiency.md)
+for the timing, numerical checks, rejected experiments and read-only profiler.
 
 Bare CLI calls retain the original random sampler. To explicitly use that sampler
 with the checked-in config and the former smaller pool, use a NEW run directory:
@@ -164,7 +66,7 @@ training checkpoints.
 
 ```bash
 python tools/evaluate_response_long.py @configs/response_long_eval.args \
-    --checkpoint runs/compiled_prefetch_3072/fresh_seed7/best.pt \
+    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
     --work-dir runs/long_hover_eval/seed20260927
 python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
 ```
@@ -201,8 +103,8 @@ scores cannot be compared directly; use the retained physical flight metrics.
 
 An old-source/objective run cannot be exactly resumed with this source. Keep its
 checkpoint and checkout intact; `--init-checkpoint PATH` explicitly imports only
-same-architecture weights into a fresh Adam/sampling/best-score run. For 3072
-scenes, use `--scenarios 768` and `--group-min-scenarios 24` (four-bank size convention). Exact resume inside
+same-architecture weights into a fresh Adam/sampling/best-score run. For 2048
+scenes, keep `--scenarios 512` (four-bank size convention). Exact resume inside
 this new run requires matching source, objective and sampler settings.
 
 ## Online metrics without live training rendering
@@ -224,9 +126,9 @@ The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
 
 ```bash
 python tools/short_eval_replay.py \
-    --run-dir runs/compiled_prefetch_3072/fresh_seed7 --device cuda
+    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7 --device cuda
 python tools/monitor_response_training.py \
-    --run-dir runs/compiled_prefetch_3072/fresh_seed7
+    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7
 ```
 
 The exporter retains the latest complete fixed-EVAL trace, including the exact
@@ -241,14 +143,7 @@ The dashboard itself never launches export or simulation.
 Polling is bounded and read-only; shared CPU/disk/display resources still have
 some overhead. Run it on another machine with synced files for best isolation.
 
-## Disturbance settings shared by TRAIN and EVAL
-
-The force-enabled protocol below remains the default for **hover** and is
-available to agile with `--enable-external-forces`. Agile defaults to force off:
-constant force, pulse force and its induced torque are zero; sensor noise and
-latency remain as listed. `--disable-external-forces` selects force off explicitly
-for either task. The selected settings are saved with the checkpoint and reused
-for fixed EVAL and exact replay.
+## One disturbance protocol for TRAIN and EVAL
 
 | Component | Distribution | Lifetime |
 |---|---|---|
@@ -287,11 +182,9 @@ pulse can push AND rotate the aircraft; its torque is not frozen as attitude cha
 TRAIN resamples airframes, initial states, constant force, pulses, latency and
 measurement tapes each update. The **single** fixed EVAL retains original random
 airframe sampling and fixed seeds/tapes; the conditional disturbance laws above
-are shared when external forces are enabled. EVAL reads saved checkpoint settings,
-not new CLI noise flags. `--disable-pulses` disables pulses while retaining any
-enabled constant force and sensors; `--disable-disturbances` turns off all
-disturbances, including sensors and latency, for regression. Neither undoes the
-harder hover reset below or creates another evaluator.
+are shared. EVAL reads saved checkpoint settings, not new CLI noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
+turns off all disturbances for regression. Neither undoes the harder reset below
+or creates another evaluator.
 
 Measurement scales are L2F-inspired. SO(3) rotation-vector noise is not identical
 to L2F's matrix-element corruption. Uniform 10-30 ms latency is a modeling choice
@@ -383,15 +276,15 @@ are recorded with old/new provenance in the core contract; other protected hashe
 not CUDA throughput, convergence, trained recovery or real-flight safety results.
 Checkpoints retain `deployment_authorized: false`.
 
-`diffphys/env_raptor.py` owns physics; `diffphys/response_noise.py` sampling/sensing/pulse tapes;
-`diffphys/response_policy.py` the deployable Actor; `diffphys/response_task.py` rollout/true losses;
-`diffphys/response_adjoints.py` and `diffphys/response_groups.py` grouped full BPTT;
-`diffphys/response_training.py` banks/Adam/checkpoints; `diffphys/response_sampling.py` TRAIN coverage;
-`diffphys/response_grad_probe.py` one-traversal layer-local group derivatives;
-`diffphys/response_audit.py` bounded Actor/Adam/RNG update evidence;
+`env_raptor.py` owns physics; `response_noise.py` sampling/sensing/pulse tapes;
+`response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
+`response_adjoints.py` and `response_groups.py` grouped full BPTT;
+`response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
+`response_grad_probe.py` one-traversal layer-local group derivatives;
+`response_audit.py` bounded Actor/Adam/RNG update evidence;
 `tools/train_response_control.py`
 is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
 [third-party notices](THIRD_PARTY_NOTICES.md) are retained. Retired source and
-alternative implementations are preserved in Git history and the documented
-source archive. CUDA production uses strict whole-step compilation and bounded CPU prefetch;
-CPU keeps the native numerical reference.
+alternative implementations are preserved in Git history, not the production
+tree. The current physics and training files use eager PyTorch; the experimental
+compiled hotpath backend is not included.
