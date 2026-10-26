@@ -1,5 +1,6 @@
 @configs/response_raptor_multi_airframe.args
 --mission-config configs/pass_stop.json
 --time-decay 0
+--scenarios 768
 --disable-pulses
 --work-dir runs/pass_stop/seed7

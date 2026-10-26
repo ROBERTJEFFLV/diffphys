@@ -1,0 +1,79 @@
+{
+  "snapshot": "20261026-u1456",
+  "created_at_utc": "2026-10-26T03:38:55.407286+00:00",
+  "repository": "ROBERTJEFFLV/diffphys",
+  "branch": "Agile-Flight-training",
+  "tag": "frozen-aft-20261026-u1456",
+  "base_commit": "42e5f1704ba1128877c8cab738085403e2a8d04a",
+  "training_source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+  "stopped_update": 1456,
+  "best_update": 1450,
+  "checkpoints": {
+    "latest.pt": {
+      "updates": 1456,
+      "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+      "model_sha256": "cdcb4aa6bad731138e944d51968a50a6d9abc99440637355c715148b78c95e27",
+      "file_sha256": "23f64a21f0cf6b8ef70b5c784ebe0f9c654dfeed252ddbf40b9f385d2cbd9dea",
+      "bytes": 343317
+    },
+    "best.pt": {
+      "updates": 1450,
+      "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+      "model_sha256": "360ccee70404795bdc0b43064a31c52e4bdc4f0f4bbc0a56af1cb6679b4fc136",
+      "file_sha256": "9517caa8468c6d0483a223c74b0d90301d91696f2e20417e8f0975d4a135fdf8",
+      "bytes": 343317
+    }
+  },
+  "fixed_development_eval": {
+    "update": 1450,
+    "task_objective": 13.651424407958984,
+    "success_fraction": 0.3046875,
+    "pass_fraction": 0.30859375,
+    "region_enter_fraction": 0.82421875,
+    "region_exit_fraction": 0.82421875,
+    "pass_position_m": 0.10113312304019928,
+    "pass_chordal_ratio": 1.213594913482666,
+    "pass_speed_shortfall_m_s": 0.0
+  },
+  "fixed_eval_scenarios": 256,
+  "publication_source_file_count": 104,
+  "runtime_sources": {
+    "runs/pass_stop/local_trial_20261026_095338/continuous_train_response_control.py": {
+      "bytes": 1257,
+      "sha256": "a650b48264e48a2f5cf628d0ceae9ce4e88932aa7e560c9c3772a8ffda7f1245"
+    },
+    "runs/pass_stop/local_trial_20261026_095338/training_supervisor.py": {
+      "bytes": 1148,
+      "sha256": "4b80b843a781a1056ab13686d23435c4036c41ad55d5f7a7baf77c10b19c62ec"
+    }
+  },
+  "training": {
+    "scenes": 3072,
+    "horizon": 500,
+    "control_dt": 0.01,
+    "time_decay": 0,
+    "goal_features": 69,
+    "memory_dim": 64,
+    "sampling": "coverage128",
+    "group_count": 128,
+    "region_radius": "2 * arm_length",
+    "minimum_pass_speed_m_s": 2,
+    "requested_pass_roll_deg": 105,
+    "compiler": "strict-inductor native-arithmetic-v2",
+    "cpu_sampling": "one prefetched bank",
+    "saved_tensor_storage": "large contiguous values in pinned CPU memory"
+  },
+  "verification": {
+    "fresh_cpu_suite": "608 passed, 25 skipped, 14 warnings",
+    "prior_cuda_targeted_suite": "8 passed, recorded 2026-10-23",
+    "gpu_training_observed_through_update": 1456,
+    "checkpoint_actor_digests_verified": true
+  },
+  "scope": "A frozen trained development snapshot; fixed EVAL was used repeatedly for best-model selection. Not an independent test or deployment certification.",
+  "local_only_backups": [
+    "complete current run with all logs/audit/evaluated checkpoints/replay",
+    "complete reports",
+    "raw inputs including research PDF and original patch ZIP",
+    "pre-freeze git bundle and working-tree patch"
+  ]
+}

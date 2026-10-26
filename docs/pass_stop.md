@@ -1,245 +1,267 @@
-# AFT: master + fixed PASS/STOP goals + differentiable completion-time proxy
+# AFT v3：三点位姿、球形穿越区域与最低速率监督
 
-## Scope and provenance
+## 本次交付状态
 
-This AFT revision rebuilds the source tree from `master@82e7634ac82e8f719f33ee028768a73a82d33191`.
-The prior AFT implementation remains in Git history (`85bf954`); its additional
-`diffphys/` package, AL trainer, bank multipliers, paired parameter probes, event
-root solver, reference-trajectory generator and non-deceleration constraints are
-not in this tree. `master` itself is not modified.
+本改动以 `Agile-Flight-training@42e5f1704ba1128877c8cab738085403e2a8d04a` 为基线。
+本地已经应用补丁并修复区域几何、最低速率语义和回放接口，未提交或推送远端，也未启动正式训练。
 
-There is still one training entry and one optimizer: `tools/train_response_control.py`
-and `response_training.py`. The opt-in `pass_stop.py` task supplies goals and a
-full-episode cost to the existing native grouped backward/Adam pipeline. No MPC,
-critic, teacher, additional readout, learnable metric, curriculum or line search
-is added. No long training was run for this change.
+不增加 MPC、轨迹优化器、教师网络、Critic 或另一套积分器。
+继续使用同一个训练入口、原生 GRU/Linear、原四旋翼 RK4、分组梯度、Adam 和 H500。
+物理方程、噪声、基础 Actor 和分组裁剪的受保护内核保持原合约。
+训练执行层现已接入 CUDA 分块编译、CPU 场景预取及大张量暂存，详见 [编译与预取](compiled_prefetch.md)。
 
-Protected master files are unchanged: `env_raptor.py`, `response_noise.py`,
-`response_policy.py`, `response_task.py`, `response_groups.py`,
-`response_sampling.py`, `response_audit.py`, `response_execution.py` and the
-physical-coverage configuration. Their original Git blob hashes are recorded in
-`pass_stop_validation.json`.
+点2要求的是球内速率下限，不是恒定速度向量。配置向量的模长给出该下限，方向不参与球内速度评分。
+起点实际初速也按最新要求设为零，而不是此前保留的随机初速。
 
-**Compiler scope follows master, not the old AFT:** `--rotation-backend compile`
-compiles the quaternion-to-rotation expression. It does not compile the whole
-RK4 step, whole backward, or Actor. The previous AFT whole-step compilation and
-CPU-prefetch subsystem are removed along with that baseline. Native physical-cell
-gradient clipping and the one-traversal GRU/Linear parameter probe remain active.
+## 1. 三个固定点和状态切换
 
-## Run
+默认任务（B是原世界坐标每轴边界，L是机体中心到电机中心的距离）：
 
-```bash
+| 点 | 位置 | 姿态 | 速度要求 |
+| --- | --- | --- | --- |
+| 点1 START | (-0.70B, 0, 0) | 水平 | (0,0,0) m/s |
+| 点2 PASS | (0, 0.38B, 0) | 105° roll | 速率 >= 2 m/s，配置编码为 (2,0,0) |
+| 点3 STOP | (0.70B, 0, 0) | 水平 | (0,0,0) m/s |
+
+在 `configs/pass_stop.json` 修改 `velocities[1]` 的模长可改变最低速率。
+默认2 m/s，没有针对随机机型做可达性优化；3、4 m/s不会因高于2 m/s受到球内速度处罚。
+方向也不受球内速度损失限制。起终点仍要求零速度。保留原向量输入布局以支持权重初始化，不对零向量求方向。
+
+点2区域半径为 `region_radius_arms * initial.arm_length = 2L`。
+它与中心位置容差 `radius_m=0.1 m` 是两个不同量：前者规定区域，后者规定需要靠近点2中心多少。
+检查整个球都在原边界内，且起终点不与球重叠。没有扩大边界，也没有悄悄缩小倾角或速度。
+
+三阶段状态机：
+
+```
+点1出生且已处于START初态
+  -> APPROACH：以点2为位置、姿态、速度目标
+  -> ENTERED：第一次入球；仍以点2为目标，不切点，不重置GRU
+  -> STOP：首次出球；同一次控制调用即用点3生成下一电机命令
+```
+
+出球不等待姿态或速度达标，不增加保持计时，STOP永久锁定。
+不论是否完成中点要求，最终停车义务一直计入损失。
+
+控制切换使用测量位置；任务位姿和速度误差使用真实仿真状态，不向Actor泄漏物理真值。
+相邻100 Hz位置的线段与球相交检查可检测“两端都在球外、线段穿球”的情形。
+数值保护只屏蔽静止、相切及无效分支；不会用FP32机器精度截断合法的小判别式。毫米量级入球比例和位置梯度有独立回归。
+这不是对两个时刻之间真实弯曲轨迹的连续时间证明；只在下一个控制时刻更新命令。
+切点条件仍是离散布尔操作，不声称给它添加了精确导数。
+
+## 2. 观测和网络：22维测量 + 任务状态 -> 69维特征
+
+原22维测量未改变：位置3、延迟速度3、旋转矩阵9、机体系角速度3、上一命令4。
+三点要求保存在公共任务状态，不混入质量、惯量、电机真值、外力、噪声元数据或未来时钟。
+
+| 特征列（0起始，右端不含） | 数量 | 内容 |
+| --- | ---: | --- |
+| 0:16 | 16 | 原控制特征；位置改为相对当前固定目标 |
+| 16:19 | 3 | 终点机体系相对位置，保留旧AFT布局 |
+| 19:25 | 6 | 当前目标相对姿态的前两列，保留旧AFT布局 |
+| 25:26 | 1 | STOP标志，保留旧AFT布局 |
+| 26:32 | 6 | 起点和中点机体系相对位置 |
+| 32:50 | 18 | 三个目标各自相对当前机体的姿态表示 |
+| 50:59 | 9 | 三点速度配置向量旋转到当前机体系，除以3；中点模长定义最低速率，方向不作约束 |
+| 59:65 | 6 | 当前测量姿态的前两列，显式提供自身完整方向 |
+| 65:68 | 3 | APPROACH / ENTERED / STOP one-hot |
+| 68:69 | 1 | 公共任务球半径，单位m |
+
+所有目标姿态都采用旋转表示，不使用有跳变的欧拉角差。
+部分字段有意保留冗余：这样旧26维输入权重可完整拷贝，新43列置零。
+
+```
+69维特征 -> GRUCell(69,64) -> Linear(64,4) -> tanh
+           同一64维记忆      四路归一化电机命令
+```
+
+仍只有原来的六个参数张量，没有新增分支、辅助头或加速度执行器。
+初始状态在点1、零速度、零角速度、指定水平姿态和模型内平衡电机状态；
+已知命令历史仍为原来的零占位，不将电机真值伪装成上一次命令。
+传感器噪声及10–30 ms速度延迟保留，外力和脉冲关闭。
+
+## 3. NMI物理反传与当前刚体模型怎样衔接
+
+参考原文：Y. Zhang et al., Learning vision-based agile flight via differentiable physics,
+Nature Machine Intelligence 7, 954–966 (2025), DOI 10.1038/s42256-025-01048-0，Methods及Extended Data Fig. 2。
+
+NMI模型使用期望推力加速度、低阶执行器响应、位置/速度积分和其平台的阻力模型。
+NMI速度损失使用两秒平均速度；网络接收姿态估计；原文还提供指数时间梯度衰减。
+这些是来源内容。**以下是面向当前电机级刚体系统的对应实现，不是逐行复制NMI的质点模型。**
+
+原始RK4已联合推进：
+
+```
+p_dot = v
+v_dot = R(q) e3 * sum(thrust_i(m_i))/mass + gravity
+q_dot = 0.5 * q ⊗ [0,omega]
+omega_dot = J^-1 (torque(m) - omega × J omega)
+motor_dot_i = (motor_command_i(u_i) - m_i) / tau_i
+```
+
+当前 `tau_i` 根据上升/下降响应选取，推力是原二次电机曲线；
+旋转矩阵参与每个RK4中间阶段的推力方向和力矩计算。
+
+因此梯度自然沿以下关系传播：
+
+```
+目标位置、姿态、速度与时间Loss
+ -> 各时刻 p, v, q, omega 与末端 motor
+ -> 原RK4的状态/动作导数
+ -> 四路电机命令
+ -> Linear、GRU及更早的记忆/观测
+```
+
+局部例子（只用于理解，不替代原积分器）：
+
+```
+v_next = v + dt * a
+p_next = p + dt*v + 0.5*dt^2*a
+∂Lv/∂a = dt * ∂Lv/∂v_next
+δa = -(F/m) R [e3]_x δphi + (R e3/m) δF
+```
+
+最后一式说明，速度误差既可以通过总推力改变，也可以通过姿态改变；
+姿态又由四电机差动推力、角速度和惯量决定。
+实际训练使用原RK4自动微分，而不是把这些Euler示例当作自定义backward。
+
+新增 `pass_stop_physics.py` 只读出已有轨迹的量：
+
+```
+a_bar[k] = (v[k+1]-v[k])/dt
+alpha_bar[k] = (omega[k+1]-omega[k])/dt
+jerk[k] = (a_bar[k+1]-a_bar[k])/dt
+```
+
+两个端点都保留计算图；它们是原RK4区间平均加速度等读出，不是第二次物理积分。
+没有对真值做detach，没有用有噪测量差分代替仿真力学，也没有再叠加一个“虚拟加速度动作”。
+终点的瞬时净加速度、角加速度用同一推力/力矩公式计算一次，用于平衡检查。
+
+| NMI内容 | 本次处理 |
+| --- | --- |
+| 位置、速度、加速度的求导 | 由既有完整刚体RK4覆盖，并新增可检查读出与有限差分测试 |
+| 推力方向与姿态 | 用真实q/R和角动力学桥接，不能直接把机体方向强设为目标加速度方向 |
+| 执行器滞后 | 保留原四电机上升/下降时间常数，不重复加入NMI近似滤波器 |
+| 速度监督 | 本任务只处罚首次球内低于最低速率的部分，允许加速及方向变化 |
+| 速度均值窗口 | 未采用；删除旧v2的固定速度向量均值监督，避免它继续推动恒速 |
+| 加速度/jerk正则 | 支持，默认权重0；否则会无意惩罚特技所需的强加速 |
+| 指数时间梯度衰减 | 沿用原 `time-decay`，默认0；正值是有意修改的代理梯度 |
+| 校准的阻力、姿态内环、障碍项 | 未移植：当前模型/任务没有对应校准及障碍观测，不能伪称“所有NMI模型项已加入” |
+
+`time-decay=0`时保持原计算图完整BPTT。
+`time-decay>0`按原master对跨步物理状态、记忆和延迟速度历史乘指数因子；
+这不改变前向飞行，但不再是未衰减标量Loss的完整导数。
+
+## 4. 损失的具体职责
+
+### 球内位姿与速度
+
+在首次穿球的每个控制间隔，对线段入球点、中点、出球点进行有限个插值检查。
+姿态采用短弧四元数归一化插值；位置、速度线性插值。这些是评分近似，不替代物理状态推进。
+
+- 位置：首次穿球期间最接近球心的真实/插值状态，要求进入0.1 m中心容差。
+- 姿态：整个首次穿球期间的最大姿态违规。
+- 速率：整个首次穿球期间低于下限的最大缺额。
+
+```
+r_p = |p-p2| / 0.1
+r_R = |R-R2|_F / (2 sqrt(2) sin(epsilon_R/2))
+v_min = |velocities[1]|
+r_v = 1 + (v_min - |v|) / pass_speed_scale_m_s
+L_pass = 10*[r_p-1]_+^2 + 10*[r_R-1]_+^2 + 10*[r_v-1]_+^2
+```
+
+`pass_speed_scale_m_s=0.5`只是损失归一化尺度，不允许低于下限0.5 m/s的余量。
+默认2 m/s时，1.9 m/s仍有处罚；2 m/s及以上速度项为零。没有恒速、固定速度方向或均值速度匹配项。
+同一速率的不同方向在球内速度项中等价；位置与姿态要求仍分别计分。
+不增加“角速度必须为零”的中点条件，也不恢复旧的全程25倍姿态变化惩罚。
+没有随距离减弱的可微姿态权重；故不会引入此前的“离远一点就降低姿态权重”路径。
+缩短穿越的采样数不删除峰值误差，后续好姿态重访也不覆盖第一次失败。
+
+尚未入球时，以同一个实际存活时刻的位姿/速度联合误差提供恢复梯度；
+没有出球时保留未完成代价。选择时刻和事件本身仍然是离散的。
+有限惩罚不是严格约束求解器，不能保证所有飞机都满足请求。
+
+### 连续运动引导
+
+接近区域使用弱前进/侧向速度引导，方向由点1到点2确定。
+球内保留逐检查点的最低速率监督，不作固定速度向量的滑动均值匹配。
+出球后不再施加球内速率下限，终点继续要求停止；不生成带时钟的参考轨迹。
+这不是DiffRacing的额外自定义梯度注入，而是普通标量辅助Loss；反传仍一次完成。
+
+### STOP与时间
+
+终点位置、线速度、姿态和角速度始终计分，不因还没切到点3而免除。
+末端同时检查净加速度、角加速度和四电机变化率，避免第500步零速度转折点被误认为平衡。
+无需预留固定保持一秒；有限H500仍不能保证无限时间稳定。
+
+时间项沿用：
+
+```
+quality(r) = 1/(1 + relu(r-1))
+P_t = 最好的过去PASS联合质量
+S_t = 最差的未来STOP质量
+T_proxy = dt * sum_t (1 - min(P_t,S_t))
+```
+
+PASS联合质量包含最低速率缺额，并被第一次穿球最差质量封顶。
+原硬完成指标另外要求实际出球，再在STOP中保持至H500。
+时间代理仍可能给未严格合格飞行较好的分数；`max/min`的梯度也比较稀疏。
+它不是所有不同轨迹完成时间的精确排序，更不是切点处处可微的证明。
+
+## 5. 重要物理限制
+
+105°倾角下，正推力的竖直分量向下。无外力模型中：
+
+```
+a_z = (F/m)*cos(105deg) - 9.81 < -9.81
+```
+
+105°姿态会改变速度，但本任务允许加速和改变速度方向，只规定速率不得低于下限；不再要求与恒定速度向量同时成立。
+仍使用有限软惩罚，不能保证全部随机飞机满足位姿、最低速率和停车要求。
+球半径、最低速率、容差应由实际训练/可达性检查决定；没有偷偷改小姿态要求。
+高速机动的模型误差、节点间弯曲路径、传感器噪声导致的误入球仍需更高频独立评估。
+
+## 6. 权重、训练、部署
+
+```
 python tools/train_response_control.py @configs/agile_flight.args \
   --init-checkpoint /absolute/path/hover.pt \
-  --work-dir runs/pass_stop/from_hover
+  --work-dir runs/pass_region/from_hover
 ```
 
-`configs/agile_flight.args` includes the original master argument file and overrides
-only the mission, `time-decay=0`, pulse generation and run directory. H500, 100 Hz,
-4 x 512 TRAIN scenes, coverage128, native group probe and Adam remain. The inherited
-50-update budget is a smoke/screening budget, not a claim of sufficient training.
+默认H500、100 Hz、CPU线程设置继承master，AFT配置设置 `--scenarios 768`，
+原四bank约定得到3072个TRAIN场景；coverage128每cell24个场景。
+这不是3072场景GPU性能验证。原50次更新/1800秒预算仍只是配置，未启动正式训练。
 
-`configs/pass_stop.json` defines the public task. Default positions are fractions
-of each airframe's original world-origin boundary B:
+原16维悬停权重：保留16列，新增列置零。
+旧26维AFT权重：保留26列，新增43列置零。
+全部参数继续训练，Adam重新初始化；不是原优化器精确续训。
+新69维任务支持同源码/配置严格resume，日志、RNG、Adam与原审计回放保持绑定。
+本次目标协议是 `pass-region-min-speed-v3`。v2恒速目标checkpoint不可作为新任务精确续训或重新解释；可显式导入同布局权重，在新目录使用新的Adam和任务。
+输出.pt含完整Actor与任务协议，运行时不需要旧.pt基座。
+没有用户实际训练好的hover.pt参与本次测试；迁移测试使用真实协议的合成权重。
 
-- Point1: `(-0.7B,0,0)`, spawn; horizontal attitude and balanced motor state.
-- Point2: `(0,0.38B,0)`, PASS; first sampled entry into the 0.1 m ball must have the
-  specified full attitude (default 105-degree roll, one-degree tolerance).
-- Point3: `(0.7B,0,0)`, STOP; position, velocity, full attitude and angular velocity
-  tolerances. The terminal position target remains forever.
+部署接口是测量obs22 + 公共三点位姿/速度/区域数据，仍输出四路归一化电机命令。
+部署端必须使用相同状态机、姿态坐标约定、速度单位和69维特征，不可只加载权重到旧26维Actor。
 
-Set `relative_to_boundary=false` to use positions in metres. Invalid/out-of-bound
-or overlapping goals raise an error; neither tilt nor geometry is silently reduced
-for weak airframes. This checks geometry, not complete dynamic feasibility.
+编译范围仍跟随当前AFT/master：仅四元数转旋转矩阵可compile。
+没有恢复旧 `CPU_compile_accelerated` 的整步RK4编译或预取，也没有声称完成CUDA验证。
 
-PASS has **no speed target, speed floor, non-deceleration condition or zero-rate
-condition**. A time-minimizing policy may slow down when that helps complete the
-whole task. STOP includes a zero-velocity and zero-angular-velocity requirement.
+## 7. 文件与验证
 
-The initial velocity sample from master is retained, including the original 10%
-zero-speed guidance rows. This is an initial-state deviation, not an initial dwell
-phase. Constant external force and force-at-point pulse tapes are zeroed only by
-task preparation; sensor noise and 10–30 ms velocity delay are preserved. Physical
-parameters and random coverage sampling are unchanged.
+| 文件 | 职责 |
+| --- | --- |
+| pass_stop.py | 三点任务、69维输入、入球/出球逻辑、联合损失与指标 |
+| pass_stop_physics.py | 原轨迹的加速度/jerk读出、球线段几何、姿态插值 |
+| response_adjoints.py | 新任务接原单次分组反传，透传可选time-decay |
+| response_training.py | 来源绑定、16/26/69维权重导入、原Adam/审计流程 |
+| tools/train_response_control.py | 原CLI，允许显式选择time-decay |
+| configs/pass_stop.json | 三点位姿、最低速率编码、区域半径、中心容差、辅助权重 |
+| tools/short_eval_replay.py, tools/play_response_short.py | 记录实际阶段、每机区域半径和速率下限，显示三阶段及速率缺额 |
+| tests/test_pass_stop*.py, tests/test_pose_velocity_bridge.py | 回归与梯度测试 |
+| tools/audit_pose_velocity.py | 50项真实原模型姿态/电机有限差分审计 |
 
-## Command semantics and smallest network change
-
-The original 22 measured values are unchanged. The native 16-feature GRU becomes
-26 features, while its hidden size, Linear(64,4), tanh and six parameter tensors
-remain structurally unchanged. The first 16 features keep their meanings except
-that position is relative to the current fixed target. The extra ten numbers are:
-
-1. End-point displacement in body coordinates (3).
-2. First two columns of `R_measured.T @ R_target - I` (6); no Euler-angle wrapping.
-3. STOP target flag (1).
-
-The controller targets point2 immediately after spawning at point1. The position
-switch uses the acquired/measured position and does not wait for attitude or
-velocity success. On first entry, the next motor command uses point3 and its
-level target attitude. GRU memory is not reset. Losses retain the true position
-and attitude **at that first entry**, so switching does not forgive a bad PASS.
-
-This specification is radius-entry passage, not an exact crossing-plane or gate
-collision certificate. It does not claim the desired attitude at the exact centre
-or over a surrounding flight band. At 100 Hz a brief between-sample entry can be
-missed; the control and evaluation use the same sampled command convention.
-
-## Two task objectives
-
-### 1. Simultaneous PASS pose and terminal STOP
-
-Let `r_p(t)=|p(t)-p2|/0.1` and
-
-```
-r_R(t) = |R(t)-R2|_F / (2 sqrt(2) sin(epsilon_R/2)).
-```
-
-For unit rotations, `r_R<=1` means the full relative rotation is within tolerance;
-quaternion signs have no effect. At the first measured radius entry `j`, score
-
-```
-L_PASS = w_point * (relu(r_p(j)-1)^2 + relu(r_R(j)-1)^2).
-```
-
-When no entry occurs, use the single post-action live state minimizing the **sum
-of these two violations**, and add a missing-entry penalty. Position and attitude
-are never minimized at different times. The fixed spawn is excluded as a fallback
-when a live post-action state exists, to avoid a witness with no control derivative.
-No distance-dependent multiplier reduces the attitude penalty when moving away.
-For a fixed witness/attitude, the direct radial derivative is nonnegative.
-
-STOP ratios are position, speed, full attitude and angular speed divided by their
-explicit tolerances. At H, their squared positive violations are scored unconditionally,
-including when PASS has not happened. No stage transition turns on an otherwise
-waived final stopping obligation. Default `w_point=10`; these remain finite strong
-penalties, **not solver-enforced hard constraints or convergence guarantees**.
-
-Master's `25*(1-cos(R_t.T R_(t+1)))` is an attitude-motion penalty, not a target
-attitude penalty. It is not used by PASS/STOP. Original hover still uses it.
-A weak original action-change regularizer and original failure accounting remain;
-a differentiable boundary violation supplements the unchanged hard termination.
-
-### 2. Completion-time proxy through ordinary physical BPTT
-
-Define joint ratios at each actual state (no moving reference):
-
-```
-r_PASS(t) = max(position_ratio, attitude_ratio)
-r_STOP(t) = max(position_ratio, velocity_ratio, attitude_ratio, angular_speed_ratio)
-q(r) = 1 / (1 + relu(r-1))
-```
-
-`q` is one within all task tolerances and decreases outside. Its rational tail
-avoids an exponential underflow and yields `dq/dr=-1/r^2` for `r>1`.
-
-```
-P(t) = max_{i<=t} q(r_PASS(i))            # best simultaneous past pose
-S(t) = min_{i>=t} q(r_STOP(i))            # worst future stop quality through H
-C(t) = min(P(t), S(t))
-T_proxy = dt * sum_{t=0}^{H-1} (1-C(t))
-```
-
-Once a sampled entry exists, `P` is capped by that first entry's true joint pose
-quality, so an incorrect first PASS cannot be erased by a later good revisit.
-Dead/frozen padding has zero quality. Repeated weak near-passes are not summed,
-so waiting does not accumulate completion evidence. Taking `min` rather than a
-product also avoids multiplying two tiny quality gradients. Its tradeoff is
-sparse bottleneck gradients; it does not provide a nonzero gradient to every node.
-
-In the binary-quality limit, this clock equals the later of valid passage and
-**last** departure from STOP, not the first momentary zero velocity. For fixed
-event selection, increasing any ratio cannot lower the proxy; all its direct
-ratio partials are nonnegative wherever differentiable. Delaying an otherwise
-identical completion increases the measured proxy in the timing audit.
-
-This is a continuous, **piecewise differentiable surrogate**, not the ordinary
-derivative of the hard sampled completion time. `cummax/cummin`, ties and hinge
-boundaries have nonsmooth points. Position-only command switches and first-entry
-indices remain discrete: no saltation claim, straight-through switch gradient,
-paired stochastic probe, or hidden detach-based correction is introduced. At a
-changed hard branch, ordinary finite-difference equality is not promised.
-
-There is no global ranking guarantee between arbitrary trajectories: nearly-correct
-but technically failed passages can have a low proxy, and hard failure produces
-zero time-proxy gradients. The separate PASS/STOP penalties, boundary residual and
-independent hard metrics are therefore necessary. A finite horizon cannot certify
-infinite-time hovering; reaching STOP only at H is not evidence of later stability.
-
-The total scalar is
-
-```
-L = w_time * T_proxy/(H*dt) + L_PASS + L_STOP
-    + weak_original_action_change + original_failure_cost + boundary_violation.
-```
-
-Only the task terms change. A native full-horizon graph yields the same per-scene
-scalar derivatives, then master's physical-group shrink-only clipping, averaging,
-global clipping and Adam apply. Those postprocessings are preserved, but the final
-optimizer step is not labelled an exact raw scalar gradient. `time-decay=0` is
-required for this task. No detachment at the old 50-step statistics boundaries.
-
-## Checkpoints and deployment interface
-
-Compatible master hover weights initialize the first 16 GRU input columns; new
-columns are zero. All recurrent/readout weights are copied and **all** weights
-remain trainable. Different matrix widths can introduce FP32 reduction rounding,
-so structural initialization equivalence is not claimed bit-for-bit against the
-old 16-input network. The original source checkpoint digest is checked before
-expansion. Output contains the complete 26-input Actor, task specification, Adam
-and RNG state, with a different architecture/objective identifier.
-
-```bash
-# Exact resume: same source and settings, no original hover file required.
-python tools/train_response_control.py @configs/agile_flight.args \
-  --resume runs/pass_stop/from_hover/latest.pt \
-  --work-dir runs/pass_stop/from_hover --updates 200
-
-# Evaluate the checkpoint's saved task, not a newly supplied mission.
-python tools/train_response_control.py --mode evaluate --device cuda \
-  --checkpoint runs/pass_stop/from_hover/latest.pt \
-  --work-dir runs/pass_stop/eval --epsilon-p .01 --epsilon-a .01 --lambda-R 25
-
-# Existing update-capsule replay includes the typed mission and native probe.
-python tools/replay_response_update.py <audit/updates/u00000001_....pt>
-```
-
-Old AFT 36-input/event-AL checkpoints are not silently reinterpreted as this task.
-Use a compatible master hover checkpoint or a new same-architecture checkpoint.
-Original hover rendering tools are not generic PASS/STOP players; use
-`pass_stop.task_rollout` with the saved mission for trajectory inspection.
-
-For a controller, load with `response_training.load_policy_checkpoint`, then create
-`policy.task_state(observation22, via, stop, via_rotation, stop_rotation, radius)`
-from public goals and call `policy(observation22, state)` each control step. The
-returned next state contains recurrent memory and the permanently latched STOP
-flag. It uses no hidden motor/force/airframe state. Keep goal tensors on the same
-device and dtype. A complete `.pt` still needs its matching model code and this
-goal wrapper; it does not require a second weight file or MPC runtime.
-
-## Verification and limitations
-
-```bash
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python -m pytest -q \
-  tests/test_pass_stop.py tests/test_pass_stop_integration.py
-python tools/audit_pass_stop_time.py --report /tmp/time_gradient_checks.json
-```
-
-The recorded run uses Python 3.13.5 / PyTorch 2.10.0+cpu. 68 focused tests passed.
-They cover geometry/velocity separation, first-entry scoring, no accumulated weak
-success, late departures, finite failure padding, native full H500 forward/backward,
-a fixed-branch H500 finite difference, probe-vs-VJP, unchanged hover collection,
-new-process standalone load, checkpoint/Adam/RNG continuation and update replay.
-A 24-case temporal shift audit performs ten bounded gradient steps per case and
-finite-difference checks. Its inputs are synthetic residual histories, **not a
-quadrotor planner or learned flight benchmark**. Randomized derivative signs are
-also checked; their nonzero counts are reported to expose gradient sparsity.
-
-This environment could not clone the full repository. Original runtime dependencies
-were retrieved through GitHub and individually verified by Git blob hash, and the
-focused tests ran on that dependency snapshot. Existing master tests were retained
-in the published tree, not replaced or counted as run. This is not a full-checkout
-regression, CUDA compilation/throughput qualification, trained-hover import test,
-105-degree learned-policy result, or hardware-flight authorization.
-
-General reference for finite-difference limitations at nonsmooth points:
-https://docs.pytorch.org/docs/main/generated/torch.autograd.gradcheck.gradcheck.html
+`docs/pose_velocity_validation.json` 保留原v2补丁的历史验证记录。v3本地回归与截图记录在 `reports/min_speed_region_current.json` 指向的目录，不将历史记录当作新任务的训练成绩。
+检查覆盖代码/局部数值导数/权重迁移/一次反传，不等于训练收敛、机动成功、全局最优或实飞安全。
+禁止将本补丁直接作为已验证飞行固件部署。

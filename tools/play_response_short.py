@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Play a saved 5-second fixed-EVAL flight without Torch or policy inference."""
+"""Play a saved fixed-EVAL flight without Torch or policy inference."""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +15,9 @@ FIELDS = ("position", "velocity", "orientation", "omega", "action", "valid",
           "rotor_positions", "mass_kg", "arm_length_m", "thrust_to_weight",
           "torque_to_inertia", "position_limit")
 FORCE_FIELDS = ("external_force_world", "pulse_force_world", "pulse_point_body", "pulse_active")
+GOAL_FIELDS = ("command_position", "command_rotation", "command_is_stop",
+               "mission_points", "pass_rotation", "stop_rotation")
+REGION_FIELDS = ("command_phase", "command_min_speed_m_s", "region_radius_m")
 
 
 def _sha256(path):
@@ -30,6 +33,9 @@ def load_replay(path):
     meta = json.loads(path.read_text(encoding="utf-8"))
     if meta.get("replay_type") != "short-eval-v1":
         raise ValueError("expected a short-EVAL replay")
+    task = meta.get("task", "hover")
+    if task not in ("hover", "pass-stop"):
+        raise ValueError("unsupported short-EVAL task")
     filename = meta.get("trajectory_file")
     if (not isinstance(filename, str) or Path(filename).name != filename
             or filename in ("", ".", "..")):
@@ -46,6 +52,16 @@ def load_replay(path):
             raise ValueError("incomplete short-EVAL force telemetry")
         if all(present):
             arrays.update((name, archive[name]) for name in FORCE_FIELDS)
+        if task == "pass-stop":
+            if not all(name in archive for name in GOAL_FIELDS):
+                raise ValueError("incomplete PASS/STOP typed command telemetry")
+            arrays.update((name, archive[name]) for name in GOAL_FIELDS)
+            present = [name in archive for name in REGION_FIELDS]
+            minimum_speed_task = (meta.get("mission") or {}).get("version") == "pass-region-min-speed-v3"
+            if (any(present) or minimum_speed_task) and not all(present):
+                raise ValueError("incomplete PASS/STOP region telemetry")
+            if all(present):
+                arrays.update((name, archive[name]) for name in REGION_FIELDS)
     count = len(meta.get("scenes", ()))
     horizon = arrays["valid"].shape[0]
     if (count < 1 or horizon < 1 or arrays["valid"].shape != (horizon, count)
@@ -66,7 +82,54 @@ def load_replay(path):
                for name in FORCE_FIELDS[:3])
     ):
         raise ValueError("short-EVAL force telemetry shape or value mismatch")
+    if task == "pass-stop":
+        mission = meta.get("mission")
+        if (not isinstance(mission, dict)
+                or any(not isinstance(mission.get(name), (int, float))
+                       or not math.isfinite(mission[name]) or mission[name] <= 0
+                       for name in ("radius_m", "pose_tolerance_deg"))
+                or arrays["command_position"].shape != (horizon, count, 3)
+                or arrays["command_rotation"].shape != (horizon, count, 3, 3)
+                or arrays["command_is_stop"].shape != (horizon, count)
+                or arrays["command_is_stop"].dtype != np.bool_
+                or arrays["mission_points"].shape != (count, 3, 3)
+                or any(arrays[name].shape != (count, 3, 3)
+                       for name in ("pass_rotation", "stop_rotation"))
+                or any(not np.isfinite(arrays[name]).all() for name in GOAL_FIELDS)):
+            raise ValueError("PASS/STOP typed telemetry shape or value mismatch")
+        if REGION_FIELDS[0] in arrays:
+            phase = arrays['command_phase']
+            floor = arrays['command_min_speed_m_s']
+            radius = arrays['region_radius_m']
+            if (phase.shape != (horizon, count) or not np.issubdtype(phase.dtype, np.integer)
+                    or not np.isin(phase, (0, 1, 2)).all()
+                    or not np.array_equal(phase == 2, arrays['command_is_stop'])
+                    or floor.shape != (horizon, count) or not np.isfinite(floor).all()
+                    or (floor[phase != 2] <= 0).any() or (floor[phase == 2] != 0).any()
+                    or radius.shape != (count,) or not np.isfinite(radius).all()
+                    or (radius <= 0).any()):
+                raise ValueError("PASS/STOP region telemetry shape or value mismatch")
     return meta, arrays
+
+
+def goal_status(meta, arrays, frame, scene):
+    """Public command data for the HUD; old replays keep their original protocol."""
+    command_frame = min(frame, len(arrays['valid'])-1)
+    mission = meta['mission']
+    is_stop = bool(arrays['command_is_stop'][command_frame, scene])
+    phase = (int(arrays['command_phase'][command_frame, scene])
+             if 'command_phase' in arrays else (2 if is_stop else None))
+    radius = (float(arrays['region_radius_m'][scene]) if 'region_radius_m' in arrays
+              else float(mission.get('region_radius_arms', 0)*arrays['arm_length_m'][scene]
+                         or mission['radius_m']))
+    floor = (float(arrays['command_min_speed_m_s'][command_frame, scene])
+             if 'command_min_speed_m_s' in arrays else None)
+    speed = float(np.linalg.norm(arrays['velocity'][frame, scene]))
+    return {'phase': phase,
+            'phase_name': {0: '接近点2', 1: '球内穿越', 2: '终点停稳'}.get(phase, 'PASS #2（旧回放）'),
+            'region_radius_m': radius, 'center_tolerance_m': float(mission['radius_m']),
+            'minimum_speed_m_s': floor, 'speed_m_s': speed,
+            'speed_shortfall_m_s': None if floor is None else max(0., floor-speed)}
 
 
 def quaternion_rotation(q):
@@ -141,6 +204,7 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
     import pygame as pg
 
     meta, arrays = load_replay(path)
+    typed = meta.get("task") == "pass-stop"
     pg.display.init()
     pg.font.init()
     screen = pg.display.set_mode((1500, 900))
@@ -236,7 +300,8 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
         buttons.clear()
         screen.fill(colors["background"])
         pg.draw.rect(screen, colors["panel"], (1002, 0, 498, 784))
-        text("固定 EVAL · 已保存的 5 秒轨迹", 27, 19, 28)
+        task_name = "PASS/STOP" if typed else "悬停"
+        text(f"固定 EVAL · {task_name} · {meta['duration_seconds']:g} 秒轨迹", 27, 19, 28)
         text(f"Actor #{meta['checkpoint_update']}   {len(meta['scenes'])} 架   H{len(arrays['valid'])}",
              28, 57, 16, colors["muted"])
         scene = state.scene
@@ -248,7 +313,7 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
         limit = scene["position_limit_m"]
         failed = not scene["completed"]
         pg.draw.rect(screen, colors["line"], (17, 105, 972, 672), width=1, border_radius=6)
-        # Draw this aircraft's actual per-axis position boundary and origin target.
+        # Draw this aircraft's original world boundary and recorded public goals.
         signs = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)])
         corners = signs * limit
         pixels = project(corners, limit)
@@ -257,8 +322,33 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
                 b = a ^ bit
                 if b > a:
                     line((pixels[a], pixels[b]), (112, 84, 74), 1)
-        goal = project(np.zeros(3), limit).astype(int)
-        pg.draw.circle(screen, colors["gold"], goal, 9, 2)
+        if typed:
+            task_status = goal_status(meta, arrays, frame, index)
+            command_frame = min(frame, len(arrays["valid"]) - 1)
+            goal_position = arrays["command_position"][command_frame, index]
+            goal_rotation = arrays["command_rotation"][command_frame, index]
+            is_stop = bool(arrays["command_is_stop"][command_frame, index])
+            for point, label in zip(arrays["mission_points"][index], ("1 出生", "2 PASS", "3 STOP")):
+                pixel = project(point, limit).astype(int)
+                pg.draw.circle(screen, colors["muted"], pixel, 7, 2)
+                text(label, pixel[0] + 12, pixel[1] - 12, 16, colors["muted"])
+            theta = np.linspace(0, 2*np.pi, 49)
+            for first, second in ((0, 1), (0, 2), (1, 2)):
+                circle = np.zeros((len(theta), 3))
+                circle[:, first], circle[:, second] = np.cos(theta), np.sin(theta)
+                ball = arrays['mission_points'][index, 1] + circle*task_status['region_radius_m']
+                line(project(ball, limit), colors['muted'], 1)
+            goal = project(goal_position, limit).astype(int)
+            pg.draw.circle(screen, colors["gold"], goal, 13, 2)
+            ghost = goal_position + arrays["rotor_positions"][index] @ goal_rotation.T
+            for rotor in ghost:
+                pg.draw.line(screen, colors["gold"], goal, project(rotor, limit).astype(int), 2)
+            # Target body z-axis makes the commanded full attitude visible.
+            line(project((goal_position, goal_position + goal_rotation[:, 2]*limit*.22), limit),
+                 colors["gold"], 3)
+        else:
+            goal = project(np.zeros(3), limit).astype(int)
+            pg.draw.circle(screen, colors["gold"], goal, 9, 2)
         trail = arrays["position"][:frame+1:max(1, frame // 250), index]
         line(project(trail, limit), (75, 164, 175), 2)
         body_to_world = quaternion_rotation(arrays["orientation"][frame, index])
@@ -272,6 +362,8 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
         force = force_at_frame(arrays, index, frame)
         if force is None:
             text("旧回放未记录外力数据", 30, 120, 16, colors["muted"])
+        elif typed and force["applied"]:
+            text("固定点任务：外力关闭 · 金色为当前命令姿态", 30, 120, 16, colors["gold"])
         elif force["applied"]:
             gravity = scene["mass_kg"] * 9.81
             steady = force["external_force_world"]
@@ -291,7 +383,8 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
             text("箭头按重力比例缩放；脉冲施力点随机体旋转", 30, 172, 14, colors["muted"])
         else:
             text("飞行已终止；此时没有后续物理步或外力", 30, 120, 16, colors["muted"])
-        text(f"目标 (0, 0, 0) m   |   位置边界 ±{limit:.2f} m/轴", 29, 744, 16, colors["muted"])
+        target_label = "固定三点 · 按测量位置切换 · 姿态不阻止切换" if typed else "目标 (0, 0, 0) m"
+        text(f"{target_label}   |   位置边界 ±{limit:.2f} m/轴", 29, 744, 16, colors["muted"])
 
         text("选择无人机", 1022, 20, 22)
         button("上一页", (1212, 17, 93, 30), "page_back")
@@ -307,17 +400,38 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
             status = "全程" if row["completed"] else f"{row['valid_steps']*meta['dt']:.2f}s 越界"
             text(f"#{j:03d}  {row['mass_kg']*1000:.0f} g  {status}",
                  rect.x + 7, rect.y + 2, 16, color)
-        text(f"Scene #{index:03d}  {'越界终止' if failed else '飞满 5 秒'}", 1022, 565, 22,
+        status = "越界终止" if failed else f"飞满 {meta['duration_seconds']:g} 秒"
+        text(f"Scene #{index:03d}  {status}", 1022, 565, 22,
              colors["red"] if failed else colors["green"])
         text(f"时间 {state.seconds:.2f}/{state.end_seconds:.2f}s   速度 {state.speed:g}×", 1022, 601, 18)
-        text(f"|p| {np.linalg.norm(position):.3f} m    |v| {np.linalg.norm(velocity):.3f} m/s",
-             1022, 633, 18)
-        text(f"|ω| {np.linalg.norm(omega):.3f} rad/s", 1022, 661, 18)
-        text(f"推重比 {scene['thrust_to_weight']:.2f}    T/I {scene['torque_to_inertia']:.0f}",
-             1022, 695, 16, colors["muted"])
-        text(f"整段 RMS：p {scene['position_rms_m']:.3f} m   v {scene['velocity_rms_m_s']:.3f} m/s",
-             1022, 724, 16, colors["muted"])
-        text(f"ω {scene['omega_rms_rad_s']:.3f} rad/s", 1022, 749, 16, colors["muted"])
+        if typed:
+            angle = math.degrees(math.acos(float(np.clip(
+                (np.trace(body_to_world.T @ goal_rotation) - 1)/2, -1., 1.))))
+            mode = task_status['phase_name']
+            text(f"命令 {mode}   距离 {np.linalg.norm(position-goal_position):.3f} m", 1022, 633, 18)
+            text(f"姿态误差 {angle:.2f}°   速率 {task_status['speed_m_s']:.3f} m/s", 1022, 661, 18)
+            floor = task_status['minimum_speed_m_s']
+            if floor is not None and not is_stop:
+                shortfall = task_status['speed_shortfall_m_s']
+                label = '达标' if shortfall == 0 else f'不足 {shortfall:.2f}'
+                color = colors['muted'] if task_status['phase'] == 0 else colors['red' if shortfall else 'green']
+                text(f"球内速率 ≥ {floor:.2f} m/s · {label}", 1022, 691, 18, color)
+            else:
+                text(f"|ω| {np.linalg.norm(omega):.3f} rad/s", 1022, 691, 18)
+            text(f"球半径 {task_status['region_radius_m']:.3f} m · 中心容差 {task_status['center_tolerance_m']:g} m",
+                 1022, 721, 16, colors["muted"])
+            metrics = meta["metrics"]
+            text(f"整组 EVAL：PASS {metrics['pass_fraction']:.1%} · 成功 {metrics['success_fraction']:.1%}",
+                 1022, 749, 16, colors["muted"])
+        else:
+            text(f"|p| {np.linalg.norm(position):.3f} m    |v| {np.linalg.norm(velocity):.3f} m/s",
+                 1022, 633, 18)
+            text(f"|ω| {np.linalg.norm(omega):.3f} rad/s", 1022, 661, 18)
+            text(f"推重比 {scene['thrust_to_weight']:.2f}    T/I {scene['torque_to_inertia']:.0f}",
+                 1022, 695, 16, colors["muted"])
+            text(f"整段 RMS：p {scene['position_rms_m']:.3f} m   v {scene['velocity_rms_m_s']:.3f} m/s",
+                 1022, 724, 16, colors["muted"])
+            text(f"ω {scene['omega_rms_rad_s']:.3f} rad/s", 1022, 749, 16, colors["muted"])
 
         pg.draw.rect(screen, (49, 64, 79), timeline, border_radius=5)
         usable = round(timeline.width * state.end_seconds / meta["duration_seconds"])

@@ -32,15 +32,14 @@ def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_dec
                     group_config: GroupBalanceConfig = GroupBalanceConfig()):
     from pass_stop import PassStopLossConfig, prepare, typed_costs
     if isinstance(config, PassStopLossConfig):
-        if time_decay != 0:
-            raise ValueError("PASS/STOP time objective requires --time-decay 0")
         closed = prepare(policy, initial, config)
         probe = (GroupGradientProbe(policy, *physics_group_layout(initial, group_config))
                  if group_config.backward_backend == "probe" else None)
         try:
             with probe.capture() if probe is not None else nullcontext():
-                trace = rollout(policy, simulator, closed, horizon, actor_probe=probe)
-                costs, metrics, _ = typed_costs(trace, config)
+                trace = rollout(policy, simulator, closed, horizon, actor_probe=probe, time_decay=time_decay)
+                costs, metrics, _ = typed_costs(trace, config,
+                                               compiled=getattr(simulator, 'compiled_execution', False))
             weights = uniform_scene_weights(costs)
             coefficients, report = group_gradient_coefficients(weights, initial, group_config)
             return RolloutRecord(costs, weights, metrics, coefficients, report,

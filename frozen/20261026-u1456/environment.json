@@ -1,0 +1,16 @@
+{
+  "python": "3.11.17 (main, Oct 14 2026, 01:05:33) [Clang 23.1.3 ]",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "torch": "2.10.0+cu126",
+  "torch_cuda_build": "12.6",
+  "numpy": "2.4.6",
+  "pytest": "9.1.1",
+  "gui_environment": "Separate optional Pygame CPU environment, pygame 2.6.1",
+  "gpu_info": "NVIDIA GeForce RTX 4060 Ti, 595.99.02, 8188 MiB",
+  "precision": {
+    "dtype": "float32",
+    "tf32": false
+  },
+  "compiler_threads": 1,
+  "torch_threads": 1
+}

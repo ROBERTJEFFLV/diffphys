@@ -1,0 +1,48 @@
+{
+  "run_dir": "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/local_trial_20261026_095338",
+  "root": "/home/insta360/workspace_ROB/Agile-Flight-Training",
+  "command": [
+    "/tmp/diffphys-cuda-venv/bin/python",
+    "-u",
+    "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/local_trial_20261026_095338/continuous_train_response_control.py",
+    "@configs/agile_flight.args",
+    "--device",
+    "cuda",
+    "--resume",
+    "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/local_trial_20261026_095338/launches/before_continuous_20261026_101043/latest.pt",
+    "--work-dir",
+    "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/local_trial_20261026_095338",
+    "--development-every",
+    "10",
+    "--checkpoint-every",
+    "10"
+  ],
+  "started_at_utc": "2026-10-26T02:10:43.687317+00:00",
+  "resume_checkpoint": "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/local_trial_20261026_095338/launches/before_continuous_20261026_101043/latest.pt",
+  "parent_update": 50,
+  "target_update": null,
+  "max_seconds": null,
+  "budget_mode": "until_user_stop",
+  "scenes": 3072,
+  "horizon": 500,
+  "time_decay": 0,
+  "exact_resume": true,
+  "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+  "runtime_runner_sha256": "a650b48264e48a2f5cf628d0ceae9ce4e88932aa7e560c9c3772a8ffda7f1245",
+  "runtime_overrides": {
+    "updates": "positive_infinity",
+    "max_seconds": "positive_infinity"
+  },
+  "checkpoint_every": 10,
+  "development_every": 10,
+  "stop_signal": "SIGTERM",
+  "stop_behavior": "Finish the current update, save Actor/Adam/RNG, join the CPU sampler, and exit.",
+  "environment": {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+    "PYTHONUNBUFFERED": "1"
+  }
+}

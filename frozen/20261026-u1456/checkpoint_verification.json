@@ -1,0 +1,29 @@
+{
+  "checkpoints": {
+    "latest.pt": {
+      "updates": 1456,
+      "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+      "model_sha256": "cdcb4aa6bad731138e944d51968a50a6d9abc99440637355c715148b78c95e27",
+      "file_sha256": "23f64a21f0cf6b8ef70b5c784ebe0f9c654dfeed252ddbf40b9f385d2cbd9dea",
+      "bytes": 343317
+    },
+    "best.pt": {
+      "updates": 1450,
+      "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+      "model_sha256": "360ccee70404795bdc0b43064a31c52e4bdc4f0f4bbc0a56af1cb6679b4fc136",
+      "file_sha256": "9517caa8468c6d0483a223c74b0d90301d91696f2e20417e8f0975d4a135fdf8",
+      "bytes": 343317
+    }
+  },
+  "last_fixed_eval": {
+    "update": 1450,
+    "task_objective": 13.651424407958984,
+    "success_fraction": 0.3046875,
+    "pass_fraction": 0.30859375,
+    "region_enter_fraction": 0.82421875,
+    "region_exit_fraction": 0.82421875,
+    "pass_position_m": 0.10113312304019928,
+    "pass_chordal_ratio": 1.213594913482666,
+    "pass_speed_shortfall_m_s": 0.0
+  }
+}

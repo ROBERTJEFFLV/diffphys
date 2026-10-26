@@ -25,7 +25,7 @@ def test_cpu_profiler_never_steps_or_mutates_checkpoint(tmp_path, monkeypatch):
     assert len(result['samples']) == 1
     assert result['scenes'] == 128
     assert result['samples'][0]['physical_transitions'] <= 384
-    assert result['numerical_backend']['rotation'] == 'eager'
+    assert result['numerical_backend']['physics'] == 'native-cpu-reference'
     assert result['median_seconds'] > 0
     assert result['samples'][0]['peak_bytes'] is None
 
@@ -37,3 +37,14 @@ def test_profiler_rejects_overwriting_input_checkpoint(tmp_path):
         main(['--device','cpu','--checkpoint',str(checkpoint),'--report',str(checkpoint),
               '--epsilon-p','.01','--epsilon-a','.01','--lambda-R','.2'])
     assert checkpoint.read_bytes() == b'original'
+
+
+def test_profiler_measures_the_real_goal_conditioned_task(tmp_path):
+    result = main(['--device', 'cpu', '--scenes', '128', '--horizon', '3',
+                   '--warmup', '0', '--repeats', '1', '--mission-config', 'configs/pass_stop.json',
+                   '--epsilon-p', '.01', '--epsilon-a', '.01', '--lambda-R', '25',
+                   '--report', str(tmp_path/'goal.json')])
+    assert result['actor_input_size'] == 69
+    assert result['loss_config']['mission']['version'] == 'pass-region-min-speed-v3'
+    assert result['time_decay'] == 0.
+    assert result['model_unchanged']

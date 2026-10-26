@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from response_policy import ResponseMotorPolicy
+from compiled_execution import tensor_kernel
 
 PROBE_VERSION = "native-gru-linear-group-probe-v1"
 
@@ -42,6 +43,24 @@ def gru_gate_deltas(
     dz = adjoint * (h - n) * z * (1 - z)
     dr = dn * hn * r * (1 - r)
     return torch.cat((dr, dz, dn), -1), torch.cat((dr, dz, dn * r), -1)
+
+
+def _pack_rows(value, slots, groups, width):
+    packed = value.new_zeros(groups*width, value.shape[-1])
+    packed.index_copy_(0, slots, value)
+    return packed.view(groups, width, value.shape[-1])
+
+
+def _gru_group_partials(layer, x, h, delta, slots, groups, width):
+    di, dh = gru_gate_deltas(layer, x, h, delta)
+    a, b = _pack_rows(x, slots, groups, width), _pack_rows(h, slots, groups, width)
+    i, r = _pack_rows(di, slots, groups, width), _pack_rows(dh, slots, groups, width)
+    return torch.bmm(i.transpose(1,2),a), torch.bmm(r.transpose(1,2),b), i.sum(1), r.sum(1)
+
+
+def _linear_group_partials(x, delta, slots, groups, width):
+    a, d = _pack_rows(x, slots, groups, width), _pack_rows(delta, slots, groups, width)
+    return torch.bmm(d.transpose(1,2),a), d.sum(1)
 
 
 class GroupGradientProbe:
@@ -178,29 +197,18 @@ class GroupGradientProbe:
     def _linear_forward(self, module, inputs, output) -> None:
         self._watch("linear", inputs, output)
 
-    def _pack(self, value, slots):
-        packed = value.new_zeros(self.groups*self.width, value.shape[-1])
-        packed.index_copy_(0, slots, value)
-        return packed.view(self.groups, self.width, value.shape[-1])
-
-    def _affine_partial(self, prefix, x, delta, slots):
-        a, d = self._pack(x, slots), self._pack(delta, slots)
-        # add_ converts into the FP64 accumulator directly. Local bmm/sum
-        # retain their original dtype/order; no FP64 temporary is needed.
-        self.views[prefix+".weight"].add_(torch.bmm(d.transpose(1,2), a))
-        self.views[prefix+".bias"].add_(d.sum(1))
-
     def _linear_partial(self, x, delta, slots):
-        self._affine_partial("readout", x, delta, slots)
+        weight, bias = tensor_kernel(_linear_group_partials, x, delta, slots, self.groups, self.width,
+                                     compiled=getattr(self.policy, '_compiled_execution', False))
+        self.views['readout.weight'].add_(weight)
+        self.views['readout.bias'].add_(bias)
 
     def _gru_partial(self, x, h, delta, slots):
-        di, dh = gru_gate_deltas(self.policy.response_memory, x, h, delta)
-        a, b = self._pack(x, slots), self._pack(h, slots)
-        i, r = self._pack(di, slots), self._pack(dh, slots)
-        self.views["response_memory.weight_ih"].add_(torch.bmm(i.transpose(1,2),a))
-        self.views["response_memory.weight_hh"].add_(torch.bmm(r.transpose(1,2),b))
-        self.views["response_memory.bias_ih"].add_(i.sum(1))
-        self.views["response_memory.bias_hh"].add_(r.sum(1))
+        values = tensor_kernel(_gru_group_partials, self.policy.response_memory, x, h, delta, slots,
+                                self.groups, self.width,
+                                compiled=getattr(self.policy, '_compiled_execution', False))
+        for name, value in zip(('weight_ih', 'weight_hh', 'bias_ih', 'bias_hh'), values):
+            self.views['response_memory.'+name].add_(value)
 
     def close(self) -> None:
         self._armed = False

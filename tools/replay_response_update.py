@@ -19,6 +19,9 @@ from response_task import TaskLossConfig
 from pass_stop import loss_config as parse_loss_config, policy_class
 from response_noise import DisturbanceConfig
 from env_raptor import RaptorSimulator, RaptorParams
+from compiled_physics import make_simulator
+from compiled_execution import compile_actor
+from tensor_storage import saved_tensor_storage
 from response_adjoints import collect_rollout, backward_actor
 from response_training import (source_hash, migrate_actor_weights, migrate_named_adam,
                                restore_rng, capture_rng, sample_training_scenarios,
@@ -67,7 +70,7 @@ def replay(path, mode='full'):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     loss = parse_loss_config(cfg['protocol']['loss'])
-    policy = policy_class(loss)(ResponsePolicyConfig(**capsule['policy_config'])).to(device=device, dtype=dtype)
+    policy = compile_actor(policy_class(loss)(ResponsePolicyConfig(**capsule['policy_config'])).to(device=device, dtype=dtype), device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg['lr'])
     migrate_actor_weights(policy, capsule['before']['model'])
     migrate_named_adam(optimizer, policy, capsule['before']['optimizer'], capsule['optimizer_parameter_names'])
@@ -82,12 +85,12 @@ def replay(path, mode='full'):
             sampling=cfg['training_sampling']['mode'], sampling_report=sampling)
         if {'seeds':seeds, 'report':sampling} != capsule['sampling']:
             raise ValueError('replayed TRAIN sampling does not match recorded batch')
-        simulator = RaptorSimulator(RaptorParams(dt=policy.config.dt),
-                                    rotation_backend=cfg.get("numerical_backend", {}).get("rotation", "eager"))
+        simulator = make_simulator(RaptorParams(dt=policy.config.dt), device)
         loss = parse_loss_config(cfg['protocol']['loss'])
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
-        record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
-                                 time_decay=cfg['time_decay'], group_config=group)
+        with saved_tensor_storage(device):
+            record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
+                                     time_decay=cfg['time_decay'], group_config=group)
         backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
         safe_global_clip(policy.parameters(), cfg['gradient_clip'])
     elif mode == 'adam':

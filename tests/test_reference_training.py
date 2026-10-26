@@ -96,13 +96,20 @@ def test_retained_training_and_eval_configs_match_their_clis(tmp_path):
     from tools.evaluate_response_long import parse_args as parse_eval_args
     root=Path(__file__).resolve().parents[1]
     configs={p.name:p for p in (root/'configs').glob('*.args')}
-    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args'}
+    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args',
+                         'agile_flight.args'}
     args=parse_args(['@'+str(configs['response_raptor_multi_airframe.args'])])
     assert args.scenarios==512 and args.eval_scenarios==128 and args.horizon==500
     assert args.train_sampling=="coverage128"
     assert args.time_decay==1 and not args.disable_disturbances
     assert (args.position_noise_std,args.velocity_noise_std,args.attitude_noise_std,args.omega_noise_std)==(.001,.002,.001,.002)
     assert (args.velocity_delay_min,args.velocity_delay_max)==(.010,.030)
+    agile=parse_args(['@'+str(configs['agile_flight.args'])])
+    assert agile.scenarios==768 and agile.eval_scenarios==128 and agile.horizon==500
+    assert agile.train_sampling=='coverage128' and agile.time_decay==0
+    assert agile.group_backward=='probe' and not hasattr(agile,'rotation_backend')
+    assert agile.disable_pulses and not agile.disable_disturbances
+    assert agile.mission_config==Path('configs/pass_stop.json')
     evaluation=parse_eval_args(['@'+str(configs['response_long_eval.args']),
                                '--checkpoint',str(tmp_path/'actor.pt'),
                                '--work-dir',str(tmp_path/'eval')])

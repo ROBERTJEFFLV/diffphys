@@ -1,0 +1,48 @@
+{
+  "reference": "/home/insta360/workspace_ROB/Agile-Flight-Training/reports/compiled_prefetch_20261023_192850/before/pass_stop.py",
+  "results": [
+    {
+      "dtype": "torch.float32",
+      "checks": {
+        "costs": [
+          true,
+          0.0
+        ],
+        "metrics": [
+          true,
+          0.0
+        ],
+        "components": [
+          true,
+          0.0
+        ],
+        "gradients": [
+          true,
+          0.0
+        ]
+      }
+    },
+    {
+      "dtype": "torch.float64",
+      "checks": {
+        "costs": [
+          true,
+          0.0
+        ],
+        "metrics": [
+          true,
+          0.0
+        ],
+        "components": [
+          true,
+          0.0
+        ],
+        "gradients": [
+          true,
+          0.0
+        ]
+      }
+    }
+  ],
+  "scope": "Native CPU refactor identity; CUDA comparisons recorded separately."
+}

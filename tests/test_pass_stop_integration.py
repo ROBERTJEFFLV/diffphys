@@ -58,7 +58,7 @@ def test_hover_collector_objective_and_unclipped_gradient_unchanged(dtype):
 
 def cli(work,updates,*,mission=True,extra=()):
     cmd=[sys.executable,'tools/train_response_control.py','--mode','train','--device','cpu',
-         '--rotation-backend','eager','--scenarios','8','--eval-scenarios','2','--horizon','8',
+         '--scenarios','8','--eval-scenarios','2','--horizon','8',
          '--time-decay','0','--epsilon-p','.01','--epsilon-a','.01','--lambda-R','25',
          '--updates',str(updates),'--max-seconds','120','--development-every','1','--checkpoint-every','1',
          '--work-dir',str(work),'--threads','1','--seed','11']
@@ -113,6 +113,56 @@ def test_default_configuration_and_no_time_decay():
         os.chdir(ROOT)
         args=module.parse_args(['@configs/agile_flight.args'])
     finally:os.chdir(cwd)
-    assert args.horizon==500 and args.time_decay==0 and args.scenarios==512
-    assert args.group_backward=='probe' and args.rotation_backend=='compile'
+    assert args.horizon==500 and args.time_decay==0 and args.scenarios==768
+    assert args.group_backward=='probe' and not hasattr(args,'rotation_backend')
     assert args.mission.via_quaternion==GoalConfig().via_quaternion
+
+
+def test_legacy_aft26_weights_import_without_base_dependency(tmp_path):
+    """Weights-only migration of the actual 26-column checkpoint layout."""
+    from pass_stop import LEGACY_ARCHITECTURE, GOAL_FEATURE_DIM
+    from env_raptor import ACTION_CONVENTION
+    torch.manual_seed(97)
+    old = ResponseMotorPolicy()
+    old.response_memory = torch.nn.GRUCell(26,64)
+    saved = {
+        'architecture': LEGACY_ARCHITECTURE,
+        'policy_config': asdict(old.config),
+        'model': old.state_dict(),
+        'model_sha256': model_hash(old),
+        'binding': {'dtype':'float32','protocol': {'environment': {
+            'action_convention':ACTION_CONVENTION}}},
+    }
+    source=tmp_path/'legacy26.pt'
+    torch.save(saved,source)
+    output=tmp_path/'migrated'
+    cli(output,0,extra=['--init-checkpoint',str(source)])
+    source.unlink()
+    migrated,value=load_policy_checkpoint(output/'latest.pt',torch.device('cpu'),torch.float32)
+    for name,tensor in old.state_dict().items():
+        current=migrated.state_dict()[name]
+        if name=='response_memory.weight_ih':
+            assert current.shape==(192,GOAL_FEATURE_DIM)
+            assert torch.equal(current[:,:26],tensor)
+            assert torch.count_nonzero(current[:,26:])==0
+        else:
+            assert torch.equal(current,tensor)
+    assert value['architecture']!=LEGACY_ARCHITECTURE
+
+
+def test_no_additional_physics_rollouts_or_backward_traversals():
+    """The richer loss must not turn into an inner-loop planner."""
+    class CountSimulator(RaptorSimulator):
+        calls=0
+        def step(self,state,action):
+            self.calls+=1
+            return super().step(state,action)
+    sim=CountSimulator()
+    initial=sim.reset(32,seed=91,horizon=12,disturbances=DisturbanceConfig.clean())
+    actor=GoalMotorPolicy()
+    record=collect_rollout(actor,sim,initial,cfg(),horizon=12,time_decay=0,
+                          group_config=GroupBalanceConfig(max_groups=1,min_scenarios=32))
+    assert sim.calls==12
+    report=backward_actor(actor,sim,record,cfg())['group_gradient']
+    assert sim.calls==12
+    assert report['graph_traversals']==1 and report['vjp_calls']==1

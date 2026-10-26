@@ -141,7 +141,11 @@ def rollout(
             and int(closed.physical.step_index.max()) + steps >= closed.physical.noise_tape.shape[1]):
         raise ValueError("noise tape too short: sample scenarios for the full requested horizon")
     initial_physical = closed.physical
-    observations = [observation(closed.physical)] if record_observations else []
+    observe = observation
+    if getattr(policy, '_compiled_execution', False):
+        from compiled_execution import compiled_kernel, measured_kernel
+        observe = compiled_kernel(measured_kernel)
+    observations = [observe(closed.physical)] if record_observations else []
     actions, positions, velocities, omegas, action_deltas, omega_deltas = [], [], [], [], [], []
     valid = []
     pre_positions, pre_orientations, post_orientations = [], [], []
@@ -157,9 +161,9 @@ def rollout(
             # Cover observation, physics, GRU/history and delta-cost paths once.
             closed = _decay_closed_state(closed, rho)
             live = _decay_closed_state(live, rho)
-            current_observation = observation(closed.physical)
+            current_observation = observe(closed.physical)
         elif indices.numel() and not record_observations:
-            current_observation = observation(closed.physical)
+            current_observation = observe(closed.physical)
         before = closed.physical
         pre_positions.append(before.position)
         pre_orientations.append(before.orientation)
@@ -192,7 +196,7 @@ def rollout(
         action_deltas.append(action - before.previous_action)
         omega_deltas.append(physical.omega - before.omega)
         if record_observations:
-            observations.append(observation(physical))
+            observations.append(observe(physical))
     return TaskTrajectory(
         closed, torch.stack(observations) if record_observations else None,
         torch.stack(actions), torch.stack(positions),

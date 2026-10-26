@@ -143,18 +143,27 @@ def test_compiled_rotation_backend_preserves_rk4_and_all_actor_gradients(device)
         torch.testing.assert_close(a.grad, b.grad, rtol=1e-5, atol=1e-6)
 
 
-def test_rotation_backend_is_explicit_in_binding_and_rejects_invalid_choice():
+def test_execution_backend_is_bound_to_device_without_production_selector():
     from tools.train_response_control import parse_args
     from response_training import binding
     loss = TaskLossConfig(.01, .01, .2)
     extra = ['--epsilon-p', '.01', '--epsilon-a', '.01', '--lambda-R', '.2']
-    eager = parse_args(extra + ['--rotation-backend', 'eager'])
-    compiled = parse_args(extra + ['--rotation-backend', 'compile'])
+    eager = parse_args(extra + ['--device', 'cpu'])
+    compiled = parse_args(extra + ['--device', 'cuda'])
     a, b = [binding(args, ResponsePolicyConfig(), loss) for args in (eager, compiled)]
-    assert a['numerical_backend']['rotation'] == 'eager'
-    assert b['numerical_backend']['rotation'] == 'compile'
+    assert a['numerical_backend']['physics'] == 'native-cpu-reference'
+    assert b['numerical_backend']['physics'] == 'compiled'
     assert b['numerical_backend']['options']['emulate_precision_casts'] is True
     assert b['numerical_backend']['options']['triton.cudagraphs'] is False
     assert a != b
+    assert b['execution']['sampling'] == 'spawn-one-batch'
+    assert 'task-loss' not in b['execution']['regions']
+    from pass_stop import PassStopLossConfig, GoalConfig
+    from dataclasses import asdict
+    goal = binding(compiled, ResponsePolicyConfig(),
+                   PassStopLossConfig(.01,.01,.2,mission=asdict(GoalConfig())))
+    assert 'task-loss' in goal['execution']['regions']
+    with pytest.raises(SystemExit):
+        parse_args(extra + ['--rotation-backend', 'compile'])
     with pytest.raises(ValueError, match='rotation backend'):
         RaptorSimulator(rotation_backend='unsupported')

@@ -24,8 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from env_raptor import RaptorParams, RaptorSimulator
+from compiled_physics import make_simulator
+from pass_stop import PassStopLossConfig, loss_config as parse_loss_config, prepare
 from response_noise import DisturbanceConfig
-from response_task import TaskLossConfig
 from response_training import (
     DEVELOPMENT_SEEDS,
     evaluate,
@@ -100,15 +101,21 @@ def _trajectory_arrays(initial, events, horizon):
             frames[name].append(state[name].clone())
 
     arrays = {name: _cpu_array(torch.stack(values)) for name, values in frames.items()}
+    # Clean episodes store one shared zero step instead of a full pulse tape.
+    pulse_steps = torch.arange(horizon, device=initial.pulse_tape.device)
+    if initial.pulse_tape.shape[1] == 1:
+        pulse_steps = torch.zeros_like(pulse_steps)
+    pulses = initial.pulse_tape.index_select(1, pulse_steps)
+    pulse_active = initial.pulse_active_tape.index_select(1, pulse_steps)
     arrays.update(
         action=_cpu_array(torch.stack(actions)),
         valid=_cpu_array(torch.stack(valid)),
         # These are the forces used for transition t -> t+1, not inferred
         # from the resulting motion or the noisy policy observation.
         external_force_world=_cpu_array(initial.external_force),
-        pulse_force_world=_cpu_array(initial.pulse_tape[:, :horizon, :3].transpose(0, 1)),
-        pulse_point_body=_cpu_array(initial.pulse_tape[:, :horizon, 3:].transpose(0, 1)),
-        pulse_active=_cpu_array(initial.pulse_active_tape[:, :horizon].transpose(0, 1)),
+        pulse_force_world=_cpu_array(pulses[:, :, :3].transpose(0, 1)),
+        pulse_point_body=_cpu_array(pulses[:, :, 3:].transpose(0, 1)),
+        pulse_active=_cpu_array(pulse_active.transpose(0, 1)),
         rotor_positions=_cpu_array(initial.rotor_positions),
         mass_kg=_cpu_array(initial.mass),
         arm_length_m=_cpu_array(initial.arm_length),
@@ -119,12 +126,59 @@ def _trajectory_arrays(initial, events, horizon):
     return arrays
 
 
+def _command_arrays(prepared, events, commands, horizon):
+    """Map the actual compact Actor outputs back to stable scene rows."""
+    if len(commands) != len(events):
+        raise RuntimeError("typed commands and physical steps disagree")
+    state = prepared.policy
+    latest = (state.via, state.via_rotation, state.is_stop, state.phase,
+              torch.where(state.is_stop, 0., state.target_velocities[:,1].norm(dim=-1)))
+    frames = [[], [], [], [], []]
+    for step in range(horizon):
+        if step < len(events):
+            rows = events[step][0]
+            latest = tuple(value.index_copy(0, rows, new)
+                           for value, new in zip(latest, commands[step]))
+        for values, value in zip(frames, latest):
+            values.append(value)
+    arrays = {name: _cpu_array(torch.stack(values)) for name, values in zip(
+        ("command_position", "command_rotation", "command_is_stop",
+         "command_phase", "command_min_speed_m_s"), frames)}
+    arrays.update(
+        mission_points=_cpu_array(torch.stack((prepared.physical.position, state.via, state.stop), 1)),
+        pass_rotation=_cpu_array(state.via_rotation),
+        stop_rotation=_cpu_array(state.stop_rotation),
+        region_radius_m=_cpu_array(state.radius),
+    )
+    return arrays
+
+
 @torch.no_grad()
 def capture_short_eval(policy, simulator, initial, horizon, loss_config):
     """Run the usual EVAL exactly once and retain its full state/action trace."""
     recorder = _RecordingSimulator(simulator)
-    report = evaluate(policy, recorder, initial, horizon, loss_config)
-    arrays = _trajectory_arrays(initial, recorder.events, horizon)
+    typed = isinstance(loss_config, PassStopLossConfig)
+    # prepare is deterministic and has no RNG side effects. EVAL still owns
+    # its usual rollout; this copy provides the exact public birth/goal state.
+    prepared = prepare(policy, initial, loss_config) if typed else None
+    commands = []
+    def record_command(module, args, output):
+        state = output.next_state
+        stop = state.is_stop
+        commands.append((torch.where(stop[:, None], state.stop, state.via).detach().clone(),
+                         torch.where(stop[:, None, None], state.stop_rotation,
+                                     state.via_rotation).detach().clone(),
+                         stop.detach().clone(), state.phase.detach().clone(),
+                         torch.where(stop, 0., state.target_velocities[:,1].norm(dim=-1)).detach().clone()))
+    handle = policy.register_forward_hook(record_command) if typed else None
+    try:
+        report = evaluate(policy, recorder, initial, horizon, loss_config)
+    finally:
+        if handle is not None:
+            handle.remove()
+    arrays = _trajectory_arrays(prepared.physical if typed else initial, recorder.events, horizon)
+    if typed:
+        arrays.update(_command_arrays(prepared, recorder.events, commands, horizon))
     expected = (horizon + 1, initial.position.shape[0])
     if arrays["position"].shape[:2] != expected or arrays["orientation"].shape[:2] != expected:
         raise RuntimeError("recorded short-EVAL state dimensions are inconsistent")
@@ -211,8 +265,11 @@ def save_latest_replay(run_dir, *, checkpoint_update, model_sha256, source_sha25
             os.unlink(temporary_npz)
 
     horizon = int(arrays["valid"].shape[0])
+    mission = report.get("loss_config", {}).get("mission")
     metadata = {
         "replay_type": REPLAY_SCHEMA,
+        "task": "pass-stop" if mission is not None else "hover",
+        "mission": mission,
         "dt": float(dt),
         "duration_seconds": float(horizon * dt),
         "scenes": _scene_rows(arrays),
@@ -228,7 +285,7 @@ def save_latest_replay(run_dir, *, checkpoint_update, model_sha256, source_sha25
         "trajectory_compressed_bytes": int(final_npz.stat().st_size),
         "capture_seconds": capture_seconds,
         "cuda_peak_allocated_bytes": cuda_peak_allocated_bytes,
-        "target_world_m": [0.0, 0.0, 0.0],
+        "target_world_m": None if mission is not None else [0.0, 0.0, 0.0],
         "arena": "per-scene position boundary from the fixed-EVAL sampler",
     }
     _atomic_json(playlist, metadata)
@@ -286,14 +343,14 @@ def export_checkpoint(checkpoint_path, run_dir, *, device="cuda"):
         torch.cuda.reset_peak_memory_stats(device)
     protocol = saved["binding"]["protocol"]
     horizon = int(saved["binding"]["horizon"])
-    simulator = RaptorSimulator(RaptorParams(**protocol["environment_params"]))
+    simulator = make_simulator(RaptorParams(**protocol["environment_params"]), device)
     initial = sample_pool(
         int(protocol["eval_scenarios_per_bank"]), DEVELOPMENT_SEEDS,
         dt=policy.config.dt, device=device, dtype=dtype, horizon=horizon,
         disturbances=DisturbanceConfig(**protocol["disturbances"]),
     )
     report, arrays = capture_short_eval(
-        policy, simulator, initial, horizon, TaskLossConfig(**protocol["loss"])
+        policy, simulator, initial, horizon, parse_loss_config(protocol["loss"])
     )
     if device.type == "cuda":
         torch.cuda.synchronize(device)

@@ -1,0 +1,16 @@
+........                                                                 [100%]
+=============================== warnings summary ===============================
+tests/test_compiled_execution.py: 14 warnings
+  /tmp/diffphys-cuda-venv/lib/python3.11/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_compiled_execution.py::test_compiled_goal_rollout_gradients_and_adam_match_reference[dtype0-0.0-12]
+  /tmp/diffphys-cuda-venv/lib/python3.11/site-packages/torch/_inductor/compile_fx.py:321: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+    warnings.warn(
+
+tests/test_compiled_execution.py::test_compiled_goal_rollout_gradients_and_adam_match_reference[dtype0-0.0-12]
+  /tmp/diffphys-cuda-venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2056: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+    torch._dynamo.utils.warn_once(msg)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8 passed, 16 warnings in 153.77s (0:02:33)

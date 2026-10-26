@@ -1,0 +1,50 @@
+{
+  "capsule": "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/compiled_prefetch_smoke_20261023_195918/audit/updates/u00000003_377e5a3ed9d5.pt",
+  "update": 3,
+  "mode": "full",
+  "gradient_equal": true,
+  "gradient_max_abs_difference": 0.0,
+  "model_equal": true,
+  "model_max_abs_difference": 0.0,
+  "adam_equal": true,
+  "adam_max_abs_difference": 0.0,
+  "rng_equal": true,
+  "passed": true,
+  "parameter_changes": {
+    "l2": 0.026936868619315477,
+    "max_abs": 0.00030103023163974285,
+    "relative_l2": 0.0004630970779015177,
+    "layers": {
+      "response_memory.weight_ih": {
+        "l2": 0.018853267681826925,
+        "max_abs": 0.00030103023163974285,
+        "relative_l2": 0.0006646021173631447
+      },
+      "response_memory.weight_hh": {
+        "l2": 0.018746140174467497,
+        "max_abs": 0.0003008842468261719,
+        "relative_l2": 0.00037825348950586
+      },
+      "response_memory.bias_ih": {
+        "l2": 0.002252808593814577,
+        "max_abs": 0.0002961158752441406,
+        "relative_l2": 0.00042984062424709484
+      },
+      "response_memory.bias_hh": {
+        "l2": 0.002253838515733856,
+        "max_abs": 0.00028642453253269196,
+        "relative_l2": 0.0004336514948376208
+      },
+      "readout.weight": {
+        "l2": 0.002905656026238025,
+        "max_abs": 0.00029129162430763245,
+        "relative_l2": 0.0003523749405803778
+      },
+      "readout.bias": {
+        "l2": 0.0003655758918135387,
+        "max_abs": 0.0002014748752117157,
+        "relative_l2": 0.006770460629158701
+      }
+    }
+  }
+}

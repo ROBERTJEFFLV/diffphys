@@ -1,0 +1,184 @@
+{
+  "update": 1450,
+  "task_objective": 13.651424407958984,
+  "task_components": {
+    "pass_position": 4.435479164123535,
+    "pass_attitude": 6.0317840576171875,
+    "pass_speed": 0.0,
+    "pass_missing": 1.7578125,
+    "stop": 0.7545873522758484,
+    "time": 0.6697680354118347,
+    "direction": 0.001537548960186541,
+    "action_delta": 0.00045587384374812245,
+    "acceleration": 0.0,
+    "jerk": 0.0,
+    "failure": 0.0,
+    "boundary": 0.0
+  },
+  "time_proxy_seconds": 3.3488402366638184,
+  "completion_time_seconds": 4.609453201293945,
+  "pass_fraction": 0.30859375,
+  "success_fraction": 0.3046875,
+  "region_enter_fraction": 0.82421875,
+  "region_exit_fraction": 0.82421875,
+  "pass_position_m": 0.10113312304019928,
+  "pass_chordal_ratio": 1.213594913482666,
+  "pass_minimum_speed_m_s": 2.0,
+  "pass_speed_shortfall_m_s": 0.0,
+  "region_max_speed_shortfall_m_s": 0.0,
+  "region_samples": 1926,
+  "region_radius_m_min": 0.0558820404112339,
+  "region_radius_m_max": 0.4393002986907959,
+  "terminal_acceleration_m_s2": 0.06544753909111023,
+  "terminal_angular_acceleration_rad_s2": 0.5112817287445068,
+  "terminal_motor_rate_per_s": 0.032240454107522964,
+  "acceleration_rms_m_s2": 9.512837409973145,
+  "position_rms": 2.1013376712799072,
+  "velocity_rms": 2.7372562885284424,
+  "omega_rms": 3.3142688274383545,
+  "physical_transitions": 128000,
+  "scenario_count": 256,
+  "finite": true,
+  "motor_saturation_fraction": 0.0,
+  "disturbances": {
+    "version": "raptor-force-pulses-gaussian-observation-delay-v3",
+    "deployment_authorized": false,
+    "force_model": "raptor-source-gaussian-episode-constant-no-extra-g",
+    "force_std_N": [
+      0.0,
+      0.0
+    ],
+    "force_norm_N": [
+      0.0,
+      0.0
+    ],
+    "measurement_std": {
+      "position_m": [
+        0.0010000000474974513,
+        0.0010000000474974513
+      ],
+      "velocity_m_s": [
+        0.0020000000949949026,
+        0.0020000000949949026
+      ],
+      "attitude_rotvec_rad": [
+        0.0010000000474974513,
+        0.0010000000474974513
+      ],
+      "omega_rad_s": [
+        0.0020000000949949026,
+        0.0020000000949949026
+      ]
+    },
+    "velocity_delay_s": [
+      0.010102846659719944,
+      0.029993470758199692
+    ],
+    "external_torque_noise": false,
+    "motor_command_noise": false,
+    "transient_force_schedule": false,
+    "pulse_protocol": {
+      "duration_s": 0.1,
+      "onset_interval_s": [
+        0.8,
+        1.2
+      ],
+      "first_onset_s": [
+        0.0,
+        0.99
+      ],
+      "time_quantization_s": 0.01,
+      "force": "independent-world-Gaussian-same-airframe-force-std",
+      "point": "uniform-arm-then-uniform-COM-to-rotor-fraction",
+      "torque": "body-point-cross-R-transpose-world-force-at-every-RK4-stage"
+    }
+  },
+  "reference_protocol": "raptor",
+  "episode_termination": "position-only",
+  "raptor_episode_length_mean": 500.0,
+  "raptor_episode_length_std": 0.0,
+  "raptor_share_terminated": 0.0,
+  "reference_position_limit_min_m": 0.8382306098937988,
+  "reference_position_limit_max_m": 6.589504241943359,
+  "loss_config": {
+    "epsilon_p": 0.01,
+    "epsilon_a": 0.01,
+    "lambda_R": 25.0,
+    "dead_cost": 3.0,
+    "terminal_cost": 200.0,
+    "mission": {
+      "points": [
+        [
+          -0.7,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.38,
+          0.0
+        ],
+        [
+          0.7,
+          0.0,
+          0.0
+        ]
+      ],
+      "relative_to_boundary": true,
+      "via_quaternion": [
+        0.6087614290087207,
+        0.7933533402912352,
+        0.0,
+        0.0
+      ],
+      "stop_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "start_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "velocities": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          2.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "region_radius_arms": 2.0,
+      "pass_speed_scale_m_s": 0.5,
+      "velocity_weight": 10.0,
+      "direction_weight": 0.01,
+      "acceleration_weight": 0.0,
+      "jerk_weight": 0.0,
+      "stop_acceleration_m_s2": 0.5,
+      "stop_angular_acceleration_rad_s2": 2.0,
+      "stop_motor_rate_per_s": 0.1,
+      "radius_m": 0.1,
+      "pose_tolerance_deg": 1.0,
+      "stop_position_m": 0.1,
+      "stop_velocity_m_s": 0.1,
+      "stop_pose_deg": 5.0,
+      "stop_omega_rad_s": 0.5,
+      "point_weight": 10.0,
+      "time_weight": 1.0,
+      "smooth_weight": 0.01,
+      "version": "pass-region-min-speed-v3"
+    }
+  }
+}

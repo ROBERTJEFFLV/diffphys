@@ -29,6 +29,37 @@
     0.0,
     0.0
   ],
+  "start_quaternion": [
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "velocities": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      2.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "region_radius_arms": 2.0,
+  "velocity_weight": 10.0,
+  "direction_weight": 0.01,
+  "acceleration_weight": 0.0,
+  "jerk_weight": 0.0,
+  "stop_acceleration_m_s2": 0.5,
+  "stop_angular_acceleration_rad_s2": 2.0,
+  "stop_motor_rate_per_s": 0.1,
   "radius_m": 0.1,
   "pose_tolerance_deg": 1.0,
   "stop_position_m": 0.1,
@@ -38,5 +69,6 @@
   "point_weight": 10.0,
   "time_weight": 1.0,
   "smooth_weight": 0.01,
-  "version": "pass-stop-prefix-suffix-v1"
+  "version": "pass-region-min-speed-v3",
+  "pass_speed_scale_m_s": 0.5
 }

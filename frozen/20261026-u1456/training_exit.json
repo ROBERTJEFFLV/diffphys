@@ -1,0 +1,26 @@
+{
+  "exit_code": 0,
+  "finished_at_utc": "2026-10-26T03:25:26.072343+00:00",
+  "summary": {
+    "audit_last_event_update": 1450,
+    "audit_step_norm_ema": 0.004675773863274356,
+    "best_score": 13.651424407958984,
+    "best_update": 1450,
+    "deployment_authorized": false,
+    "elapsed_seconds": 4826.264908386162,
+    "exit_class": "interrupted",
+    "final_seeds_consumed": [],
+    "initialization": {
+      "file_sha256": "5ddbef550e1bd5a15701caa32d0244e1512b38b6a212b13cc5c3665cd2764851",
+      "weights_only": true
+    },
+    "last_evaluated_update": 1450,
+    "prefetch": {
+      "worker_close_seconds": 0.16403887188062072,
+      "worker_closed": true,
+      "worker_pid": 2546414
+    },
+    "status": "interrupted",
+    "updates": 1456
+  }
+}

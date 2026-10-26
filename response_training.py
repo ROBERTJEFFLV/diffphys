@@ -18,12 +18,16 @@ import numpy as np
 import torch
 
 from env_raptor import (RaptorParams, RaptorSimulator, RaptorState, environment_contract,
-                        rotation_backend_contract, ACTION_CONVENTION)
+                        ACTION_CONVENTION)
+from compiled_physics import make_simulator, physics_backend_contract
+from compiled_execution import compile_actor, execution_contract
+from scene_prefetch import PrefetchedSampler
+from tensor_storage import saved_tensor_storage
 from response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from pass_stop import (PassStopLossConfig, GoalMotorPolicy, policy_class,
                        loss_config as parse_loss_config, architecture, objective_version,
-                       task_rollout, typed_costs, import_motor_weights)
+                       task_rollout, typed_costs, import_motor_weights, LEGACY_ARCHITECTURE)
 from response_task import (
     TaskLossConfig,
     TASK_OBJECTIVE_VERSION,
@@ -47,7 +51,13 @@ TRAIN_SEED_BASE = 31_000_007
 TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
 SOURCE_FILES = (
+    "compiled_execution.py",
+    "compiled_physics.py",
+    "strict_inductor.py",
+    "scene_prefetch.py",
+    "tensor_storage.py",
     "pass_stop.py",
+    "pass_stop_physics.py",
     "response_policy.py",
     "response_task.py",
     "response_adjoints.py",
@@ -148,9 +158,12 @@ def migrate_actor_weights(policy, state):
 def require_reference_checkpoint(value):
     """A shape match cannot certify old hover-centered or plus-frame semantics."""
     if value.get("schema") != PROTOCOL_VERSION:
-        raise ValueError("incompatible checkpoint schema")
+        raise ValueError("incompatible checkpoint schema/motor semantics")
     cfg = value["binding"]["protocol"]
-    loss = parse_loss_config(cfg["loss"])
+    try:
+        loss = parse_loss_config(cfg["loss"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("incompatible checkpoint objective; use weights-only initialization") from error
     if (value.get("architecture") != architecture(loss)
             or cfg.get("architecture") != architecture(loss)
             or cfg.get("task_objective") != objective_version(loss)):
@@ -209,7 +222,7 @@ def load_policy_checkpoint(path, device, dtype):
     migrate_actor_weights(policy, value["model"])
     if value.get("model_sha256") != model_hash(policy):
         raise ValueError("checkpoint model digest mismatch")
-    return policy.to(device=device, dtype=dtype), value
+    return compile_actor(policy.to(device=device, dtype=dtype), device), value
 
 
 def pool_states(states):
@@ -282,6 +295,7 @@ def safe_global_clip(parameters, limit):
 
 
 def binding(args, policy_config, loss_config):
+    execution_device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
     return {
         "source_sha256": source_hash(),
         "algorithm": ("time-decayed-bptt-adam" if args.time_decay > 0 else "exact-horizon-bptt-adam")
@@ -322,7 +336,8 @@ def binding(args, policy_config, loss_config):
         "training_banks": TRAINING_BANKS,
         "training_sampling": sampling_contract(getattr(args, "train_sampling", "random")),
         "torch_version": str(torch.__version__),
-        "numerical_backend": rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
+        "numerical_backend": physics_backend_contract(execution_device),
+        "execution": execution_contract(execution_device, goal_task=isinstance(loss_config, PassStopLossConfig)),
     }
 
 
@@ -370,7 +385,8 @@ def _append(path, row):
 def evaluate(policy, simulator, initial, horizon, loss_config):
     if isinstance(loss_config, PassStopLossConfig):
         trace = task_rollout(policy, simulator, initial, horizon, loss_config)
-        _, report, _ = typed_costs(trace, loss_config)
+        _, report, _ = typed_costs(trace, loss_config,
+                                  compiled=getattr(simulator, 'compiled_execution', False))
         report.update(reference_episode_metrics(trace))
         report["loss_config"] = asdict(loss_config)
         report["disturbances"] = disturbance_report(trace.initial)
@@ -414,12 +430,9 @@ def train(args, policy_config, loss_config):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     started = time.monotonic()
-    if isinstance(loss_config, PassStopLossConfig) and args.time_decay != 0:
-        raise ValueError("PASS/STOP requires --time-decay 0")
-    policy = policy_class(loss_config)(policy_config).to(device=device, dtype=dtype)
+    policy = compile_actor(policy_class(loss_config)(policy_config).to(device=device, dtype=dtype), device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-    simulator = RaptorSimulator(RaptorParams(dt=policy_config.dt),
-                                rotation_backend=getattr(args, "rotation_backend", "eager"))
+    simulator = make_simulator(RaptorParams(dt=policy_config.dt), device)
     group_config = GroupBalanceConfig.from_args(args)
     disturbances = DisturbanceConfig.from_args(args)
     audit_config = AuditConfig.from_args(args)
@@ -464,16 +477,19 @@ def train(args, policy_config, loss_config):
         # old training environment. No legacy simulator/optimizer is restored.
         old_policy = saved.get("policy_config", {})
         old_environment = saved.get("binding", {}).get("protocol", {}).get("environment", {})
-        allowed = (ARCHITECTURE, architecture(loss_config))
+        allowed = ((ARCHITECTURE, LEGACY_ARCHITECTURE, architecture(loss_config))
+                   if isinstance(loss_config, PassStopLossConfig) else (ARCHITECTURE,))
         if (saved.get("architecture") not in allowed
                 or any(old_policy.get(k) != v for k, v in asdict(policy_config).items())
                 or old_environment.get("action_convention") != ACTION_CONVENTION):
             raise ValueError("initialization Actor interface/motor semantics mismatch")
         # Verify the original digest BEFORE expanding the goal-input columns.
-        old_class = ResponseMotorPolicy if saved["architecture"] == ARCHITECTURE else GoalMotorPolicy
+        old_class = ResponseMotorPolicy if saved["architecture"] in (ARCHITECTURE, LEGACY_ARCHITECTURE) else GoalMotorPolicy
         source_dtype = getattr(torch, saved["binding"]["dtype"])
         with torch.random.fork_rng(devices=[]):
             source_policy = old_class(policy_config).to(dtype=source_dtype)
+            if saved["architecture"] == LEGACY_ARCHITECTURE:
+                source_policy.response_memory = torch.nn.GRUCell(26,policy_config.memory_dim).to(dtype=source_dtype)
         migrate_actor_weights(source_policy, saved.get("model", {}))
         if saved.get("model_sha256") != model_hash(source_policy):
             raise ValueError("checkpoint model digest mismatch")
@@ -494,9 +510,8 @@ def train(args, policy_config, loss_config):
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_handlers[signum] = signal.signal(signum, interrupted)
-    eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
-                               device=device, dtype=dtype, horizon=args.horizon,
-                               disturbances=disturbances)
+    sampler = None
+    record = None
 
     def save(name="latest.pt"):
         atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
@@ -522,12 +537,20 @@ def train(args, policy_config, loss_config):
             save("best.pt")
 
     try:
+        eval_initial = sample_pool(args.eval_scenarios, DEVELOPMENT_SEEDS, dt=policy_config.dt,
+                                   device=device, dtype=dtype, horizon=args.horizon,
+                                   disturbances=disturbances)
         if (
             progress.get("last_evaluated_update") != progress["updates"]
             and progress["updates"] == 0
         ):
             evaluation()
         save()
+        if progress["updates"] < args.updates:
+            sampler = PrefetchedSampler(TRAINING_BANKS*args.scenarios, args.horizon,
+                                        progress["updates"], args.updates, dtype=dtype,
+                                        threads=args.threads, sampling=sampling,
+                                        dt=policy_config.dt, disturbances=disturbances)
         while progress["updates"] < args.updates:
             if stop:
                 progress["status"] = "interrupted"
@@ -550,7 +573,7 @@ def train(args, policy_config, loss_config):
             seeds, sampling_report = [], {}
             try:
                 sampling_report = {}
-                initial, seeds = sample_training_scenarios(
+                initial, seeds = sampler(
                     args.scenarios,
                     progress["updates"],
                     dt=policy_config.dt,
@@ -562,15 +585,16 @@ def train(args, policy_config, loss_config):
                     sampling_report=sampling_report,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                record = collect_rollout(
-                    policy,
-                    simulator,
-                    initial,
-                    loss_config,
-                    horizon=args.horizon,
-                    time_decay=args.time_decay,
-                    group_config=group_config,
-                )
+                with saved_tensor_storage(device) as storage:
+                    record = collect_rollout(
+                        policy,
+                        simulator,
+                        initial,
+                        loss_config,
+                        horizon=args.horizon,
+                        time_decay=args.time_decay,
+                        group_config=group_config,
+                    )
                 _sync(device)
                 forward_done = time.monotonic()
                 backward = backward_actor(
@@ -631,6 +655,8 @@ def train(args, policy_config, loss_config):
             progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
             row = {
                 "update": progress["updates"],
+                **sampler.last,
+                "tensor_storage": storage,
                 "train_seeds": seeds,
                 "training_sampling": sampling_report,
                 **record.metrics,
@@ -656,7 +682,8 @@ def train(args, policy_config, loss_config):
             }
             _append(work / "history.jsonl", row)
             print(json.dumps(row, allow_nan=False), flush=True)
-            del record, backward, before, gradients_for_audit
+            record = backward = before = initial = None
+            gradients_for_audit = {}
             if progress["updates"] % args.development_every == 0:
                 evaluation()
             if progress["updates"] % args.checkpoint_every == 0:
@@ -668,6 +695,13 @@ def train(args, policy_config, loss_config):
         save("failure.pt")
         raise
     finally:
+        if record is not None and record.probe is not None:
+            record.probe.close()
+        if sampler is not None:
+            sampler.worker.close()
+            progress['prefetch'] = {'worker_closed': sampler.worker.closed,
+                                    'worker_pid': sampler.worker.pid,
+                                    'worker_close_seconds': sampler.worker.close_seconds}
         progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
@@ -705,7 +739,7 @@ def evaluate_checkpoint(args):
                           disturbances=DisturbanceConfig(**cfg["disturbances"]))
     report = evaluate(
         policy,
-        RaptorSimulator(params, rotation_backend=getattr(args, "rotation_backend", "eager")),
+        make_simulator(params, device),
         initial,
         saved["binding"]["horizon"],
         parse_loss_config(cfg["loss"]),
@@ -714,7 +748,8 @@ def evaluate_checkpoint(args):
         checkpoint_source_sha256=checkpoint_source,
         evaluator_source_sha256=evaluator_source,
         source_match=checkpoint_source == evaluator_source,
-        numerical_backend=rotation_backend_contract(getattr(args, "rotation_backend", "eager")),
+        numerical_backend=physics_backend_contract(device),
+        execution=execution_contract(device, goal_task='mission' in cfg['loss']),
     )
     atomic_json(Path(args.work_dir) / "evaluation.json", report)
     return report

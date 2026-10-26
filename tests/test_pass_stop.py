@@ -11,8 +11,9 @@ from env_raptor import RaptorParams, RaptorSimulator, quaternion_rotation
 from response_noise import DisturbanceConfig, measured_observation
 from response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import TaskLossConfig, rollout
+from pass_stop_physics import advance_phase
 from pass_stop import (GoalConfig, GoalMotorPolicy, PassStopLossConfig, temporal_proxy,
-                       typed_costs, prepare, task_rollout, attitude_ratio, import_motor_weights)
+                       typed_costs, prepare, task_rollout, attitude_ratio, import_motor_weights, GOAL_FEATURE_DIM)
 
 torch.set_num_threads(1)
 DTYPES=(torch.float32,torch.float64)
@@ -149,22 +150,23 @@ def test_import_matches_translated_hover_multistep(dtype):
         hs,gs=h.next_state,g.next_state
         obs=measured_observation(sim.step(ini,h.action))
     assert len(list(goal.parameters()))==6
-    assert goal.response_memory.input_size==26 and goal.response_memory.hidden_size==64
+    assert goal.response_memory.input_size==GOAL_FEATURE_DIM and goal.response_memory.hidden_size==64
 
 @pytest.mark.parametrize('dtype',DTYPES)
-def test_switch_position_only_latches_and_does_not_reset(dtype):
+def test_switch_on_exit_not_entry_and_no_memory_reset(dtype):
     sim,ini,actor=system(2,dtype)
     closed=prepare(actor,ini,cfg());state=closed.policy
     state=replace(state,memory=torch.full_like(state.memory,.25))
     obs=measured_observation(closed.physical)
-    obs=torch.cat((state.via+torch.tensor([[.05,0,0],[.11,0,0]],dtype=dtype),obs[:,3:]),-1)
-    out=actor(obs,state)
-    assert out.next_state.is_stop.tolist()==[True,False]
-    # Incorrect pose does not prevent switching, and old memory contributes.
-    other=actor(obs,replace(state,memory=torch.zeros_like(state.memory)))
+    entering=torch.cat((state.via,obs[:,3:]),-1)
+    out=actor(entering,state)
+    assert out.next_state.phase.tolist()==[1,1]
+    other=actor(entering,replace(state,memory=torch.zeros_like(state.memory)))
     assert not torch.equal(out.next_state.memory,other.next_state.memory)
-    far=torch.cat((state.via+2,obs[:,3:]),-1)
-    assert actor(far,out.next_state).next_state.is_stop.tolist()==[True,False]
+    far=torch.cat((state.via+2*state.radius[:,None],obs[:,3:]),-1)
+    exit_out=actor(far,out.next_state)
+    assert exit_out.next_state.phase.tolist()==[2,2]
+    assert actor(entering,exit_out.next_state).next_state.phase.tolist()==[2,2]
 
 @pytest.mark.parametrize('dtype',DTYPES)
 def test_sample_task_preserves_physics_sensor_velocity(dtype):
@@ -172,9 +174,11 @@ def test_sample_task_preserves_physics_sensor_velocity(dtype):
     closed=prepare(actor,ini,cfg())
     s=closed.physical
     for name in ('mass','inertia','rotor_positions','thrust_coefficients','motor_time_rising','motor_time_falling',
-                 'velocity','velocity_delay','noise_tape','rotation_tape','position_limit'):
+                 'velocity_delay','noise_tape','rotation_tape','position_limit'):
         assert torch.equal(getattr(s,name),getattr(ini,name))
     assert not s.external_force.any() and not s.pulse_tape.any()
+    assert not s.velocity.any() and not s.previous_velocity.any()
+    torch.testing.assert_close(closed.policy.radius,2*s.arm_length)
     assert torch.equal(s.previous_velocity[:,0],s.velocity)
     a=quaternion_rotation(s.orientation)[:,:,2]*(sim.thrust(s,s.motor).sum(-1)/s.mass)[:,None]
     torch.testing.assert_close(a,s.position.new_tensor((0,0,9.81)).expand_as(a),rtol=1e-5,atol=1e-5)
@@ -182,34 +186,31 @@ def test_sample_task_preserves_physics_sensor_velocity(dtype):
     assert torch.all(s.position.abs()<s.position_limit[:,None])
 
 @pytest.mark.parametrize('dtype',DTYPES)
-def test_pass_score_no_speed_requirement_and_same_time_pose(dtype):
-    p=torch.tensor([[-1.,0,0],[.05,0,0],[1.,0,0]],dtype=dtype)
-    wrong,c=synthetic(p)
-    cval=typed_costs(wrong,c)[2]['pass_pose']
+def test_pass_requires_minimum_speed_and_pose_across_region(dtype):
+    p=torch.tensor([[-1.,0,0],[0.,0,0],[1.,0,0]],dtype=dtype)
     q=p.new_tensor(GoalConfig().via_quaternion).expand(3,1,4)
-    good,c=synthetic(p,q=q)
-    base=typed_costs(good,c)[2]['pass_pose']
-    assert float(base)==0 and float(cval)>1
-    # Correct pose away from the first position hit does not satisfy the task.
+    v=p.new_tensor((2.,0,0)).expand(3,1,3).clone()
+    good,c=synthetic(p,q=q,v=v)
+    comp=typed_costs(good,c)[2]
+    assert float(comp['pass_attitude'])==pytest.approx(0.)
+    assert float(comp['pass_speed'])==pytest.approx(0.)
+    for velocity in ((0.,0,0),(1.9,0,0)):
+        other,_=synthetic(p,q=q,v=p.new_tensor(velocity).expand(3,1,3))
+        assert float(typed_costs(other,c)[2]['pass_speed'])>0
+    for velocity in ((0.,2,0),(-2.,0,0),(4.,0,0)):
+        other,_=synthetic(p,q=q,v=p.new_tensor(velocity).expand(3,1,3))
+        assert float(typed_costs(other,c)[2]['pass_speed'])==0
     q2=q.clone();q2[1]=p.new_tensor((1,0,0,0))
-    mixed,c=synthetic(p,q=q2)
-    assert float(typed_costs(mixed,c)[2]['pass_pose'])>1
-    for speed in (0.,.1,3.,8.):
-        velocity=torch.zeros(3,1,3,dtype=dtype);velocity[1,:,0]=speed
-        speedy,c=synthetic(p,q=q,v=velocity)
-        torch.testing.assert_close(typed_costs(speedy,c)[2]['pass_pose'],base)
+    bad,_=synthetic(p,q=q2,v=v)
+    assert float(typed_costs(bad,c)[2]['pass_attitude'])>0
 
 @pytest.mark.parametrize('dtype',DTYPES)
 def test_position_gradient_cannot_hide_pose_by_distance(dtype):
-    p=torch.tensor([[-1.,0,0],[.3,0,0],[1.,0,0]],dtype=dtype,requires_grad=True)
-    q=p.new_tensor(GoalConfig().via_quaternion).expand(3,1,4).clone()
-    q[1]=p.new_tensor((.9,math.sqrt(.19),0,0))
-    tr,c=synthetic(p,q=q)
-    # The single best joint witness can vary: first freeze it by making endpoints worse.
-    q[0]=q[2]=p.new_tensor((1.,0,0,0))
-    val=typed_costs(tr,c)[2]['pass_pose'].sum()
+    p=torch.tensor([[-1.,0,0],[-.7,0,0],[-.8,0,0]],dtype=dtype,requires_grad=True)
+    tr,c=synthetic(p)
+    val=typed_costs(tr,c)[2]['pass_position'].sum()
     g=torch.autograd.grad(val,p)[0]
-    assert g[1,0]>=0 # descent does not move the selected point outward
+    assert g[1,0]<0
 
 @pytest.mark.parametrize('dtype',DTYPES)
 def test_h500_real_physics_backward(dtype):
@@ -267,7 +268,7 @@ def test_all_500_transitions_remain_connected(dtype):
 def test_failed_approach_fallback_not_fixed_spawn(dtype):
     p=torch.tensor([[-1.,0,0],[-1.01,0,0],[-1.02,0,0]],dtype=dtype,requires_grad=True)
     tr,c=synthetic(p)
-    value=typed_costs(tr,c)[2]['pass_pose'].sum()
+    value=typed_costs(tr,c)[2]['pass_position'].sum()
     g=torch.autograd.grad(value,p)[0]
     assert g[0].abs().sum()==0 and g[1,0]<0
 

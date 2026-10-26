@@ -28,8 +28,6 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
-    parser.add_argument("--rotation-backend", choices=("eager", "compile"), default="eager",
-                        help="compile only quaternion-to-rotation; RK4 and Actor stay unchanged")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--scenarios", type=int, default=128, help="scenes per bank; TRAIN pools four banks")
@@ -104,8 +102,6 @@ def parse_args(argv=None):
         TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})
         if args.mission_config is not None:
             args.mission = GoalConfig(**json.loads(args.mission_config.read_text()))
-            if args.time_decay != 0:
-                raise ValueError("PASS/STOP requires --time-decay 0")
         groups = GroupBalanceConfig.from_args(args) if args.mode == "train" else GroupBalanceConfig()
         DisturbanceConfig.from_args(args)
         AuditConfig.from_args(args)
