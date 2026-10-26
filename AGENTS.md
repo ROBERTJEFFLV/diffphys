@@ -38,31 +38,31 @@ are `env_raptor.py`, `response_noise.py`, `response_policy.py`,
 `response_audit.py`, `response_grad_probe.py`, and the single CLI
 `tools/train_response_control.py`. See README.md for responsibilities.
 
-The sole training config is `configs/response_raptor_multi_airframe.args`.
+The sole recommended training config is `configs/agile_flight.args`, with the task in `configs/pass_stop.json`.
 Full BPTT, Time Decay and physical-cell shrink-only gradient clipping are the retained
 algorithm. Production uses one native-backward group probe; the older grouped
 VJP backend remains an explicit numerical reference, never an automatic fallback.
 See docs/group_gradient_probe.md. Do not reintroduce L2F single-airframe, reverse-window recomputation,
 AGC, action slew constraints or private GRU dispatcher backends. No auxiliary
-network belongs to the production chain. The sole Actor is native B:
-GRUCell(16,64) followed by a hidden-only Linear(64,4); do not reintroduce the
-direct feature-to-readout Wc branch or an A/B production selector.
+network belongs to the production chain. The AFT Actor is GoalMotorPolicy: native GRUCell(69,64) followed by a hidden-only
+Linear(64,4). The 16-feature base Actor remains a weight-import and numerical
+reference. Do not add the direct feature-to-readout Wc branch, an auxiliary
+network, or an A/B production selector.
 Noise changes must remain outside the
 Actor and truth-based task loss, with known-command history (not hidden execution).
 
-`docs/disturbance_budget.md` defines the Gaussian and pulsed recovery protocol;
-its legacy filename is retained. The old shared 10% budget is removed. TRAIN and
-the one fixed EVAL use RAPTOR constant Gaussian force, independent measurement
-Gaussians, uniform 10-30 ms velocity latency, and the requested 0.1 s force-at-point
-pulses with randomized phase/0.8-1.2 s onset intervals. Pulse torque is computed
-from the body lever and true intermediate attitude at each RK4 stage, not a
-separate random torque process. Initial kinematics are 120 degrees, +/-2.5 m/s
-and +/-2.2 rad/s (velocity limits per axis); position/motor/guidance are retained.
-No additive command noise or recovery/safety guarantee is introduced.
-Initial command history is a fixed zero placeholder, never sampled motor truth.
-Keep all noise AND pulse tapes immutable and shared by stable scene IDs during
-compaction; never expose force/point/schedule metadata to the Actor. Keep all
-three previous world-velocity slots differentiable through Time Decay.
+`docs/pass_stop.md` defines the active three-point mission. Start at point 1 with
+level pose, zero velocity/angular velocity and physically balanced motors; the
+public previous command remains a fixed zero placeholder. Point 2 uses radius
+2L, full pose and a speed floor, not a constant velocity vector. First measured
+exit switches permanently to point 3 without a pose/speed gate or GRU reset.
+AFT disables external forces/pulses in task preparation while retaining the
+original measurement noise and 10-30 ms velocity latency. The underlying force,
+pulse and sampling kernels remain intact as numerical references; the Gaussian
+and force-at-point source protocol remains documented in
+`docs/disturbance_budget.md`. Never expose hidden force/airframe/noise metadata
+to the Actor. Keep immutable tapes shared by stable scene IDs and all three
+previous world-velocity slots differentiable through optional Time Decay.
 
 Generated runs/checkpoints, applicable provenance and license notices, source
 audit evidence and local agent configuration are not disposable source. Historical
@@ -75,15 +75,17 @@ Python 3.11+ with PyTorch 2.10 and NumPy; no native extension build is required.
 Run training only when explicitly requested with a budget:
 
 ```bash
-python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
+python tools/train_response_control.py @configs/agile_flight.args
 ```
 
-`--scenarios` retains its four-bank size convention. The checked-in config uses
-coverage128 sampling, 4x512=2048 TRAIN scenes with 16 scenes per physical cell.
+`--scenarios` retains its four-bank size convention. The checked-in AFT config uses
+coverage128 sampling, 4x768=3072 TRAIN scenes with 24 scenes per physical cell.
 Bare CLI defaults retain the original random 4x128=512 pool for compatibility.
 Fixed EVAL pools two original random banks (default 2x128=256). For production coverage128, sampling cells
-are also the 128 fixed gradient groups (16 initial scenes each). See docs/physics_coverage.md for frozen yaw calibration,
-candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only CLI modes are train and evaluate.
+are also the 128 fixed gradient groups (24 initial scenes each in the AFT preset). See docs/physics_coverage.md for frozen yaw calibration,
+candidate budgets, seed/tape isolation, and objective-changing fork semantics. The only production CLI modes are train and evaluate. The separate long-hover
+evaluator/player and duplicate hover presets have been removed; restore the
+frozen tag for that historical workflow. Keep all frozen artifacts unchanged.
 Exact resume requires identical source/config; never rewrite checkpoint hashes
 to bypass an environment/noise mismatch. Older protocol checkpoints require their
 original source. Deterministic unit checks use `python -m pytest -q tests`.

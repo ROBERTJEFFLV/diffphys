@@ -11,11 +11,11 @@ from response_training import sample_training_scenarios
 from loss_fixtures import parse_loss_args as parse_args
 
 
-def test_production_config_selects_2048_coverage_without_changing_eval():
+def test_production_config_selects_3072_coverage_without_changing_eval():
     root = Path(__file__).resolve().parents[1]
-    args = parse_args(['@' + str(root / 'configs/response_raptor_multi_airframe.args')])
+    args = parse_args(['@' + str(root / 'configs/agile_flight.args')])
     assert getattr(args, 'train_sampling', None) == 'coverage128'
-    assert args.scenarios == 512 and args.eval_scenarios == 128
+    assert args.scenarios == 768 and args.eval_scenarios == 128
     assert args.group_max_groups == 128
 
 

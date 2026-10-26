@@ -48,3 +48,23 @@ def test_profiler_measures_the_real_goal_conditioned_task(tmp_path):
     assert result['loss_config']['mission']['version'] == 'pass-region-min-speed-v3'
     assert result['time_decay'] == 0.
     assert result['model_unchanged']
+
+
+def test_profiler_loads_the_current_goal_actor_without_losing_task_columns(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from pass_stop import ARCHITECTURE as GOAL_ARCHITECTURE, GoalMotorPolicy
+    policy = GoalMotorPolicy()
+    checkpoint = tmp_path/'goal.pt'
+    torch.save({'architecture':GOAL_ARCHITECTURE, 'policy_config':asdict(policy.config),
+                'model':policy.state_dict(), 'model_sha256':model_hash(policy)}, checkpoint)
+    before = checkpoint.read_bytes()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('profiling must not perform Adam updates')
+    monkeypatch.setattr(torch.optim.Adam, 'step', forbidden)
+    result = main(['--device','cpu','--scenes','128','--horizon','3','--warmup','0',
+                   '--repeats','1','--mission-config','configs/pass_stop.json',
+                   '--epsilon-p','.01','--epsilon-a','.01','--lambda-R','25',
+                   '--checkpoint',str(checkpoint),'--report',str(tmp_path/'profile.json')])
+    assert result['model_unchanged'] and result['model_sha256'] == model_hash(policy)
+    assert result['actor_input_size'] == 69
+    assert checkpoint.read_bytes() == before

@@ -8,12 +8,14 @@ their local parameter contributions grouped by the existing physical-cell IDs.
 One scalar vector-Jacobian product traverses the original full H500 graph.
 No separate group VJP traversals or second flight rollout are performed.
 
-The sole deployment Actor is native B, GRUCell(16,64) plus hidden-only Linear(64,4).
+The AFT Actor is native GRUCell(69,64) plus hidden-only Linear(64,4).
+The 16-feature base Actor is retained for weight import and numerical references.
 The probe observes this actual hidden input without changing the Actor or state
 adjoints; the Wc removal does not require another backward backend.
-Physics, sensors, pulses, 128-cell sampler/calibration, H500, Time Decay, equal-scene task weights,
-fixed shrink-only cap, global clipping and Adam are retained. `response_task`
-uses the adapted pre-action task cost; its training observer passes the current original live
+Physics, sensors, the 128-cell sampler/calibration, H500, Time Decay, equal-scene task weights,
+fixed shrink-only cap, global clipping and Adam are retained. AFT task preparation
+disables external forces/pulses; their original kernels remain numerical references.
+The training observer in `response_task` passes the current original live
 row indices to the observer immediately before the unchanged Actor invocation.
 No group ID, physical parameter or privileged state enters the Actor.
 
@@ -82,11 +84,12 @@ Original scene IDs map to unique padded group slots. After compaction, only the
 current live rows contribute to those original slots. Zero padding contributes
 nothing; a terminated scene never joins a different group. The packing uses
 unique `index_copy_` writes, not floating atomic scatter sums. Grouped matrix
-multiplications reduce the 16 scene members directly. There is no full NxP
+multiplications reduce the cell members directly (24 per cell in the 3072-scene
+AFT preset). There is no full NxP
 per-scene derivative tensor, and no HxNxP derivative tape.
 
-The persistent accumulators are GxP in float64: 128 x 16004 x 8 bytes = about
-15.6 MiB for the production Actor, plus normal graph/activation storage and
+The persistent accumulators are GxP in float64: 128 x 26180 x 8 bytes = about
+25.6 MiB for the AFT Actor, plus normal graph/activation storage and
 small temporary packed tensors. Float32 local gate calculations/group matmuls
 remain float32; float64 accumulation does not promote the whole physics graph.
 Saved input aliases are detached only for the observer, not for native BPTT,
@@ -117,17 +120,19 @@ TRAIN additionally reports `backward_seconds`, `optimizer_seconds` and
 `forward_seconds` retains its existing inclusion of sampling/metrics; the
 new audit phase measures capsule creation and retention, not just file bytes.
 
-Read-only numerical/timing comparison (no optimizer update):
+Read-only timing of the actual AFT Actor (no optimizer update):
 
-    python tools/benchmark_group_backward.py --device cuda --scenes 2048 \
-        --horizon 500 --memory-dim 64 --repeats 3 \
-        --report /tmp/group_probe_benchmark.json
+    python tools/profile_response_training.py --device cuda --scenes 128 \
+        --horizon 500 --mission-config configs/pass_stop.json \
+        --checkpoint frozen/20261026-u1456/best.pt \
+        --epsilon-p .01 --epsilon-a .01 --lambda-R 25 \
+        --warmup 1 --repeats 3 --report reports/aft_profile.json
 
-The tool alternates backend order and includes a warmup. It reports forward,
-backward and combined gradient-phase time, CUDA peak allocation when available,
-forward-cost identity, group-norm/multiplier agreement and clipped-gradient
-agreement. The timings EXCLUDE Adam and capsule I/O, so they must not be labeled
-as complete training-update latency. Do not extrapolate CPU speedups to CUDA.
+Compilation/warmup is reported separately. Add `--native-reference` for the
+explicit original tensor-execution reference. These timings exclude Adam and
+capsule I/O and are not complete update latency. Independent probe-versus-VJP
+correctness remains covered by the focused regressions below; the separate
+old hover-only benchmark tool has been removed.
 
 Run focused regressions:
 
@@ -143,7 +148,9 @@ CUDA-specific fused-GRU checks skip explicitly without a GPU.
 
 ## Compatibility and limits
 
-This is a new source/backend and is not an exact resume of old source.
+The original introduction of the probe changed the source/backend and could not
+exactly resume checkpoints from before that change. This cleanup leaves all
+training-bound sources unchanged and retains exact resume of the frozen AFT checkpoint.
 Preserve the old checkout/run. The existing `--init-checkpoint` path imports
 the same Actor interface into a new directory and starts fresh Adam/sampling;
 no checkpoint hashes are rewritten. Compatible historical EVAL still uses

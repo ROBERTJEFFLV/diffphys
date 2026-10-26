@@ -1,4 +1,4 @@
-"""The production B architecture retains the confirmed adapted loss."""
+"""The base weight-import architecture and AFT preset retain confirmed scales."""
 from dataclasses import fields
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyCon
 from tools.train_response_control import parse_args
 
 
-def test_mainline_keeps_only_the_original_gru_and_hidden_linear_readout():
+def test_base_actor_keeps_only_the_original_gru_and_hidden_linear_readout():
     policy = ResponseMotorPolicy()
     assert ARCHITECTURE == 'gru16-hidden-only-readout-absolute-motor-policy-v1'
     assert [type(module) for module in policy.children()] == [torch.nn.GRUCell, torch.nn.Linear]
@@ -20,9 +20,9 @@ def test_mainline_keeps_only_the_original_gru_and_hidden_linear_readout():
 
 def test_gru_only_run_config_has_only_confirmed_loss_and_no_geometry_flags():
     root = Path(__file__).resolve().parents[1]
-    args = parse_args(['@'+str(root/'configs/response_raptor_multi_airframe.args')])
+    args = parse_args(['@'+str(root/'configs/agile_flight.args')])
     assert (args.epsilon_p, args.epsilon_a, args.lambda_R) == (.01, .01, 25.)
     assert not any(hasattr(args, name) for name in ('residual_amplitude', 'residual_gain',
                                                   'horizontal_accel_limit', 'vertical_fraction',
                                                   'antipodal_epsilon'))
-    assert str(args.work_dir) == 'runs/attitude_delta_lambda25_gru_only_no_cvar/seed7'
+    assert str(args.work_dir) == 'runs/pass_stop/seed7'

@@ -1,3 +1,5 @@
+> 当前AFT配置为3072场景、每个物理单元24行。下文2048/16的审计数字保留为原始覆盖协议的数值证据，不是当前任务规模。
+
 # Fixed physical coverage for TRAIN
 
 Adapted-loss branch: this sampler/group layout is unchanged. The task now uses
@@ -10,9 +12,10 @@ The existing random sampler remains available; fixed EVAL is always unchanged.
 
 ## Cells and pool size
 
-The production argument file selects `--train-sampling coverage128` and
-`--scenarios 512`. The latter retains its original four-bank size convention:
-4 * 512 = 2048 selected scenes in ONE pool, not four separate quota pools.
+The AFT argument file selects `--train-sampling coverage128` and
+`--scenarios 768`. The latter retains its original four-bank size convention:
+4 * 768 = 3072 selected scenes in ONE pool, not four separate quota pools.
+The original 2048-scene/16-per-cell audits below remain historical evidence.
 
 - TTI: [40,330), [330,620), [620,910), [910,1200].
 - Motor rise time (s): [.03,.0475), [.0475,.065), [.065,.0825), [.0825,.10].
@@ -110,7 +113,7 @@ starts fresh Adam, update numbering, and TRAIN sampling, as before. No old Adam
 state is silently converted, and no existing local service is restarted.
 
 ```bash
-python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
+python tools/train_response_control.py @configs/agile_flight.args \
     --init-checkpoint PATH_TO_CHECKPOINT --work-dir runs/coverage128/seed7
 python tools/verify_physics_coverage.py --batches 32
 python -m pytest -q tests/test_physics_coverage.py tests/test_core_contract.py

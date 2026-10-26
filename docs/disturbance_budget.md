@@ -1,3 +1,5 @@
+> 本文保留原始RAPTOR扰动/测量协议及其物理回归依据。当前AFT任务在prepare阶段关闭外力和脉冲，并保留测量噪声及速度延迟，见 [任务说明](pass_stop.md)。
+
 # Gaussian disturbances, force-at-point pulses and recovery initialization
 
 This filename is retained for existing links. There is no shared 10% budget.

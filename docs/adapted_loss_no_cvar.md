@@ -1,5 +1,9 @@
 # Smooth-vector task objective with relative attitude changes
 
+> Historical base-Actor loss and its numerical reference. Current AFT task,
+> configuration and Actor inputs are described in [pass_stop.md](pass_stop.md)
+> and [README.md](../README.md).
+
 The adapted loss was introduced on the GRU16/direct-Linear commit
 `e45739e1b290df67592ccbcc3799cdaed4764846`. The current local branch
 `feat/gru-only-no-wc` adopts B: GRUCell(16,64) plus hidden-only Linear(64,4),

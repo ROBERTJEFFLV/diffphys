@@ -212,7 +212,7 @@ def run_monitor(args):
             page = min(max(0, (len(replays) - 1) // 5), page + 1)
         elif action == "open":
             if not replays:
-                message = "No replay. Save a fixed-EVAL trace or export a long-EVAL flight."
+                message = "No replay. Export the saved fixed-EVAL checkpoint trace."
             elif replay_process is not None and replay_process.poll() is None:
                 message = "A replay window is already open. Close it before opening another."
             else:
@@ -336,14 +336,14 @@ def run_monitor(args):
                 text(str(entry.path.parent.parent.name), 1034, yy + 23, 13, MUTED, 417)
             if not replays:
                 text("No exported playlist found.", 1034, 491, 17, MUTED)
-                text("--replay /path/to/playback/playlist.json", 1034, 523, 13, MUTED)
-                text("or --replay-root /path/to/long_eval", 1034, 548, 13, MUTED)
+                text("--replay /path/to/short_eval/playlist.json", 1034, 523, 13, MUTED)
+                text("or --replay-root /path/to/run", 1034, 548, 13, MUTED)
             button("<", (1026, 724, 40, 32), "back")
             button(">", (1074, 724, 40, 32), "more")
             button("Refresh list [R]", (1122, 724, 149, 32), "scan")
             button("Open replay", (1280, 724, 179, 32), "open")
             text(message, 1026, 770, 13, MUTED, 431)
-            text("Check Actor/update; historical long EVAL may use another model.",
+            text("Replay shows its saved Actor/update, not unsaved TRAIN steps.",
                  1026, 797, 13, GOLD)
             text("It never replaces these logged training metrics.", 1026, 819, 13, MUTED)
             text("TRAIN log age: " + ("waiting for file" if age is None else f"{age:.0f}s") + " | Not a process heartbeat", 24, 869, 15, MUTED)

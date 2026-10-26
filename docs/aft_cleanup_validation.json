@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "700944c42d98d263a5234001c3635c4f3cdd43ed",
+  "frozen_tag": "frozen-aft-20261026-u1456",
+  "source_integrity": {
+    "source_files_count": 21,
+    "source_files_changed": [],
+    "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+    "preserved_artifacts_checked": 23,
+    "frozen_tag_commit": "700944c42d98d263a5234001c3635c4f3cdd43ed"
+  },
+  "size_reduction": {
+    "deleted_paths": 10,
+    "deleted_files_lines": 1594,
+    "deleted_python_tool_lines": 1092,
+    "production_python_lines_before": 7338,
+    "production_python_lines_after": 6248,
+    "production_python_net_reduction": 1090,
+    "production_python_reduction_fraction": 0.14854183701281004
+  },
+  "cpu_regression": {
+    "command": "python -m pytest -q tests",
+    "torch_version": "2.10.0+cpu",
+    "passed": 589,
+    "skipped": 25,
+    "warnings": 14,
+    "seconds": 94.48,
+    "pygame_installed": true,
+    "sdl_driver": "dummy",
+    "cuda_cases": "skipped in CPU environment"
+  },
+  "zero_update_cuda_resume": {
+    "torch_version": "2.10.0+cu126",
+    "cuda_available": true,
+    "next_update_before": 1456,
+    "next_update_after": 1456,
+    "model_sha256": "cdcb4aa6bad731138e944d51968a50a6d9abc99440637355c715148b78c95e27",
+    "source_sha256": "60227cbe739189e57d4b43fc925b2d8774235c7601c9d1394935ad791ad0f5bf",
+    "status": "update_budget",
+    "model_equal": true,
+    "model_max_abs_difference": 0.0,
+    "optimizer_equal": true,
+    "optimizer_max_abs_difference": 0.0,
+    "rng_equal": true,
+    "rng_max_abs_difference": 0.0,
+    "binding_equal": true,
+    "binding_max_abs_difference": 0.0,
+    "optimizer_parameter_names_equal": true,
+    "optimizer_parameter_names_max_abs_difference": 0.0
+  },
+  "training_updates_executed": 0,
+  "flight_evaluations_executed": 0
+}

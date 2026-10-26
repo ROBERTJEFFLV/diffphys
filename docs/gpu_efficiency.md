@@ -1,5 +1,10 @@
 # CUDA efficiency audit, 2026-10-05
 
+> Historical GRU16 benchmark and commands for the source from that date. The
+> current AFT uses Goal69 and full single-step compilation; see
+> [compiled_prefetch.md](compiled_prefetch.md) and the current profiler command
+> in [group_gradient_probe.md](group_gradient_probe.md).
+
 The Actor remains native B: GRUCell(16,64), hidden-only Linear(64,4), tanh.
 These changes accelerate the existing H500 computation; they do not change
 the controller, loss, physical sampler, group clipping or Adam.

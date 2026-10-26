@@ -29,7 +29,8 @@ from response_adjoints import collect_rollout, backward_actor
 from response_groups import GroupBalanceConfig
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from response_task import TaskLossConfig
-from pass_stop import GoalConfig, PassStopLossConfig, GoalMotorPolicy, import_motor_weights
+from pass_stop import (ARCHITECTURE as GOAL_ARCHITECTURE, GoalConfig, PassStopLossConfig,
+                       GoalMotorPolicy, import_motor_weights)
 from response_training import sample_training_scenarios, model_hash, source_hash, atomic_json
 
 
@@ -69,12 +70,15 @@ def main(argv=None):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True) if args.checkpoint else None
-    if saved is not None and saved.get('architecture') != ARCHITECTURE:
-        raise ValueError('profiling requires a native hidden-only B checkpoint; no architecture conversion')
+    if saved is not None and saved.get('architecture') not in (ARCHITECTURE, GOAL_ARCHITECTURE):
+        raise ValueError('profiling requires a native hidden-only Actor checkpoint')
+    if saved is not None and saved['architecture'] == GOAL_ARCHITECTURE and not args.mission_config:
+        raise ValueError('goal Actor profiling requires --mission-config')
     config = ResponsePolicyConfig(**saved['policy_config']) if saved is not None else ResponsePolicyConfig()
     policy = (GoalMotorPolicy(config) if args.mission_config else ResponseMotorPolicy(config)).to(args.device)
     if saved is not None:
-        reference = ResponseMotorPolicy(config)
+        reference = (GoalMotorPolicy if saved['architecture'] == GOAL_ARCHITECTURE
+                     else ResponseMotorPolicy)(config)
         reference.load_state_dict(saved['model'], strict=True)
         if model_hash(reference) != saved.get('model_sha256'):
             raise ValueError('checkpoint model digest mismatch')

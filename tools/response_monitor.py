@@ -402,6 +402,8 @@ class ReplayEntry:
 def replay_entry(path) -> ReplayEntry:
     path = Path(path).resolve()
     meta = small_json(path)
+    if meta.get("replay_type") != "short-eval-v1":
+        raise ValueError("expected a short-EVAL replay")
     scenes = meta.get("scenes")
     if not isinstance(scenes, list) or not scenes:
         raise ValueError("playlist contains no scenes")
@@ -431,7 +433,7 @@ def discover_replays(root, explicit=(), *, limit=64, directory_limit=128):
     errors = []
     if root is not None:
         root = Path(root)
-        candidates += [root / "playlist.json", root / "playback/playlist.json"]
+        candidates += [root / "playlist.json", root / "short_eval/playlist.json"]
         try:
             # Limit *entries inspected*, not just matching directories.
             with os.scandir(root) as entries:
@@ -441,7 +443,7 @@ def discover_replays(root, explicit=(), *, limit=64, directory_limit=128):
                         break
                     if entry.is_dir(follow_symlinks=False):
                         child = Path(entry.path)
-                        candidates += [child / "playlist.json", child / "playback/playlist.json"]
+                        candidates += [child / "playlist.json", child / "short_eval/playlist.json"]
         except OSError as error:
             errors.append(str(error))
     result, seen = [], set()
@@ -463,11 +465,7 @@ def discover_replays(root, explicit=(), *, limit=64, directory_limit=128):
 def launch_replay(path, *, python=sys.executable, max_frames=None):
     """Only launch the saved-array renderer. Never --run-dir, export or EVAL."""
     entry = replay_entry(path)
-    meta = small_json(entry.path)
-    player_name = ("play_response_short.py"
-                   if meta.get("replay_type") == "short-eval-v1"
-                   else "play_response_long.py")
-    player = Path(__file__).with_name(player_name)
+    player = Path(__file__).with_name("play_response_short.py")
     command = [str(python), str(player), "--replay", str(entry.path), "--fps", "20"]
     if max_frames is not None:
         command += ["--max-frames", str(max_frames)]

@@ -105,24 +105,39 @@ def make_replay(path):
     path.parent.mkdir(parents=True,exist_ok=True)
     scene=dict(scene_id=254,scene_index=0,mass_kg=.027,arm_length_m=.04,
                thrust_to_weight=2.,torque_to_inertia=100.,completed=True,
-               failure_reason=None,failure_step=None)
-    meta=dict(dt=.01,duration_seconds=.1,scenes=[scene],checkpoint_update=50,
-              model_sha256='saved-model-not-live',arena_side=4.,target_margin=.5,
-              force_period_seconds=.1,target_period_seconds=.1,force_fraction=.2,pulse_seconds=.1)
-    path.write_text(json.dumps(meta))
+               valid_steps=10,position_limit_m=4.,failure_reason=None,failure_step=None,
+               position_rms_m=2.,velocity_rms_m_s=0.,omega_rms_rad_s=0.)
+    data=path.with_suffix('.npz')
     position=np.zeros((11,1,3));position[:,:,2]=2
     orientation=np.zeros((11,1,4));orientation[:,:,0]=1
-    np.savez(path.with_suffix('.npz'),position=position,velocity=np.zeros_like(position),
-        omega=np.zeros_like(position),orientation=orientation,targets=np.array([[0.,0.,2.]]),
-        force_world=np.zeros((10,1,3)),points_body=np.zeros((1,1,3)),
-        surface_half_extents=np.ones((1,3))*.025,
+    np.savez(data,position=position,velocity=np.zeros_like(position),
+        omega=np.zeros_like(position),orientation=orientation,
+        action=np.zeros((10,1,4)),valid=np.ones((10,1),dtype=np.bool_),
+        mass_kg=np.array([.027]),arm_length_m=np.array([.04]),
+        thrust_to_weight=np.array([2.]),torque_to_inertia=np.array([100.]),
+        position_limit=np.array([4.]),
         rotor_positions=np.array([[[.028,-.028,0],[-.028,-.028,0],[-.028,.028,0],[.028,.028,0]]]))
+    meta=dict(replay_type='short-eval-v1',task='hover',dt=.01,duration_seconds=.1,
+              scenes=[scene],checkpoint_update=50,model_sha256='saved-model-not-live',
+              trajectory_file=data.name,trajectory_sha256=hashlib.sha256(data.read_bytes()).hexdigest(),
+              metrics=dict(task_objective=0.,position_rms=2.,velocity_rms=0.,omega_rms=0.))
+    path.write_text(json.dumps(meta))
     return path
 
 
+def test_removed_long_schema_is_rejected_before_becoming_a_launchable_replay(tmp_path):
+    path=make_replay(tmp_path/'short_eval/playlist.json')
+    meta=json.loads(path.read_text());meta['replay_type']='long-eval-v1'
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError,match='short-EVAL'):
+        replay_entry(path)
+    entries,errors=discover_replays(tmp_path)
+    assert not entries and errors
+
+
 def test_replay_scan_is_shallow_metadata_only_and_manual_launch_is_cpu(tmp_path):
-    path=make_replay(tmp_path/'eval1/playback/playlist.json')
-    ignored=make_replay(tmp_path/'nested/too/deep/playback/playlist.json')
+    path=make_replay(tmp_path/'eval1/short_eval/playlist.json')
+    ignored=make_replay(tmp_path/'nested/too/deep/short_eval/playlist.json')
     files,errors=discover_replays(tmp_path)
     assert [r.path for r in files]==[path.resolve()] and not errors
     assert replay_entry(path).update==50
@@ -149,7 +164,7 @@ class Block(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0,Block())
 from tools.response_monitor import TrainingLogs
 from tools.monitor_response_training import parse_args
-from tools.play_response_long import Playback
+from tools.play_response_short import Playback
 logs=TrainingLogs(sys.argv[1]);logs.poll()
 assert logs.train.latest['update']==1
 assert 'torch' not in sys.modules
@@ -158,21 +173,14 @@ assert 'torch' not in sys.modules
     assert result.returncode==0,result.stderr
 
 
-def test_export_selection_tolerates_fewer_completed_flights():
-    from tools.play_response_long import select_scenes
-    failed=dict(scene_id=1,scene_index=0,mass_kg=.02,completed=False,failure_reason='arena_exit',failure_step=1)
-    completed=dict(scene_id=2,scene_index=1,mass_kg=.04,completed=True,failure_reason=None,failure_step=None)
-    assert select_scenes(dict(scenes=[failed]),allow_fewer=True)==[failed]
-    assert select_scenes(dict(scenes=[failed,completed]),allow_fewer=True)==[failed,completed]
-    with pytest.raises(ValueError):select_scenes(dict(scenes=[]),allow_fewer=True)
-
-
-def test_replay_zero_failure_and_paging_are_safe():
-    from tools.play_response_long import Playback, visible_scene_indices
-    state=Playback(dict(dt=.01,duration_seconds=60.,scenes=[dict(failure_step=0)]))
+def test_short_replay_zero_failure_and_frozen_padding_are_safe():
+    from tools.play_response_short import Playback
+    state=Playback(dict(dt=.01,duration_seconds=.1,
+                        scenes=[dict(valid_steps=0),dict(valid_steps=3)]))
+    state.seek(10.)
     assert state.end_seconds==0 and state.frame==0
-    assert visible_scene_indices(list(range(40)),1)==list(range(13,26))
-    assert visible_scene_indices(list(range(40)),3)==[39]
+    state.choose(1);state.seek(10.)
+    assert state.end_seconds==pytest.approx(.03) and state.frame==3
 
 
 @pytest.mark.parametrize('flag,value',[('--poll-seconds','0.1'),('--poll-seconds','nan'),
@@ -207,7 +215,7 @@ if sys.argv[1]=='dashboard':
     from tools.monitor_response_training import main
     main(['--run-dir',sys.argv[2],'--replay',sys.argv[3],'--screenshot',sys.argv[4]])
 else:
-    from tools.play_response_long import run_player
+    from tools.play_response_short import run_player
     run_player(sys.argv[3],screenshot=sys.argv[4])
 assert 'torch' not in sys.modules
 '''

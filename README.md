@@ -1,290 +1,108 @@
-# DiffPhys: multi-airframe recurrent motor control
+# AFT：三点机动训练
 
-One trainable Actor, one RAPTOR-style multi-airframe simulator, one train/evaluate
-entry. Training uses full-horizon BPTT, backward-only Time Decay, physical-group
-shrink-only gradient clipping and persistent Adam. There is no critic, teacher,
-auxiliary network or single-airframe mode. The sole production Actor is B:
-GRUCell(16,64) + hidden-only Linear(64,4). Wc is removed, with no mask or
-alternative direct-feature branch. Geometric feedback is not used.
+本分支用于三点位姿机动：从点1出发，穿越点2区域，最后在点3停稳。
+推荐入口只有 `tools/train_response_control.py @configs/agile_flight.args`。
+原生四旋翼RK4、测量噪声/延迟、完整H500反传、物理分组裁剪、CUDA编译、CPU预取与审计保留。
 
-## Run
+## 当前任务
 
-Python 3.11+, PyTorch 2.10, NumPy and pytest. Install the PyTorch build matching
-your CUDA runtime; no native extension build is required.
+- 点1：指定位置、水平姿态，实际出生速度和角速度为零。
+- 点2：默认105°姿态，区域内速率下限2 m/s。速度高于下限不受速度项惩罚，不要求恒定速度向量。
+- 区域半径为两倍机臂长度 `2L`；靠近中点中心的容差另为0.1 m。
+- 测量位置首次入球后仍以点2为目标，首次出球后锁定点3；切换不等待姿态或速度达标，不重置GRU。
+- 点3：固定终点、水平姿态、零速度与停稳要求。末端义务始终计分。
+- Actor使用69维任务/观测特征，经过原生 `GRUCell(69,64) -> Linear(64,4) -> tanh` 输出四路电机命令。
+
+这是软损失训练，任务判定和源配置见 [三点任务说明](docs/pass_stop.md) 与 `configs/pass_stop.json`。
+没有轨迹规划器、教师网络、Critic或第二套生产积分器。
+
+## 运行
+
+原冻结环境为Python3.11、PyTorch2.10.0+cu126、NumPy；可视化另安装 `requirements-gui.txt`。
+精确续训使用与检查点绑定一致的源代码、PyTorch版本和配置。
 
 ```bash
-python tools/train_response_control.py @configs/response_raptor_multi_airframe.args
-python tools/train_response_control.py --mode evaluate \
-    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
-    --work-dir runs/attitude_delta_lambda25_gru_only_no_cvar/evaluation
+TORCHINDUCTOR_COMPILE_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True python tools/train_response_control.py @configs/agile_flight.args --work-dir runs/pass_stop/new_run
+```
+
+默认3072个TRAIN场景、256个固定EVAL场景、100 Hz、H500；`--scenarios 768`指四个银行各768场景。
+`coverage128`每个物理单元24场景。默认运行到50次更新或1800秒，需更长训练时显式指定预算。
+初始化权重使用 `--init-checkpoint PATH`；同源精确续训使用 `--resume PATH`。二者不能混用。
+
+从已保留的1456次检查点继续到累计2000次：
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True python tools/train_response_control.py @configs/agile_flight.args --resume frozen/20261026-u1456/latest.pt --work-dir runs/pass_stop/from_frozen --updates 2000 --max-seconds 3600
+```
+
+持续训练使用保留的运行包装器；它仅取消预算，仍调用同一训练函数：
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True python runs/pass_stop/local_trial_20261026_095338/continuous_train_response_control.py @configs/agile_flight.args --resume frozen/20261026-u1456/latest.pt --work-dir runs/pass_stop/from_frozen --development-every 10 --checkpoint-every 10
+```
+
+Ctrl+C或SIGTERM在当前更新完成后保存Actor、Adam、RNG并退出。数值错误仍保存故障证据并报错。
+源码、任务、物理、噪声、采样、优化器配置与检查点绑定；不能修改哈希绕过不一致。
+
+固定EVAL使用检查点保存的任务、场景与时域：
+
+```bash
+python tools/train_response_control.py @configs/agile_flight.args --mode evaluate --checkpoint frozen/20261026-u1456/best.pt --work-dir runs/pass_stop/frozen_eval
+```
+
+## 编译和梯度
+
+CUDA编译原RK4单步及其AOT反向、任务特征、任务损失及其反向、分组参数梯度局部贡献。
+原生CUDA融合GRU、Adam和外层钩子/检查保留。CPU执行是数值参考。
+CPU子进程只提前准备一批不可变场景/噪声；飞行前向和反传在GPU进行。
+较大连续反传保存值暂存CPU固定内存，以适配本机8 GB显卡，不截断计算图。
+
+Time Decay默认0，保留完整H500 BPTT；显式正值只改变反向传播，不能再称为原始loss的精确梯度。
+物理组固定128组，各组仅缩小超限梯度，再合并进行Adam；生产默认只有一次原生反传图遍历。
+旧VJP及16维基础Actor/悬停损失作为权重导入和独立数值参照保留，没有额外推荐训练配置。
+
+详见 [编译与预取](docs/compiled_prefetch.md)、[分组梯度](docs/group_gradient_probe.md)、[物理覆盖](docs/physics_coverage.md)。
+
+## 监视和回放
+
+```bash
+python tools/monitor_response_training.py --run-dir runs/pass_stop/from_frozen
+python tools/short_eval_replay.py --run-dir runs/pass_stop/from_frozen --device cuda --poll-seconds 2
+python tools/play_response_short.py --replay runs/pass_stop/from_frozen/short_eval/playlist.json
+```
+
+监视器只读日志；播放器只读已导出的NPZ，不导入Torch或占用CUDA推理。
+独立导出工具负责用已保存的检查点生成固定EVAL回放，播放窗口显示对应Actor更新号。
+详见 [GUI说明](docs/training_gui.md)。
+
+## 文件职责
+
+| 文件 | 责任 |
+| --- | --- |
+| `pass_stop.py` / `pass_stop_physics.py` | 三点任务、Goal69特征、区域几何、速度下限、时间/末端loss |
+| `env_raptor.py` / `response_noise.py` | 原RK4、电机、刚体、硬边界及测量带 |
+| `response_policy.py` / `response_task.py` | 原生Actor基础特征、状态/轨迹、通用展开和数值参照 |
+| `response_adjoints.py` / `response_groups.py` / `response_grad_probe.py` | 完整反传、物理组、一次原生反传探针 |
+| `response_training.py` / `response_audit.py` | Adam事务、校验、检查点与可回放审计证据 |
+| `compiled_physics.py` / `compiled_execution.py` / `strict_inductor.py` | CUDA编译边界与精度约定 |
+| `response_sampling.py` / `scene_prefetch.py` / `tensor_storage.py` | 物理覆盖、CPU一批预取和反传暂存 |
+| `tools/profile_response_training.py` | 对实际任务进行只读前向/反传剖析 |
+| `tools/replay_response_update.py` | 同源码/后端的完整更新与Adam回放 |
+| `tools/audit_pose_velocity.py` | 原动力学/位姿损失的定向数值检查 |
+
+## 验证与冻结版本
+
+```bash
 python -m pytest -q tests
 ```
 
-The checked-in config uses one GPU, 4 x 512 = **2048 TRAIN** scenes per update,
-2 x 128 = **256 fixed EVAL** scenes, H500 at 100 Hz, memory dimension 64,
-Time Decay 1 s^-1, Adam 3e-4, gradient scale 0.1 and global clip 10.
-It stops at 50 updates or 1800 seconds. `--scenarios` and `--eval-scenarios` are
-**per bank**, not totals. No training runs on import.
+保留原物理、测量、位姿/速率、状态机、完整梯度、分组裁剪、CPU预取、Adam回滚、精确续训及GUI只读测试。
+CPU测试不代表CUDA吞吐；本轮简化不启动正式训练或长程评估。
+清理范围和数值兼容依据见 [清理记录](docs/aft_cleanup.md)。
 
-TRAIN now uses [fixed physical coverage](docs/physics_coverage.md):
-TTI 4 x rise 4 x fall 4 x conditional yaw 2 = 128 cells, 16 scenes each.
-Candidate aircraft retain the original physical coupling and initial conditions;
-noise is attached after selection. Fixed EVAL does not change. The 128 fixed
-sampling cells are now also the 128 gradient groups: 16 initial scenes each,
-including terminated scenes. Each group is capped at `--group-clip-norm 1.0`
-after equal-scene weighting/gradient-scale, never amplified, then averaged. Groups are processed
-using a training-only native GRU/Linear gradient probe in one backward graph
-traversal. The former eight-chunk VJP path is an explicit reference backend only.
-This preserves per-group clipping, not an approximation of the group norms.
-See [one-pass probes and profiling](docs/group_gradient_probe.md). Update evidence
-is retained locally by `response_audit.py`. CUDA throughput must
-be measured on the target GPU; fewer traversals do not promise a specific latency.
+冻结标签 `frozen-aft-20261026-u1456` 保留原始完整版本；`frozen/20261026-u1456/`里的清单与历史证据描述该标签。
+当前简化分支删除了未使用的独立工具，因此不要用冻结标签的全仓文件清单检查当前分支文件是否齐全。
+本轮保持所有训练源码绑定文件逐字不变，1456次检查点可继续精确续训。
+当以后主动修改这些文件时，应切回冻结标签精确续训，或在新目录只导入权重开始新训练。
 
-The main config explicitly compiles the original quaternion rotation inside RK4
-(`--rotation-backend compile`), retaining the Actor and other physics. See
-[measured CUDA optimizations and checkpoint boundaries](docs/gpu_efficiency.md)
-for the timing, numerical checks, rejected experiments and read-only profiler.
-
-Bare CLI calls retain the original random sampler. To explicitly use that sampler
-with the checked-in config and the former smaller pool, use a NEW run directory:
-
-```bash
-python tools/train_response_control.py @configs/response_raptor_multi_airframe.args \
-    --train-sampling random --scenarios 128 --group-max-groups 16 \
-    --group-min-scenarios 32 --work-dir runs/random_sampling/seed7
-```
-
-Use an empty directory for fresh Actor/Adam initialization. Extend `--updates`
-and `--max-seconds` explicitly for a longer run. Numerical failures still use
-transactional rollback. Generated checkpoints/logs/visualizations are not bundled.
-
-The independent [60-second surface-force EVAL and switchable replay UI](docs/long_hover_eval.md)
-are also retained. This stress test uses a 4 m arena, a concentric 3 m target cube,
-target changes every 10 s, and 0.1 s surface-force pulses every second at 20% of
-vehicle weight. It is separate from the trainer's fixed EVAL and never selects
-training checkpoints.
-
-```bash
-python tools/evaluate_response_long.py @configs/response_long_eval.args \
-    --checkpoint runs/attitude_delta_lambda25_gru_only_no_cvar/seed7/best.pt \
-    --work-dir runs/long_hover_eval/seed20260927
-python tools/play_response_long.py --run-dir runs/long_hover_eval/seed20260927
-```
-
-New evaluations require a checkpoint compatible with the current protocol.
-Existing exported replays remain viewable; reproduce older trajectories with
-their archived evaluator sources rather than rewriting checkpoint bindings.
-
-## Adapted task loss, equal scene weights
-
-Every valid control step contributes true pre-action position smooth L2,
-`25.0 * (1 - cos(relative rotation from R_t to R_(t+1)))`, and smooth L2 of
-the final four-command difference. A constant necessary tilt is free; actual
-roll, pitch and yaw changes all count. This is a soft motion cost, not a test
-for instability, and is not divided by dt.
-The fixed coefficient 25.0 is the current experimental setting (previously 0.2),
-not a validated stability bound. Changing it requires a new run and best-score
-record; physical flight metrics remain comparable across coefficients.
-The fixed smoothing scales are `epsilon_p=0.01 m` and `epsilon_a=0.01` in raw
-[-1,1] command units. Time normalization is always `1/H`; all initial scenes
-have weight `1/N`. Velocity/omega penalties, Huber, CVaR and tail weighting
-are removed from the task objective. Read-only velocity/omega/risk metrics remain.
-
-A failed scene still pays `[3*(H-T)+200]/H` once, including failure on the last
-step. This is detached bookkeeping and supplies no direct avoidance gradient.
-Position, attitude_delta, action_delta, dead and terminal logs use the same cost as TRAIN
-and EVAL. See [the exact loss and checkpoint rules](docs/adapted_loss_no_cvar.md).
-
-Removing Wc changes only the Actor's readout and architecture binding. The adapted
-loss, physics, sensor/pulse tapes, physical coverage, termination, Time Decay,
-group clipping and Adam retain their definitions. Equal scene weights do not make the
-Time-Decay/group-clipped update an exact unprocessed gradient. New and old task
-scores cannot be compared directly; use the retained physical flight metrics.
-
-An old-source/objective run cannot be exactly resumed with this source. Keep its
-checkpoint and checkout intact; `--init-checkpoint PATH` explicitly imports only
-same-architecture weights into a fresh Adam/sampling/best-score run. For 2048
-scenes, keep `--scenarios 512` (four-bank size convention). Exact resume inside
-this new run requires matching source, objective and sampler settings.
-
-## Online metrics without live training rendering
-
-The optional [read-only Pygame dashboard](docs/training_gui.md) follows existing
-TRAIN/EVAL JSONL logs and manually opens the saved-flight player. It never loads
-checkpoints, runs extra EVAL, or changes the training process/source binding.
-Already-running training does not need to restart for this GUI-only addition.
-
-```bash
-python -m pip install -r requirements-gui.txt
-python tools/monitor_response_training.py \
-    --run-dir runs/pulsed_recovery_b2048/seed7 \
-    --replay-root runs/long_hover_eval
-```
-
-The dashboard opens saved short-EVAL or long-EVAL playlists and their matching
-`.npz` files. For the ordinary H500 fixed EVAL, enable the separate exporter:
-
-```bash
-python tools/short_eval_replay.py \
-    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7 --device cuda
-python tools/monitor_response_training.py \
-    --run-dir runs/attitude_delta_lambda25_gru_only_no_cvar/seed7
-```
-
-The exporter retains the latest complete fixed-EVAL trace, including the exact
-constant force and force-at-point pulses. It does one additional EVAL forward
-pass per new EVAL/checkpoint pair and does not update Actor or Adam. Its source
-must match the checkpoint. The monitor automatically discovers new short
-replays; opening one uses saved arrays without policy inference.
-
-To convert an existing finished long EVAL, run
-`tools/play_response_long.py --run-dir PATH --export-only` separately.
-The dashboard itself never launches export or simulation.
-Polling is bounded and read-only; shared CPU/disk/display resources still have
-some overhead. Run it on another machine with synced files for best isolation.
-
-## One disturbance protocol for TRAIN and EVAL
-
-| Component | Distribution | Lifetime |
-|---|---|---|
-| Constant external world force | Pinned RAPTOR Gaussian law below | One vector per episode |
-| Force-at-point pulse | Independent Gaussian with the same airframe sigma_F | Constant world vector for 0.1 s |
-| Pulse application point | Random arm, uniform fraction from COM to rotor | New body-fixed point per pulse |
-| Position measurement | Gaussian, sigma = 0.001 m per axis | Each acquired sample |
-| World-velocity measurement | Gaussian, sigma = 0.002 m/s per axis | Each acquired sample |
-| Attitude measurement | Gaussian rotation vector, sigma = 0.001 rad per axis | Each acquired sample |
-| Body angular velocity | Gaussian, sigma = 0.002 rad/s per axis | Each acquired sample |
-| Velocity measurement latency | Uniform [0.010, 0.030] seconds | Fixed per episode |
-
-For sampled mass m and thrust-to-weight ratio TWR:
-
-```
-r ~ Uniform(0, 0.3 * max(TWR - 1, 0))
-sigma_F = r * TWR * m / 3
-F_const ~ Normal(0, sigma_F^2 I_3)
-F_pulse[k] ~ Normal(0, sigma_F^2 I_3)
-```
-
-The constant force numerical law is RAPTOR's; there is no extra g or clipping.
-Each pulse gets a new force vector, NOT a copy of F_const. Gaussian force
-components have no hard bound. During a pulse, F_total = F_const + F_pulse;
-otherwise F_total = F_const. There is no shared 10% budget, independently sampled
-external torque, or additive motor-command noise. Motor-response dynamics remain.
-
-The first pulse onset is uniformly sampled at steps 0..99 (0.00-0.99 s).
-Subsequent onset intervals are uniform integer steps 80..120 (0.8-1.2 s).
-Each pulse lasts 10 transitions (0.1 s), unless episode end cuts it short.
-Each scene has an independent phase/schedule. The minimal body geometry uses
-existing COM-to-rotor arms, not a fictitious fuselage mesh. At each RK4 stage,
-`tau_body = r_body x (R_true.T @ F_pulse_world)` is added to rotor torque. Thus a
-pulse can push AND rotate the aircraft; its torque is not frozen as attitude changes.
-
-TRAIN resamples airframes, initial states, constant force, pulses, latency and
-measurement tapes each update. The **single** fixed EVAL retains original random
-airframe sampling and fixed seeds/tapes; the conditional disturbance laws above
-are shared. EVAL reads saved checkpoint settings, not new CLI noise flags. `--disable-pulses` is a regression switch; `--disable-disturbances`
-turns off all disturbances for regression. Neither undoes the harder reset below
-or creates another evaluator.
-
-Measurement scales are L2F-inspired. SO(3) rotation-vector noise is not identical
-to L2F's matrix-element corruption. Uniform 10-30 ms latency is a modeling choice
-motivated by RAPTOR's diagnosis, not an identified hardware law or stability proof.
-See [protocol, equations and source audit](docs/disturbance_budget.md).
-
-## Recovery initialization
-
-For non-guidance scenes, random-axis orientation angle is uniform in **0-120 degrees**, each world-velocity component in **[-2.5,2.5] m/s**, and each body
-angular-velocity component in **[-2.2,2.2] rad/s**. These velocity limits are per
-axis, not vector magnitudes. Position remains uniform within +/-10*arm_length per
-axis; motor coordinates remain independently uniform in [0,0.5].
-
-The 10% guidance draw still sets position, velocities and attitude to the target,
-but does not reset motors to hover. Position-only first failure is strict
-per-axis exceedance of 30*arm_length. No filtering or automatic curriculum hides
-difficult initial states. These settings may include unrecoverable
-samples and require actual training evidence before making performance claims.
-
-## Actor visibility and causal history
-
-The Actor still receives 22 values in this order:
-
-```
-measured position (3), delayed measured world velocity (3),
-current measured rotation matrix (9), current measured body angular velocity (3),
-last known motor command (4)
-```
-
-The 16 features feed `GRUCell(16,64)` and `memory -> Linear(64,4) -> tanh`:
-**16,004 trainable parameters**. GRU16 denotes input size, not hidden dimension.
-Current state feedback and action history reach the motors through the GRU; there
-is no Wc shortcut. The first observation updates memory before the first command.
-Commands remain absolute [-1,1], FR/BR/BL/FL, FLU.
-
-Initial previous_action is a fixed zero placeholder, independent of random motor
-truth; following steps store the Actor's issued command. The Actor never receives
-pulse force, lever, schedule/mask, countdown, sigma, actual motor state, physical
-parameters, force truth, latent delay, group IDs or boundary metadata. Motion
-observed after a pulse is legitimate feedback, not a hidden answer.
-
-Latency uses current plus three past world velocities with ORIGINAL acquisition
-noise. Pre-reset history holds the first noisy measurement. Only velocity is
-delayed; other measurements remain current. Current measured attitude converts
-the delayed world vector to body features. Noise/pulse tapes are precomputed on
-CPU and shared by stable original-row IDs during compaction; step/observe draw
-no RNG. No physics, GRU memory or velocity history detaches at 50-step metric
-boundaries. Posture-dependent pulse torque remains differentiable through RK4.
-Loss, termination and flight metrics use true physical state.
-
-## Checkpoints and retained training rules
-
-Use a **new work directory**. Environment/noise versions and source bindings
-changed; older Gaussian-without-pulse or bounded-noise checkpoints cannot be
-silently resumed/evaluated under this environment. Their original source is
-required for exact original evaluation. Never rewrite checkpoint hashes.
-
-`--init-checkpoint PATH` explicitly imports only interface-compatible Actor
-weights, with fresh Adam/new sampling. This is fine-tuning, not from-scratch
-training. A historical hidden-only B checkpoint can be imported explicitly this
-way; an A checkpoint with an 80-column readout is rejected. Neither historical
-source is treated as an exact resume of the new mainline. Fresh initialization
-uses the native 64-column layer's RNG sequence; use a B weight import to preserve
-an existing B Actor exactly. The checkpoint serialization schema remains unchanged; the new
-environment and disturbance settings are stored in the existing strict binding.
-For new-protocol runs, exact resume still requires matching source/configuration;
-update/time budgets can be extended.
-
-Joint RK4 and motor laws are retained with the requested additional force/torque
-terms. The task objective is the adapted loss documented above;
-position-only first-failure semantics, Adam and Time Decay are unchanged.
-Physical-group gradients now use fixed-cell membership and shrink-only caps. Time Decay > 0 is a
-surrogate backward gradient; 0 is exact BPTT. No auxiliary controller is added.
-
-## Provenance and verification
-
-The official RAPTOR submodule pins rl-tools at
-`e43ae4bcda4556321a63f4eb5dcc826cd637aa39`. Its audited force is constant within
-episodes; its Langevin process changes reference trajectories. The pulses and
-expanded reset here are **requested DiffPhys extensions**, not claimed features
-of RAPTOR's original training or an exact reproduction of its benchmark.
-
-Tests cover pulse timing/geometry/Gaussian scale, analytic COM impulse, independent
-NumPy force-at-point RK4, attitude/action finite differences, privileged-input
-noninterference, pre-pulse causality, original-row compaction, terminal freezing,
-grouped full BPTT across metric boundaries and exact noisy checkpoint resume.
-Intentional dynamics RHS, uniform-time default, and fixed-cell/clipping changes
-are recorded with old/new provenance in the core contract; other protected hashes are retained. CPU tests are
-not CUDA throughput, convergence, trained recovery or real-flight safety results.
-Checkpoints retain `deployment_authorized: false`.
-
-`env_raptor.py` owns physics; `response_noise.py` sampling/sensing/pulse tapes;
-`response_policy.py` the deployable Actor; `response_task.py` rollout/true losses;
-`response_adjoints.py` and `response_groups.py` grouped full BPTT;
-`response_training.py` banks/Adam/checkpoints; `response_sampling.py` TRAIN coverage;
-`response_grad_probe.py` one-traversal layer-local group derivatives;
-`response_audit.py` bounded Actor/Adam/RNG update evidence;
-`tools/train_response_control.py`
-is the only train/evaluate CLI. [Physics provenance](docs/raptor_reference.md),
-[third-party notices](THIRD_PARTY_NOTICES.md) are retained. Retired source and
-alternative implementations are preserved in Git history, not the production
-tree. The current physics and training files use eager PyTorch; the experimental
-compiled hotpath backend is not included.
+第三方来源与MIT声明保留在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [物理来源说明](docs/raptor_reference.md)。

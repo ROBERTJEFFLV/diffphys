@@ -19,7 +19,7 @@ from test_adapted_loss import trace_fixture
 
 CONFIRMED = dict(epsilon_p=.01, epsilon_a=.01, lambda_R=25.,
                  dead_cost=3., terminal_cost=200.)
-ARGUMENT_FILE = Path(__file__).resolve().parents[1] / 'configs/response_raptor_multi_airframe.args'
+ARGUMENT_FILE = Path(__file__).resolve().parents[1] / 'configs/agile_flight.args'
 
 
 def test_checked_in_config_supplies_all_confirmed_constants_without_fixture_defaults():

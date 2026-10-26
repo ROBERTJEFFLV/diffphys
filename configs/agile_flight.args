@@ -1,6 +1,36 @@
-@configs/response_raptor_multi_airframe.args
---mission-config configs/pass_stop.json
---time-decay 0
+--mode train
+--device cuda
+--dtype float32
+--seed 7
 --scenarios 768
---disable-pulses
+--train-sampling coverage128
+--eval-scenarios 128
+--horizon 500
+--time-decay 0
+--gradient-scale 0.1
+--updates 50
+--max-seconds 1800
+--lr 3e-4
+--gradient-clip 10
+--development-every 50
+--checkpoint-every 50
+--epsilon-p 0.01
+--epsilon-a 0.01
+--lambda-R 25.0
+--dead-cost 3
+--terminal-cost 200
 --work-dir runs/pass_stop/seed7
+--group-max-groups 128
+--group-min-scenarios 16
+--group-clip-norm 1.0
+--group-gradient-epsilon 1e-12
+--group-backward probe
+--group-vjp-chunk-size 16
+--position-noise-std 0.001
+--velocity-noise-std 0.002
+--attitude-noise-std 0.001
+--omega-noise-std 0.002
+--velocity-delay-min 0.010
+--velocity-delay-max 0.030
+--mission-config configs/pass_stop.json
+--disable-pulses

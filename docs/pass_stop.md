@@ -1,9 +1,10 @@
 # AFT v3：三点位姿、球形穿越区域与最低速率监督
 
-## 本次交付状态
+## 任务与实现范围
 
-本改动以 `Agile-Flight-training@42e5f1704ba1128877c8cab738085403e2a8d04a` 为基线。
-本地已经应用补丁并修复区域几何、最低速率语义和回放接口，未提交或推送远端，也未启动正式训练。
+原v3任务补丁以 `Agile-Flight-training@42e5f1704ba1128877c8cab738085403e2a8d04a` 为基线。
+随后已完成编译接线和本机训练，冻结于`frozen-aft-20261026-u1456`。
+当前入口、续训与清理范围见[README](../README.md)及[清理记录](aft_cleanup.md)；下文任务语义保留。
 
 不增加 MPC、轨迹优化器、教师网络、Critic 或另一套积分器。
 继续使用同一个训练入口、原生 GRU/Linear、原四旋翼 RK4、分组梯度、Adam 和 H500。
@@ -232,7 +233,7 @@ python tools/train_response_control.py @configs/agile_flight.args \
 
 默认H500、100 Hz、CPU线程设置继承master，AFT配置设置 `--scenarios 768`，
 原四bank约定得到3072个TRAIN场景；coverage128每cell24个场景。
-这不是3072场景GPU性能验证。原50次更新/1800秒预算仍只是配置，未启动正式训练。
+场景数量本身不是吞吐验证。冻结版后续3072场景训练的执行证据见[编译与预取](compiled_prefetch.md)及冻结清单；默认仍有50次更新/1800秒预算。
 
 原16维悬停权重：保留16列，新增列置零。
 旧26维AFT权重：保留26列，新增43列置零。
@@ -240,13 +241,13 @@ python tools/train_response_control.py @configs/agile_flight.args \
 新69维任务支持同源码/配置严格resume，日志、RNG、Adam与原审计回放保持绑定。
 本次目标协议是 `pass-region-min-speed-v3`。v2恒速目标checkpoint不可作为新任务精确续训或重新解释；可显式导入同布局权重，在新目录使用新的Adam和任务。
 输出.pt含完整Actor与任务协议，运行时不需要旧.pt基座。
-没有用户实际训练好的hover.pt参与本次测试；迁移测试使用真实协议的合成权重。
+原v3补丁的迁移测试使用真实协议的合成权重，没有用用户hover.pt；这些回归结果不能冒充实际权重的训练成绩。
 
 部署接口是测量obs22 + 公共三点位姿/速度/区域数据，仍输出四路归一化电机命令。
 部署端必须使用相同状态机、姿态坐标约定、速度单位和69维特征，不可只加载权重到旧26维Actor。
 
-编译范围仍跟随当前AFT/master：仅四元数转旋转矩阵可compile。
-没有恢复旧 `CPU_compile_accelerated` 的整步RK4编译或预取，也没有声称完成CUDA验证。
+当前CUDA编译原RK4单步及其AOT反向、任务特征/损失和分组梯度局部贡献，并使用CPU场景预取/反传暂存。
+编译边界、原生参考对照及CUDA验证的具体范围见[编译与预取](compiled_prefetch.md)。
 
 ## 7. 文件与验证
 

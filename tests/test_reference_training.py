@@ -91,30 +91,29 @@ def test_checkpoint_rejects_changed_noise_implementation(tmp_path):
         require_reference_checkpoint(saved)
 
 
-def test_retained_training_and_eval_configs_match_their_clis(tmp_path):
+def test_aft_preset_is_self_contained_and_preserves_frozen_resume_binding(tmp_path,monkeypatch):
+    """The recommended preset must not depend on an unused hover argument file."""
+    from dataclasses import asdict
     from pathlib import Path
-    from tools.evaluate_response_long import parse_args as parse_eval_args
+    import shutil
+    from pass_stop import PassStopLossConfig
+    from response_training import binding
     root=Path(__file__).resolve().parents[1]
-    configs={p.name:p for p in (root/'configs').glob('*.args')}
-    assert set(configs)=={'response_raptor_multi_airframe.args','response_long_eval.args',
-                         'agile_flight.args'}
-    args=parse_args(['@'+str(configs['response_raptor_multi_airframe.args'])])
-    assert args.scenarios==512 and args.eval_scenarios==128 and args.horizon==500
-    assert args.train_sampling=="coverage128"
-    assert args.time_decay==1 and not args.disable_disturbances
-    assert (args.position_noise_std,args.velocity_noise_std,args.attitude_noise_std,args.omega_noise_std)==(.001,.002,.001,.002)
-    assert (args.velocity_delay_min,args.velocity_delay_max)==(.010,.030)
-    agile=parse_args(['@'+str(configs['agile_flight.args'])])
-    assert agile.scenarios==768 and agile.eval_scenarios==128 and agile.horizon==500
-    assert agile.train_sampling=='coverage128' and agile.time_decay==0
-    assert agile.group_backward=='probe' and not hasattr(agile,'rotation_backend')
-    assert agile.disable_pulses and not agile.disable_disturbances
-    assert agile.mission_config==Path('configs/pass_stop.json')
-    evaluation=parse_eval_args(['@'+str(configs['response_long_eval.args']),
-                               '--checkpoint',str(tmp_path/'actor.pt'),
-                               '--work-dir',str(tmp_path/'eval')])
-    assert evaluation.duration_seconds==60 and evaluation.target_period_seconds==10
-    assert evaluation.pulse_seconds==.1 and evaluation.force_fraction==.2
+    config=tmp_path/'configs';config.mkdir()
+    for name in ('agile_flight.args','pass_stop.json'):
+        shutil.copy2(root/'configs'/name,config/name)
+    monkeypatch.chdir(tmp_path)
+    args=parse_args(['@configs/agile_flight.args'])
+    policy=ResponsePolicyConfig(**{f.name:getattr(args,f.name) for f in fields(ResponsePolicyConfig)})
+    loss=PassStopLossConfig(**{f.name:getattr(args,f.name) for f in fields(TaskLossConfig)},
+                           mission=asdict(args.mission))
+    actual=binding(args,policy,loss)
+    saved=torch.load(root/'frozen/20261026-u1456/latest.pt',map_location='cpu',weights_only=True)
+    expected=dict(saved['binding'])
+    # CPU numerical CI and the CUDA checkpoint use different PyTorch builds.
+    # Every source/objective/optimizer/sampling setting must otherwise match.
+    actual.pop('torch_version');expected.pop('torch_version')
+    assert actual==expected
 
 
 def test_explicit_parent_actor_weight_import_uses_fresh_new_protocol(tmp_path):
