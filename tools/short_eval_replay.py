@@ -27,6 +27,7 @@ from diffphys.env_raptor import RaptorParams
 from diffphys.compiled_physics import make_simulator, physics_backend_contract
 from diffphys.response_noise import DisturbanceConfig
 from diffphys.response_task import TaskLossConfig
+from diffphys.hover_time_loss import HoverTimeConfig
 from diffphys.response_training import (
     DEVELOPMENT_SEEDS,
     evaluate,
@@ -121,10 +122,10 @@ def _trajectory_arrays(initial, events, horizon):
 
 
 @torch.no_grad()
-def capture_short_eval(policy, simulator, initial, horizon, loss_config):
+def capture_short_eval(policy, simulator, initial, horizon, loss_config, *, hover_time=None):
     """Run the usual EVAL exactly once and retain its full state/action trace."""
     recorder = _RecordingSimulator(simulator)
-    report = evaluate(policy, recorder, initial, horizon, loss_config)
+    report = evaluate(policy, recorder, initial, horizon, loss_config, hover_time=hover_time)
     arrays = _trajectory_arrays(initial, recorder.events, horizon)
     expected = (horizon + 1, initial.position.shape[0])
     if arrays["position"].shape[:2] != expected or arrays["orientation"].shape[:2] != expected:
@@ -296,7 +297,8 @@ def export_checkpoint(checkpoint_path, run_dir, *, device="cuda"):
         disturbances=DisturbanceConfig(**protocol["disturbances"]),
     )
     report, arrays = capture_short_eval(
-        policy, simulator, initial, horizon, TaskLossConfig(**protocol["loss"])
+        policy, simulator, initial, horizon, TaskLossConfig(**protocol["loss"]),
+        hover_time=HoverTimeConfig(**protocol["hover_time"])
     )
     if device.type == "cuda":
         torch.cuda.synchronize(device)

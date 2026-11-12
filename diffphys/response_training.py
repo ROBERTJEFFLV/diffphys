@@ -25,7 +25,6 @@ from .response_noise import DisturbanceConfig, attach_disturbances, disturbance_
 from .response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from .response_task import (
     TaskLossConfig,
-    TASK_OBJECTIVE_VERSION,
     sample_scenarios,
     rollout,
     trajectory_metrics,
@@ -35,6 +34,7 @@ from .response_task import (
     tensors_finite,
 )
 from .response_adjoints import collect_rollout, backward_actor
+from .hover_time_loss import HoverTimeConfig, HoverTimeObjective, TASK_OBJECTIVE_VERSION
 from .response_execution import exit_class, critical_gc
 from .compiled_physics import make_simulator, physics_backend_contract
 from .scene_prefetch import PrefetchedSampler
@@ -49,6 +49,8 @@ TRAINING_BANKS = 4
 DEVELOPMENT_SEEDS = (32_000_007, 32_010_007)
 SOURCE_FILES = (
     "diffphys/__init__.py",
+    "diffphys/hover_time_experiment.py",
+    "diffphys/hover_time_loss.py",
     "diffphys/response_policy.py",
     "diffphys/response_task.py",
     "diffphys/response_adjoints.py",
@@ -65,6 +67,7 @@ SOURCE_FILES = (
     "diffphys/env_raptor.py",
     "diffphys/response_noise.py",
     "tools/train_response_control.py",
+    "tools/run_hover_time_experiment.py",
     "tools/replay_response_update.py",
 )
 
@@ -157,6 +160,7 @@ def require_reference_checkpoint(value):
     if cfg.get("task_objective") != TASK_OBJECTIVE_VERSION:
         raise ValueError("checkpoint task objective mismatch: old losses require weights-only initialization")
     TaskLossConfig(**cfg["loss"])
+    HoverTimeConfig(**cfg["hover_time"])
     params = RaptorParams(**cfg["environment_params"])
     if (cfg.get("environment") != environment_contract(params)
             or cfg.get("environment_source_sha256") != file_hash(ROOT / "diffphys/env_raptor.py")
@@ -292,6 +296,7 @@ def binding(args, policy_config, loss_config):
             "architecture": ARCHITECTURE,
             "policy": asdict(policy_config),
             "loss": asdict(loss_config),
+            "hover_time": asdict(HoverTimeConfig(weight=getattr(args, "hover_time_weight", 1.))),
             "task_objective": TASK_OBJECTIVE_VERSION,
             "scenarios_per_bank": args.scenarios,
             "disturbances": asdict(DisturbanceConfig.from_args(args)),
@@ -374,7 +379,8 @@ def _append(path, row):
 
 
 @torch.no_grad()
-def evaluate(policy, simulator, initial, horizon, loss_config):
+def evaluate(policy, simulator, initial, horizon, loss_config, *,
+             hover_time: HoverTimeConfig | None = None):
     trace = rollout(policy, simulator, initial, horizon)
     report = trajectory_metrics(trace, loss_config)
     if not report["finite"]:
@@ -385,6 +391,10 @@ def evaluate(policy, simulator, initial, horizon, loss_config):
     report["disturbances"] = disturbance_report(initial)
     risk = hard_risk_metrics(trace)
     report["risk"] = risk
+    if hover_time is not None:
+        time_objective = HoverTimeObjective(hover_time, simulator.params.dt)
+        time_objective.observe(trace)
+        _, report = time_objective.finish(None, report)
     return report
 
 
@@ -426,6 +436,7 @@ def train(args, policy_config, loss_config):
     if TRAINING_BANKS*args.scenarios < group_config.min_scenarios:
         raise ValueError("not enough unique TRAIN scenes for group balancing")
     run_binding = binding(args, policy_config, loss_config)
+    hover_time = HoverTimeConfig(**run_binding["protocol"]["hover_time"])
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
     if not args.resume and any(
@@ -499,7 +510,8 @@ def train(args, policy_config, loss_config):
     def evaluation():
         rng = capture_rng()
         try:
-            report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config)
+            report = evaluate(policy, simulator, eval_initial, args.horizon, loss_config,
+                              hover_time=hover_time)
         finally:
             restore_rng(rng)
         _append(work / "evaluation.jsonl", {"update": progress["updates"], **report})
@@ -574,6 +586,7 @@ def train(args, policy_config, loss_config):
                         horizon=args.horizon,
                         time_decay=args.time_decay,
                         group_config=group_config,
+                        hover_time=hover_time,
                     )
                     _sync(device)
                     forward_done = time.monotonic()
@@ -746,6 +759,7 @@ def evaluate_checkpoint(args):
         initial,
         saved["binding"]["horizon"],
         TaskLossConfig(**cfg["loss"]),
+        hover_time=HoverTimeConfig(**cfg["hover_time"]),
     )
     report.update(
         checkpoint_source_sha256=checkpoint_source,

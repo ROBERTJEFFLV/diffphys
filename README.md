@@ -120,15 +120,36 @@ record; physical flight metrics remain comparable across coefficients.
 The fixed smoothing scales are `epsilon_p=0.01 m` and `epsilon_a=0.01` in raw
 [-1,1] command units. Time normalization is always `1/H`; all initial scenes
 have weight `1/N`. Velocity/omega penalties, Huber, CVaR and tail weighting
-are removed from the task objective. Read-only velocity/omega/risk metrics remain.
+are absent from the base motion objective. The default settling-time term below
+also uses true velocity and angular velocity to measure recovery.
+
+Normal training now adds `--hover-time-weight 1` times `T_proxy / (H*dt)` to
+each scene's original loss. Let
+`r_t=max(||p_t||/0.1m, ||v_t||/0.1m/s, ||omega_t||/0.5rad/s)`,
+`q_t=1/(1+relu(r_t-1))`, and `q_t=0` after boundary failure. Then
+`T_proxy=dt*sum_{t=0}^{H-1}(1-min_{s=t..H} q_s)`.
+This uses the complete retained physical graph, including across 50-step metric
+chunks, without changing the control frequency or adding simulator forwards.
+There is no absolute level-attitude requirement: force rejection can need tilt.
+Set `--hover-time-weight 0` to disable the extra loss while retaining diagnostics.
+TRAIN, fixed EVAL, best-checkpoint selection and update replay share the same
+configuration; checkpoint evaluation/replay use the saved weight and tolerances.
+The logs retain `hover_objective` for the original score and add the time
+contribution under `task_components.hover_time`.
+
+The finite-horizon success diagnostic checks position <=0.1m, speed <=0.1m/s,
+and angular speed <=0.5rad/s at the final sample. Settling time is the first
+sample after the last violation; failures are censored at H*dt. This is not an
+infinite-time stability guarantee. A boundary-failed future makes the added
+time loss constant at the full horizon and gives no additional time gradient.
 
 A failed scene still pays `[3*(H-T)+200]/H` once, including failure on the last
 step. This is detached bookkeeping and supplies no direct avoidance gradient.
-Position, attitude_delta, action_delta, dead and terminal logs use the same cost as TRAIN
+Position, attitude_delta, action_delta, dead, terminal and hover_time logs use the same cost as TRAIN
 and EVAL. See [the exact loss and checkpoint rules](docs/adapted_loss_no_cvar.md).
 
 Removing Wc changes only the Actor's readout and architecture binding. The adapted
-loss, physics, sensor/pulse tapes, physical coverage, termination, Time Decay,
+base motion loss, physics, sensor/pulse tapes, physical coverage, termination, Time Decay,
 group clipping and Adam retain their definitions. Equal scene weights do not make the
 Time-Decay/group-clipped update an exact unprocessed gradient. New and old task
 scores cannot be compared directly; use the retained physical flight metrics.
@@ -310,6 +331,7 @@ Checkpoints retain `deployment_authorized: false`.
 
 `diffphys/env_raptor.py` owns physics; `diffphys/response_noise.py` sampling/sensing/pulse tapes;
 `diffphys/response_policy.py` the deployable Actor; `diffphys/response_task.py` rollout/true losses;
+`diffphys/hover_time_loss.py` the default whole-horizon settling-time term;
 `diffphys/response_adjoints.py` and `diffphys/response_groups.py` grouped full BPTT;
 `diffphys/response_training.py` banks/Adam/checkpoints; `diffphys/response_sampling.py` TRAIN coverage;
 `diffphys/response_grad_probe.py` one-traversal layer-local group derivatives;

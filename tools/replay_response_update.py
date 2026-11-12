@@ -16,6 +16,7 @@ from diffphys.response_audit import AUDIT_VERSION, parameter_changes
 from diffphys.response_policy import ResponseMotorPolicy, ResponsePolicyConfig
 from diffphys.response_groups import GroupBalanceConfig
 from diffphys.response_task import TaskLossConfig
+from diffphys.hover_time_loss import HoverTimeConfig
 from diffphys.response_noise import DisturbanceConfig
 from diffphys.env_raptor import RaptorParams
 from diffphys.compiled_physics import make_simulator
@@ -88,7 +89,8 @@ def replay(path, mode='full'):
         group = GroupBalanceConfig(**{k:v for k,v in cfg['group_balance'].items() if k != 'version'})
         with critical_gc():
             record = collect_rollout(policy, simulator, initial, loss, horizon=cfg['horizon'],
-                                     time_decay=cfg['time_decay'], group_config=group)
+                                     time_decay=cfg['time_decay'], group_config=group,
+                                     hover_time=HoverTimeConfig(**cfg['protocol']['hover_time']))
             backward_actor(policy, simulator, record, loss, gradient_scale=cfg['gradient_scale'])
         safe_global_clip(policy.parameters(), cfg['gradient_clip'])
     elif mode == 'adam':

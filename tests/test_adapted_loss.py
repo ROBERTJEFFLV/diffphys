@@ -243,7 +243,8 @@ def test_objective_version_is_bound_and_old_checkpoint_cannot_resume(tmp_path):
     policy = actor()
     args.dtype = 'float64'
     bound = binding(args, policy.config, config())
-    assert bound['protocol']['task_objective'] == task.TASK_OBJECTIVE_VERSION
+    from diffphys.hover_time_loss import TASK_OBJECTIVE_VERSION
+    assert bound['protocol']['task_objective'] == TASK_OBJECTIVE_VERSION
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     checkpoint = _checkpoint(policy, optimizer, dict(updates=0), bound)
     require_reference_checkpoint(checkpoint)
@@ -280,7 +281,8 @@ def test_old_objective_only_imports_weights_not_adam_best_score_or_sampling_inde
     assert new['optimizer']['state'] == {} and new['next_update'] == 0
     assert new['progress']['best_score'] >= 0
     assert new['progress']['initialization']['weights_only']
-    assert new['binding']['protocol']['task_objective'] == task.TASK_OBJECTIVE_VERSION
+    from diffphys.hover_time_loss import TASK_OBJECTIVE_VERSION
+    assert new['binding']['protocol']['task_objective'] == TASK_OBJECTIVE_VERSION
 
 
 def test_streaming_components_match_the_full_eval_objective_and_physical_metrics():

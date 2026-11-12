@@ -10,6 +10,7 @@ from .response_task import (TaskLossConfig, FlightStatistics, initialize, rollou
 from .response_groups import (GroupBalanceConfig, group_gradient_coefficients,
                              backward_group_gradients, physics_group_layout)
 from .response_grad_probe import GroupGradientProbe
+from .hover_time_loss import HoverTimeConfig, HoverTimeObjective
 
 # Streaming metrics/cost reduction preserves the original 50-step reduction order.
 # This is NOT truncated BPTT: closed-loop tensors are never detached between chunks.
@@ -29,7 +30,8 @@ class RolloutRecord:
 
 
 def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_decay=1.,
-                    group_config: GroupBalanceConfig = GroupBalanceConfig()):
+                    group_config: GroupBalanceConfig = GroupBalanceConfig(),
+                    hover_time: HoverTimeConfig | None = None):
     if horizon < 1:
         raise ValueError("horizon must be positive")
     closed = initialize(policy, initial)
@@ -37,6 +39,7 @@ def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_dec
     probe = (GroupGradientProbe(policy, *physics_group_layout(initial, group_config))
              if group_config.backward_backend == "probe" else None)
     chunks = []
+    time_objective = None if hover_time is None else HoverTimeObjective(hover_time, simulator.params.dt)
     try:
         with probe.capture() if probe is not None else nullcontext():
             for start in range(0, horizon, METRIC_CHUNK):
@@ -45,13 +48,18 @@ def collect_rollout(policy, simulator, initial, config, *, horizon=500, time_dec
                 components = step_cost_components(trace, config, start=start, horizon=horizon)
                 chunks.append(sum(components.values()))
                 statistics.add(trace, start, components=components)
+                if time_objective is not None:
+                    time_objective.observe(trace)
                 closed = trace.end
         costs = torch.cat(chunks).sum(0)
         if not bool(torch.isfinite(costs).all()):
             raise FloatingPointError("nonfinite full-horizon costs")
         weights = uniform_scene_weights(costs)
         coefficients, report = group_gradient_coefficients(weights, initial, group_config)
-        return RolloutRecord(costs, weights, statistics.finish(costs.detach(), weights),
+        metrics = statistics.finish(costs.detach(), weights)
+        if time_objective is not None:
+            costs, metrics = time_objective.finish(costs, metrics)
+        return RolloutRecord(costs, weights, metrics,
                              coefficients, report, group_config, config, probe)
     except BaseException:
         if probe is not None:

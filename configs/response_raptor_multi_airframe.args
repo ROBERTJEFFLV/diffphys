@@ -7,6 +7,7 @@
 --eval-scenarios 128
 --horizon 500
 --time-decay 1
+--hover-time-weight 1
 --gradient-scale 0.1
 --updates 50
 --max-seconds 1800

@@ -16,13 +16,29 @@ For a vector x, with fixed epsilon > 0:
     rho(x) = sqrt(sum(x*x) + epsilon*epsilon) - epsilon
            = sum(x*x) / (sqrt(sum(x*x) + epsilon*epsilon) + epsilon).
 
-One scene is scored as:
+The base motion loss for one scene is:
 
     L_i = sum_valid_t [rho_epsilon_p(p_t)
                       + lambda_R * (1 - cos(theta(R_t.T @ R_(t+1))))
                       + rho_epsilon_a(a_t - a_(t-1))] / H
           + failed_i * [3*(H - T_i) + 200] / H.
-    J = mean_i L_i, over the initial N scenes.
+    J_base = mean_i L_i, over the initial N scenes.
+
+Production now defaults to the settling-time objective verified in the paired
+from-zero experiment (3000 accepted updates per arm):
+
+    r_t = max(||p_t|| / 0.1 m, ||v_t|| / 0.1 m/s, ||omega_t|| / 0.5 rad/s)
+    q_t = 1 / (1 + relu(r_t - 1)), or 0 after boundary failure
+    T_proxy_i = dt * sum_{t=0}^{H-1} (1 - min_{s=t..H} q_s)
+    J = mean_i [L_i + hover_time_weight * T_proxy_i / (H*dt)].
+
+`--hover-time-weight` defaults to 1 in the normal CLI and checked-in config;
+0 disables its contribution. This is a continuous quality proxy with piecewise
+minimum selection, not the derivative of a hard settling-time event. It uses
+true physical state with no absolute attitude target and preserves the original
+Time Decay and clipping. A failed future contributes a constant H*dt proxy and
+no extra time gradient. Finite H cannot certify indefinite stability.
+`hover_objective` retains J_base; `task_objective` and best-score selection use J.
 
 `TaskTrajectory.pre_positions` and `pre_orientations` store true pre-command
 states. `post_orientations` stores each executed transition's true endpoint.
@@ -63,6 +79,7 @@ The user-selected experiment parameters are recorded in the argument file:
 | `epsilon_p` | 0.01 m | Whole three-dimensional position-vector smooth norm |
 | `epsilon_a` | 0.01 | Whole four-command difference-vector smooth norm in raw [-1,1] units |
 | `lambda_R` | 25.0 | Multiplier of per-control-step relative rotation `1 - cos(theta)` |
+| `hover_time_weight` | 1.0 | Multiplier of the dimensionless settling-time proxy |
 
 These finite positive constants are experimental starting settings, not validated
 stability bounds. They are frozen configuration values, not network parameters;
@@ -88,8 +105,10 @@ confirmed constants above. Training remains an explicit CLI operation, separatel
 
 `step_cost_components()` returns position, attitude_delta, action_delta, dead, terminal
 directly. Their sum defines `step_costs()`. TRAIN streaming statistics, fixed
-EVAL, independent checkpoint evaluation and best-score selection consume this
-same definition. Component sums agree with the total up to floating reduction
+EVAL, independent checkpoint evaluation and best-score selection also add the
+whole-horizon `hover_time` component from `diffphys/hover_time_loss.py`.
+The base `response_task` cost helpers remain unchanged and exclude this term.
+Component sums agree with the total up to floating reduction
 roundoff. The old residual/feature-square and old loss-field interfaces are
 removed, not silently accepted or converted into square-root costs.
 
@@ -106,8 +125,10 @@ group cotangents, clipping, or update approval.
 
 ## Checkpoints and verification
 
-Binding stores `task_objective=pre-position-so3-transition-action-delta-equal-scenes-v2`
-and the fixed loss configuration. Resume still requires exact source and full
+Binding stores `task_objective=hover-motion-and-settling-time-v3`, the fixed base
+loss configuration, and `protocol.hover_time` with weight and all three tolerances.
+Evaluation and update/flight replay read the saved time configuration.
+Resume still requires exact source and full
 configuration. An old-objective checkpoint is rejected for resume/current
 scoring. A same-architecture checkpoint may explicitly initialize weights using
 `--init-checkpoint`; Adam, sampling index and best score start afresh. This is

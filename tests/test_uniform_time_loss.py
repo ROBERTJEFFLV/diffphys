@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from diffphys.response_task import step_costs, TASK_OBJECTIVE_VERSION
+from diffphys.response_task import step_costs
+from diffphys.hover_time_loss import TASK_OBJECTIVE_VERSION
 from loss_fixtures import test_loss, parse_loss_args as parse_args
 from test_reference_training import args_for, run
 

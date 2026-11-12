@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from diffphys.response_policy import ResponsePolicyConfig
 from diffphys.response_task import TaskLossConfig
+from diffphys.hover_time_loss import HoverTimeConfig
 from diffphys.response_groups import GroupBalanceConfig
 from diffphys.response_noise import DisturbanceConfig
 from diffphys.response_training import train, evaluate_checkpoint
@@ -35,6 +36,8 @@ def parse_args(argv=None):
     parser.add_argument("--eval-scenarios", type=int, default=128, help="scenes per fixed EVAL bank; two banks")
     parser.add_argument("--horizon", type=int, default=500)
     parser.add_argument("--time-decay", type=float, default=1., help="backward-only decay s^-1; 0 gives exact BPTT")
+    parser.add_argument("--hover-time-weight", type=float, default=1.,
+                        help="settling-time loss weight, normalized by episode duration; 0 disables")
     parser.add_argument("--updates", type=int, default=50)
     parser.add_argument("--max-seconds", type=float, default=1800.)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -94,6 +97,7 @@ def parse_args(argv=None):
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
     try:
+        HoverTimeConfig(weight=args.hover_time_weight)
         if any(getattr(args, field.name) is None for field in fields(TaskLossConfig)):
             raise ValueError("specify --epsilon-p, --epsilon-a and --lambda-R explicitly")
         TaskLossConfig(**{field.name: getattr(args, field.name) for field in fields(TaskLossConfig)})

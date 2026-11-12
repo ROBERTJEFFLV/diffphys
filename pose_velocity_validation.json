@@ -1,0 +1,70 @@
+{
+  "base_commit": "42e5f1704ba1128877c8cab738085403e2a8d04a",
+  "remote_pushed": false,
+  "execution_environment": {
+    "python": "3.13.5",
+    "torch": "2.10.0+cpu",
+    "cuda": false
+  },
+  "tests": {
+    "passed_in_separate_invocations": 100,
+    "failed_in_completed_invocations": 0,
+    "commands": [
+      {
+        "group": "unit",
+        "command": "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_pass_stop.py tests/test_pose_velocity_bridge.py -k \"not h500 and not all_500\"",
+        "passed": 86,
+        "pytest_seconds": 3.15
+      },
+      {
+        "group": "h500",
+        "command": "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_pass_stop.py -k \"h500 or all_500\"",
+        "passed": 4,
+        "pytest_seconds": 16.92
+      },
+      {
+        "group": "integration",
+        "command": "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_pass_stop_integration.py",
+        "passed": 10,
+        "pytest_seconds": 32.69
+      }
+    ],
+    "combined_run": "Stopped at the container 120-second command budget after 96 progress dots; no complete all-in-one verdict. Not counted as a passed run.",
+    "scope": "Pinned dependency snapshot, not full-repository regression."
+  },
+  "gradient_audit": {
+    "command": "python tools/audit_pose_velocity.py --report docs/pose_velocity_gradient_audit.json",
+    "independent_finite_difference_checks": 50,
+    "maximum_normalized_error": 1.183128012227641e-09,
+    "motor_and_attitude_gradients_verified": true,
+    "hard_switch_derivative_claimed": false
+  },
+  "cost_structure": {
+    "added_complete_rollouts_per_update": 0,
+    "probe_backward_traversals": 1,
+    "native_control_steps_unchanged": true,
+    "new_gpu_throughput_measured": false,
+    "note": "Extra features, region samples and reductions incur compute/memory; no zero-overhead or speedup claim."
+  },
+  "protected_master_blobs": {
+    "env_raptor.py": "a1cc9b0235405778788f742a0329f58187db0125",
+    "response_noise.py": "e43b11017c673289a5c13d431966b757c668da39",
+    "response_policy.py": "fd019d1d570113abf5a43a8728754e93bfd8caab",
+    "response_task.py": "bb08935c68d72dff72876ed504da2409ad1a210d",
+    "response_groups.py": "d9ba236a36b69a963d803200b7357ddf85b5bcd9",
+    "response_sampling.py": "60db377738a12b9d42cbedb252e344e6eb75687e",
+    "response_audit.py": "e914c60b61e39630edbfe446f2d47bbb5c384528",
+    "response_execution.py": "455ea13d9bba81259e90cb161dd987cf94b3d8e4",
+    "configs/physics_coverage.json": "5f348dbd22ec5458d391f70dc63979a2cb1a0da4"
+  },
+  "limitations": [
+    "No CUDA execution",
+    "No 3072-scene throughput or GPU-memory test",
+    "No trained user hover checkpoint",
+    "No long Actor training or learned-flight success claim",
+    "Finite region sampling and chord geometry are not continuous-time certificates",
+    "Nonzero-duration constant105deg attitude and exactly constant velocity cannot simultaneously hold without external force",
+    "Hard stage switches are discrete; smooth-branch gradient checks do not differentiate the switch topology",
+    "No deployment safety authorization"
+  ]
+}
