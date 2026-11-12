@@ -178,7 +178,7 @@ def test_sample_task_preserves_physics_sensor_velocity(dtype):
         assert torch.equal(getattr(s,name),getattr(ini,name))
     assert not s.external_force.any() and not s.pulse_tape.any()
     assert not s.velocity.any() and not s.previous_velocity.any()
-    torch.testing.assert_close(closed.policy.radius,2*s.arm_length)
+    torch.testing.assert_close(closed.policy.radius,(2*s.arm_length).clamp_min(.1))
     assert torch.equal(s.previous_velocity[:,0],s.velocity)
     a=quaternion_rotation(s.orientation)[:,:,2]*(sim.thrust(s,s.motor).sum(-1)/s.mass)[:,None]
     torch.testing.assert_close(a,s.position.new_tensor((0,0,9.81)).expand_as(a),rtol=1e-5,atol=1e-5)

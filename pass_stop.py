@@ -7,13 +7,15 @@ speed floor. Hard switches are not assigned fictitious derivatives.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import math
+import random
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from env_raptor import RaptorSimulator, quaternion_rotation
+from env_raptor import RaptorSimulator, RaptorState, quaternion_rotation
 from response_noise import measured_observation, disturbance_report
 from response_policy import (ResponseMotorPolicy, ResponsePolicyConfig,
                              ResponsePolicyState, ResponsePolicyOutput, body_vector)
@@ -23,6 +25,9 @@ from pass_stop_physics import (advance_phase, segment_ball_geometry,
 from response_task import (TaskLossConfig, ResponseClosedLoopState, rollout,
                            smooth_l2, tensors_finite)
 from compiled_execution import tensor_kernel
+from plane_tasks import (sample_plane_goals, plane_attitude_ratio,
+                         directed_velocity_ratio, velocity_z_orthogonality_ratio, segment_plane_geometry,
+                         pass_region_radius)
 
 VERSION = "pass-region-min-speed-v3"
 LEGACY_ARCHITECTURE = "gru26-hidden-only-typed-goal-motor-policy-v1"
@@ -59,6 +64,13 @@ class GoalConfig:
     time_weight: float = 1.
     smooth_weight: float = .01
     version: str = VERSION
+    random_initial_state: bool = False
+    random_via: bool = False
+    via_tilt_range_deg: tuple = (60., 120.)
+    via_boundary_margin_arms: float = 7.
+    task_seed: int = 7
+    plane_task: bool = False
+    plane_crossing_only: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, 'points', tuple(tuple(float(v) for v in p) for p in self.points))
@@ -95,6 +107,26 @@ class GoalConfig:
         # A stationary ordinary quadrotor cannot support a persistently tilted thrust axis.
         if any(abs(q[1])+abs(q[2]) > 1e-6 for q in (self.start_quaternion, self.stop_quaternion)):
             raise ValueError('START/STOP must be level (yaw allowed) for an ordinary quadrotor')
+        if type(self.random_initial_state) is not bool or type(self.random_via) is not bool:
+            raise ValueError('random task switches must be boolean')
+        if type(self.plane_task) is not bool or (self.plane_task and not self.random_via):
+            raise ValueError('plane task requires boolean plane_task and random_via enabled')
+        if type(self.plane_crossing_only) is not bool or (self.plane_crossing_only and not self.plane_task):
+            raise ValueError('plane crossing evaluation requires plane_task')
+        if type(self.task_seed) is not int:
+            raise ValueError('task seed must be an integer')
+        angles = tuple(float(x) for x in self.via_tilt_range_deg)
+        object.__setattr__(self, 'via_tilt_range_deg', angles)
+        if (len(angles) != 2 or not all(math.isfinite(x) for x in angles)
+                or not 60 <= angles[0] < angles[1] <= 120
+                or (self.random_via and not self.plane_task
+                    and angles[0]+self.pose_tolerance_deg >= angles[1]-self.pose_tolerance_deg)):
+            raise ValueError('tilt range must fit inside 60..120 degrees with pose tolerance reserved')
+        if (not math.isfinite(self.via_boundary_margin_arms)
+                or self.via_boundary_margin_arms < max(7., self.region_radius_arms)):
+            raise ValueError('PASS centre must reserve at least 7L and fit its entire ball')
+        if self.random_via and math.hypot(*self.velocities[1]) < 1.5:
+            raise ValueError('random PASS speed floor must be at least 1.5 m/s')
 
 
 @dataclass(frozen=True)
@@ -118,7 +150,16 @@ def policy_class(config):
 
 def objective_version(config):
     from response_task import TASK_OBJECTIVE_VERSION
-    return VERSION if isinstance(config, PassStopLossConfig) else TASK_OBJECTIVE_VERSION
+    task_version = VERSION + '-min-region-radius-0p1m-v1'
+    if isinstance(config, PassStopLossConfig):
+        mission = GoalConfig(**config.mission)
+        if mission.plane_task:
+            if mission.plane_crossing_only:
+                return task_version + '-unoriented-plane-velocity-z-orthogonal-first-crossing-v4-speed-monotone'
+            return task_version + '-unoriented-plane-velocity-z-orthogonal-v3-speed-monotone'
+        if mission.random_via or mission.random_initial_state:
+            return task_version + '-random-initial-via-v1'
+    return task_version if isinstance(config, PassStopLossConfig) else TASK_OBJECTIVE_VERSION
 
 
 def architecture(config):
@@ -142,6 +183,11 @@ class GoalState(ResponsePolicyState):
     @property
     def is_stop(self):
         return self.phase == 2
+
+
+@dataclass(frozen=True)
+class RandomGoalState(GoalState):
+    via_quaternion: torch.Tensor
 
 
 class GoalMotorPolicy(ResponseMotorPolicy):
@@ -230,6 +276,47 @@ def import_motor_weights(policy, weights):
     policy.load_state_dict(value,strict=True)
 
 
+@torch.no_grad()
+def sample_via_goals(initial: RaptorState, mission: GoalConfig,
+                     points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample public goals without consuming training RNG or retained hidden state."""
+    widths = initial.position_limit-mission.via_boundary_margin_arms*initial.arm_length
+    radius = pass_region_radius(initial.arm_length, mission.region_radius_arms)
+    start_gap = torch.maximum(radius, torch.full_like(radius, 2*mission.radius_m))
+    stop_gap = torch.maximum(radius+mission.stop_position_m,
+                             torch.full_like(radius, mission.radius_m+mission.stop_position_m))
+    if not bool((widths > 0).all()):
+        raise ValueError('original fence cannot accommodate the required PASS margin')
+    # Original spawn positions are discarded when START is placed at its fixed point.
+    # They provide reset entropy without reading retained motor/kinematic truth or noise.
+    entropy = initial.position.detach().cpu().double().tolist()
+    rows = initial.noise_row.detach().cpu().tolist()
+    geometry = torch.cat((points[:, 0], points[:, 2], widths[:, None],
+                          start_gap[:, None], stop_gap[:, None]), -1).detach().cpu().double().tolist()
+    via, poses = [], []
+    lo, hi = mission.via_tilt_range_deg
+    for row, spawn, shape in zip(rows, entropy, geometry):
+        key = repr((mission.task_seed, row, spawn)).encode()
+        rng = random.Random(int.from_bytes(hashlib.sha256(key).digest()[:8], 'little'))
+        start, stop, width, first_gap, last_gap = shape[:3], shape[3:6], *shape[6:]
+        for _ in range(256):
+            point = [rng.uniform(-width, width) for _ in range(3)]
+            if math.dist(point, start) > first_gap+1e-5 and math.dist(point, stop) > last_gap+1e-5:
+                break
+        else:
+            raise ValueError(f'random PASS geometry cannot fit scene {row}; no aircraft removed')
+        theta = math.radians(rng.uniform(lo+mission.pose_tolerance_deg, hi-mission.pose_tolerance_deg))/2
+        azimuth, twist = rng.uniform(-math.pi, math.pi), rng.uniform(-math.pi, math.pi)
+        a, b = (azimuth+twist)/2, (azimuth-twist)/2
+        # Rz(azimuth) Ry(tilt) Rz(twist): thrust-axis tilt equals the sampled tilt.
+        poses.append((math.cos(theta)*math.cos(a), -math.sin(theta)*math.sin(b),
+                      math.sin(theta)*math.cos(b), math.cos(theta)*math.sin(a)))
+        via.append(point)
+    planned = points.clone()
+    planned[:, 1] = points.new_tensor(via)
+    return planned, points.new_tensor(poses)
+
+
 def prepare(policy, initial, config):
     """Retask a sampled master scene; leave sampler, dynamics and sensor code intact."""
     if not isinstance(config, PassStopLossConfig):
@@ -238,16 +325,25 @@ def prepare(policy, initial, config):
     if not isinstance(policy, GoalMotorPolicy):
         raise ValueError('typed loss requires typed Actor')
     n = len(initial.mass)
-    points = initial.position.new_tensor(c.points)[None].expand(n,-1,-1)
-    if c.relative_to_boundary:
-        points = points*initial.position_limit[:,None,None]
-    if bool((points.abs() >= initial.position_limit[:,None,None]).any()):
+    sampled_q = None
+    velocities = None
+    task_limit = initial.position_limit
+    if c.plane_task:
+        points, sampled_q, velocities = sample_plane_goals(initial, c)
+        task_limit = 50*initial.arm_length
+    else:
+        points = initial.position.new_tensor(c.points)[None].expand(n,-1,-1)
+        if c.relative_to_boundary:
+            points = points*task_limit[:,None,None]
+        if c.random_via:
+            points, sampled_q = sample_via_goals(initial, c, points)
+    if bool((points.abs() >= task_limit[:,None,None]).any()):
         raise ValueError('task points must lie strictly inside the original world boundary')
     if bool(((points[:,1]-points[:,0]).norm(dim=-1) <= 2*c.radius_m).any()
             or ((points[:,2]-points[:,1]).norm(dim=-1) <= c.radius_m+c.stop_position_m).any()):
         raise ValueError('task goal regions must be disjoint; no silent geometric rescaling')
-    radius = c.region_radius_arms*initial.arm_length
-    if bool((points[:,1].abs()+radius[:,None] >= initial.position_limit[:,None]).any()):
+    radius = pass_region_radius(initial.arm_length, c.region_radius_arms)
+    if bool((points[:,1].abs()+radius[:,None] >= task_limit[:,None]).any()):
         raise ValueError('the entire PASS ball must fit inside the original boundary')
     if bool(((points[:,0]-points[:,1]).norm(dim=-1) <= radius).any()
             or ((points[:,2]-points[:,1]).norm(dim=-1) <= radius+c.stop_position_m).any()):
@@ -255,26 +351,38 @@ def prepare(policy, initial, config):
     q_start = initial.orientation.new_tensor(c.start_quaternion).expand(n,-1)
     q_end = initial.orientation.new_tensor(c.stop_quaternion).expand(n,-1)
     q_via = q_end.new_tensor(c.via_quaternion).expand(n,-1)
+    if sampled_q is not None:
+        q_via = sampled_q
     # Exact positive root of the original thrust polynomial at force balance.
     coef = initial.thrust_coefficients
     d = coef[...,0]-initial.mass[:,None]*9.81/4
     motor = -2*d/(coef[...,1]+torch.sqrt(coef[...,1].square()-4*coef[...,2]*d))
     if bool(((motor < initial.motor_min[:,None]) | (motor > initial.motor_max[:,None])).any()):
         raise ValueError('sampled actuator cannot initialize hover equilibrium')
-    # The new task starts at rest. START/STOP velocity vectors are exactly zero.
+    if c.random_initial_state:
+        motor = initial.motor
+    # Public START/STOP velocity goals stay zero. Random starts retain the source
+    # initial kinematics, hidden motors and all three delayed-velocity slots.
     # No external forces or pulses in this task. Measurement noise/delay survive.
-    state = replace(initial, position=points[:,0], orientation=q_start, velocity=torch.zeros_like(initial.velocity), omega=torch.zeros_like(initial.omega),
+    state = replace(initial, position=points[:,0], position_limit=task_limit,
+                    orientation=initial.orientation if c.random_initial_state else q_start,
+                    velocity=initial.velocity if c.random_initial_state else torch.zeros_like(initial.velocity),
+                    omega=initial.omega if c.random_initial_state else torch.zeros_like(initial.omega),
                     motor=motor, previous_action=torch.zeros_like(initial.previous_action),
                     external_force=torch.zeros_like(initial.external_force),
                     external_torque=torch.zeros_like(initial.external_torque),
                     force_std=torch.zeros_like(initial.force_std),
                     pulse_tape=torch.zeros_like(initial.pulse_tape),
                     pulse_active_tape=torch.zeros_like(initial.pulse_active_tape),
-                    previous_velocity=torch.zeros_like(initial.previous_velocity))
+                    previous_velocity=(initial.previous_velocity if c.random_initial_state
+                                       else torch.zeros_like(initial.previous_velocity)))
     obs = measured_observation(state)
     ps = policy.task_state(obs,points[:,1],points[:,2],quaternion_rotation(q_via),quaternion_rotation(q_end),radius,
                            start=points[:,0],start_rotation=quaternion_rotation(q_start),
-                           velocities=obs.new_tensor(c.velocities)[None].expand(n,-1,-1))
+                           velocities=(obs.new_tensor(c.velocities)[None].expand(n,-1,-1)
+                                       if velocities is None else velocities))
+    if sampled_q is not None:
+        ps = RandomGoalState(**vars(ps), via_quaternion=q_via)
     return ResponseClosedLoopState(state,ps)
 
 
@@ -356,14 +464,22 @@ def _tensor_costs(trace, c, config):
     dt = .01
     alive = ~RaptorSimulator.position_terminated(p,trace.initial.position_limit)
     row = torch.arange(N,device=p.device)
-    tq = q.new_tensor(c.via_quaternion)
+    tq = state.via_quaternion if isinstance(state, RandomGoalState) else q.new_tensor(c.via_quaternion)
     eq = q.new_tensor(c.stop_quaternion)
     target_v = state.target_velocities[:,1]
     minimum_speed = target_v.norm(dim=-1)
+    if c.plane_task:
+        minimum_speed = torch.full_like(minimum_speed, math.hypot(*c.velocities[1]))
+    heading_to_stop = F.normalize(target_v, dim=-1)
     pos = (p-state.via).norm(dim=-1)/c.radius_m
-    rot = pose_ratio_quaternion(q,tq,c.pose_tolerance_deg)
+    rot = (plane_attitude_ratio(q, state.via_rotation[:, :, 2], c.pose_tolerance_deg)
+           if c.plane_task else pose_ratio_quaternion(q,tq,c.pose_tolerance_deg))
     vel = 1+(minimum_speed-v.norm(dim=-1))/c.pass_speed_scale_m_s
     pair = torch.maximum(torch.maximum(pos,rot),vel)
+    if c.plane_task:
+        direction_ratio = directed_velocity_ratio(v, heading_to_stop, minimum_speed, c.pose_tolerance_deg)
+        orthogonal_ratio = velocity_z_orthogonality_ratio(q, v, minimum_speed, c.pose_tolerance_deg)
+        pair = torch.maximum(pair, torch.maximum(direction_ratio, orthogonal_ratio))
     kinematic = interval_kinematics(trace,dt)
     stop_parts = torch.stack(((p-state.stop).norm(dim=-1)/c.stop_position_m,
                              (v-state.target_velocities[:,2]).norm(dim=-1)/c.stop_velocity_m_s,
@@ -382,44 +498,67 @@ def _tensor_costs(trace, c, config):
     stop = stop_parts.amax(-1)
     stop = torch.cat((stop[:-1],torch.maximum(stop[-1],end_balance)[None]),0)
     region,entry_fraction,exit_fraction,phases,exit_index = _region_schedule(trace.observations,state,trace.valid)
-    exists = region.any(0)
+    entered_region = region.any(0)
+    scoring_region = region
     finished_region = exit_index >= 0
     # Score entry/middle/exit on every first-traversal chord. This has fixed O(HN)
     # cost, no extra RK4 step, and catches straight between-sample passages.
     fractions = torch.stack((entry_fraction,(entry_fraction+exit_fraction)*.5,exit_fraction),0)
+    if c.plane_crossing_only:
+        plane_hits, plane_fraction, forward = segment_plane_geometry(
+            p[:-1], p[1:], state.via, heading_to_stop, state.radius)
+        candidates = plane_hits & region
+        scoring_region = candidates & (candidates.long().cumsum(0) == 1)
+        forward_crossing = (scoring_region & forward).any(0)
+        fractions = plane_fraction[None]
+    exists = scoring_region.any(0)
     ps = p[:-1][None]+fractions[...,None]*(p[1:]-p[:-1])[None]
     vs = v[:-1][None]+fractions[...,None]*(v[1:]-v[:-1])[None]
-    qs = interpolate_quaternion(q[:-1][None].expand(3,-1,-1,-1),
-                                 q[1:][None].expand(3,-1,-1,-1),fractions)
+    qs = interpolate_quaternion(q[:-1][None].expand(fractions.shape[0],-1,-1,-1),
+                                 q[1:][None].expand(fractions.shape[0],-1,-1,-1),fractions)
     rp = (ps-state.via).norm(dim=-1)/c.radius_m
-    rr = pose_ratio_quaternion(qs,tq,c.pose_tolerance_deg)
+    rr = (plane_attitude_ratio(qs, state.via_rotation[:, :, 2], c.pose_tolerance_deg)
+          if c.plane_task else pose_ratio_quaternion(qs,tq,c.pose_tolerance_deg))
     rv = 1+(minimum_speed-vs.norm(dim=-1))/c.pass_speed_scale_m_s
     # Missing a region still gets a joint same-time recovery gradient.
     joint = (pos-1).clamp_min(0).square()+(rot-1).clamp_min(0).square()+(vel-1).clamp_min(0).square()
+    if c.plane_task:
+        rd = directed_velocity_ratio(vs, heading_to_stop, minimum_speed, c.pose_tolerance_deg)
+        ro = velocity_z_orthogonality_ratio(qs, vs, minimum_speed, c.pose_tolerance_deg)
+        joint = joint+(direction_ratio-1).clamp_min(0).square()+(orthogonal_ratio-1).clamp_min(0).square()
     eligible = alive.clone()
     eligible[0] = ~alive[1:].any(0)
     witness = joint.masked_fill(~eligible,torch.inf).argmin(0)
     fallback_p, fallback_r, fallback_v = pos[witness,row],rot[witness,row],vel[witness,row]
     # The whole interval's pose/velocity is scored; making the visit shorter does
     # not remove its peak error, nor can a later good revisit erase the first.
-    region_p = rp.masked_fill(~region[None],torch.inf).amin((0,1))
-    region_r = torch.where(region[None],rr,0.).amax((0,1))
-    region_v = rv.masked_fill(~region[None],-torch.inf).amax((0,1))
+    region_p = rp.masked_fill(~scoring_region[None],torch.inf).amin((0,1))
+    region_r = torch.where(scoring_region[None],rr,0.).amax((0,1))
+    region_v = rv.masked_fill(~scoring_region[None],-torch.inf).amax((0,1))
     selected_p = torch.where(exists,region_p,fallback_p)
     selected_r = torch.where(exists,region_r,fallback_r)
     selected_v = torch.where(exists,region_v,fallback_v)
+    if c.plane_task:
+        selected_d = torch.where(exists, torch.where(scoring_region[None], rd, 0.).amax((0, 1)), direction_ratio[witness, row])
+        selected_o = torch.where(exists, torch.where(scoring_region[None], ro, 0.).amax((0, 1)), orthogonal_ratio[witness, row])
     pass_position = c.point_weight*(selected_p-1).clamp_min(0).square()
     pass_attitude = c.point_weight*(selected_r-1).clamp_min(0).square()
     pass_speed = c.velocity_weight*(selected_v-1).clamp_min(0).square()
     missing = c.point_weight*(~finished_region).to(p)
+    if c.plane_crossing_only:
+        missing = c.point_weight*(~(finished_region & exists & forward_crossing)).to(p)
     end_cost = c.point_weight*((stop_parts[-1]-1).clamp_min(0).square().sum(-1)
                                +(balance_parts-1).clamp_min(0).square().sum(-1))
     # Use interpolated joint states to inform the retained time proxy as well.
     interval_quality = torch.maximum(torch.maximum(rp,rr),rv).amin(0)
-    interval_quality = torch.where(region,interval_quality,pair[1:])
+    if c.plane_task:
+        interval_quality = torch.maximum(torch.maximum(torch.maximum(rp, rr), rv), torch.maximum(rd, ro)).amin(0)
+    interval_quality = torch.where(scoring_region,interval_quality,pair[1:])
     time_pair = torch.cat((pair[:1],interval_quality),0)
     # Worst first-traversal quality caps all future completion evidence.
     cap_ratio = torch.maximum(torch.maximum(selected_p,selected_r),selected_v)
+    if c.plane_task:
+        cap_ratio = torch.maximum(cap_ratio, torch.maximum(selected_d, selected_o))
     time_pair = torch.where(exists[None],torch.maximum(time_pair,cap_ratio[None]),time_pair)
     time_s,completion = temporal_proxy(time_pair,stop,dt=.01,alive=alive)
     # Weak fixed approach direction: no moving reference, no target speed floor.
@@ -444,9 +583,16 @@ def _tensor_costs(trace, c, config):
                   'action_delta':action_cost,
                   'acceleration':acceleration_cost,'jerk':jerk_cost,
                   'failure':failure,'boundary':c.point_weight*boundary}
+    if c.plane_task:
+        components['pass_direction'] = c.velocity_weight*(selected_d-1).clamp_min(0).square()
+        components['pass_orthogonality'] = c.velocity_weight*(selected_o-1).clamp_min(0).square()
     costs = sum(components.values())
     with torch.no_grad():
         passed = finished_region & (selected_p <= 1) & (selected_r <= 1) & (selected_v <= 1)
+        if c.plane_task:
+            passed = passed & (selected_d <= 1) & (selected_o <= 1)
+        if c.plane_crossing_only:
+            passed = passed & exists & forward_crossing
         after_exit = torch.arange(H+1,device=p.device)[:,None] >= torch.where(finished_region,exit_index,H+1)[None]
         stopped = (stop <= 1) & alive & passed[None] & after_exit
         outside = torch.where(~stopped,torch.arange(H+1,device=p.device)[:,None],-1)
@@ -458,12 +604,12 @@ def _tensor_costs(trace, c, config):
                    'task_components':{k:a.mean() for k,a in components.items()},
                    'time_proxy_seconds':time_s.mean(),'completion_time_seconds':hard_time.mean(),
                    'pass_fraction':passed.float().mean(),'success_fraction':completed.float().mean(),
-                   'region_enter_fraction':exists.float().mean(),'region_exit_fraction':finished_region.float().mean(),
+                   'region_enter_fraction':entered_region.float().mean(),'region_exit_fraction':finished_region.float().mean(),
                    'pass_position_m':(selected_p*c.radius_m).mean(),
                    'pass_chordal_ratio':selected_r.mean(),
                    'pass_minimum_speed_m_s':minimum_speed.mean(),
                    'pass_speed_shortfall_m_s':((selected_v-1)*c.pass_speed_scale_m_s).clamp_min(0).mean(),
-                   'region_max_speed_shortfall_m_s':torch.where(region[None],shortfall,0.).amax((0,1)).mean(),
+                   'region_max_speed_shortfall_m_s':torch.where(scoring_region[None],shortfall,0.).amax((0,1)).mean(),
                    'region_samples':region.sum(),'region_radius_m_min':state.radius.min(),
                    'region_radius_m_max':state.radius.max(),
                    'terminal_acceleration_m_s2':end_acceleration.norm(dim=-1).mean(),
@@ -475,6 +621,9 @@ def _tensor_costs(trace, c, config):
                    'omega_rms':w[1:].square().sum(-1).mean().sqrt(),
                    'physical_transitions':trace.valid.sum(),'scenario_count':N,'finite':True,
                    'motor_saturation_fraction':(trace.actions.abs() >= 1-1e-6).float().mean()}
+        if c.plane_crossing_only:
+            metrics['plane_crossing_fraction'] = exists.float().mean()
+            metrics['plane_forward_crossing_fraction'] = forward_crossing.float().mean()
     return costs,metrics,components
 
 
@@ -488,4 +637,16 @@ def typed_costs(trace, config, *, compiled=False):
                if isinstance(value, torch.Tensor) else value for name, value in values.items()}
     metrics['task_components'] = {name: float(value) for name, value in values['task_components'].items()}
     metrics['disturbances'] = disturbance_report(trace.initial)
+    if c.random_via:
+        state = trace.end.policy
+        tilt = torch.rad2deg(torch.acos(state.via_rotation[:, 2, 2].detach().clamp(-1., 1.)))
+        clearance = (trace.initial.position_limit[:, None]-state.via.abs())/trace.initial.arm_length[:, None]
+        metrics['via_target_tilt_deg_min'] = float(tilt.min())
+        metrics['via_target_tilt_deg_max'] = float(tilt.max())
+        metrics['via_boundary_clearance_arms_min'] = float(clearance.min())
+        metrics['random_initial_state'] = c.random_initial_state
+        metrics['pass_attitude_mode'] = 'unoriented-plane' if c.plane_task else 'complete-pose'
+        metrics['pass_evaluation'] = 'first-plane-crossing' if c.plane_crossing_only else 'first-ball-traversal'
+        if c.plane_task:
+            metrics['pass_velocity_body_z_constraint'] = 'orthogonal'
     return costs, metrics, components

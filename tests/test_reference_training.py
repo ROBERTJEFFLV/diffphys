@@ -91,7 +91,7 @@ def test_checkpoint_rejects_changed_noise_implementation(tmp_path):
         require_reference_checkpoint(saved)
 
 
-def test_aft_preset_is_self_contained_and_preserves_frozen_resume_binding(tmp_path,monkeypatch):
+def test_aft_preset_keeps_fixed_task_but_requires_new_source_binding(tmp_path,monkeypatch):
     """The recommended preset must not depend on an unused hover argument file."""
     from dataclasses import asdict
     from pathlib import Path
@@ -111,8 +111,19 @@ def test_aft_preset_is_self_contained_and_preserves_frozen_resume_binding(tmp_pa
     saved=torch.load(root/'frozen/20261026-u1456/latest.pt',map_location='cpu',weights_only=True)
     expected=dict(saved['binding'])
     # CPU numerical CI and the CUDA checkpoint use different PyTorch builds.
-    # Every source/objective/optimizer/sampling setting must otherwise match.
+    # Random-task support intentionally changes source binding. Frozen artifacts
+    # retain their original hashes. The0.1m minimum ball radius intentionally
+    # changes typed-task identity; other preset bindings remain unchanged.
     actual.pop('torch_version');expected.pop('torch_version')
+    assert actual.pop('source_sha256') != expected.pop('source_sha256')
+    # Runtime-only pinned-cache release is explicit; frozen execution stays intact.
+    assert actual['execution']['saved_tensors'].pop('cache') == 'release-inactive-pinned-after-update'
+    from pass_stop import GoalConfig
+    expected['protocol']['loss']['mission']=asdict(GoalConfig(**expected['protocol']['loss']['mission']))
+    from pass_stop import objective_version
+    old_task = expected['protocol']['task_objective']
+    assert old_task != objective_version(loss)
+    expected['protocol']['task_objective'] = objective_version(loss)
     assert actual==expected
 
 

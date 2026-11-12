@@ -1,0 +1,2 @@
+@configs/velocity_z_time3_lr001_flight.args
+--work-dir runs/pass_stop/gradient_repaired_time3_lr001_seed7

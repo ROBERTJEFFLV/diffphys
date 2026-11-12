@@ -1,0 +1,19 @@
+{
+  "selected_source_sha256": "c98afdbf36f5d63d0b7ba8d8e9415c0a16466d3187eee385122508825522ceff",
+  "CPU_passed": 673,
+  "CPU_CUDA_skipped": 25,
+  "CUDA_reference_check": {
+    "scenes": 64,
+    "horizon": 8,
+    "dtype": "float32",
+    "device": "NVIDIA GeForce RTX 4060 Ti",
+    "compiled_matches_eager_costs_and_gradients": true,
+    "graph_traversals": 1,
+    "source_sha256": "c98afdbf36f5d63d0b7ba8d8e9415c0a16466d3187eee385122508825522ceff",
+    "scope": "bounded numerical smoke check; no learned-success claim"
+  },
+  "comparison_file": "comparison_final.json",
+  "production_verification_file": "production_verification.json",
+  "source_archive": "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/velocity_z_orthogonal_time3_lr001_seed7/source_before_gradient_design.tar.gz",
+  "learned_full_mission_success_established": false
+}

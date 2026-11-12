@@ -1,0 +1,3 @@
+@configs/plane_flight.args
+--mission-config configs/plane_time10_pass_stop.json
+--work-dir runs/pass_stop/plane_crossing_time10_seed7

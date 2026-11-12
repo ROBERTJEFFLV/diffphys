@@ -50,7 +50,8 @@ def execution_contract(device, *, goal_task=False):
         regions += ['phase', 'task-loss']
     return {'version': 'compiled-prefetch-v1', 'sampling': 'spawn-one-batch',
             'tensor_execution': 'strict-inductor', 'compiler': compiler_contract(),
-            'saved_tensors': {'storage': 'cpu-pinned-large-contiguous', 'minimum_elements': 65536},
+            'saved_tensors': {'storage': 'cpu-pinned-large-contiguous', 'minimum_elements': 65536,
+                             'cache': 'release-inactive-pinned-after-update'},
             'regions': regions,
             'native_regions': ['fused-gru', 'Adam', 'validation-and-hooks'],
             'backward': 'AOTAutograd of the same tensor regions'}

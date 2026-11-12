@@ -1,0 +1,4 @@
+@configs/velocity_z_flight.args
+--mission-config configs/velocity_z_time3_pass_stop.json
+--work-dir runs/pass_stop/velocity_z_orthogonal_time3_seed7
+--development-every 50

@@ -125,11 +125,36 @@ def goal_status(meta, arrays, frame, scene):
     floor = (float(arrays['command_min_speed_m_s'][command_frame, scene])
              if 'command_min_speed_m_s' in arrays else None)
     speed = float(np.linalg.norm(arrays['velocity'][frame, scene]))
-    return {'phase': phase,
+    result = {'phase': phase,
             'phase_name': {0: '接近点2', 1: '球内穿越', 2: '终点停稳'}.get(phase, 'PASS #2（旧回放）'),
             'region_radius_m': radius, 'center_tolerance_m': float(mission['radius_m']),
             'minimum_speed_m_s': floor, 'speed_m_s': speed,
-            'speed_shortfall_m_s': None if floor is None else max(0., floor-speed)}
+            'speed_shortfall_m_s': None if floor is None else max(0., floor-speed),
+            'attitude_mode': 'complete-pose'}
+    if mission.get('plane_task') and not is_stop:
+        normal = arrays['pass_rotation'][scene, :, 2]
+        normal = normal/np.linalg.norm(normal)
+        body_z = quaternion_rotation(arrays['orientation'][frame, scene])[:, 2]
+        body_z = body_z/np.linalg.norm(body_z)
+        heading = arrays['mission_points'][scene, 2]-arrays['mission_points'][scene, 1]
+        heading = heading/np.linalg.norm(heading)
+        def angle(cosine):
+            return math.degrees(math.acos(float(np.clip(cosine, -1., 1.))))
+        unit = arrays['velocity'][frame, scene]/speed if speed > 1e-12 else None
+        result.update(attitude_mode='unoriented-plane',
+                      pass_evaluation=('first-plane-crossing' if mission.get('plane_crossing_only') else 'first-ball-traversal'),
+                      velocity_body_z_constraint=meta.get('metrics', {}).get(
+                          'pass_velocity_body_z_constraint', 'parallel'),
+                      target_velocity_z_angle_deg=math.degrees(math.atan2(
+                          float(np.linalg.norm(np.cross(heading, normal))), abs(float(heading@normal)))),
+                      target_velocity_plane_angle_deg=math.degrees(math.atan2(
+                          abs(float(heading@normal)), float(np.linalg.norm(np.cross(heading, normal))))),
+                      plane_error_deg=angle(abs(body_z@normal)),
+                      velocity_direction_error_deg=None if unit is None else angle(unit@heading),
+                      velocity_z_error_deg=None if unit is None else math.degrees(math.atan2(
+                          abs(float(unit@body_z)), float(np.linalg.norm(np.cross(unit, body_z))))),
+                      velocity_plane_error_deg=None if unit is None else angle(abs(unit@body_z)))
+    return result
 
 
 def quaternion_rotation(q):
@@ -340,12 +365,41 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
                 line(project(ball, limit), colors['muted'], 1)
             goal = project(goal_position, limit).astype(int)
             pg.draw.circle(screen, colors["gold"], goal, 13, 2)
-            ghost = goal_position + arrays["rotor_positions"][index] @ goal_rotation.T
-            for rotor in ghost:
-                pg.draw.line(screen, colors["gold"], goal, project(rotor, limit).astype(int), 2)
-            # Target body z-axis makes the commanded full attitude visible.
-            line(project((goal_position, goal_position + goal_rotation[:, 2]*limit*.22), limit),
-                 colors["gold"], 3)
+            if task_status['attitude_mode'] == 'unoriented-plane':
+                circle = (np.cos(theta)[:, None]*goal_rotation[:, 0]
+                          + np.sin(theta)[:, None]*goal_rotation[:, 1])
+                line(project(goal_position+circle*task_status['region_radius_m'], limit), colors['gold'], 2)
+                # Enlarge the orientation guide, leaving the physical 2L region unchanged.
+                square = np.array(((-1., -1.), (1., -1.), (1., 1.), (-1., 1.), (-1., -1.)))
+                guide = goal_position+limit*.15*(square@goal_rotation[:, :2].T)
+                line(project(guide, limit), colors['gold'], 2)
+                heading = arrays['mission_points'][index, 2]-arrays['mission_points'][index, 1]
+                heading = heading/np.linalg.norm(heading)
+                tip = goal_position+heading*limit*.22
+                line(project((goal_position, tip), limit), colors['green'], 3)
+                side = np.cross(goal_rotation[:, 2], heading)
+                side_norm = np.linalg.norm(side)
+                side = side/side_norm if side_norm > 1e-6 else goal_rotation[:, 0]
+                arrow = (tip-heading*limit*.035+side*limit*.02,
+                         tip, tip-heading*limit*.035-side*limit*.02)
+                line(project(arrow, limit), colors['green'], 3)
+                if task_status['velocity_body_z_constraint'] == 'orthogonal':
+                    normal = goal_rotation[:, 2]
+                    line(project((goal_position-normal*limit*.18, goal_position+normal*limit*.18), limit),
+                         colors['gold'], 3)
+                    target_angle = task_status['target_velocity_z_angle_deg']
+                    text(f"目标：速度与机体 z 轴夹角 {target_angle:.2f}° · z 轴正反等价 · 金色方框为机体平面示意",
+                         30, 150, 16, colors['gold'])
+                else:
+                    target_angle = task_status['target_velocity_plane_angle_deg']
+                    text(f"历史任务：速度与机体平面夹角 {target_angle:.2f}° · 绕法向自由 · 金色方框为放大示意",
+                         30, 150, 16, colors['gold'])
+            else:
+                ghost = goal_position + arrays["rotor_positions"][index] @ goal_rotation.T
+                for rotor in ghost:
+                    pg.draw.line(screen, colors["gold"], goal, project(rotor, limit).astype(int), 2)
+                line(project((goal_position, goal_position + goal_rotation[:, 2]*limit*.22), limit),
+                     colors["gold"], 3)
         else:
             goal = project(np.zeros(3), limit).astype(int)
             pg.draw.circle(screen, colors["gold"], goal, 9, 2)
@@ -363,7 +417,13 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
         if force is None:
             text("旧回放未记录外力数据", 30, 120, 16, colors["muted"])
         elif typed and force["applied"]:
-            text("固定点任务：外力关闭 · 金色为当前命令姿态", 30, 120, 16, colors["gold"])
+            label = (("首次穿面验收：金色为机体平面 · 绿色为朝终点的目标速度"
+                      if meta['mission'].get('plane_crossing_only') else "平面穿越：金色为机体平面 · 绿色为朝终点的目标速度")
+                     if task_status['attitude_mode'] == 'unoriented-plane'
+                     else "固定点任务：外力关闭 · 金色为当前命令姿态")
+            if task_status.get('velocity_body_z_constraint') == 'orthogonal':
+                label = '首次穿面验收：金色长线为机体 z 轴 · 绿色为朝终点的目标速度 · 两者正交'
+            text(label, 30, 120, 16, colors["gold"])
         elif force["applied"]:
             gravity = scene["mass_kg"] * 9.81
             steady = force["external_force_world"]
@@ -409,17 +469,29 @@ def run_player(path, *, screenshot=None, max_frames=None, fps=30):
                 (np.trace(body_to_world.T @ goal_rotation) - 1)/2, -1., 1.))))
             mode = task_status['phase_name']
             text(f"命令 {mode}   距离 {np.linalg.norm(position-goal_position):.3f} m", 1022, 633, 18)
-            text(f"姿态误差 {angle:.2f}°   速率 {task_status['speed_m_s']:.3f} m/s", 1022, 661, 18)
+            plane_mode = task_status['attitude_mode'] == 'unoriented-plane'
+            attitude = (f"平面误差 {task_status['plane_error_deg']:.2f}°" if plane_mode else f"姿态误差 {angle:.2f}°")
+            text(f"{attitude}   速率 {task_status['speed_m_s']:.3f} m/s", 1022, 661, 18)
             floor = task_status['minimum_speed_m_s']
             if floor is not None and not is_stop:
                 shortfall = task_status['speed_shortfall_m_s']
                 label = '达标' if shortfall == 0 else f'不足 {shortfall:.2f}'
                 color = colors['muted'] if task_status['phase'] == 0 else colors['red' if shortfall else 'green']
-                text(f"球内速率 ≥ {floor:.2f} m/s · {label}", 1022, 691, 18, color)
+                where = '穿面速率' if meta['mission'].get('plane_crossing_only') else '球内速率'
+                text(f"{where} ≥ {floor:.2f} m/s · {label}", 1022, 691, 18, color)
             else:
                 text(f"|ω| {np.linalg.norm(omega):.3f} rad/s", 1022, 691, 18)
+            if plane_mode:
+                toward = task_status['velocity_direction_error_deg']
+                body_z_orthogonal = task_status['velocity_body_z_constraint'] == 'orthogonal'
+                orthogonal = (task_status['velocity_z_error_deg'] if body_z_orthogonal
+                              else task_status['velocity_plane_error_deg'])
+                relation = 'z轴正交误差' if body_z_orthogonal else '平面正交误差'
+                label = ("速度过低，方向未定义" if toward is None else
+                         f"当前朝终点误差 {toward:.1f}° · {relation} {orthogonal:.1f}°")
+                text(label, 1022, 721, 16, colors['muted'])
             text(f"球半径 {task_status['region_radius_m']:.3f} m · 中心容差 {task_status['center_tolerance_m']:g} m",
-                 1022, 721, 16, colors["muted"])
+                 1022, 777 if plane_mode else 721, 16, colors["muted"])
             metrics = meta["metrics"]
             text(f"整组 EVAL：PASS {metrics['pass_fraction']:.1%} · 成功 {metrics['success_fraction']:.1%}",
                  1022, 749, 16, colors["muted"])

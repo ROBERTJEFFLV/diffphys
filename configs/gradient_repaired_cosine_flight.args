@@ -1,0 +1,6 @@
+@configs/gradient_repaired_flight.args
+--lr 0.001
+--lr-schedule cosine
+--lr-decay-updates 10000
+--lr-min 0.00001
+--work-dir runs/pass_stop/gradient_repaired_cosine_from_scratch_seed7

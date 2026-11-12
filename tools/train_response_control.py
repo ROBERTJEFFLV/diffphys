@@ -39,6 +39,10 @@ def parse_args(argv=None):
     parser.add_argument("--updates", type=int, default=50)
     parser.add_argument("--max-seconds", type=float, default=1800.)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
+    parser.add_argument("--lr-decay-updates", type=int, default=10000,
+                        help="successful Adam updates to reach lr-min; then hold it")
+    parser.add_argument("--lr-min", type=float, default=1e-5)
     parser.add_argument("--gradient-clip", type=float, default=10.)
     parser.add_argument("--gradient-scale", type=float, default=.1)
     parser.add_argument("--group-max-groups", type=int, default=None,
@@ -94,6 +98,12 @@ def parse_args(argv=None):
     for name in ("max_seconds", "lr", "gradient_clip", "gradient_scale"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(name+" must be finite and positive")
+    if args.lr_decay_updates < 1:
+        parser.error("lr-decay-updates must be positive")
+    if not math.isfinite(args.lr_min) or args.lr_min < 0:
+        parser.error("lr-min must be finite and nonnegative")
+    if args.lr_schedule == "cosine" and args.lr_min > args.lr:
+        parser.error("lr-min must not exceed lr for cosine decay")
     if not math.isfinite(args.time_decay) or args.time_decay < 0:
         parser.error("time-decay must be finite and nonnegative")
     try:

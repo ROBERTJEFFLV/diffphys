@@ -179,6 +179,9 @@ def capture_short_eval(policy, simulator, initial, horizon, loss_config):
     arrays = _trajectory_arrays(prepared.physical if typed else initial, recorder.events, horizon)
     if typed:
         arrays.update(_command_arrays(prepared, recorder.events, commands, horizon))
+        if loss_config.mission.get('plane_task'):
+            floor = math.hypot(*loss_config.mission['velocities'][1])
+            arrays['command_min_speed_m_s'] = np.where(arrays['command_is_stop'], 0., floor).astype(arrays['velocity'].dtype)
     expected = (horizon + 1, initial.position.shape[0])
     if arrays["position"].shape[:2] != expected or arrays["orientation"].shape[:2] != expected:
         raise RuntimeError("recorded short-EVAL state dimensions are inconsistent")
@@ -286,7 +289,7 @@ def save_latest_replay(run_dir, *, checkpoint_update, model_sha256, source_sha25
         "capture_seconds": capture_seconds,
         "cuda_peak_allocated_bytes": cuda_peak_allocated_bytes,
         "target_world_m": None if mission is not None else [0.0, 0.0, 0.0],
-        "arena": "per-scene position boundary from the fixed-EVAL sampler",
+        "arena": "actual per-scene position boundary after task preparation",
     }
     _atomic_json(playlist, metadata)
     for path in output.glob("trajectory_*.npz"):

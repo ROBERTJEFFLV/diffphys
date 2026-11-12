@@ -22,7 +22,7 @@ from env_raptor import (RaptorParams, RaptorSimulator, RaptorState, environment_
 from compiled_physics import make_simulator, physics_backend_contract
 from compiled_execution import compile_actor, execution_contract
 from scene_prefetch import PrefetchedSampler
-from tensor_storage import saved_tensor_storage
+from tensor_storage import saved_tensor_storage, release_saved_tensor_cache
 from response_noise import DisturbanceConfig, attach_disturbances, disturbance_report
 from response_policy import ARCHITECTURE, ResponseMotorPolicy, ResponsePolicyConfig
 from pass_stop import (PassStopLossConfig, GoalMotorPolicy, policy_class,
@@ -58,6 +58,7 @@ SOURCE_FILES = (
     "tensor_storage.py",
     "pass_stop.py",
     "pass_stop_physics.py",
+    "plane_tasks.py",
     "response_policy.py",
     "response_task.py",
     "response_adjoints.py",
@@ -338,10 +339,12 @@ def binding(args, policy_config, loss_config):
         "torch_version": str(torch.__version__),
         "numerical_backend": physics_backend_contract(execution_device),
         "execution": execution_contract(execution_device, goal_task=isinstance(loss_config, PassStopLossConfig)),
+        **({"lr_scheduler": {"type": "CosineAnnealingLR", "T_max": args.lr_decay_updates,
+                             "eta_min": args.lr_min}} if args.lr_schedule == "cosine" else {}),
     }
 
 
-def _checkpoint(policy, optimizer, progress, run_binding):
+def _checkpoint(policy, optimizer, progress, run_binding, scheduler=None):
     return {
         "schema": PROTOCOL_VERSION,
         "architecture": run_binding["protocol"]["architecture"],
@@ -355,6 +358,7 @@ def _checkpoint(policy, optimizer, progress, run_binding):
         "progress": copy.deepcopy(progress),
         "binding": run_binding,
         "deployment_authorized": False,
+        **({"lr_scheduler": scheduler.state_dict()} if scheduler is not None else {}),
     }
 
 
@@ -432,6 +436,9 @@ def train(args, policy_config, loss_config):
     started = time.monotonic()
     policy = compile_actor(policy_class(loss_config)(policy_config).to(device=device, dtype=dtype), device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.lr_decay_updates, eta_min=args.lr_min,
+    ) if args.lr_schedule == "cosine" else None)
     simulator = make_simulator(RaptorParams(dt=policy_config.dt), device)
     group_config = GroupBalanceConfig.from_args(args)
     disturbances = DisturbanceConfig.from_args(args)
@@ -470,6 +477,16 @@ def train(args, policy_config, loss_config):
         progress = copy.deepcopy(saved["progress"])
         if saved["next_update"] != progress["updates"]:
             raise ValueError("inconsistent checkpoint sampling index")
+        if scheduler is not None:
+            state = saved.get("lr_scheduler")
+            if (not isinstance(state, dict)
+                    or state.get("last_epoch") != min(progress["updates"], args.lr_decay_updates)
+                    or state.get("T_max") != args.lr_decay_updates
+                    or state.get("eta_min") != args.lr_min
+                    or state.get("base_lrs") != [args.lr]
+                    or state.get("_last_lr") != [group["lr"] for group in optimizer.param_groups]):
+                raise ValueError("checkpoint scheduler state missing or inconsistent")
+            scheduler.load_state_dict(state)
         restore_rng(saved["rng"])
     elif args.init_checkpoint:
         saved = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
@@ -514,7 +531,7 @@ def train(args, policy_config, loss_config):
     record = None
 
     def save(name="latest.pt"):
-        atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding))
+        atomic_torch(work / name, _checkpoint(policy, optimizer, progress, run_binding, scheduler))
 
     def evaluation():
         rng = capture_rng()
@@ -532,7 +549,8 @@ def train(args, policy_config, loss_config):
         # Every evaluated Actor has its own full checkpoint; never only latest.pt.
         evaluated = work / "checkpoints" / f"eval_{progress['updates']:08d}_{model_hash(policy)[:16]}.pt"
         if not evaluated.exists():
-            atomic_torch(work / "checkpoints" / evaluated.name, _checkpoint(policy, optimizer, progress, run_binding))
+            atomic_torch(work / "checkpoints" / evaluated.name,
+                         _checkpoint(policy, optimizer, progress, run_binding, scheduler))
         if cost_best:
             save("best.pt")
 
@@ -571,6 +589,7 @@ def train(args, policy_config, loss_config):
             record = backward = None
             gradients_for_audit = {}
             seeds, sampling_report = [], {}
+            learning_rate = optimizer.param_groups[0]["lr"]
             try:
                 sampling_report = {}
                 initial, seeds = sampler(
@@ -649,12 +668,17 @@ def train(args, policy_config, loss_config):
                 restore_rng(before[2])
                 optimizer.zero_grad(set_to_none=True)
                 raise
+            # Audit records the actual Adam step; only committed updates advance LR.
+            if scheduler is not None and scheduler.last_epoch < scheduler.T_max:
+                scheduler.step()
             _sync(device)
             audit_done = time.monotonic()
             progress["updates"] += 1
             progress["elapsed_seconds"] = elapsed_before + time.monotonic() - started
             row = {
                 "update": progress["updates"],
+                "learning_rate": learning_rate,
+                "next_learning_rate": optimizer.param_groups[0]["lr"],
                 **sampler.last,
                 "tensor_storage": storage,
                 "train_seeds": seeds,
@@ -680,10 +704,12 @@ def train(args, policy_config, loss_config):
                     torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
                 ),
             }
-            _append(work / "history.jsonl", row)
-            print(json.dumps(row, allow_nan=False), flush=True)
             record = backward = before = initial = None
             gradients_for_audit = {}
+            storage.update(release_saved_tensor_cache(device))
+            row["update_seconds"] = time.monotonic() - update_start
+            _append(work / "history.jsonl", row)
+            print(json.dumps(row, allow_nan=False), flush=True)
             if progress["updates"] % args.development_every == 0:
                 evaluation()
             if progress["updates"] % args.checkpoint_every == 0:

@@ -1,0 +1,3 @@
+@configs/gradient_repaired_cosine_flight.args
+--init-checkpoint best.pt
+--work-dir runs/pass_stop/gradient_repaired_cosine_hover_best_hostcache_seed7

@@ -1,0 +1,5 @@
+@configs/agile_flight.args
+--mission-config configs/random_via_pass_stop.json
+--work-dir runs/pass_stop/random_via_from_scratch_seed7
+--development-every 10
+--checkpoint-every 1

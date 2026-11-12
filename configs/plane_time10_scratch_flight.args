@@ -1,0 +1,2 @@
+@configs/plane_time10_flight.args
+--work-dir runs/pass_stop/plane_crossing_time10_from_scratch_seed7

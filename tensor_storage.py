@@ -8,6 +8,18 @@ from __future__ import annotations
 from contextlib import contextmanager
 import torch
 
+
+def release_saved_tensor_cache(device):
+    """Return inactive pinned allocations to the OS after the update graph dies."""
+    if torch.device(device).type != 'cuda':
+        return {}
+    before = torch.cuda.memory.host_memory_stats()['allocated_bytes.current']
+    # PyTorch 2.10 exposes host-cache release here; cuda.empty_cache is GPU-only.
+    torch._C._host_emptyCache()
+    after = torch.cuda.memory.host_memory_stats()['allocated_bytes.current']
+    return {'pinned_reserved_before_bytes': before, 'pinned_reserved_after_bytes': after}
+
+
 @contextmanager
 def saved_tensor_storage(device):
     stats = {'offloaded_tensors': 0, 'offloaded_bytes': 0}

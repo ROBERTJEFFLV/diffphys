@@ -1,0 +1,5 @@
+@configs/agile_flight.args
+--mission-config configs/plane_pass_stop.json
+--work-dir runs/pass_stop/plane_crossing_to_stop_seed7
+--development-every 10
+--checkpoint-every 1

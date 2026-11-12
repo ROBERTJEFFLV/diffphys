@@ -1,0 +1,2 @@
+@configs/gradient_repaired_cosine_from_hover_best.args
+--work-dir runs/pass_stop/quadratic_points_hover_best_cosine_seed7

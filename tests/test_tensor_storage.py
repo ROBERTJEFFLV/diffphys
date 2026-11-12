@@ -36,3 +36,30 @@ def test_large_saved_values_and_strided_views_have_identical_gradients(compiled)
     assert stats['offloaded_bytes'] >= source.numel()*source.element_size()
     assert stats['offloaded_tensors'] > 0
     assert torch.equal(*gradients)
+
+
+def test_releasing_saved_tensor_cache_on_cpu_does_not_initialize_cuda():
+    import tensor_storage
+    assert callable(getattr(tensor_storage, 'release_saved_tensor_cache', None))
+    initialized = torch.cuda.is_initialized()
+    assert tensor_storage.release_saved_tensor_cache('cpu') == {}
+    assert torch.cuda.is_initialized() == initialized
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_release_reclaims_inactive_pinned_storage_and_preserves_live_values():
+    import tensor_storage
+    assert callable(getattr(tensor_storage, 'release_saved_tensor_cache', None))
+    torch.cuda.init()
+    live = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+    live.copy_(torch.arange(1024, dtype=live.dtype))
+    value = torch.empty(16 * 1024 * 1024, pin_memory=True)
+    value.zero_()
+    del value
+    before = torch.cuda.memory.host_memory_stats()['allocated_bytes.current']
+    report = tensor_storage.release_saved_tensor_cache('cuda')
+    after = torch.cuda.memory.host_memory_stats()['allocated_bytes.current']
+    assert after <= before - 64 * 1024 * 1024
+    assert report == {'pinned_reserved_before_bytes': before,
+                      'pinned_reserved_after_bytes': after}
+    assert torch.equal(live, torch.arange(1024, dtype=live.dtype))

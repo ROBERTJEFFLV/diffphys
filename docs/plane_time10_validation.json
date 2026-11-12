@@ -1,0 +1,243 @@
+{
+  "launch": {
+    "pid": 2974699,
+    "started_at_utc": "2026-10-27T06:23:28.138721+00:00",
+    "command": [
+      "/tmp/diffphys-cuda-venv/bin/python",
+      "-u",
+      "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/plane_crossing_time10_from_scratch_seed7/continuous_train_response_control.py",
+      "@configs/plane_time10_scratch_flight.args"
+    ],
+    "run_directory": "/home/insta360/workspace_ROB/Agile-Flight-Training/runs/pass_stop/plane_crossing_time10_from_scratch_seed7",
+    "source_sha256": "f6cf8db0a8d40f3279f1f7e88261cb10d32a02c568afc15b851c64a4e9d62358",
+    "seed": 7,
+    "initial_random_actor_sha256": "2707eb044bfb421a5370f2bf419c9ca662bafe37121017a4c8d0fac515e9ad6a",
+    "resume": null,
+    "init_checkpoint": null,
+    "initialization": "fresh random Actor, fresh Adam, update zero",
+    "budget": "until user says stop; numerical faults abort normally",
+    "train_scenes": 3072,
+    "physical_groups": 128,
+    "members_per_group": 24,
+    "eval_scenes": 256,
+    "horizon": 500,
+    "time_weight": 10.0,
+    "time_decay": 0.0,
+    "speed_floor_m_s": 1.5,
+    "plane_crossing_only": true,
+    "fence_L": 50,
+    "endpoints_cube_surface_L": 40,
+    "via_cube_interior_L": 30
+  },
+  "current_training": {
+    "observed_at_utc": "2026-10-27T06:27:31.093543+00:00",
+    "pid": 2974699,
+    "alive": true,
+    "saved_update": 95,
+    "initial_random_weights_confirmed": true,
+    "no_checkpoint_initialization": true,
+    "initial_Adam_empty": true,
+    "time_weight": 10.0,
+    "time_gradient_multiplier_before_clipping": 10.0,
+    "live_time_loss_component": 10.0,
+    "live_time_proxy_seconds": 5.0,
+    "source_unchanged": true,
+    "scenes": 3072,
+    "groups": 128,
+    "scenes_per_group": 24,
+    "horizon": 500,
+    "speed_floor_m_s": 1.5,
+    "first_plane_crossing_only": true,
+    "update_seconds": 2.348615614930168,
+    "gradient_norm": 0.10721095648194189,
+    "continuing_until_user_stop": true
+  },
+  "config_change": {
+    "changed_at_utc": "2026-10-27T06:20:40.832550+00:00",
+    "changed_fields": [
+      "time_weight"
+    ],
+    "before": {
+      "points": [
+        [
+          -0.7,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.38,
+          0.0
+        ],
+        [
+          0.7,
+          0.0,
+          0.0
+        ]
+      ],
+      "relative_to_boundary": true,
+      "via_quaternion": [
+        0.7071067811865476,
+        0.7071067811865476,
+        0.0,
+        0.0
+      ],
+      "stop_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "start_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "velocities": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "region_radius_arms": 2.0,
+      "velocity_weight": 10.0,
+      "direction_weight": 0.01,
+      "acceleration_weight": 0.0,
+      "jerk_weight": 0.0,
+      "stop_acceleration_m_s2": 0.5,
+      "stop_angular_acceleration_rad_s2": 2.0,
+      "stop_motor_rate_per_s": 0.1,
+      "radius_m": 0.1,
+      "pose_tolerance_deg": 1.0,
+      "stop_position_m": 0.1,
+      "stop_velocity_m_s": 0.1,
+      "stop_pose_deg": 5.0,
+      "stop_omega_rad_s": 0.5,
+      "point_weight": 10.0,
+      "time_weight": 1.0,
+      "smooth_weight": 0.01,
+      "version": "pass-region-min-speed-v3",
+      "pass_speed_scale_m_s": 0.5,
+      "random_initial_state": true,
+      "random_via": true,
+      "via_boundary_margin_arms": 20.0,
+      "task_seed": 7,
+      "plane_task": true,
+      "plane_crossing_only": true
+    },
+    "after": {
+      "points": [
+        [
+          -0.7,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.38,
+          0.0
+        ],
+        [
+          0.7,
+          0.0,
+          0.0
+        ]
+      ],
+      "relative_to_boundary": true,
+      "via_quaternion": [
+        0.7071067811865476,
+        0.7071067811865476,
+        0.0,
+        0.0
+      ],
+      "stop_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "start_quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "velocities": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "region_radius_arms": 2.0,
+      "velocity_weight": 10.0,
+      "direction_weight": 0.01,
+      "acceleration_weight": 0.0,
+      "jerk_weight": 0.0,
+      "stop_acceleration_m_s2": 0.5,
+      "stop_angular_acceleration_rad_s2": 2.0,
+      "stop_motor_rate_per_s": 0.1,
+      "radius_m": 0.1,
+      "pose_tolerance_deg": 1.0,
+      "stop_position_m": 0.1,
+      "stop_velocity_m_s": 0.1,
+      "stop_pose_deg": 5.0,
+      "stop_omega_rad_s": 0.5,
+      "point_weight": 10.0,
+      "time_weight": 10.0,
+      "smooth_weight": 0.01,
+      "version": "pass-region-min-speed-v3",
+      "pass_speed_scale_m_s": 0.5,
+      "random_initial_state": true,
+      "random_via": true,
+      "via_boundary_margin_arms": 20.0,
+      "task_seed": 7,
+      "plane_task": true,
+      "plane_crossing_only": true
+    },
+    "old_pid": 2955684
+  },
+  "component_gradient_check": {
+    "source_sha256": "f6cf8db0a8d40f3279f1f7e88261cb10d32a02c568afc15b851c64a4e9d62358",
+    "scenes": 32,
+    "horizon": 64,
+    "dtype": "float64",
+    "time_gradient_norm_before": 7.5669170520564695,
+    "time_gradient_norm_after": 75.66917052056445,
+    "raw_time_gradient_ratio": 9.999999999999968,
+    "other_loss_components_exactly_unchanged": true,
+    "configuration_change_only": "time_weight: 1 to 10",
+    "scope": "component gradient before group/global clipping and Adam; no optimizer step"
+  },
+  "initial_checkpoint_check": {
+    "random_seed_7_initial_weights_confirmed": true,
+    "no_checkpoint_initialization_confirmed": true,
+    "initial_Adam_empty": true,
+    "time_weight": 10.0,
+    "pid": 2974699,
+    "source_sha256": "f6cf8db0a8d40f3279f1f7e88261cb10d32a02c568afc15b851c64a4e9d62358"
+  },
+  "verification_scope": "configuration-only change; source and speed contract unchanged; raw component gradient, not Adam-step multiplier"
+}

@@ -1,0 +1,3 @@
+@configs/velocity_z_time3_flight.args
+--lr 0.001
+--work-dir runs/pass_stop/velocity_z_orthogonal_time3_lr001_seed7
